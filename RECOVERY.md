@@ -20,6 +20,14 @@ to HyperOS).
 | Slot backups 2026-09-30 / 2026-10-01 | `~/work/topaz/backup/*.img.gz`, `~/work/topaz/backup_20261001/`, `~/work/topaz/stock/` |
 | GPT tools | `/mnt/mui/ios-topaz/gptdump.py` (print slot GUIDs/attrs), `/mnt/mui/ios-topaz/mkgptboth.py` (build gpt_bothN.bin from head/tail dumps with CRC checks) |
 
+## Current layout (2026-10-19)
+
+- Slot **b** active: `boot_b` = iOS shim (`/mnt/mui/ios-topaz/shim-boot-0088.img`), boots iOS on power-on.
+- `userdata` = iOS HFS+ root (`/mnt/mui/ios-topaz/ios16-root.simg`).
+- Slot a = stock HyperOS 2.0.208 (needs userdata wiped to boot), `recovery_a` = TWRP.
+- Windows data intact in `esp`/`win`; Mu is not installed (step 6 to boot Windows).
+- Update iOS: `fastboot flash boot_b <new shim-boot.img>` (or test first with `fastboot boot`).
+
 ## 0. Diagnose first
 
 ```sh
