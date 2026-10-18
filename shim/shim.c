@@ -177,6 +177,42 @@ static uintptr_t find_gicr(void);
 static volatile uint64_t gold_dtb;
 static void test_gic(void);
 
+/*
+ * xnu starts the other gold CPUs itself (PSCI CPU_ON), without the shim, so
+ * give their redistributors the same setup test_gic() gives the boot CPU:
+ * awake, SGIs/PPIs in Group 1, default priority. The frames are MMIO, so the
+ * boot CPU can do it for all of them.
+ */
+static void gold_gicr_prepare(void)
+{
+	for (uint32_t aff = 0x101; aff <= 0x103; aff++) {
+		uintptr_t r = 0;
+		for (uintptr_t off = 0; off < GICR_SIZE; off += GICR_PE_SIZE) {
+			uint64_t typer = rd64(GICR_BASE + off + GICR_TYPER);
+			if ((uint32_t)(typer >> 32) == aff) {
+				r = GICR_BASE + off;
+				break;
+			}
+			if (typer & (1 << 4))	/* Last */
+				break;
+		}
+		if (!r) {
+			con_hex("GICR miss", aff);
+			continue;
+		}
+		uint32_t waker = rd32(r + GICR_WAKER);
+		if (waker & 2) {
+			wr32(r + GICR_WAKER, waker & ~2U);
+			for (int i = 0; i < 100000 && (rd32(r + GICR_WAKER) & 4); i++)
+				;
+		}
+		wr32(r + GICR_IGROUPR0, 0xffffffff);
+		for (int id = 0; id < 32; id++)
+			wr8(r + GICR_IPRIORITYR + id, 0xa0);
+		con_hex2("GICR+", "aff=", aff, "waker=", rd32(r + GICR_WAKER));
+	}
+}
+
 static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 {
 	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
@@ -194,6 +230,7 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		 * be narrowed down.
 		 */
 		test_gic();
+		gold_gicr_prepare();
 		con_skip();
 		con_str("LOADER", loader_boot(dtb));
 	}
