@@ -1,0 +1,93 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index c810ee9..61f7769 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -90,6 +90,10 @@ static struct {
+ 	uint32_t d_vote, d_cfg, d_cbcr, d_fw, d_status, d_hwtx, d_hwrx;
+ 	int d_fe1, d_fe2, d_ge;
+ 	uint8_t d_fid1, d_fid2;
++	/* sweettouchdiag=2: polling statistics */
++	unsigned s_frames, s_errs, s_down, s_up, s_maxn;
++	int s_lasterr, s_lastx, s_lasty;
++	uint8_t s_raw[12];
+ } st;
+ static int touch_sleep_chan;
+ 
+@@ -383,11 +387,15 @@ touch_report(uint32_t mask, const int *x, const int *y)
+ 		if (mask & bit) {
+ 			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
+ 				sweet_hid_touch((int)id, 1, x[id], y[id]);
++				st.s_down++;
++				st.s_lastx = x[id];
++				st.s_lasty = y[id];
+ 			}
+ 			st.x[id] = x[id];
+ 			st.y[id] = y[id];
+ 		} else if (st.active & bit) {
+ 			sweet_hid_touch((int)id, 0, st.x[id], st.y[id]);
++			st.s_up++;
+ 		}
+ 	}
+ 	st.active = mask;
+@@ -461,7 +469,14 @@ touch_focaltech(void)
+ 		return err;
+ 	}
+ 	unsigned n = buf[2] & 15u, active = 0;
+-	if ((buf[0] & 0x70u) || n > TOUCH_MAX) {
++	if (n || !st.s_frames) {
++		memcpy(st.s_raw, buf, sizeof(st.s_raw)); /* keep the last frame with contacts */
++	}
++	st.s_frames++;
++	if (n > st.s_maxn) {
++		st.s_maxn = n;
++	}
++	if (n > TOUCH_MAX) {
+ 		return EIO;
+ 	}
+ 	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
+@@ -478,7 +493,7 @@ touch_focaltech(void)
+ 			continue; /* UP record */
+ 		}
+ 		if (event == 3u) {
+-			return EIO;
++			continue; /* topaz: "no event" slot (TopazTouch) */
+ 		}
+ 		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
+ 		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
+@@ -495,9 +510,7 @@ touch_focaltech(void)
+ 		y[id] = (int)py;
+ 		++active;
+ 	}
+-	if (active != n) {
+-		return EIO;
+-	}
++	(void)active;   /* topaz: byte 2 does not always match the records */
+ 	touch_report(mask, x, y);
+ 	return 0;
+ }
+@@ -637,14 +650,24 @@ touch_thread(void *arg, wait_result_t result)
+ 	st.stage = "polling";
+ 	printf("SWEET TOUCH: selected %s, 1080x2400, poll=10ms irq-hint=%d\n",
+ 	    goodix ? "GT9896 Yellowstone" : "Focaltech 54:52", st.irq_hint);
+-	unsigned errors = 0, ticks = 0;
++	unsigned errors = 0, ticks = 0, polls = 0;
+ 	while (!st.dead) {
++		if (st.diag == 2 && ++polls == 3000) {  /* ~30 s at 10 ms */
++			panic("SWEET TOUCH stats: frames=%u errs=%u lasterr=%d maxn=%u hid down=%u up=%u last=%d,%d | "
++			    "raw %02x %02x %02x | %02x %02x %02x %02x %02x %02x | %02x %02x %02x",
++			    st.s_frames, st.s_errs, st.s_lasterr, st.s_maxn, st.s_down, st.s_up,
++			    st.s_lastx, st.s_lasty, st.s_raw[0], st.s_raw[1], st.s_raw[2],
++			    st.s_raw[3], st.s_raw[4], st.s_raw[5], st.s_raw[6], st.s_raw[7],
++			    st.s_raw[8], st.s_raw[9], st.s_raw[10], st.s_raw[11]);
++		}
+ 		/* Optional IRQ hint still reads every 100ms, and always while down. */
+ 		if (!st.irq_hint || st.active ||
+ 		    !(touch_rd(st.west, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)) & 1u) ||
+ 		    (++ticks % 10u) == 0) {
+ 			int err = st.kind == TOUCH_GOODIX ? touch_goodix() : touch_focaltech();
+ 			if (err) {
++				st.s_errs++;
++				st.s_lasterr = err;
+ 				if ((errors++ % 100u) == 0) {
+ 					printf("SWEET TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
+ 				}
