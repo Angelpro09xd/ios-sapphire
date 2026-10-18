@@ -209,7 +209,13 @@ static void gold_gicr_prepare(void)
 		wr32(r + GICR_IGROUPR0, 0xffffffff);
 		for (int id = 0; id < 32; id++)
 			wr8(r + GICR_IPRIORITYR + id, 0xa0);
-		con_hex2("GICR+", "aff=", aff, "waker=", rd32(r + GICR_WAKER));
+		/*
+		 * Also enable the timers and SGI1, as test_gic() does on the boot
+		 * CPU: without it a thread whose wakeup timer is armed on a
+		 * secondary never wakes (backboardd stuck in usleep()).
+		 */
+		wr32(r + GICR_ISENABLER0, (1U << VTIMER_INTID) | (1U << PTIMER_INTID) | (1U << SGI_INTID));
+		con_hex2("GICR+", "aff=", aff, "en=", rd32(r + GICR_ISENABLER0));
 	}
 }
 
