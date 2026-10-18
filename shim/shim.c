@@ -213,6 +213,27 @@ static void gold_gicr_prepare(void)
 	}
 }
 
+/*
+ * Core speed probe: ticks (19.2 MHz) for a fixed dependent-add loop with the
+ * I-cache on. Silver runs at whatever ABL set; gold has no cpufreq driver
+ * after PSCI CPU_ON, so a much larger count than silver means a low clock.
+ */
+static volatile uint64_t silver_ticks;
+
+static uint64_t speed_ticks(void)
+{
+	uint64_t sctlr = rsr("sctlr_el1");
+	wsr("sctlr_el1", sctlr | (1UL << 12));	/* I-cache on (fine with MMU off) */
+	__asm__ volatile("isb");
+	uint64_t t = now(), x = 0;
+	for (uint64_t i = 0; i < 20000000; i++)
+		__asm__ volatile("add %0, %0, #1" : "+r"(x));
+	t = now() - t;
+	wsr("sctlr_el1", sctlr);
+	__asm__ volatile("isb");
+	return t;
+}
+
 static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 {
 	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
@@ -231,6 +252,10 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		 */
 		test_gic();
 		gold_gicr_prepare();
+		uint64_t gt = speed_ticks();
+		con_hex2("SPEED", "silver=", (uint32_t)silver_ticks, "gold=", (uint32_t)gt);
+		con_str("GOLD", "speed probe shown, xnu in 8 s");
+		delay_ms(8000);
 		con_skip();
 		con_str("LOADER", loader_boot(dtb));
 	}
@@ -460,6 +485,7 @@ void shim_main(uint64_t dtb)
 	if (((mmfr0 >> 20) & 0xf) == 0) {
 		con_str("SILVER", "no 16K granule: handing off to gold CPU 0x100");
 		con_skip();
+		silver_ticks = speed_ticks();
 		gold_dtb = dtb;
 		__asm__ volatile("dsb sy" ::: "memory");
 		int64_t r = smc(PSCI_CPU_ON, 0x100, (uintptr_t)secondary_entry, 4);
