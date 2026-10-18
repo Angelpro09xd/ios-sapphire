@@ -1,0 +1,151 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index a148608..65970f9 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -17,11 +17,12 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+ void sweet_keys_init(void);
+ 
+-#define KEYS_CORE_PA     0x0c440000u
+-#define KEYS_OBS_PA      0x0e600000u
+-#define KEYS_CNFG_PA     0x0c40a000u
++/* topaz (SM6225, sm6125.dtsi spmi_bus; PM6125 USID 0): PON 0x800, Vol+ = GPIO5 */
++#define KEYS_CORE_PA     0x01c40000u
++#define KEYS_OBS_PA      0x03e00000u
++#define KEYS_CNFG_PA     0x01c0a000u
+ #define KEYS_PON_RT      0x0810u
+-#define KEYS_GPIO_RT     0xc110u
++#define KEYS_GPIO_RT     0xc410u
+ #define KEYS_NO_APID     0xffffu
+ 
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+@@ -152,13 +153,13 @@ sweet_keys_init(void)
+ 		return;
+ 	}
+ 	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
++	keys_gpio_apid = keys_find_apid(0x0c4, count);
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+-	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+-	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
++	bool mok = keys_read(keys_gpio_apid, 0xc440, &mode);
++	bool eok = keys_read(keys_gpio_apid, 0xc446, &en);
++	bool sok = keys_read(keys_gpio_apid, 0xc405, &subtype);
+ 	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+ 	    keys_version, count, keys_pon_apid, keys_gpio_apid,
+ 	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
+@@ -166,7 +167,7 @@ sweet_keys_init(void)
+ 	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+ 	    mode & 3u : (mode >> 4) & 7u;
+ 	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
+-		printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
++		printf("SWEET KEYS: GPIO5 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
+ 		keys_gpio_apid = KEYS_NO_APID;
+ 	}
+ 	if (!pok && !gok) {
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 61f7769..a9b928b 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -29,7 +29,7 @@ void sweet_touch_init(void);
+ #define TOUCH_WEST_PA    0x00500000u /* TLMM 0x400000 + WEST tile: GPIO 6/7/80/86 */
+ #define TOUCH_EAST_PA    0x00d00000u /* TLMM 0x400000 + EAST tile: GPIO 36 */
+ #define TOUCH_GCC_VOTE   0x7900cu    /* QUP0 wrapper + SE2 vote, bits 0x13c0 */
+-#define TOUCH_RCG       0x3f3a8u    /* QUP0 S2 CMD; CFG +4, CBCR -4 */
++#define TOUCH_RCG       0x1f3a8u    /* QUP0 S2 CMD; CFG +4, CBCR -4 (gcc-khaje.c) */
+ #define TOUCH_PIN_RESET  86u
+ #define TOUCH_PIN_IRQ    80u
+ #define TOUCH_PIN_AVDD   36u
+@@ -189,15 +189,26 @@ touch_clocks(void)
+ static void
+ touch_abort(void)
+ {
+-	touch_wr(st.se, SE_CTRL, 2); /* abort M command, release held bus */
++	/* i2c-qcom-geni.c: M_GENI_CMD_CANCEL, then ABORT if cancel does not finish */
+ 	bool done = false;
+-	for (unsigned i = 0; i < 5000; ++i) {
+-		if (touch_rd(st.se, SE_IRQ) & (1u << 5)) {
++	touch_wr(st.se, SE_CTRL, 4);
++	for (unsigned i = 0; i < 1000; ++i) {
++		if (touch_rd(st.se, SE_IRQ) & (1u << 4)) {
+ 			done = true;
+ 			break;
+ 		}
+ 		delay(1);
+ 	}
++	if (!done) {
++		touch_wr(st.se, SE_CTRL, 2); /* abort M command, release held bus */
++		for (unsigned i = 0; i < 1000; ++i) {
++			if (touch_rd(st.se, SE_IRQ) & (1u << 5)) {
++				done = true;
++				break;
++			}
++			delay(1);
++		}
++	}
+ 	if (!done || !touch_wait_clear(st.se, SE_STATUS, 1u)) {
+ 		st.dead = true;
+ 		printf("SWEET TOUCH: abort failed status=%#x irq=%#x; stopping\n",
+@@ -240,8 +251,11 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ 	touch_wr(st.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
+ 	touch_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
+ 	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
++	if (nr > 8 && !st.probing) {
++		touch_wait(2); /* sleep, do not spin, through most of the transfer */
++	}
+ 	int err = ETIMEDOUT;
+-	for (unsigned i = 0; i < 20000; ++i) {
++	for (unsigned i = 0; i < 5000; ++i) {
+ 		uint32_t irq = touch_irq();
+ 		if (irq & SE_ERRORS) {
+ 			err = (irq & SE_NACK) ? ENXIO : EIO;
+@@ -548,8 +562,8 @@ touch_se_init(void)
+ 	touch_wr(st.se, 0x24, 0x7f);
+ 	touch_wr(st.se, 0x20, 1);
+ 	touch_wr(st.se, SE_CLK_SEL, 0);
+-	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
+-	touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
++	touch_wr(st.se, SE_MCLK, (2u << 4) | 1u);
++	touch_wr(st.se, SE_SCL, (5u << 20) | (11u << 10) | 22u); /* 400 kHz */
+ 	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
+ 	touch_wr(st.se, 0x254, 0);
+ 	touch_wr(st.se, 0x260, SE_PACK0);
+@@ -703,6 +717,7 @@ sweet_touch_init(void)
+ 	}
+ 	st.started = true;
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
++	st.irq_hint = 1; /* topaz: read on IRQ GPIO80 low, while touching, else every 100 ms */
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
+ 	(void)PE_parse_boot_argn("sweettouchdiag", &st.diag, sizeof(st.diag));
+ 	if (!enabled) {
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index af6e35c..b7be070 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -658,18 +658,18 @@ sweet_ufs_init(void)
+ 	sweet_sample_start();
+ 	/*
+ 	 * Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp).
+-	 * Touch is ported to topaz (FT5452 on QUP0 SE2; sweettouch=0 disables
+-	 * it). Keys and USB still poke SM7150 MMIO (SPMI, DWC3 at 0xa600000);
+-	 * on topaz that faults or hangs, so they only run with sweethw=1.
++	 * Touch (FT5452 on QUP0 SE2) and keys (PM6125 over SPMI) are ported to
++	 * topaz; sweettouch=0 / sweetkeys=0 disable them. USB still pokes SM7150
++	 * MMIO (DWC3 at 0xa600000), so it only runs with sweethw=1.
+ 	 */
+ 	int hw = 0;
+ 	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));
+ 	sweet_touch_init();
++	sweet_keys_init();
+ 	if (hw == 1) {
+-		sweet_keys_init();
+ 		sweet_usb_probe();
+ 	} else {
+-		printf("SWEET UFS: keys/USB skipped (topaz, sweethw=0)\n");
++		printf("SWEET UFS: USB skipped (topaz, sweethw=0)\n");
+ 	}
+ 	return 0;
+ }
