@@ -175,6 +175,7 @@ static uintptr_t find_gicr(void);
  * runs the loader and xnu never sees the silver cluster.
  */
 static volatile uint64_t gold_dtb;
+static void test_gic(void);
 
 static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 {
@@ -185,8 +186,17 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 	con_skip();
 	if (((mmfr0 >> 20) & 0xf) == 0)
 		con_str("GOLD", "no 16K granule here either");
-	else
+	else {
+		/*
+		 * Required: without it xnu hangs after initCPU on gold (no SGI or
+		 * vtimer). It sets GICD EnableGrp1/ARE_NS, wakes gold's redistributor
+		 * and puts its SGIs/PPIs in Group 1; which part matters is still to
+		 * be narrowed down.
+		 */
+		test_gic();
+		con_skip();
 		con_str("LOADER", loader_boot(dtb));
+	}
 	for (;;)
 		__asm__ volatile("wfe");
 }
@@ -349,7 +359,7 @@ static void test_gic(void)
 		wr8(r + GICR_IPRIORITYR + id, 0xa0);
 	wr32(r + GICR_ISENABLER0, (1U << VTIMER_INTID) | (1U << PTIMER_INTID) | (1U << SGI_INTID));
 	con_hex2("ENABLE", "was=", en_before, "now=", rd32(r + GICR_ISENABLER0));
-	(void)grp;
+	con_hex2("IGROUP0", "was=", grp, "now=", rd32(r + GICR_IGROUPR0));
 	(void)pri_before;
 
 	uint64_t ctlr = rsr("icc_ctlr_el1");
