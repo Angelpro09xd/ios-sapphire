@@ -1,0 +1,104 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index b7be070..467ce46 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -271,6 +271,15 @@ ufs_read_blocks(uint64_t lba, uint32_t count)
+ 	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, false);
+ }
+ 
++/*
++ * topaz: on 2026-10-19 the LUN0 GPT (super, userdata, esp, win, ...) was found
++ * destroyed after iOS sessions. Remember both GPT copies and fence them off;
++ * a watchdog thread re-reads them and panics the moment they change.
++ */
++static uint64_t gpt_alt;                /* backup header LBA (last LBA of LUN0) */
++static uint32_t gpt_hcrc, gpt_ecrc, gpt_bhcrc;
++static int gpt_chan;
++
+ /*
+  * WRITE(10) of count device blocks from the bounce buffer to lba. The range
+  * must lie inside the partition: this is the only place data goes out.
+@@ -280,7 +289,8 @@ ufs_write_blocks(uint64_t lba, uint32_t count)
+ {
+ 	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
+ 	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
+-	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX) {
++	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX ||
++	    lba < 6 || (gpt_alt && lba + count - 1 >= gpt_alt - 4)) {
+ 		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
+ 		return EPERM;
+ 	}
+@@ -313,6 +323,9 @@ ufs_find_partition(const char *want)
+ 	}
+ 	uint64_t entry_lba;
+ 	uint32_t nent, esz;
++	memcpy(&gpt_hcrc, b + 16, 4);
++	memcpy(&gpt_alt, b + 32, 8);
++	memcpy(&gpt_ecrc, b + 88, 4);
+ 	memcpy(&entry_lba, b + 72, 8);
+ 	memcpy(&nent, b + 80, 4);
+ 	memcpy(&esz, b + 84, 4);
+@@ -347,6 +360,11 @@ ufs_find_partition(const char *want)
+ 		}
+ 		su.first_block = first;
+ 		su.nblocks = last - first + 1;
++		if (ufs_read_blocks(gpt_alt, 1) == 0 && memcmp(b, "EFI PART", 8) == 0) {
++			memcpy(&gpt_bhcrc, b + 16, 4);
++		}
++		printf("SWEET UFS: GPT LUN0 hcrc %#x ecrc %#x backup@%#llx hcrc %#x\n",
++		    gpt_hcrc, gpt_ecrc, gpt_alt, gpt_bhcrc);
+ 		return 0;
+ 	}
+ 	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
+@@ -583,6 +601,40 @@ static const struct cdevsw sweet_ufs_cdevsw = {
+ 	.d_type       = D_DISK,
+ };
+ 
++static void
++sweet_gpt_watch(__unused void *arg, __unused wait_result_t wr)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	uint64_t start = mach_absolute_time();
++	for (;;) {
++		uint64_t deadline;
++		clock_interval_to_deadline(10, NSEC_PER_SEC, &deadline);
++		(void)assert_wait_deadline(&gpt_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++
++		uint32_t h = 0, e = 0, bh = 0;
++		bool ok;
++		lck_mtx_lock(&sweet_ufs_lock);
++		ok = ufs_read_blocks(1, 1) == 0 && memcmp(b, "EFI PART", 8) == 0;
++		if (ok) {
++			memcpy(&h, b + 16, 4);
++			memcpy(&e, b + 88, 4);
++		}
++		if (ok && gpt_bhcrc && ufs_read_blocks(gpt_alt, 1) == 0) {
++			if (memcmp(b, "EFI PART", 8) == 0) {
++				memcpy(&bh, b + 16, 4);
++			}
++		}
++		lck_mtx_unlock(&sweet_ufs_lock);
++		if (!ok || h != gpt_hcrc || e != gpt_ecrc || (gpt_bhcrc && bh != gpt_bhcrc)) {
++			uint64_t ns;
++			absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
++			panic("SWEET UFS: GPT LUN0 CHANGED after %llu s: primary %s hcrc %#x/%#x ecrc %#x/%#x backup hcrc %#x/%#x",
++			    ns / NSEC_PER_SEC, ok ? "present" : "MISSING", h, gpt_hcrc, e, gpt_ecrc, bh, gpt_bhcrc);
++		}
++	}
++}
++
+ static int
+ sweet_ufs_init(void)
+ {
+@@ -656,6 +708,10 @@ sweet_ufs_init(void)
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
++	thread_t gpt_thread;
++	if (kernel_thread_start(sweet_gpt_watch, NULL, &gpt_thread) == KERN_SUCCESS) {
++		thread_deallocate(gpt_thread);
++	}
+ 	/*
+ 	 * Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp).
+ 	 * Touch (FT5452 on QUP0 SE2) and keys (PM6125 over SPMI) are ported to
