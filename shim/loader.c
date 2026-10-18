@@ -85,9 +85,32 @@ const char *loader_boot(uintptr_t dtb)
 		return "no initrd in /chosen";
 	con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
 
-	const struct payload *p = (const struct payload *)rd_start;
-	if (!magic_ok(p->magic))
+	/*
+	 * Boot image v4 (topaz ABL ignores v1/v2): ABL concatenates the
+	 * vendor_boot ramdisk(s) and ours, so the payload is somewhere inside
+	 * the initrd and not necessarily 8-byte aligned. Find it and move it
+	 * down to an aligned address; the vendor ramdisk below it is unused.
+	 */
+	uintptr_t hit = 0;
+	for (uintptr_t a = rd_start; a + 8 <= rd_end; a++)
+		if (magic_ok((const char *)a)) {
+			hit = a;
+			break;
+		}
+	if (!hit)
 		return "no SWEETXNU payload";
+	if (hit != rd_start) {
+		uintptr_t dst = (rd_start + 7) & ~7UL;
+		volatile uint8_t *d = (volatile uint8_t *)dst;
+		volatile const uint8_t *src = (volatile const uint8_t *)hit;
+
+		con_hex2("PAYLOAD", "at=", hit, "to=", dst);
+		for (uint64_t i = 0; i < rd_end - hit; i++)
+			d[i] = src[i];
+		rd_end = dst + (rd_end - hit);
+		rd_start = dst;
+	}
+	const struct payload *p = (const struct payload *)rd_start;
 	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
 		return "bad payload header";
 

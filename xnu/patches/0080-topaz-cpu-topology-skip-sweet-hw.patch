@@ -1,0 +1,68 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..40044c8 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -656,10 +656,21 @@ sweet_ufs_init(void)
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
+-	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+-	sweet_keys_init();
+-	sweet_touch_init();
+-	sweet_usb_probe();
++	/*
++	 * Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp).
++	 * They still poke SM7150 MMIO (SPMI, GENI SE7, DWC3 at 0xa600000); on
++	 * topaz that faults or hangs, so they only run with sweethw=1 until
++	 * they are ported.
++	 */
++	int hw = 0;
++	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));
++	if (hw == 1) {
++		sweet_keys_init();
++		sweet_touch_init();
++		sweet_usb_probe();
++	} else {
++		printf("SWEET UFS: keys/touch/USB skipped (topaz, sweethw=0)\n");
++	}
+ 	return 0;
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..1724396 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -73,8 +73,8 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+-	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
++	/* topaz (SM6225): MPIDR Aff1 = cluster, Aff0 = core: 0x0-0x3 A53, 0x100-0x103 A73 */
++	if ((cpu->phys_id >> 8) > 1 || (cpu->phys_id & 0xff) > 3 ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+@@ -82,7 +82,7 @@ SweetCPU::start(IOService *provider)
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
+-	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
++	cpuName = OSSymbol::withCStringNoCopy("Kryo 260");
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index b99c2f4..ebf0107 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -18,7 +18,8 @@
+ #define SWEET                     1
+ 
+ /*
+- * All eight cores (six A55 + two A76) as one homogeneous SMP cluster:
++ * All eight cores as one homogeneous SMP cluster (topaz: four A53 at
++ * MPIDR 0x0-0x3 + four A73 at 0x100-0x103; sweet: six A55 + two A76):
+  * cpus=N is clamped here. Same ISA level (ARMv8.2), 64-byte lines, PSCI
+  * CPU_ON; the scheduler does not know the A76s are faster (no AMP/P-E
+  * clusters yet).
