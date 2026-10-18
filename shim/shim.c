@@ -168,8 +168,33 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 
 static uintptr_t find_gicr(void);
 
+/*
+ * topaz: xnu needs the 16K translation granule. ABL starts us on a Kryo 260
+ * Silver core (Cortex-A53 class, TGran16 = 0); the Gold A73 cluster has it.
+ * The boot core wakes gold CPU 0x100 with this DTB and parks itself; gold
+ * runs the loader and xnu never sees the silver cluster.
+ */
+static volatile uint64_t gold_dtb;
+
+static void __attribute__((noreturn)) gold_main(uint64_t dtb)
+{
+	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
+
+	con_hex2("GOLD", "midr=", (uint32_t)rsr("midr_el1"), "mpidr=", (uint32_t)rsr("mpidr_el1"));
+	con_hex2("MMFR0", "lo=", (uint32_t)mmfr0, "tg16=", (mmfr0 >> 20) & 0xf);
+	con_skip();
+	if (((mmfr0 >> 20) & 0xf) == 0)
+		con_str("GOLD", "no 16K granule here either");
+	else
+		con_str("LOADER", loader_boot(dtb));
+	for (;;)
+		__asm__ volatile("wfe");
+}
+
 void secondary_main(uint64_t idx)
 {
+	if (gold_dtb)
+		gold_main(gold_dtb);
 	sec_mpidr[idx] = rsr("mpidr_el1") | (1ULL << 63);
 	if (idx == 1) {
 		uintptr_t r = find_gicr();
@@ -381,6 +406,23 @@ void shim_main(uint64_t dtb)
 	stage = "loader";
 	con_clear(RED);
 	con_str("SHIM", "sweet milestone 4: xnu loader");
+	/* topaz: xnu needs the 16K granule (TGran16 != 0); Cortex-A53 may lack it */
+	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
+	con_hex2("MMFR0", "lo=", (uint32_t)mmfr0, "tg16=", (mmfr0 >> 20) & 0xf);
+	con_hex2("MIDR", "el1=", (uint32_t)rsr("midr_el1"), "mpidr=", (uint32_t)rsr("mpidr_el1"));
+	if (((mmfr0 >> 20) & 0xf) == 0) {
+		con_str("SILVER", "no 16K granule: handing off to gold CPU 0x100");
+		con_skip();
+		gold_dtb = dtb;
+		__asm__ volatile("dsb sy" ::: "memory");
+		int64_t r = smc(PSCI_CPU_ON, 0x100, (uintptr_t)secondary_entry, 4);
+		if (r == 0) {
+			for (;;)	/* parked with DAIF masked (start.S) */
+				__asm__ volatile("wfi");
+		}
+		gold_dtb = 0;
+		con_hex("CPU_ON", (uint64_t)r);
+	}
 	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
