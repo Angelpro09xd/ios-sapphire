@@ -37,6 +37,7 @@ env:
   CCACHE_COMPILERCHECK: content
   CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,file_macro,pch_defines
   CCACHE_MAXSIZE: 3G
+  CCACHE_WRAP: ${{ github.workspace }}/ccache-bin
 
 jobs:
   build:
@@ -59,9 +60,10 @@ jobs:
           # (clang's apple-m1 default emits LSE atomics and LDAPR)
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53"/' dxb/build.sh
           grep -c 'OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53"' dxb/build.sh
-          # xnu's makedefs take CC/CXX from the environment dxb exports
-          sed -i '' 's|export CC="$(xcrun -find clang)"|export CC="ccache $(xcrun -find clang)"|; s|export CXX="$(xcrun -find clang++)"|export CXX="ccache $(xcrun -find clang++)"|' dxb/build.sh
-          grep -c 'export CC="ccache' dxb/build.sh
+          # xnu's makedefs take CC/CXX from the environment dxb exports; xcodebuild
+          # (mig, ctf tools) needs a single executable, so point at wrappers
+          sed -i '' 's|export CC="$(xcrun -find clang)"|export CC="$CCACHE_WRAP/clang"|; s|export CXX="$(xcrun -find clang++)"|export CXX="$CCACHE_WRAP/clang++"|' dxb/build.sh
+          grep -c 'export CC="$CCACHE_WRAP/clang"' dxb/build.sh
           ls dxb/patches
 
       - name: Deps
@@ -77,6 +79,12 @@ jobs:
           sudo xcode-select -s "$XC"
           xcodebuild -version
           xcrun --find iig
+          mkdir -p "$CCACHE_WRAP"
+          for t in clang clang++; do
+            printf '#!/bin/sh\nexec ccache %s "$@"\n' "$(xcrun -find $t)" > "$CCACHE_WRAP/$t"
+            chmod +x "$CCACHE_WRAP/$t"
+          done
+          cat "$CCACHE_WRAP/clang"
 
       - name: Restore ccache
         uses: actions/cache@v4
