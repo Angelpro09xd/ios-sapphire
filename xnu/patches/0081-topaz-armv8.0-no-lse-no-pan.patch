@@ -1,0 +1,252 @@
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 9a748ea..f968fc7 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -61,7 +61,8 @@ MACHINE_FLAGS_ARM64_T8103 = -DARM64_BOARD_CONFIG_T8103                  -mcpu=ap
+ MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+-MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
++# topaz: Cortex-A53/A73 are ARMv8.0 (no LSE atomics, RCpc, PAN or FP16)
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crypto+crc
+ 
+ 
+ #
+diff --git a/osfmk/arm/commpage/commpage_asm.s b/osfmk/arm/commpage/commpage_asm.s
+index da0bbba..32582c0 100644
+--- a/osfmk/arm/commpage/commpage_asm.s
++++ b/osfmk/arm/commpage/commpage_asm.s
+@@ -273,7 +273,14 @@ _pfz_trylock_and_enqueue:
+ 	mov		w11, #1			 // locked value = w11 = 1
+ 
+ 	// Try to grab the lock
+-	casa	w10, w11, [x3]	 // Atomic CAS with acquire barrier
++	// topaz (ARMv8.0, no LSE): CASA as an LDAXR/STXR loop, w10 = old value
++1:	ldaxr	w10, [x3]
++	cbnz	w10, 2f
++	stxr	w12, w11, [x3]
++	cbnz	w12, 1b
++	b	3f
++2:	clrex
++3:
+ 	cbz		w10, Ltrylock_enqueue_success
+ 
+ 	mov		x0, #-1			// Failed
+@@ -323,7 +330,14 @@ _pfz_trylock_and_dequeue:
+ 	mov		w10, wzr		 // unlock value = w10 = 0
+ 	mov		w11, #1			 // locked value = w11 = 1
+ 
+-	casa	w10, w11, [x2]	 // Atomic CAS with acquire barrier
++	// topaz (ARMv8.0, no LSE): CASA as an LDAXR/STXR loop, w10 = old value
++1:	ldaxr	w10, [x2]
++	cbnz	w10, 2f
++	stxr	w12, w11, [x2]
++	cbnz	w12, 1b
++	b	3f
++2:	clrex
++3:
+ 	cbz		w10, Ltrylock_dequeue_success
+ 
+ 	mov		x0, #-1			// Failed
+diff --git a/osfmk/arm64/machine_routines_asm.s b/osfmk/arm64/machine_routines_asm.s
+index 2449334..9faf940 100644
+--- a/osfmk/arm64/machine_routines_asm.s
++++ b/osfmk/arm64/machine_routines_asm.s
+@@ -1315,3 +1315,88 @@ Lsign_ret:
+ 	COPYIO_RECOVER_TABLE_SYM	copyio_recover_table_end
+ 
+ /* vim: set sw=4 ts=4: */
++
++
++#if defined(SWEET)
++/*
++ * topaz (Cortex-A53/A73, ARMv8.0): emulate one LSE atomic / LDAPR on a user
++ * address for handle_uncategorized() in sleh.c.
++ *
++ * int _sweet_lse_{b,h,w,x}(user_addr_t addr, uint32_t op, uint64_t operand,
++ *                          uint64_t compare, uint64_t *old)
++ *   op 0-7: LD<ADD,CLR,EOR,SET,SMAX,SMIN,UMAX,UMIN>, 8: SWP, 9: CAS, 10: LDAPR
++ * operand/compare are already truncated to the access size. Always
++ * acquire+release (at least as strong as every LSE variant). Returns 0, or
++ * EFAULT through copyio_error.
++ */
++.macro SWEET_LSE sfx, ldx, stx, r, sxa, sxb
++	.text
++	.align 2
++	.globl EXT(_sweet_lse_\sfx)
++LEXT(_sweet_lse_\sfx)
++	ARM64_STACK_PROLOG
++	PUSH_FRAME
++	COPYIO_RECOVER_RANGE 9f
++1:	\ldx	\r\()10, [x0]
++	cmp	w1, #10
++	b.eq	7f
++	cmp	w1, #9
++	b.ne	20f
++	cmp	\r\()10, \r\()3
++	b.ne	7f
++	mov	\r\()11, \r\()2
++	b	5f
++20:	cmp	w1, #8
++	b.ne	21f
++	mov	\r\()11, \r\()2
++	b	5f
++21:	cmp	w1, #0
++	b.ne	22f
++	add	\r\()11, \r\()10, \r\()2
++	b	5f
++22:	cmp	w1, #1
++	b.ne	23f
++	bic	\r\()11, \r\()10, \r\()2
++	b	5f
++23:	cmp	w1, #2
++	b.ne	24f
++	eor	\r\()11, \r\()10, \r\()2
++	b	5f
++24:	cmp	w1, #3
++	b.ne	25f
++	orr	\r\()11, \r\()10, \r\()2
++	b	5f
++25:	\sxa
++	\sxb
++	cmp	w1, #4
++	b.ne	26f
++	cmp	\r\()12, \r\()13
++	csel	\r\()11, \r\()10, \r\()2, gt
++	b	5f
++26:	cmp	w1, #5
++	b.ne	27f
++	cmp	\r\()12, \r\()13
++	csel	\r\()11, \r\()10, \r\()2, lt
++	b	5f
++27:	cmp	\r\()10, \r\()2
++	csel	\r\()11, \r\()10, \r\()2, hi
++	cmp	w1, #6
++	b.eq	5f
++	csel	\r\()11, \r\()10, \r\()2, lo
++5:	\stx	w9, \r\()11, [x0]
++	cbnz	w9, 1b
++	b	8f
++7:	clrex
++8:	dmb	ish
++	str	x10, [x4]
++	mov	x0, #0
++9:
++	POP_FRAME
++	ARM64_STACK_EPILOG
++.endmacro
++
++	SWEET_LSE b, ldaxrb, stlxrb, w, "sxtb w12, w10", "sxtb w13, w2"
++	SWEET_LSE h, ldaxrh, stlxrh, w, "sxth w12, w10", "sxth w13, w2"
++	SWEET_LSE w, ldaxr,  stlxr,  w, "mov w12, w10",  "mov w13, w2"
++	SWEET_LSE x, ldaxr,  stlxr,  x, "mov x12, x10",  "mov x13, x2"
++#endif /* SWEET */
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..a2a8c1b 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -875,6 +875,78 @@ sleh_synchronous(arm_context_t *context, uint32_t esr, vm_offset_t far)
+ #endif
+ }
+ 
++#if defined(SWEET)
++extern int _sweet_lse_b(user_addr_t, uint32_t, uint64_t, uint64_t, uint64_t *);
++extern int _sweet_lse_h(user_addr_t, uint32_t, uint64_t, uint64_t, uint64_t *);
++extern int _sweet_lse_w(user_addr_t, uint32_t, uint64_t, uint64_t, uint64_t *);
++extern int _sweet_lse_x(user_addr_t, uint32_t, uint64_t, uint64_t, uint64_t *);
++
++/*
++ * topaz (Cortex-A53/A73, ARMv8.0): the iPhone X userland still has LSE
++ * atomics (LD<op>, SWP, CAS) and LDAPR outside its CPU-capability checks.
++ * Emulate them atomically with LDAXR/STLXR on the user address
++ * (machine_routines_asm.s); returns false for anything else (CASP stays
++ * EXC_BAD_INSTRUCTION).
++ */
++static bool
++sweet_emulate_lse(arm_saved_state_t *state, uint32_t instr)
++{
++	uint32_t size = instr >> 30;
++	uint32_t rs = (instr >> 16) & 31, rn = (instr >> 5) & 31, rt = instr & 31;
++	uint64_t mask = size == 3 ? ~0ULL : (1ULL << (8 << size)) - 1;
++	uint64_t operand = 0, compare = 0, old = 0;
++	uint32_t op, dst;
++	int err;
++
++	if ((instr & 0x3F200C00) == 0x38200000) {
++		uint32_t o3 = (instr >> 15) & 1, opc = (instr >> 12) & 7;
++		if (o3 == 0) {
++			op = opc;
++		} else if (opc == 0) {
++			op = 8;         /* SWP */
++		} else if (opc == 4 && rs == 31) {
++			op = 10;        /* LDAPR */
++		} else {
++			return false;
++		}
++		if (op != 10 && rs != 31) {
++			operand = get_saved_state_reg(state, rs) & mask;
++		}
++		dst = rt;
++	} else if ((instr & 0x3FA07C00) == 0x08A07C00) {
++		op = 9;                 /* CAS: Rs = compare and old value, Rt = new */
++		if (rs != 31) {
++			compare = get_saved_state_reg(state, rs) & mask;
++		}
++		if (rt != 31) {
++			operand = get_saved_state_reg(state, rt) & mask;
++		}
++		dst = rs;
++	} else {
++		return false;
++	}
++
++	user_addr_t addr = rn == 31 ? get_saved_state_sp(state) : get_saved_state_reg(state, rn);
++	if ((addr & ((1ULL << size) - 1)) != 0 || addr >= MACH_VM_MAX_ADDRESS) {
++		return false;
++	}
++	switch (size) {
++	case 0: err = _sweet_lse_b(addr, op, operand, compare, &old); break;
++	case 1: err = _sweet_lse_h(addr, op, operand, compare, &old); break;
++	case 2: err = _sweet_lse_w(addr, op, operand, compare, &old); break;
++	default: err = _sweet_lse_x(addr, op, operand, compare, &old); break;
++	}
++	if (err != 0) {
++		return false;
++	}
++	if (dst != 31) {
++		set_saved_state_reg(state, dst, (register_t)old);
++	}
++	add_saved_state_pc(state, 4);
++	return true;
++}
++#endif /* SWEET */
++
+ /*
+  * Uncategorized exceptions are a catch-all for general execution errors.
+  * ARM64_TODO: For now, we assume this is for undefined instruction exceptions.
+@@ -889,6 +961,12 @@ handle_uncategorized(arm_saved_state_t *state)
+ 
+ 	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
+ 
++#if defined(SWEET)
++	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) && sweet_emulate_lse(state, instr)) {
++		return;
++	}
++#endif
++
+ #if CONFIG_DTRACE
+ 
+ 	if (PSR64_IS_USER64(get_saved_state_cpsr(state))) {
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index ebf0107..424e1c0 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -34,7 +34,7 @@
+ #define __ARM_DEBUG__             7
+ #define __ARM_ENABLE_SWAP__       1
+ #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+-#define __ARM_PAN_AVAILABLE__     1
++/* topaz: Cortex-A53/A73 have no PAN (ARMv8.1); MSR PAN is undefined there */
+ #define __ARM_16K_PG__            1
+ 
+ #define HAS_GIC_V3                1

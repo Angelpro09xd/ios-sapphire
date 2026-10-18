@@ -76,14 +76,30 @@ static int magic_ok(const char *m)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
+/* build.sh appends the payload to the Image at the first 4K boundary after _end */
+extern char _end[];
+
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
+	uintptr_t emb = ((uintptr_t)_end + 0xfff) & ~0xfffUL;
 
-	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
-	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
-		return "no initrd in /chosen";
-	con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
+	/*
+	 * topaz: the ABL only passes the vendor_boot ramdisk for a v4 boot
+	 * image, so the payload rides behind the shim in the kernel Image.
+	 * Its exact size is unknown here; the kernel memory check below only
+	 * needs an upper bound, and the Image is far below phys_base.
+	 */
+	if (magic_ok((const char *)emb)) {
+		rd_start = emb;
+		rd_end = emb + 0x8000000;
+		con_hex("EMBED", emb);
+	} else {
+		if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
+		    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
+			return "no initrd in /chosen";
+		con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
+	}
 
 	/*
 	 * Boot image v4 (topaz ABL ignores v1/v2): ABL concatenates the
