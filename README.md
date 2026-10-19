@@ -135,6 +135,7 @@ The shim screen (red) shows `MMFR0`, the Gold hand-off and `SPEED silver=… gol
 5. **Real-time clock** from the PMIC RTC or passed in by the shim.
 6. **All 8 cores (experiment, later):** build XNU with 4K pages (drop `__ARM_16K_PG__` from `SWEET.h`, as XNU's own `BCM2837` Raspberry Pi 3 config does on Cortex-A53) and describe two clusters, Gold as `P` and Silver as `E`, so the AMP scheduler uses both. Risk: the iOS 16 userland was only ever run on 16K pages (hard-coded 16K in malloc, JIT guard pages, IOSurface, commpage layout), and the 16K assumptions in the shim and sweet's patches have to be checked too. The 16K Gold-only kernel stays as the fallback.
 7. **Silver cores as a coprocessor** (idea): run bare-metal shim code on them for the panel frame copy instead of XNU.
+8. **6 GB model** (requested): the RAM layout is hard-coded for the 4 GB phone (`mkadt.py --highmem`, 4 GiB at `0x1_40000000`). Have the shim read the DDR ranges from the `/memory` node of the DTB that ABL passes and write them into the ADT and boot args, so one image boots both the 4 GB and the 6 GB versions. Everything else (SoC, panel, touch, battery) is the same hardware.
 
 ## Repository layout
 
