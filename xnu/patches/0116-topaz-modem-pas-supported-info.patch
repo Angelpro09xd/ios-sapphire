@@ -1,0 +1,27 @@
+From 5ddc0ffaa28fe44f1e047b52a483c8fab857d696 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 18:06:03 +0300
+Subject: [PATCH] topaz-0116: TopazModem: PAS is_supported is informational
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index e7dc937..dd58974 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -500,9 +500,7 @@ modem_boot(void)
+ 	}
+ 	st = scm(SCM_FN(SCM_SVC_PIL, PIL_IS_SUPPORTED), 1, PAS_ID_MODEM, 0, 0, &res);
+ 	LOG("PAS id %u supported: ret=%llx res=%llx", PAS_ID_MODEM, st, res);
+-	if (st != 0 || res != 1) {
+-		return false;
+-	}
++	/* informational only: on topaz TZ answers res=0 here, init_image decides */
+ 
+ 	mdt_size = fw_size("modem.mdt");
+ 	if (mdt_size <= (int64_t)sizeof(struct elf32_ehdr) || mdt_size > 0x100000) {
+-- 
+2.43.0
+
