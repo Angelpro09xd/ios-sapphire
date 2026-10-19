@@ -1,0 +1,54 @@
+From 812ef284880083549a003266b67f4f4400ec790d Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 08:46:06 +0300
+Subject: [PATCH] topaz-0098: INTF1 refresh diagnostics
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3861a97..14d0f8e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -124,6 +124,8 @@ public:
+ 	/* topaz direct MDP scanout (VIG0 / CTL0 from TopazGpuW disp.c) */
+ 	volatile uint32_t *fVig0;
+ 	volatile uint32_t *fCtl0;
++	volatile uint32_t *fIntf1;      /* INTF_1 (DSI0) timing engine: refresh diagnostics */
++	uint32_t      fIntfFrames;
+ 	uint64_t      fScanPhys;      /* what VIG0 currently fetches */
+ 	uint32_t      fScanStride;
+ 	uint32_t      fBootSrc, fBootStride;
+@@ -219,6 +221,15 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
+ 	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
++	/* dpu sm6115 catalog: intf_1 at mdp+0x6a800, mdp at 0x5e01000 */
++	fIntf1 = (volatile uint32_t *)ml_io_map(0x05e6b000, 0x1000);
++	if (fIntf1 != NULL) {
++		volatile uint32_t *r = fIntf1 + 0x800 / 4;
++		r[0x0a8 / 4] = 0x3;     /* FRAME_LINE_COUNT_EN */
++		IOLog("SWEET INTF1: te_en %#x config %#x hsync %#x vsync_period %#x hctl %#x active_hctl %#x vstart %#x vend %#x fmt %#x cmd_trig %#x\n",
++		    r[0x000 / 4], r[0x004 / 4], r[0x008 / 4], r[0x00c / 4], r[0x03c / 4], r[0x040 / 4],
++		    r[0x01c / 4], r[0x024 / 4], r[0x090 / 4], r[0x084 / 4]);
++	}
+ 	if (fVig0 != NULL && fCtl0 != NULL) {
+ 		fBootSrc = fVig0[0x14 / 4];
+ 		fBootStride = fVig0[0x24 / 4];
+@@ -285,6 +296,12 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
++	if (fb->fIntf1 != NULL && (count % 300) == 0) {
++		uint32_t frames = fb->fIntf1[(0x800 + 0x0ac) / 4];
++		IOLog("SWEET INTF1: %u frames in 5 s (line %u, te_en %#x)\n",
++		    frames - fb->fIntfFrames, fb->fIntf1[(0x800 + 0x0b0) / 4], fb->fIntf1[0x800 / 4]);
++		fb->fIntfFrames = frames;
++	}
+ 	if (fb->fPowerOff) {
+ 		/*
+ 		 * topaz: fade in cached memory and flip whole frames to the MDP.
+-- 
+2.43.0
+
