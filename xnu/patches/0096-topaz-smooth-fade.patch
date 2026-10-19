@@ -1,0 +1,142 @@
+From 158a0c6fa4354032944d8c5950f915dd67eb5dd6 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 08:21:13 +0300
+Subject: [PATCH] topaz-0096: smooth display-off fade in cached memory
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 77 +++++++++++++++++++++++++++
+ 1 file changed, 77 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bd72f09..79fd421 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -68,6 +68,7 @@ enum {
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+ #define SWEET_FB_LAYERS                 4
++#define SWEET_FB_FADE_STEPS             30      /* ~0.5 s at 60 Hz */
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+@@ -126,6 +127,13 @@ public:
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	/* topaz fade: cached copy of the last frame and a contiguous output frame */
++	IOBufferMemoryDescriptor *fFadeOrig, *fFadeOut;
++	uint64_t      fFadeOutPhys;
++	const uint8_t *fLastVA;       /* last directly scanned frame (panel window) */
++	uint32_t      fLastStride;
++	SweetSurface *fLastSurf;      /* keeps fLastVA alive */
++	void          fadeStep(const uint8_t *src, uint32_t srcStride, uint32_t step);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -212,6 +220,16 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: MDP VIG0 src %#x stride %u (boot), direct scanout ready\n",
+ 		    fBootSrc, fBootStride);
+ 		sweet_scanout_set_geometry(fWidth, fHeight, fLogicalW, fLogicalH);
++		vm_size_t fsz = (vm_size_t)fRowBytes * fHeight;
++		fFadeOrig = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, fsz, page_size);
++		fFadeOut = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, fsz, 0x00000000fffff000ull);
++		if (fFadeOrig == NULL || fFadeOut == NULL) {
++			OSSafeReleaseNULL(fFadeOrig);
++			OSSafeReleaseNULL(fFadeOut);
++		} else {
++			fFadeOutPhys = fFadeOut->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++		}
+ 	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+@@ -246,6 +264,24 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fPowerOff) {
++		/*
++		 * topaz: fade in cached memory and flip whole frames to the MDP.
++		 * Fading the uncached boot framebuffer in place crawled down the panel.
++		 */
++		if (fb->fFadeOut != NULL) {
++			uint32_t step = fb->fFadeStep;
++			if (step <= SWEET_FB_FADE_STEPS) {
++				fb->fFadeStep = step + 1;
++			}
++			const uint8_t *src = fb->fLastVA ? fb->fLastVA : (const uint8_t *)fb->fPixels;
++			uint32_t srcStride = fb->fLastVA ? fb->fLastStride : fb->fRowBytes;
++			IOLockUnlock(fb->fLock);
++			if (step <= SWEET_FB_FADE_STEPS) {
++				fb->fadeStep(src, srcStride, step);
++			}
++			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++			return;
++		}
+ 		if (fb->fVig0 != NULL && fb->fScanPhys != fb->fBootSrc) {
+ 			fb->scanFrom(fb->fBootSrc, fb->fBootStride);
+ 		}
+@@ -344,6 +380,33 @@ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ 	fScanStride = stride;
+ }
+ 
++void
++AppleCLCD::fadeStep(const uint8_t *src, uint32_t srcStride, uint32_t step)
++{
++	uint8_t *orig = (uint8_t *)fFadeOrig->getBytesNoCopy();
++	uint8_t *out = (uint8_t *)fFadeOut->getBytesNoCopy();
++	if (step == 0) {
++		/* snapshot what is on screen (one slow read of the frame) */
++		for (uint32_t y = 0; y < fHeight; y++) {
++			memcpy(orig + (uint64_t)y * fRowBytes, src + (uint64_t)y * srcStride, (size_t)fWidth * 4);
++		}
++	}
++	/* linear fade: each channel * m / 32, m from 32 down to 0 */
++	uint32_t m = 32 - (step * 32 + SWEET_FB_FADE_STEPS / 2) / SWEET_FB_FADE_STEPS;
++	for (uint32_t y = 0; y < fHeight; y++) {
++		const uint32_t *in = (const uint32_t *)(orig + (uint64_t)y * fRowBytes);
++		uint32_t *o = (uint32_t *)(out + (uint64_t)y * fRowBytes);
++		for (uint32_t x = 0; x < fWidth; x++) {
++			uint32_t p = in[x];
++			uint32_t lo = (((p & 0x00ff00ffu) * m) >> 5) & 0x00ff00ffu;
++			uint32_t hi = ((((p >> 8) & 0x00ff00ffu) * m) >> 5) & 0x00ff00ffu;
++			o[x] = lo | (hi << 8);
++		}
++	}
++	flush_dcache64((addr64_t)(uintptr_t)out, (unsigned)fFadeOut->getLength(), FALSE);
++	scanFrom(fFadeOutPhys, fRowBytes);
++}
++
+ /*
+  * topaz: a swap that shows one full-screen surface from the scanout pool is
+  * presented by pointing the MDP at it (no 10 MB CPU copy). Returns false to
+@@ -383,6 +446,17 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 				    (unsigned)((uint64_t)fHeight * s->bytesPerRow), FALSE);
+ 				scanFrom(pa, s->bytesPerRow);
+ 				ok = true;
++				IOLockLock(fLock);
++				if (fLastSurf != s) {
++					s->retain();
++					if (fLastSurf != NULL) {
++						fLastSurf->release();
++					}
++					fLastSurf = s;
++				}
++				fLastVA = (const uint8_t *)(va + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4);
++				fLastStride = s->bytesPerRow;
++				IOLockUnlock(fLock);
+ 			}
+ 		}
+ 	}
+@@ -405,6 +479,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		return;
+ 	}
++	IOLockLock(fLock);
++	fLastVA = NULL;
++	IOLockUnlock(fLock);
+ 	/* copy path: make sure the MDP shows the boot framebuffer we copy into */
+ 	if (fVig0 != NULL && fScanPhys != fBootSrc) {
+ 		scanFrom(fBootSrc, fBootStride);
+-- 
+2.43.0
+
