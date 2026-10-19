@@ -1,0 +1,703 @@
+From 35219ad120b071401ac6ad10e8d6717c272607a8 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 17:20:53 +0300
+Subject: [PATCH] topaz-0113: TopazModem: boot the modem DSP through TrustZone
+ PAS (modem=1)
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp |   2 +
+ iokit/Kernel/arm/TopazModem.cpp       | 649 ++++++++++++++++++++++++++
+ iokit/conf/files.arm64                |   1 +
+ 3 files changed, 652 insertions(+)
+ create mode 100644 iokit/Kernel/arm/TopazModem.cpp
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 474396f..03b8e38 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -39,6 +39,7 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void sweet_console_retarget(vm_offset_t va);   /* osfmk/console/video_console.c */
+ extern "C" void (*sweet_console_show_hook)(void);
++extern "C" void topaz_modem_init(void);             /* iokit/Kernel/arm/TopazModem.cpp (boot-arg modem=1) */
+ extern "C" int sweet_console_copy_dirty(void *dst);
+ 
+ /*
+@@ -252,6 +253,7 @@ AppleCLCD::start(IOService *provider)
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++	topaz_modem_init();
+ 	PE_current_console(&video);
+ 	fPhys = video.v_baseAddr;
+ 	fWidth = (uint32_t)video.v_width;
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+new file mode 100644
+index 0000000..112cc21
+--- /dev/null
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -0,0 +1,649 @@
++/*
++ * topaz (SM6225): boot the modem DSP (MPSS). It runs the WCN3988 WLAN firmware, so this is
++ * Wi-Fi step 1. Port of MakrSas/topaz-woa drivers/TopazModem/ModemPas.c + Smem.c, the way
++ * Linux qcom_mdt_load() + qcom_q6v5_pas do it:
++ *   TrustZone PAS init_image (.mdt metadata) -> mem_setup -> copy the .bNN segments into
++ *   the carveout (0x4AB00000, 0x6900000) -> auth_and_reset -> wait for the modem's SMP2P
++ *   "slave-kernel" READY bit (SMEM item 435) and answer its IPA power query (item 428).
++ *
++ * Boot-arg modem=1. Firmware from the root filesystem, /usr/share/firmware/topaz/modem/
++ * (stock HyperOS 2.0.208 NON-HLOS: it must match this phone's EFS partitions).
++ * Rules (WIFI_RISKS.md): buffers TZ/the modem see are below 0xF0000000 (own pool, not the
++ * GPU's 0x90000000-0xD0000000), memory shared with the modem is write-combined (Normal NC:
++ * no cache upkeep, unaligned access ok), the carveout is mapped only while copying, the
++ * modem must start cold, polling only (no interrupts), no EFS writes.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include <sys/vnode.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define LOG(fmt, ...)       IOLog("TopazModem: " fmt "\n", ##__VA_ARGS__)
++
++#define FW_DIR              "/usr/share/firmware/topaz/modem/"
++
++#define PAS_ID_MODEM        4
++#define SCM_FN(svc, cmd)    (0x42000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
++#define SCM_SVC_PIL         0x02
++#define PIL_INIT_IMAGE      0x01
++#define PIL_MEM_SETUP       0x02
++#define PIL_AUTH_RESET      0x05
++#define PIL_SHUTDOWN        0x06
++#define PIL_IS_SUPPORTED    0x07
++#define SCM_ARG_RW          2
++
++#define PT_LOAD             1
++#define MDT_TYPE_MASK       (7u << 24)
++#define MDT_TYPE_HASH       (2u << 24)
++#define MDT_RELOCATABLE     (1u << 27)
++
++/* middle DDR bank, RAM the kernel does not manage; below 0xF0000000 for TZ/the modem */
++#define MODEM_POOL_BASE     0xE0000000ull
++#define MODEM_POOL_SIZE     0x00400000ull       /* 4 MB: metadata now, rmtfs/tftp later */
++
++#define SMEM_PA             0x46000000ull
++#define SMEM_SIZE           0x00200000u
++#define SMEM_GLOBAL_HOST    0xFFFE
++#define TCSR_MUTEX_PA       0x00340000ull       /* qcom,tcsr-mutex, stride 0x1000 */
++#define SMEM_HWLOCK         3
++#define HWLOCK_APPS_ID      1
++#define APCS_PA             0x0F111000ull
++#define APCS_IPC            8                   /* apcs_glb mailbox */
++#define MPSS_SMP2P_BIT      14
++
++#define ITEM_SMP2P_OUT      428                 /* apps -> modem */
++#define ITEM_SMP2P_IN       435                 /* modem -> apps */
++#define ITEM_MSS_CRASH      421
++#define SMP2P_MAGIC         0x504D5324u         /* "$SMP" */
++#define SMP2P_MAX_ENTRY     16
++
++struct elf32_ehdr {
++	uint8_t  e_ident[16];
++	uint16_t e_type, e_machine;
++	uint32_t e_version, e_entry, e_phoff, e_shoff, e_flags;
++	uint16_t e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx;
++} __attribute__((packed));
++struct elf32_phdr {
++	uint32_t p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align;
++} __attribute__((packed));
++
++struct smem_pt_entry { uint32_t offset, size, flags; uint16_t host0, host1; uint32_t cacheline, rsvd[7]; } __attribute__((packed));
++struct smem_pt { uint8_t magic[4]; uint32_t version, num_entries, rsvd[5]; } __attribute__((packed));
++struct smem_part_hdr { uint8_t magic[4]; uint16_t host0, host1; uint32_t size, free_uncached, free_cached, rsvd[3]; } __attribute__((packed));
++struct smem_priv_entry { uint16_t canary, item; uint32_t size; uint16_t pad_data, pad_hdr; uint32_t rsvd; } __attribute__((packed));
++struct smp2p_hdr { uint32_t magic; uint8_t version, features[3]; uint16_t local_pid, remote_pid, total, valid; uint32_t flags; } __attribute__((packed));
++struct smp2p_entry { char name[16]; uint32_t value; } __attribute__((packed));
++
++static uint8_t *smem;                           /* write-combined */
++static volatile uint8_t *apcs, *tcsr_mutex;     /* device */
++static uint8_t *pool;
++static uint64_t pool_used;
++
++static inline void mb(void) { __asm__ volatile ("dsb sy" ::: "memory"); }
++
++/* ---------------------------------------------------------------- mappings */
++
++/* Large or RAM regions: an IOMemoryDescriptor mapping (ml_io_map space is small). */
++static IOMemoryMap *
++map_phys(uint64_t pa, uint64_t size, bool wc)
++{
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa, size, kIODirectionInOut);
++	IOMemoryMap *m;
++
++	if (md == NULL) {
++		return NULL;
++	}
++	m = md->map(wc ? kIOMapWriteCombineCache : kIOMapInhibitCache);
++	md->release();
++	return m;
++}
++
++static void *
++pool_alloc(uint64_t size, uint64_t *pa)
++{
++	size = (size + 0xfff) & ~0xfffull;
++	if (pool == NULL || pool_used + size > MODEM_POOL_SIZE) {
++		return NULL;
++	}
++	*pa = MODEM_POOL_BASE + pool_used;
++	void *va = pool + pool_used;
++	pool_used += size;
++	bzero(va, size);                            /* Normal NC: DC ZVA is fine */
++	return va;
++}
++
++/* ---------------------------------------------------------------- TrustZone */
++
++static uint64_t
++smc(uint64_t a[8])
++{
++	register uint64_t x0 __asm__("x0") = a[0], x1 __asm__("x1") = a[1], x2 __asm__("x2") = a[2],
++	    x3 __asm__("x3") = a[3], x4 __asm__("x4") = a[4], x5 __asm__("x5") = a[5], x6 __asm__("x6") = a[6],
++	    x7 __asm__("x7") = a[7];
++	__asm__ volatile ("smc #0"
++            : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++            :
++            : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	a[0] = x0; a[1] = x1; a[2] = x2; a[3] = x3; a[4] = x4; a[5] = x5; a[6] = x6; a[7] = x7;
++	return x0;
++}
++
++static unsigned scm_resumes;
++
++static uint64_t
++scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1)
++{
++	uint64_t args[8] = { fn, arginfo, a, b, c, 0, 0, 0 };
++	unsigned n;
++
++	smc(args);
++	/* long calls return INTERRUPTED (1): resume with x0 = 1 and the session from x6 */
++	for (n = 0; args[0] == 1 && n < 100000; n++) {
++		uint64_t again[8] = { 1, arginfo, a, b, c, 0, args[6], 0 };
++		memcpy(args, again, sizeof(args));
++		smc(args);
++	}
++	scm_resumes = n;
++	if (res1 != NULL) {
++		*res1 = args[1];
++	}
++	return args[0];
++}
++
++/* ---------------------------------------------------------------- firmware files */
++
++/* Read FW_DIR name at offset 0 into dst (at most max bytes). Returns bytes read or -1. */
++static int64_t
++fw_read(const char *name, void *dst, uint64_t max)
++{
++	char path[96];
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx = vfs_context_kernel();
++	uint64_t done = 0;
++	int err;
++
++	snprintf(path, sizeof(path), FW_DIR "%s", name);
++	err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (err != 0) {
++		LOG("%s: open error %d", path, err);
++		return -1;
++	}
++	/* through a cacheable bounce buffer: the destination is device-ish WC memory */
++	const uint32_t chunk = 256 * 1024;
++	uint8_t *bounce = (uint8_t *)IOMalloc(chunk);
++	while (bounce != NULL && done < max) {
++		int resid = 0, len = (int)MIN((uint64_t)chunk, max - done);
++		err = vn_rdwr(UIO_READ, vp, (caddr_t)bounce, len, (off_t)done, UIO_SYSSPACE, 0,
++		    vfs_context_ucred(ctx), &resid, current_proc());
++		if (err != 0 || resid == len) {
++			break;
++		}
++		memcpy((uint8_t *)dst + done, bounce, len - resid);
++		done += len - resid;
++	}
++	if (bounce != NULL) {
++		IOFree(bounce, chunk);
++	}
++	vnode_close(vp, FREAD, ctx);
++	return err != 0 ? -1 : (int64_t)done;
++}
++
++static int64_t
++fw_size(const char *name)
++{
++	char path[96];
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx = vfs_context_kernel();
++	off_t size = -1;
++
++	snprintf(path, sizeof(path), FW_DIR "%s", name);
++	if (vnode_lookup(path, 0, &vp, ctx) != 0) {
++		return -1;
++	}
++	if (vnode_size(vp, &size, ctx) != 0) {
++		size = -1;
++	}
++	vnode_put(vp);
++	return size;
++}
++
++/* ---------------------------------------------------------------- SMEM */
++
++static struct smem_part_hdr *
++smem_partition(uint16_t a, uint16_t b)
++{
++	struct smem_pt *pt = (struct smem_pt *)(smem + SMEM_SIZE - 0x1000);
++	struct smem_pt_entry *e = (struct smem_pt_entry *)(pt + 1);
++
++	if (memcmp(pt->magic, "$TOC", 4) != 0 || pt->num_entries > 64) {
++		return NULL;
++	}
++	for (uint32_t i = 0; i < pt->num_entries; i++) {
++		if (e[i].offset != 0 && e[i].size != 0 && e[i].offset < SMEM_SIZE &&
++		    ((e[i].host0 == a && e[i].host1 == b) || (e[i].host0 == b && e[i].host1 == a))) {
++			return (struct smem_part_hdr *)(smem + e[i].offset);
++		}
++	}
++	return NULL;
++}
++
++static void *
++smem_get(struct smem_part_hdr *p, uint16_t item, uint32_t *size)
++{
++	uint8_t *e, *end;
++
++	if (p == NULL || memcmp(p->magic, "$PRT", 4) != 0 || p->free_uncached > p->size) {
++		return NULL;
++	}
++	e = (uint8_t *)p + sizeof(*p);
++	end = (uint8_t *)p + p->free_uncached;
++	while (e + sizeof(struct smem_priv_entry) <= end) {
++		struct smem_priv_entry *h = (struct smem_priv_entry *)e;
++		if (h->canary != 0xA5A5) {
++			return NULL;
++		}
++		if (h->item == item) {
++			if (size != NULL) {
++				*size = h->size - h->pad_data;
++			}
++			return e + sizeof(*h) + h->pad_hdr;
++		}
++		e += sizeof(*h) + h->pad_hdr + h->size;
++	}
++	return NULL;
++}
++
++static bool
++smem_lock(void)
++{
++	volatile uint32_t *reg = (volatile uint32_t *)(tcsr_mutex + SMEM_HWLOCK * 0x1000);
++
++	for (int n = 0; n < 100000; n++) {
++		*reg = HWLOCK_APPS_ID;
++		mb();
++		if (*reg == HWLOCK_APPS_ID) {
++			return true;
++		}
++		IODelay(10);
++	}
++	LOG("SMEM hwlock busy: owner %u", *reg);
++	return false;
++}
++
++static void
++smem_unlock(void)
++{
++	mb();
++	*(volatile uint32_t *)(tcsr_mutex + SMEM_HWLOCK * 0x1000) = 0;
++	mb();
++}
++
++/* qcom_smem_alloc_private(): append an uncached entry under hwlock 3 */
++static void *
++smem_alloc(struct smem_part_hdr *p, uint16_t item, uint32_t size)
++{
++	uint32_t aligned = (size + 7) & ~7u, need = sizeof(struct smem_priv_entry) + aligned;
++	void *v = smem_get(p, item, NULL);
++
++	if (v != NULL || p == NULL || !smem_lock()) {
++		return v;
++	}
++	v = smem_get(p, item, NULL);
++	if (v == NULL && p->free_uncached + need <= p->free_cached) {
++		struct smem_priv_entry *h = (struct smem_priv_entry *)((uint8_t *)p + p->free_uncached);
++		h->canary = 0xA5A5;
++		h->item = item;
++		h->size = aligned;
++		h->pad_data = (uint16_t)(aligned - size);
++		h->pad_hdr = 0;
++		h->rsvd = 0;
++		v = h + 1;
++		bzero(v, aligned);
++		mb();
++		p->free_uncached += need;
++		mb();
++	} else if (v == NULL) {
++		LOG("SMEM partition full: %x..%x need %x", p->free_uncached, p->free_cached, need);
++	}
++	smem_unlock();
++	return v;
++}
++
++/* ---------------------------------------------------------------- SMP2P */
++
++static void
++smp2p_kick(void)
++{
++	mb();
++	*(volatile uint32_t *)(apcs + APCS_IPC) = 1u << MPSS_SMP2P_BIT;
++	mb();
++}
++
++static struct smp2p_hdr *
++smp2p_create_out(struct smem_part_hdr *p)
++{
++	struct smp2p_hdr *o = (struct smp2p_hdr *)smem_alloc(p, ITEM_SMP2P_OUT,
++	    sizeof(struct smp2p_hdr) + SMP2P_MAX_ENTRY * sizeof(struct smp2p_entry));
++
++	if (o == NULL || o->version != 0) {
++		return o;
++	}
++	o->magic = SMP2P_MAGIC;
++	o->local_pid = 0;
++	o->remote_pid = 1;
++	o->total = SMP2P_MAX_ENTRY;
++	o->valid = 0;
++	o->features[0] = 1;                         /* SSR_ACK */
++	mb();
++	o->version = 1;                             /* validates the item */
++	smp2p_kick();
++	return o;
++}
++
++static volatile uint32_t *
++smp2p_find(struct smp2p_hdr *h, const char *name)
++{
++	struct smp2p_entry *e = (struct smp2p_entry *)(h + 1);
++
++	for (uint32_t i = 0; i < h->valid && i < SMP2P_MAX_ENTRY; i++) {
++		if (strncmp(e[i].name, name, 16) == 0) {
++			return &e[i].value;
++		}
++	}
++	return NULL;
++}
++
++static volatile uint32_t *
++smp2p_add_out(struct smp2p_hdr *o, const char *name, uint32_t value)
++{
++	struct smp2p_entry *e = (struct smp2p_entry *)(o + 1);
++	volatile uint32_t *v = smp2p_find(o, name);
++
++	if (v != NULL || o->valid >= o->total || o->valid >= SMP2P_MAX_ENTRY) {
++		return v;
++	}
++	bzero(e[o->valid].name, sizeof(e[o->valid].name));
++	strlcpy(e[o->valid].name, name, sizeof(e[o->valid].name));
++	e[o->valid].value = value;
++	mb();
++	o->valid++;
++	smp2p_kick();
++	return &e[o->valid - 1].value;
++}
++
++/*
++ * After auth_and_reset: watch the modem's "slave-kernel" entry (bit0 fatal, bit1 ready,
++ * bit2 handover) and answer its IPA power query ("valid, AP IPA power off"): unanswered,
++ * modem_cfg starves and the modem watchdog fires once data services come up.
++ */
++static void
++modem_watch(struct smem_part_hdr *part, unsigned seconds)
++{
++	struct smp2p_hdr *in = NULL, *out = smp2p_create_out(part);
++	volatile uint32_t *sk = NULL, *ipa_in = NULL, *ipa_out = NULL;
++	uint32_t sk_last = ~0u, ipa_last = ~0u;
++	bool ready = false;
++
++	if (out == NULL) {
++		LOG("cannot create SMP2P item %u", ITEM_SMP2P_OUT);
++		return;
++	}
++	ipa_out = smp2p_add_out(out, "ipa", 0);
++	for (unsigned ms = 0; ms < seconds * 1000; ms++) {
++		if (in == NULL) {
++			uint32_t sz = 0;
++			in = (struct smp2p_hdr *)smem_get(part, ITEM_SMP2P_IN, &sz);
++			if (in != NULL && in->magic != SMP2P_MAGIC) {
++				in = NULL;
++			}
++			if (in != NULL) {
++				LOG("t=%u ms: modem SMP2P item %u up (v%u, %u entries)", ms, ITEM_SMP2P_IN, in->version, in->valid);
++			}
++		}
++		if (in != NULL && sk == NULL) {
++			sk = smp2p_find(in, "slave-kernel");
++		}
++		if (in != NULL && ipa_in == NULL) {
++			ipa_in = smp2p_find(in, "ipa");
++		}
++		if (sk != NULL && *sk != sk_last) {
++			sk_last = *sk;
++			LOG("t=%u ms: slave-kernel %08x%s%s%s", ms, sk_last, (sk_last & 1) ? " FATAL" : "",
++			    (sk_last & 2) ? " READY" : "", (sk_last & 4) ? " HANDOVER" : "");
++			if ((sk_last & 2) && !ready) {
++				ready = true;
++				LOG("modem is up (MODEM READY)");
++			}
++			if (sk_last & 1) {
++				uint32_t sz = 0;
++				const char *why = (const char *)smem_get(smem_partition(SMEM_GLOBAL_HOST, SMEM_GLOBAL_HOST), ITEM_MSS_CRASH, &sz);
++				char buf[128] = {};
++				if (why != NULL) {
++					memcpy(buf, why, MIN(sz, (uint32_t)sizeof(buf) - 1));
++				}
++				LOG("modem crash reason: %s", why != NULL ? buf : "(none)");
++				return;
++			}
++		}
++		if (ipa_in != NULL && ipa_out != NULL && *ipa_in != ipa_last) {
++			uint32_t v = *ipa_in;
++			if ((v & 1) && !(ipa_last != ~0u && (ipa_last & 1))) {
++				*ipa_out = 1;                   /* answer valid, AP IPA power off */
++				smp2p_kick();
++				LOG("t=%u ms: answered IPA power query (%08x)", ms, v);
++			}
++			ipa_last = v;
++		}
++		IOSleep(1);
++	}
++	LOG("watch done: slave-kernel %08x, %s", sk_last, ready ? "READY" : "NOT ready");
++}
++
++/* ---------------------------------------------------------------- PAS boot */
++
++static bool
++loadable(const struct elf32_phdr *p)
++{
++	return p->p_type == PT_LOAD && p->p_memsz != 0 && (p->p_flags & MDT_TYPE_MASK) != MDT_TYPE_HASH;
++}
++
++static bool
++modem_boot(void)
++{
++	uint8_t *mdt = NULL, *meta;
++	int64_t mdt_size;
++	uint64_t meta_pa = 0, res = 0, st;
++	uint32_t min_a = ~0u, max_a = 0, hash = ~0u;
++	bool relocate = false, ok = false;
++
++	struct smem_part_hdr *part = smem_partition(0, 1);
++	LOG("SMEM apps<->modem partition %p", part);
++	if (part == NULL) {
++		return false;
++	}
++	if (smem_get(part, ITEM_SMP2P_IN, NULL) != NULL) {
++		LOG("modem SMP2P item %u already exists: modem is not cold, not touching it", ITEM_SMP2P_IN);
++		return false;
++	}
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_IS_SUPPORTED), 1, PAS_ID_MODEM, 0, 0, &res);
++	LOG("PAS id %u supported: ret=%llx res=%llx", PAS_ID_MODEM, st, res);
++	if (st != 0 || res != 1) {
++		return false;
++	}
++
++	mdt_size = fw_size("modem.mdt");
++	if (mdt_size <= (int64_t)sizeof(struct elf32_ehdr) || mdt_size > 0x100000) {
++		LOG("modem.mdt: size %lld", mdt_size);
++		return false;
++	}
++	mdt = (uint8_t *)IOMalloc(mdt_size);
++	if (mdt == NULL || fw_read("modem.mdt", mdt, mdt_size) != mdt_size) {
++		goto out;
++	}
++	{
++		struct elf32_ehdr *eh = (struct elf32_ehdr *)mdt;
++		if (memcmp(eh->e_ident, "\x7f" "ELF", 4) != 0 ||
++		    eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(struct elf32_phdr) > (uint64_t)mdt_size) {
++			LOG("modem.mdt: bad ELF header");
++			goto out;
++		}
++		struct elf32_phdr *ph = (struct elf32_phdr *)(mdt + eh->e_phoff);
++		for (uint32_t i = 0; i < eh->e_phnum; i++) {
++			if ((ph[i].p_flags & MDT_TYPE_MASK) == MDT_TYPE_HASH) {
++				hash = i;
++			}
++			if (!loadable(&ph[i])) {
++				continue;
++			}
++			if (ph[i].p_flags & MDT_RELOCATABLE) {
++				relocate = true;
++			}
++			min_a = MIN(min_a, ph[i].p_paddr);
++			max_a = MAX(max_a, ph[i].p_paddr + ph[i].p_memsz);
++		}
++		LOG("phdrs=%u hash=%u region %08x..%08x relocate=%u", eh->e_phnum, hash, min_a, max_a, relocate);
++		if (hash == ~0u || min_a < 0x4AB00000u || max_a > 0x4AB00000u + 0x6900000u) {
++			LOG("unexpected layout (carveout is 0x4ab00000+0x6900000)");
++			goto out;
++		}
++
++		/* metadata = ELF header + phdrs + hash segment, contiguous, below 0xF0000000 */
++		uint64_t hdr = eh->e_phoff + eh->e_phnum * sizeof(struct elf32_phdr);
++		uint64_t meta_size = hdr + ph[hash].p_filesz;
++		meta = (uint8_t *)pool_alloc(meta_size, &meta_pa);
++		if (meta == NULL || ph[hash].p_offset + ph[hash].p_filesz > (uint64_t)mdt_size) {
++			LOG("metadata: alloc or split hash segment not supported");
++			goto out;
++		}
++		memcpy(meta, mdt, hdr);
++		memcpy(meta + hdr, mdt + ph[hash].p_offset, ph[hash].p_filesz);
++		mb();
++
++		st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), PAS_ID_MODEM, meta_pa, 0, &res);
++		LOG("init_image: ret=%llx res=%llx resumes=%u (meta %llu bytes @%llx)", st, res, scm_resumes, meta_size, meta_pa);
++		if (st != 0 || res != 0) {
++			goto out;
++		}
++		if (relocate) {
++			st = scm(SCM_FN(SCM_SVC_PIL, PIL_MEM_SETUP), 3, PAS_ID_MODEM, min_a,
++			    ((uint64_t)(max_a - min_a) + 0xfff) & ~0xfffull, &res);
++			LOG("mem_setup: ret=%llx res=%llx", st, res);
++			if (st != 0 || res != 0) {
++				goto shutdown;
++			}
++		}
++
++		for (uint32_t i = 0; i < eh->e_phnum; i++) {
++			char name[16];
++			if (!loadable(&ph[i])) {
++				continue;
++			}
++			/* map only while copying: TZ locks the carveout at auth_and_reset */
++			uint64_t pa = ph[i].p_paddr & ~0x3fffull, off = ph[i].p_paddr - pa;
++			uint64_t len = (off + ph[i].p_memsz + 0x3fff) & ~0x3fffull;
++			IOMemoryMap *m = map_phys(pa, len, true);
++			if (m == NULL) {
++				LOG("segment %u: cannot map %08x+%x", i, ph[i].p_paddr, ph[i].p_memsz);
++				goto shutdown;
++			}
++			uint8_t *dst = (uint8_t *)m->getVirtualAddress() + off;
++			int64_t got = 0;
++			if (ph[i].p_filesz != 0) {
++				snprintf(name, sizeof(name), "modem.b%02u", i);
++				got = fw_read(name, dst, ph[i].p_filesz);
++				if (got != (int64_t)ph[i].p_filesz) {
++					LOG("%s: %lld of %u bytes", name, got, ph[i].p_filesz);
++					m->release();
++					goto shutdown;
++				}
++			}
++			if (ph[i].p_memsz > got) {
++				bzero(dst + got, ph[i].p_memsz - got);
++			}
++			mb();
++			m->release();
++		}
++		LOG("segments loaded");
++
++		st = scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, PAS_ID_MODEM, 0, 0, &res);
++		LOG("auth_and_reset: ret=%llx res=%llx resumes=%u", st, res, scm_resumes);
++		if (st != 0 || res != 0) {
++			goto shutdown;
++		}
++		ok = true;
++		goto out;
++	}
++shutdown:
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, PAS_ID_MODEM, 0, 0, &res);
++	LOG("shutdown after failure: ret=%llx res=%llx", st, res);
++out:
++	if (mdt != NULL) {
++		IOFree(mdt, mdt_size);
++	}
++	return ok;
++}
++
++static void
++topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	IOMemoryMap *smem_map, *pool_map;
++	unsigned watch = 60;
++
++	(void)PE_parse_boot_argn("modem_watch", &watch, sizeof(watch));
++	/* the firmware lives on the root filesystem: wait for it */
++	for (int i = 0; i < 300; i++) {
++		vnode_t root = vfs_rootvnode();
++		if (root != NULLVP) {
++			vnode_put(root);
++			if (fw_size("modem.mdt") > 0) {
++				break;
++			}
++		}
++		IOSleep(1000);
++	}
++	smem_map = map_phys(SMEM_PA, SMEM_SIZE, true);
++	pool_map = map_phys(MODEM_POOL_BASE, MODEM_POOL_SIZE, true);
++	apcs = (volatile uint8_t *)ml_io_map(APCS_PA, 0x1000);
++	tcsr_mutex = (volatile uint8_t *)ml_io_map(TCSR_MUTEX_PA, 0x4000);
++	if (smem_map == NULL || pool_map == NULL || apcs == NULL || tcsr_mutex == NULL) {
++		LOG("mappings failed");
++		thread_terminate(current_thread());
++		return;
++	}
++	smem = (uint8_t *)smem_map->getVirtualAddress();
++	pool = (uint8_t *)pool_map->getVirtualAddress();
++	LOG("SMEM version %u", *(volatile uint32_t *)(smem + 64 + 7 * 4) >> 16);
++	if (modem_boot()) {
++		modem_watch(smem_partition(0, 1), watch);
++	}
++	/* keep the mappings: the modem uses SMEM from now on */
++	thread_terminate(current_thread());
++}
++
++extern "C" void
++topaz_modem_init(void)
++{
++	static bool started;
++	uint32_t on = 0;
++	thread_t thread;
++
++	if (started || !PE_parse_boot_argn("modem", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	started = true;
++	if (kernel_thread_start(topaz_modem_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++#else
++extern "C" void topaz_modem_init(void) {}
++#endif
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..8b2b868 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -10,6 +10,7 @@ iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
+ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
+ 
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
++iokit/Kernel/arm/TopazModem.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+-- 
+2.43.0
+
