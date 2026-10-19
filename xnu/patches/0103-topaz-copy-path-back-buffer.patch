@@ -1,0 +1,60 @@
+From 78d81e83c374c8d2459c0c86cd789fc29b3aa505 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 09:52:45 +0300
+Subject: [PATCH] topaz-0103: multi-layer frames composed in the back buffer
+ and flipped
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 258168a..b037cd5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -287,7 +287,7 @@ AppleCLCD::start(IOService *provider)
+ 			OSSafeReleaseNULL(fFadeOrig);
+ 			OSSafeReleaseNULL(fCons);
+ 		}
+-		if (fCons != NULL && fBootStride == fRowBytes) {
++		if (fCons != NULL) {
+ 			uint8_t *c = (uint8_t *)fCons->getBytesNoCopy();
+ 			memcpy(c, (const void *)fPixels, fsz);  /* keep what the console drew */
+ 			flush_dcache64((addr64_t)(uintptr_t)c, (unsigned)fsz, FALSE);   /* for panics */
+@@ -633,8 +633,13 @@ AppleCLCD::present(const uint8_t *rec)
+ 	IOLockLock(fLock);
+ 	fLastVA = NULL;
+ 	IOLockUnlock(fLock);
+-	/* copy path: make sure the MDP shows the boot framebuffer we copy into */
+-	if (fVig0 != NULL && fScanPhys != fBootSrc) {
++	/*
++	 * copy path (several layers): compose into the cached back buffer and
++	 * flip, like the direct path. Composing into the scanned, uncached boot
++	 * framebuffer showed every multi-layer frame (dims, apps) drawn top-down.
++	 */
++	uint8_t *dst = fFlip[0] != NULL ? backBuffer() : (uint8_t *)fPixels;
++	if (fFlip[0] == NULL && fVig0 != NULL && fScanPhys != fBootSrc) {
+ 		scanFrom(fBootSrc, fBootStride);
+ 	}
+ 
+@@ -717,13 +722,16 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++				memcpy((void *)(dst + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
+ 		}
+ 		s->release();
+ 	}
++	if (fFlip[0] != NULL) {
++		flipBack();
++	}
+ }
+ 
+ bool
+-- 
+2.43.0
+
