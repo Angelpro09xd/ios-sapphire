@@ -1,0 +1,88 @@
+From 953d64aa3afaa7b4bf50b816d6ff221c05e7f315 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 22:41:37 +0000
+Subject: [PATCH] sapphire-0127: Focaltech raw format and range from boot-args
+ (sweettouch_fbits/_rx/_ry), log the first raw contacts, clamp instead of
+ dropping out-of-range frames
+
+---
+ bsd/dev/sweet_touch.c | 48 ++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 41 insertions(+), 7 deletions(-)
+
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index ff9d858..68e8181 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -94,6 +94,8 @@ static struct {
+ 	unsigned s_frames, s_errs, s_down, s_up, s_maxn;
+ 	int s_lasterr, s_lastx, s_lasty;
+ 	uint8_t s_raw[12];
++	/* Focaltech raw format and range (boot-args sweettouch_fbits/_rx/_ry) */
++	unsigned fbits, rx, ry, rawlog;
+ } st;
+ static int touch_sleep_chan;
+ 
+@@ -528,14 +530,29 @@ touch_focaltech(void)
+ 		if (event == 3u) {
+ 			continue; /* topaz: "no event" slot (TopazTouch) */
+ 		}
+-		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
+-		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
+-		/* topaz: raw 0..1349 x 0..2999 (1.25x the panel) + 2-bit fractions */
+-		if (px > 1349 || py > 2999) {
+-			return EIO;
++		unsigned hx = ((unsigned)(p[0] & 15u) << 8) | p[1];
++		unsigned hy = ((unsigned)(p[2] & 15u) << 8) | p[3];
++		/*
++		 * Raw position = 12-bit coordinate plus st.fbits fraction bits from
++		 * byte 4: topaz 2 bits each (x 7:6, y 5:4) over 0..1349 x 0..2999
++		 * (1.25x the panel); Focaltech hi-res firmware 4 bits each (x 7:4,
++		 * y 3:0). st.rx/st.ry are the raw ranges mapped onto 1080x2400.
++		 */
++		uint64_t fx, fy;
++		if (st.fbits == 4u) {
++			fx = (uint64_t)hx << 4 | (p[4] >> 4);
++			fy = (uint64_t)hy << 4 | (p[4] & 15u);
++		} else {
++			fx = (uint64_t)hx << 2 | (p[4] >> 6);
++			fy = (uint64_t)hy << 2 | ((p[4] >> 4) & 3u);
++		}
++		unsigned px = (unsigned)(fx * 1080u / st.rx);
++		unsigned py = (unsigned)(fy * 2400u / st.ry);
++		if (st.rawlog && !(st.active & (1u << id))) {
++			st.rawlog--;
++			printf("SWEET TOUCH: raw id %u x %u.%x y %u.%x -> %u,%u\n",
++			    id, hx, p[4] >> 4, hy, p[4] & 15u, px, py);
+ 		}
+-		px = (px * 4u + (p[4] >> 6)) / 5u;
+-		py = (py * 4u + ((p[4] >> 4) & 3u)) / 5u;
+ 		px = px > 1079 ? 1079 : px;
+ 		py = py > 2399 ? 2399 : py;
+ 		mask |= 1u << id;
+@@ -749,6 +766,23 @@ sweet_touch_init(void)
+ 	st.irq_hint = 1; /* topaz: read on IRQ GPIO80 low, while touching, else every 100 ms */
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
+ 	(void)PE_parse_boot_argn("sweettouchdiag", &st.diag, sizeof(st.diag));
++	/* topaz defaults; sapphire's FT3519T is set from its boot image */
++	st.fbits = 2;
++	st.rx = 1350u * 4u;
++	st.ry = 3000u * 4u;
++	st.rawlog = 40;
++	(void)PE_parse_boot_argn("sweettouch_fbits", &st.fbits, sizeof(st.fbits));
++	(void)PE_parse_boot_argn("sweettouch_rx", &st.rx, sizeof(st.rx));
++	(void)PE_parse_boot_argn("sweettouch_ry", &st.ry, sizeof(st.ry));
++	(void)PE_parse_boot_argn("sweettouch_rawlog", &st.rawlog, sizeof(st.rawlog));
++	if (st.fbits != 4u) {
++		st.fbits = 2;
++	}
++	if (!st.rx || !st.ry) {
++		st.rx = 1350u * 4u;
++		st.ry = 3000u * 4u;
++	}
++	printf("SWEET TOUCH: raw range %ux%u, %u fraction bits\n", st.rx, st.ry, st.fbits);
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
+-- 
+2.43.0
+
