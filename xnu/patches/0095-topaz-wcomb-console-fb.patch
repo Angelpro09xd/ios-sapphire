@@ -1,7 +1,7 @@
-From 8d88832e985f3f8c99be9949bf79ddb6f1cc264d Mon Sep 17 00:00:00 2001
+From c35dd5398e17b48ec9d1bedc74c72c29f490a291 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Mon, 19 Oct 2026 08:20:07 +0300
-Subject: [PATCH] topaz-0096: write-combined boot framebuffer
+Subject: [PATCH 95/96] topaz-0096: write-combined boot framebuffer
 
 ---
  osfmk/console/video_console.c | 4 ++++
