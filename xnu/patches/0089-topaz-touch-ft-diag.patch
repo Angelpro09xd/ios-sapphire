@@ -1,0 +1,38 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index a9b928b..f5fb633 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -491,6 +491,16 @@ touch_focaltech(void)
+ 		st.s_maxn = n;
+ 	}
+ 	if (n > TOUCH_MAX) {
++		/* topaz: show what the IC actually sends (rate-limited) */
++		static uint64_t last_dump;
++		uint64_t now = mach_absolute_time(), gap;
++		nanoseconds_to_absolutetime(NSEC_PER_SEC, &gap);
++		if (now - last_dump > gap) {
++			last_dump = now;
++			printf("SWEET TOUCH: bad frame n=%u raw %02x %02x %02x | %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x %02x\n",
++			    n, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
++			    buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]);
++		}
+ 		return EIO;
+ 	}
+ 	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
+@@ -647,6 +657,16 @@ touch_thread(void *arg, wait_result_t result)
+ 	int fe2 = touch_read(0x38, 0x9f, false, &fid2, 1);
+ 	printf("SWEET TOUCH: probe 0x38 err=%d/%d chip-id=%02x:%02x irq=%#x\n",
+ 	    fe1, fe2, fid1, fid2, st.irq_status);
++	{
++		uint8_t fw = 0, vendor = 0, mode = 0, pmode = 0, lib[2] = {0, 0};
++		int e1 = touch_read(0x38, 0xa6, false, &fw, 1);
++		int e2 = touch_read(0x38, 0xa8, false, &vendor, 1);
++		int e3 = touch_read(0x38, 0x00, false, &mode, 1);
++		int e4 = touch_read(0x38, 0xa5, false, &pmode, 1);
++		int e5 = touch_read(0x38, 0xa1, false, lib, 2);
++		printf("SWEET TOUCH: ft fw=%02x/%d vendor=%02x/%d devmode=%02x/%d pmode=%02x/%d lib=%02x%02x/%d\n",
++		    fw, e1, vendor, e2, mode, e3, pmode, e4, lib[0], lib[1], e5);
++	}
+ 	st.probing = false;
+ 	st.d_ge = ge;
+ 	st.d_fe1 = fe1;
