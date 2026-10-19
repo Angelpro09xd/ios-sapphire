@@ -1,0 +1,123 @@
+From a4c4f6822716f5cde325e241861ba69e3e28f39c Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 10:19:54 +0300
+Subject: [PATCH] topaz-0105: AppleARMBacklight service for CoreBrightness
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 72 +++++++++++++++++++++++++++
+ 1 file changed, 72 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a51015a..ff64ad5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -73,6 +73,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
++#include <libkern/c++/OSCollectionIterator.h>
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
+@@ -195,6 +196,21 @@ public:
+ 	void present(const uint8_t *rec);
+ };
+ 
++/*
++ * CoreBrightness (-[CBDisplayContaineriOS findBacklight]) matches
++ * {IOPropertyMatch: {backlight-control: true}} and requires the class to
++ * conform to AppleARMBacklight; without it there is no display module and
++ * the brightness slider is dead. It then sets "brightness-nits" here
++ * (SetBLDriverNitsValue) and IOMFBBrightnessLevel on the framebuffer.
++ */
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++public:
++	AppleCLCD *fFB;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+@@ -274,6 +290,18 @@ AppleCLCD::start(IOService *provider)
+ 	if (fDsi != NULL) {
+ 		IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
+ 		setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
++		AppleARMBacklight *bl = OSTypeAlloc(AppleARMBacklight);
++		if (bl != NULL && bl->init()) {
++			bl->fFB = this;
++			bl->setProperty("backlight-control", true);
++			bl->setProperty("brightness-nits", (unsigned long long)200, 32);
++			bl->setProperty("max-nits", (unsigned long long)SWEET_FB_MAX_NITS, 32);
++			if (bl->attach(this)) {
++				bl->registerService();
++				IOLog("SWEET FB: AppleARMBacklight published\n");
++			}
++		}
++		OSSafeReleaseNULL(bl);
+ 	}
+ 	/* dpu sm6115 catalog: intf_1 at mdp+0x6a800, mdp at 0x5e01000 */
+ 	fIntf1 = (volatile uint32_t *)ml_io_map(0x05e6b000, 0x1000);
+@@ -592,6 +620,7 @@ IOReturn
+ AppleCLCD::setProperties(OSObject *properties)
+ {
+ 	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	sweet_bl_log("iomfb", d);
+ 	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("IOMFBBrightnessLevel")) : NULL;
+ 	if (n == NULL || fDsi == NULL) {
+ 		return kIOReturnUnsupported;
+@@ -616,6 +645,49 @@ AppleCLCD::setProperties(OSObject *properties)
+ 	return kIOReturnSuccess;
+ }
+ 
++static void
++sweet_bl_log(const char *who, OSDictionary *d)
++{
++	static uint32_t logs;
++	if (d == NULL || logs >= 24) {
++		return;
++	}
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++	OSSymbol *k;
++	while (it != NULL && (k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++		OSObject *v = d->getObject(k);
++		OSNumber *n = OSDynamicCast(OSNumber, v);
++		if (logs++ < 24) {
++			IOLog("SWEET BL: %s set %s = %s %llu\n", who, k->getCStringNoCopy(),
++			    v ? v->getMetaClass()->getClassName() : "null", n ? n->unsigned64BitValue() : 0);
++		}
++	}
++	OSSafeReleaseNULL(it);
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	sweet_bl_log("backlight", d);
++	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("brightness-nits")) : NULL;
++	if (n != NULL && fFB != NULL) {
++		OSDictionary *m = OSDictionary::withCapacity(1);
++		/* same 16.16 nits scale as IOMFBBrightnessLevel */
++		uint64_t v = n->unsigned64BitValue();
++		if (v < 0x10000) {
++			v <<= 16;               /* plain nits */
++		}
++		OSNumber *nn = OSNumber::withNumber(v, 64);
++		m->setObject("IOMFBBrightnessLevel", nn);
++		fFB->setProperties(m);
++		nn->release();
++		m->release();
++		setProperty("brightness-nits", n);
++	}
++	return kIOReturnSuccess;
++}
++
+ /* panic: show the console frame (MMIO only, no locks) */
+ static void
+ sweet_cons_show(void)
+-- 
+2.43.0
+
