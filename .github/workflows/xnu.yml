@@ -21,9 +21,6 @@ on:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
 
-concurrency:
-  group: xnu-${{ github.ref }}
-  cancel-in-progress: true
 
 env:
   DXB_REPO: https://github.com/blacktop/darwin-xnu-build

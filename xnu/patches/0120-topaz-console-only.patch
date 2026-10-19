@@ -1,7 +1,7 @@
 From b203961fc8e8ca07b8b5d7206288058da8ebf8ef Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Mon, 19 Oct 2026 19:07:13 +0300
-Subject: [PATCH] topaz-0119: boot-arg sweetfb_console=1 keeps the kernel
+Subject: [PATCH] topaz-0120: boot-arg sweetfb_console=1 keeps the kernel
  console on the panel
 
 ---
