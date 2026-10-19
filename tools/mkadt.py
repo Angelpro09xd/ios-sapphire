@@ -18,6 +18,11 @@ MEM_SIZE = 0x4d000000
 # limited below 4G.
 HIGH_PHYS_BASE = 0x140000000
 HIGH_MEM_SIZE = 0x100000000
+# --midmem (phone only): the middle and upper banks as one range, 0x80000000 +
+# 3G + 4G = 7G up to 0x2_40000000. No fixed carve-out is above 0x63900000, and it
+# gives the kernel RAM below 4 GiB, which the GPU needs (it does not reach above).
+MID_PHYS_BASE = 0x80000000
+MID_MEM_SIZE = 0x1c0000000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
@@ -71,9 +76,10 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, native=False):
+def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
-    phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    phys_base, mem_size = ((MID_PHYS_BASE, MID_MEM_SIZE) if midmem else
+                           (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -237,7 +243,7 @@ def build(seed=None, qemu=False, highmem=False, native=False):
 
 if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 native='--native' in sys.argv)
+                 native='--native' in sys.argv, midmem='--midmem' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
