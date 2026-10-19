@@ -240,6 +240,31 @@ static uint64_t speed_ticks(void)
 	return t;
 }
 
+/*
+ * Gold cluster to its top cpufreq-hw level before xnu (which has no cpufreq
+ * driver): freq-domain1 0xf523000, LUT +0x110 (32-byte rows), PERF_STATE +0x920.
+ */
+static void gold_cpufreq_max(void)
+{
+	uintptr_t b = 0x0f523000;
+	uint32_t best = 0, best_khz = 0, prev = 0;
+	for (uint32_t i = 0; i < 12; i++) {
+		uint32_t v = rd32(b + 0x110 + i * 0x20);
+		uint32_t khz = ((v >> 30) & 3) ? 19200 * (v & 0xff) : 300000;
+		if (i && khz == prev)
+			break;
+		prev = khz;
+		if (khz > best_khz) {
+			best_khz = khz;
+			best = i;
+		}
+	}
+	uint32_t old = rd32(b + 0x920);
+	wr32(b + 0x920, best);
+	__asm__ volatile("dsb sy" ::: "memory");
+	con_hex2("CPUFREQ", "old=", old, "mhz=", best_khz / 1000);
+}
+
 static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 {
 	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
@@ -258,10 +283,10 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		 */
 		test_gic();
 		gold_gicr_prepare();
+		gold_cpufreq_max();
 		uint64_t gt = speed_ticks();
 		con_hex2("SPEED", "silver=", (uint32_t)silver_ticks, "gold=", (uint32_t)gt);
-		con_str("GOLD", "speed probe shown, xnu in 8 s");
-		delay_ms(8000);
+		delay_ms(1000);
 		con_skip();
 		con_str("LOADER", loader_boot(dtb));
 	}

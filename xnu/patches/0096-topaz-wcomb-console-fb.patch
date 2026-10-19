@@ -1,0 +1,27 @@
+From 8d88832e985f3f8c99be9949bf79ddb6f1cc264d Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 08:20:07 +0300
+Subject: [PATCH] topaz-0096: write-combined boot framebuffer
+
+---
+ osfmk/console/video_console.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+index 384118e..84092bd 100644
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -2864,6 +2864,10 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
+ 				 * equivalent.
+ 				 */
+ 				unsigned int flags = VM_WIMG_WCOMB;
++#elif defined(ARM64_BOARD_CONFIG_SWEET)
++				/* topaz: write-combine the boot framebuffer; Device memory made
++				 * the console and the boot logo crawl down the panel */
++				unsigned int flags = VM_WIMG_WCOMB;
+ #else
+ 				unsigned int flags = VM_WIMG_IO;
+ #endif
+-- 
+2.43.0
+
