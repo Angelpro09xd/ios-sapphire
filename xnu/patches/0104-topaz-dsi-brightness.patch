@@ -1,0 +1,199 @@
+From ef1fcc5b9c98a3c94132fbf0dff196a546105276 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 10:08:35 +0300
+Subject: [PATCH] topaz-0104: panel brightness over DSI DCS 0x51
+ (IOMFBBrightnessLevel)
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 135 +++++++++++++++++++++++++-
+ 1 file changed, 134 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b037cd5..a51015a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -99,6 +99,7 @@ enum {
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_FADE_STEPS             30      /* ~0.5 s at 60 Hz */
++#define SWEET_FB_MAX_NITS               500     /* IOMFBBrightnessLevel at panel DBV 0x7ff */
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+@@ -179,6 +180,15 @@ public:
+ 	void          fadeStep(const uint8_t *src, uint32_t srcStride, uint32_t step);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	/* topaz panel brightness: DCS 0x51 over DSI0 (MakrSas/topaz-woa TopazGpuW disp.c) */
++	volatile uint8_t *fDsi;
++	IOBufferMemoryDescriptor *fDsiBuf;
++	uint64_t      fDsiBufPhys;
++	IOLock       *fBlLock;
++	uint32_t      fBlLevel;       /* panel DBV 1..0x7ff, kept while the display is off */
++	bool          dsiDcsLong(const uint8_t *payload, uint32_t len);
++	void          setPanelLevel(uint32_t level);
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -255,6 +265,16 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
+ 	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
++	fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
++	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
++	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
++	fBlLock = IOLockAlloc();
++	fBlLevel = 0x133;                       /* panel init level (stock DT) */
++	if (fDsi != NULL) {
++		IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
++		setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
++	}
+ 	/* dpu sm6115 catalog: intf_1 at mdp+0x6a800, mdp at 0x5e01000 */
+ 	fIntf1 = (volatile uint32_t *)ml_io_map(0x05e6b000, 0x1000);
+ 	if (fIntf1 != NULL) {
+@@ -345,6 +365,12 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		 * topaz: fade in cached memory and flip whole frames to the MDP.
+ 		 * Fading the uncached boot framebuffer in place crawled down the panel.
+ 		 */
++		if (fb->fDsi != NULL) {
++			/* the panel is dark (DCS 0x51 0); keep the last frame */
++			IOLockUnlock(fb->fLock);
++			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++			return;
++		}
+ 		if (fb->fFadeOrig != NULL) {
+ 			uint32_t step = fb->fFadeStep;
+ 			if (step <= SWEET_FB_FADE_STEPS) {
+@@ -488,6 +514,108 @@ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ 	fScanStride = stride;
+ }
+ 
++/*
++ * DCS long write through the DSI command DMA path (topaz-woa: the TPG FIFO
++ * path is a no-op on this DSI 2.4.1). The packet lives in a contiguous
++ * buffer below 4 GiB; header = word count, data type 0x39, flags last|long.
++ */
++static inline uint32_t dsi_rd(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void dsi_wr(volatile uint8_t *b, uint32_t o, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(b + o) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++bool
++AppleCLCD::dsiDcsLong(const uint8_t *payload, uint32_t len)
++{
++	if (fDsi == NULL || fDsiBuf == NULL || len > 60) {
++		return false;
++	}
++	uint8_t *p = (uint8_t *)fDsiBuf->getBytesNoCopy();
++	uint32_t size = (4 + len + 3) & ~3u;
++	memset(p, 0xff, 64);
++	p[0] = (uint8_t)len;
++	p[1] = (uint8_t)(len >> 8);
++	p[2] = 0x39;
++	p[3] = 0xc0;
++	memcpy(p + 4, payload, len);
++	flush_dcache64((addr64_t)(uintptr_t)p, 64, FALSE);
++	uint32_t ctrl = dsi_rd(fDsi, 0x004), trig = dsi_rd(fDsi, 0x084);
++	if ((trig & 7) != 4) {
++		dsi_wr(fDsi, 0x084, (trig & ~7u) | 4);  /* DMA trigger: software */
++	}
++	dsi_wr(fDsi, 0x004, ctrl | 4 | 1);              /* CMD_MODE_EN | DSI_EN */
++	dsi_wr(fDsi, 0x110, dsi_rd(fDsi, 0x110) | 1);   /* clear CMD_DMA_DONE */
++	dsi_wr(fDsi, 0x15c, 0);                          /* no test pattern */
++	dsi_wr(fDsi, 0x048, (uint32_t)fDsiBufPhys);
++	dsi_wr(fDsi, 0x04c, size);
++	uint32_t dma = dsi_rd(fDsi, 0x03c);
++	dsi_wr(fDsi, 0x03c, dma & ~(1u << 26));          /* high speed */
++	dsi_wr(fDsi, 0x090, 1);                          /* SW trigger */
++	bool done = false;
++	for (int i = 0; i < 50 && !done; i++) {
++		done = (dsi_rd(fDsi, 0x110) & 1) != 0;
++		if (!done) {
++			IODelay(1000);
++		}
++	}
++	dsi_wr(fDsi, 0x110, dsi_rd(fDsi, 0x110) | 1);
++	dsi_wr(fDsi, 0x03c, dma);
++	dsi_wr(fDsi, 0x004, ctrl);
++	if (trig != dsi_rd(fDsi, 0x084)) {
++		dsi_wr(fDsi, 0x084, trig);
++	}
++	return done;
++}
++
++void
++AppleCLCD::setPanelLevel(uint32_t level)
++{
++	uint8_t cmd[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };   /* MSB first */
++	IOLockLock(fBlLock);
++	bool done = dsiDcsLong(cmd, sizeof(cmd));
++	IOLockUnlock(fBlLock);
++	static uint32_t logs;
++	if (logs++ < 8 || !done) {
++		IOLog("SWEET FB: panel level %#x: %s\n", level, done ? "done" : "NO DONE");
++	}
++}
++
++/*
++ * CoreBrightness (SetIOMFBBrightness) sets IOMFBBrightnessLevel on the
++ * framebuffer: nits in 16.16. It also animates the dim before the display
++ * turns off, so the panel dims while iOS keeps drawing, as on an iPhone.
++ */
++IOReturn
++AppleCLCD::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("IOMFBBrightnessLevel")) : NULL;
++	if (n == NULL || fDsi == NULL) {
++		return kIOReturnUnsupported;
++	}
++	uint64_t v = n->unsigned64BitValue();
++	setProperty("IOMFBBrightnessLevel", v, 32);
++	/* 0..SWEET_FB_MAX_NITS nits -> DBV 1..0x7ff */
++	uint64_t level = (v * 0x7ffull) / ((uint64_t)SWEET_FB_MAX_NITS << 16);
++	if (level > 0x7ff) {
++		level = 0x7ff;
++	}
++	if (level < 1) {
++		level = 1;
++	}
++	IOLockLock(fLock);
++	fBlLevel = (uint32_t)level;
++	bool off = fPowerOff;
++	IOLockUnlock(fLock);
++	if (!off) {
++		setPanelLevel((uint32_t)level);
++	}
++	return kIOReturnSuccess;
++}
++
+ /* panic: show the console frame (MMIO only, no locks) */
+ static void
+ sweet_cons_show(void)
+@@ -878,12 +1006,17 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				break;
+ 			}
+ 			IOLockLock(fFB->fLock);
+-			if (off != fFB->fPowerOff) {
++			bool changed = off != fFB->fPowerOff;
++			if (changed) {
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
++			uint32_t level = fFB->fBlLevel;
+ 			IOLockUnlock(fFB->fLock);
++			if (changed && fFB->fDsi != NULL) {
++				fFB->setPanelLevel(off ? 0 : level);
++			}
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
+-- 
+2.43.0
+
