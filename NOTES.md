@@ -27,6 +27,24 @@ Volume up: PM6125 GPIO5. Panel `n7_38_0c_0a` 1080x2400 video mode, DSC 1.1
 - ABL: assumed to behave like topaz's (boot v4, drops the boot ramdisk).
   First test = the diagnostic shim (`shim/build.sh` with no payload), RAM only.
 
+**Live phone readings (2026-10-19, sapphiren 6 GB, hwversion 2.39.0; dumps in
+`../ios-sapphire-research/live/`, not in git):**
+- ABL `/memory` reg: 0x0_40000000+0x3cc00000, 0x0_80000000+1G,
+  0x0_c0000000+4G (ends 0x1_c0000000). topaz's 4 GiB at 0x1_40000000 would run
+  2 GiB past the end: 37a6936 makes the shim clamp it to 2 GiB.
+- Fixed reserved-memory ends at 0x65b00000 (removed_region@60000000); every
+  other region is a dynamic pool (alloc-ranges below 4G). Giving xnu
+  0xc0000000+4G is a later option.
+- Touch: Linux `fts_ts`, FocalTech driver V3.4 20211214, IC ID 0x5452 (same
+  family as topaz, so 0083's chip id check passes), tp_info FT3519T, vendor
+  0x48 (Samsung panel), FW 0x2f, range 0..17279 x 0..38399 = 16x the panel.
+  Likely the FocalTech hi-res report (12-bit panel pixels + 4-bit fraction in
+  the pressure byte) instead of topaz's 1350x3000 + 2-bit fraction: confirm
+  with the 0089 raw diagnostics before changing 0083's scaling.
+- Bootloader unlocked: bootconfig androidboot.verifiedbootstate=orange (the
+  ro.boot.* props are spoofed to locked/green by the ROM). Active slot _b.
+  userdata = sda18, 115232026624 bytes.
+
 **Done:** 8cc24ec `tools/mkadt.py` sapphire identity. `shim/build.sh` builds
 on the server (aarch64-linux-gnu-gcc, `MKBOOTIMG="python3
 <aosp>/system/tools/mkbootimg/mkbootimg.py"`).
