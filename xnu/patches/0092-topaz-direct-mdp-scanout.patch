@@ -1,0 +1,302 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2094443..bd72f09 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,8 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);  /* osfmk/arm/caches.c */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -113,6 +115,14 @@ public:
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
++	/* topaz direct MDP scanout (VIG0 / CTL0 from TopazGpuW disp.c) */
++	volatile uint32_t *fVig0;
++	volatile uint32_t *fCtl0;
++	uint64_t      fScanPhys;      /* what VIG0 currently fetches */
++	uint32_t      fScanStride;
++	uint32_t      fBootSrc, fBootStride;
++	bool          directPresent(const uint8_t *rec);
++	void          scanFrom(uint64_t pa, uint32_t stride);
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -192,6 +202,17 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
++	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
++	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
++	if (fVig0 != NULL && fCtl0 != NULL) {
++		fBootSrc = fVig0[0x14 / 4];
++		fBootStride = fVig0[0x24 / 4];
++		fScanPhys = fBootSrc;
++		fScanStride = fBootStride;
++		IOLog("SWEET FB: MDP VIG0 src %#x stride %u (boot), direct scanout ready\n",
++		    fBootSrc, fBootStride);
++		sweet_scanout_set_geometry(fWidth, fHeight, fLogicalW, fLogicalH);
++	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+@@ -225,6 +246,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fPowerOff) {
++		if (fb->fVig0 != NULL && fb->fScanPhys != fb->fBootSrc) {
++			fb->scanFrom(fb->fBootSrc, fb->fBootStride);
++		}
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+ 		if (step <= 6) {
+@@ -308,11 +332,84 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
++void
++AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
++{
++	fVig0[0x14 / 4] = (uint32_t)pa;
++	fVig0[0x24 / 4] = stride;
++	__asm__ volatile("dsb sy" ::: "memory");
++	fCtl0[0x18 / 4] = 0x20001;      /* flush VIG0 + CTL: latched at the next vsync */
++	__asm__ volatile("dsb sy" ::: "memory");
++	fScanPhys = pa;
++	fScanStride = stride;
++}
++
++/*
++ * topaz: a swap that shows one full-screen surface from the scanout pool is
++ * presented by pointing the MDP at it (no 10 MB CPU copy). Returns false to
++ * fall back to the copy path.
++ */
++bool
++AppleCLCD::directPresent(const uint8_t *rec)
++{
++	if (fVig0 == NULL) {
++		return false;
++	}
++	uint32_t mask = get32(rec, 0x104), layer = 32, n = 0;
++	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++		if ((mask & (1u << i)) && get32(rec, 0x54 + 4 * i) != 0) {
++			layer = i;
++			n++;
++		}
++	}
++	if (n != 1) {
++		return false;
++	}
++	SweetSurface *s = sweet_surface_copy(get32(rec, 0x54 + 4 * layer));
++	if (s == NULL) {
++		return false;
++	}
++	bool ok = false;
++	if (s->scanoutPhys != 0 && s->bytesPerElement == 4 &&
++	    s->width >= fWidth && s->height >= fHeight) {
++		/* full-screen surface: panel window at the logical offset */
++		uint32_t ox = (s->width - fWidth) / 2, oy = (s->height - fHeight) / 2;
++		uint64_t pa = s->scanoutPhys + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4;
++		if ((pa & 0xf) == 0 && pa + (uint64_t)fHeight * s->bytesPerRow < (1ull << 32)) {
++			uintptr_t va = s->kernelAddress();
++			if (va != 0) {
++				/* the MDP does not snoop CPU caches */
++				flush_dcache64((addr64_t)(va + s->offset + (uint64_t)oy * s->bytesPerRow),
++				    (unsigned)((uint64_t)fHeight * s->bytesPerRow), FALSE);
++				scanFrom(pa, s->bytesPerRow);
++				ok = true;
++			}
++		}
++	}
++	s->release();
++	return ok;
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 
++	if (directPresent(rec)) {
++		if (!fConsolePaused) {
++			int quiet = 0;
++			fConsolePaused = true;
++			if (PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
++				sweet_console_muted = 1;
++			}
++		}
++		return;
++	}
++	/* copy path: make sure the MDP shows the boot framebuffer we copy into */
++	if (fVig0 != NULL && fScanPhys != fBootSrc) {
++		scanFrom(fBootSrc, fBootStride);
++	}
++
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..bacf85e 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -34,6 +34,7 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/system.h>
++#include <pexpert/pexpert.h>
+ #include <libkern/c++/OSArray.h>
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+@@ -75,6 +76,70 @@ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
++/* topaz scanout pool: 6 x 16 MiB at 0xb0000000 (sweet's old low-memory kernel window) */
++#define SWEET_SCANOUT_BASE      0xb0000000ull
++#define SWEET_SCANOUT_SLOT      (16u << 20)
++#define SWEET_SCANOUT_SLOTS     6
++static uint32_t sweet_scanout_used;             /* bit per slot, sweet_surface_lock */
++static uint32_t sweet_scanout_w[2], sweet_scanout_h[2];
++static int      sweet_scanout_enabled = -1;
++
++void
++sweet_scanout_set_geometry(uint32_t w1, uint32_t h1, uint32_t w2, uint32_t h2)
++{
++	sweet_scanout_w[0] = w1;
++	sweet_scanout_h[0] = h1;
++	sweet_scanout_w[1] = w2;
++	sweet_scanout_h[1] = h2;
++}
++
++static bool
++sweet_scanout_eligible(const SweetSurface *s)
++{
++	if (sweet_scanout_enabled < 0) {
++		int on = 1;
++		PE_parse_boot_argn("sweetfb_direct", &on, sizeof(on));
++		sweet_scanout_enabled = on;
++	}
++	if (!sweet_scanout_enabled || s->bytesPerElement != 4 || s->planeCount > 1 ||
++	    s->elementWidth != 1 || s->elementHeight != 1 || s->allocSize > SWEET_SCANOUT_SLOT) {
++		return false;
++	}
++	for (int i = 0; i < 2; i++) {
++		if (sweet_scanout_w[i] && s->width == sweet_scanout_w[i] && s->height == sweet_scanout_h[i]) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static int
++sweet_scanout_alloc_slot(void)
++{
++	int slot = -1;
++	IOLockLock(sweet_surface_lock);
++	for (int i = 0; i < SWEET_SCANOUT_SLOTS; i++) {
++		if (!(sweet_scanout_used & (1u << i))) {
++			sweet_scanout_used |= 1u << i;
++			slot = i;
++			break;
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	return slot;
++}
++
++static void
++sweet_scanout_free_slot(int slot)
++{
++	if (slot < 0) {
++		return;
++	}
++	IOLockLock(sweet_surface_lock);
++	sweet_scanout_used &= ~(1u << slot);
++	IOLockUnlock(sweet_surface_lock);
++}
++
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
+ void
+@@ -86,6 +151,8 @@ SweetSurface::free()
+ 	OSSafeReleaseNULL(kernelMap);
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
++	sweet_scanout_free_slot(scanoutSlot);
++	scanoutSlot = -1;
+ 	OSObject::free();
+ }
+ 
+@@ -98,7 +165,7 @@ SweetSurface::kernelAddress()
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache);
++		kernelMap = memory->map(scanoutPhys ? kIOMapDefaultCache : kIOMapWriteCombineCache);
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -684,7 +751,28 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
++	if (ret == kIOReturnSuccess && sweet_scanout_eligible(s)) {
++		int slot = sweet_scanout_alloc_slot();
++		if (slot >= 0) {
++			uint64_t pa = SWEET_SCANOUT_BASE + (uint64_t)slot * SWEET_SCANOUT_SLOT;
++			s->memory = IOMemoryDescriptor::withPhysicalAddress(pa, s->allocSize, kIODirectionInOut);
++			if (s->memory != NULL) {
++				s->scanoutPhys = pa;
++				s->scanoutSlot = slot;
++				s->mapCache = kIOMapDefaultCache;
++				uintptr_t va = s->kernelAddress();
++				if (va != 0) {
++					bzero((void *)va, s->allocSize);
++				}
++				if (!sweet_surface_publish(s)) {
++					ret = kIOReturnNoResources;
++				}
++			} else {
++				sweet_scanout_free_slot(slot);
++			}
++		}
++	}
++	if (ret == kIOReturnSuccess && s->memory == NULL) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..10b39eb 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -39,8 +39,10 @@ public:
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	uint64_t                  scanoutPhys;  /* topaz: physically contiguous scanout slot, or 0 */
++	int                       scanoutSlot;  /* pool slot, -1 when not from the pool */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { scanoutPhys = 0; scanoutSlot = -1; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+@@ -58,6 +60,13 @@ SweetSurface *sweet_surface_copy(uint32_t id);
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
++/*
++ * topaz scanout pool: physically contiguous low memory (below 4 GiB, unused by
++ * xnu, which runs in the upper DDR bank) so the MDP can fetch a surface
++ * directly. The framebuffer sets the full-screen geometry it can scan out.
++ */
++void sweet_scanout_set_geometry(uint32_t w1, uint32_t h1, uint32_t w2, uint32_t h2);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
