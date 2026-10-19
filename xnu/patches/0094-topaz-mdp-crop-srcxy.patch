@@ -1,0 +1,101 @@
+From 991aa0a55115972f1ab1a0a128d0a4b9d363b66a Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 07:34:41 +0300
+Subject: [PATCH] topaz-0094: MDP crop via SRC_XY, keep iPhone X canvas
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 27 +++++++++++++++++++--------
+ 1 file changed, 19 insertions(+), 8 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bd72f09..429a0d5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -120,9 +120,10 @@ public:
+ 	volatile uint32_t *fCtl0;
+ 	uint64_t      fScanPhys;      /* what VIG0 currently fetches */
+ 	uint32_t      fScanStride;
+-	uint32_t      fBootSrc, fBootStride;
++	uint32_t      fBootSrc, fBootStride, fBootXY, fBootImg;
++	uint32_t      fScanXY, fScanImg;
+ 	bool          directPresent(const uint8_t *rec);
+-	void          scanFrom(uint64_t pa, uint32_t stride);
++	void          scanFrom(uint64_t pa, uint32_t stride, uint32_t xy, uint32_t img);
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -207,8 +208,12 @@ AppleCLCD::start(IOService *provider)
+ 	if (fVig0 != NULL && fCtl0 != NULL) {
+ 		fBootSrc = fVig0[0x14 / 4];
+ 		fBootStride = fVig0[0x24 / 4];
++		fBootXY = fVig0[0x08 / 4];
++		fBootImg = fVig0[0x04 / 4];
+ 		fScanPhys = fBootSrc;
+ 		fScanStride = fBootStride;
++		fScanXY = fBootXY;
++		fScanImg = fBootImg;
+ 		IOLog("SWEET FB: MDP VIG0 src %#x stride %u (boot), direct scanout ready\n",
+ 		    fBootSrc, fBootStride);
+ 		sweet_scanout_set_geometry(fWidth, fHeight, fLogicalW, fLogicalH);
+@@ -247,7 +252,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	if (fb->fPowerOff) {
+ 		if (fb->fVig0 != NULL && fb->fScanPhys != fb->fBootSrc) {
+-			fb->scanFrom(fb->fBootSrc, fb->fBootStride);
++			fb->scanFrom(fb->fBootSrc, fb->fBootStride, fb->fBootXY, fb->fBootImg);
+ 		}
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+@@ -333,8 +338,12 @@ AppleCLCD::swap(const uint8_t *rec)
+ }
+ 
+ void
+-AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
++AppleCLCD::scanFrom(uint64_t pa, uint32_t stride, uint32_t xy, uint32_t img)
+ {
++	/* SSPP: SRC_IMG_SIZE +0x04 and SRC_XY +0x08 crop the panel window out of a
++	 * larger surface, so the base address stays the (aligned) surface start */
++	fVig0[0x04 / 4] = img;
++	fVig0[0x08 / 4] = xy;
+ 	fVig0[0x14 / 4] = (uint32_t)pa;
+ 	fVig0[0x24 / 4] = stride;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+@@ -342,6 +351,8 @@ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	fScanPhys = pa;
+ 	fScanStride = stride;
++	fScanXY = xy;
++	fScanImg = img;
+ }
+ 
+ /*
+@@ -374,14 +385,14 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 	    s->width >= fWidth && s->height >= fHeight) {
+ 		/* full-screen surface: panel window at the logical offset */
+ 		uint32_t ox = (s->width - fWidth) / 2, oy = (s->height - fHeight) / 2;
+-		uint64_t pa = s->scanoutPhys + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4;
+-		if ((pa & 0xf) == 0 && pa + (uint64_t)fHeight * s->bytesPerRow < (1ull << 32)) {
++		uint64_t pa = s->scanoutPhys + s->offset;
++		if ((pa & 0xf) == 0 && pa + (uint64_t)s->height * s->bytesPerRow < (1ull << 32)) {
+ 			uintptr_t va = s->kernelAddress();
+ 			if (va != 0) {
+ 				/* the MDP does not snoop CPU caches */
+ 				flush_dcache64((addr64_t)(va + s->offset + (uint64_t)oy * s->bytesPerRow),
+ 				    (unsigned)((uint64_t)fHeight * s->bytesPerRow), FALSE);
+-				scanFrom(pa, s->bytesPerRow);
++				scanFrom(pa, s->bytesPerRow, oy << 16 | ox, s->height << 16 | s->width);
+ 				ok = true;
+ 			}
+ 		}
+@@ -407,7 +418,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	}
+ 	/* copy path: make sure the MDP shows the boot framebuffer we copy into */
+ 	if (fVig0 != NULL && fScanPhys != fBootSrc) {
+-		scanFrom(fBootSrc, fBootStride);
++		scanFrom(fBootSrc, fBootStride, fBootXY, fBootImg);
+ 	}
+ 
+ 
+-- 
+2.43.0
+
