@@ -1,0 +1,1049 @@
+From 37e3c42fe8939859235ecf8c11b1266861b8fd61 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 19:37:05 +0300
+Subject: [PATCH] topaz-0123: TopazModem: wifi=1: WLAN SMMU identity, copy
+ engines, HTC, WMI, passive scan
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 990 +++++++++++++++++++++++++++++++-
+ 1 file changed, 989 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 431ec3b..cb34e86 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -45,7 +45,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ /* middle DDR bank, RAM the kernel does not manage; below 0xF0000000 for TZ/the modem */
+ #define MODEM_POOL_BASE     0xE0000000ull
+-#define MODEM_POOL_SIZE     0x00800000ull       /* 8 MB: metadata, SCM args, rmtfs buffer */
++#define MODEM_POOL_SIZE     0x01000000ull       /* 16 MB: metadata, SCM args, rmtfs, CE rings, WMI memory */
+ 
+ #define SMEM_PA             0x46000000ull
+ #define SMEM_SIZE           0x00200000u
+@@ -408,6 +408,9 @@ static bool svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, cons
+ static void svc_announce(void);
+ static void svc_summary(void);
+ static void wlfw_arrive(uint32_t node, uint32_t port);
++static bool wifi_enabled(void);
++static bool ce_start(void);
++static void radio_poll(unsigned ms);
+ 
+ /* ---------------------------------------------------------------- GLINK over SMEM */
+ 
+@@ -3403,6 +3406,10 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 			w_mission = true;
+ 			w_step = "WLAN ON (mission)";
+ 			LOG("*** WLAN ON (mission mode) ***");
++			if (wifi_enabled()) {
++				IOSleep(100);
++				(void)ce_start();               /* only now: before mission a CE access hangs the bus */
++			}
+ 		}
+ 		break;
+ 	default:
+@@ -3411,6 +3418,982 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 	}
+ }
+ 
++/* ---------------------------------------------------------------- WLAN radio (wifi=1) */
++
++/*
++ * After WLAN_MODE mission (port of topaz-woa wlanprobe.c, ce.c, htc.c, wmi.c, scan.c):
++ *  - apps SMMU: the WLAN stream 0x1A0 gets an identity context bank (SCTLR.M=0); a global
++ *    bypass S2CR is turned into a fault by this SMMU. Done before the modem boots.
++ *  - copy engines at 0xC800000+0x240000, polled; rings and buffers from our pool (Normal NC).
++ *  - HTC: READY on ep0, connect HTT_DATA and WMI_CONTROL, SETUP_COMPLETE_EX.
++ *  - WMI (TLV): SERVICE_READY -> INIT -> READY, then a passive scan (nothing is transmitted);
++ *    each BSS seen is logged once, its BSSID masked.
++ */
++#define SMMU_PA             0x0C600000ull
++#define SMMU_SIZE           0x00080000u
++#define WLAN_SID            0x1A0
++#define WLAN_SID_MASK       0x1
++#define CB_CLONE_CBAR       0x0001f000u         /* S1_TRANS_S2_FAULT, S1_MEMATTR WB */
++#define CB_CLONE_CBA2R      0x00000001u         /* VA64 */
++#define CB_CLONE_SCTLR      0x000000e0u         /* CFCFG|CFIE|CFRE, M=0: no translation */
++
++static int wifi_on = -1;
++
++static bool
++wifi_enabled(void)
++{
++	if (wifi_on < 0) {
++		uint32_t v = 0;
++		wifi_on = PE_parse_boot_argn("wifi", &v, sizeof(v)) && v != 0;
++	}
++	return wifi_on > 0;
++}
++
++static inline uint32_t r32(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void w32(volatile uint8_t *b, uint32_t o, uint32_t v) { mb(); *(volatile uint32_t *)(b + o) = v; }
++
++static bool
++smmu_sid_match(uint32_t smr, uint32_t sid, uint32_t mask)
++{
++	uint32_t id = smr & 0xFFFF, m = (smr >> 16) & 0x7FFF;
++	return ((id ^ sid) & ~(m | mask) & 0x7FFF) == 0;
++}
++
++static bool
++smmu_identity(uint32_t sid, uint32_t mask, const char *name)
++{
++	volatile uint8_t *s = (volatile uint8_t *)ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (s == NULL) {
++		LOG("smmu: map failed");
++		return false;
++	}
++	uint32_t cr0 = r32(s, 0x0), id0 = r32(s, 0x20), id1 = r32(s, 0x24);
++	uint32_t nsmr = id0 & 0xFF, ncb = id1 & 0xFF;
++	uint32_t psize = (id1 & (1u << 31)) ? 0x10000 : 0x1000, npage = 1u << (((id1 >> 28) & 7) + 1);
++	uint32_t slot = ~0u, cb = ~0u, smr, s2cr;
++	uint64_t used = 0;
++
++	LOG("smmu: sCR0 %08x ID0 %08x ID1 %08x: %u SMRs, %u CBs, page %x x%u", cr0, id0, id1, nsmr, ncb, psize, npage);
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		smr = r32(s, 0x800 + 4 * i);
++		s2cr = r32(s, 0xC00 + 4 * i);
++		if ((smr >> 31) != 0 && smmu_sid_match(smr, sid, mask)) {
++			slot = i;                           /* already there: reuse */
++		} else if ((smr >> 31) == 0 && slot == ~0u) {
++			slot = i;
++		}
++		if ((smr >> 31) != 0 && ((s2cr >> 16) & 3) == 0) {
++			used |= 1ull << (s2cr & 0x3F);
++		}
++	}
++	for (uint32_t i = 4; i < ncb && i < 64; i++) {  /* keep clear of the loader's cb0..3 */
++		if ((used & (1ull << i)) == 0) {
++			cb = i;
++			break;
++		}
++	}
++	if (slot == ~0u || cb == ~0u || (uint64_t)(npage + cb + 1) * psize > SMMU_SIZE) {
++		LOG("smmu: no free SMR/CB (slot %u cb %u)", slot, cb);
++		return false;
++	}
++	volatile uint8_t *gr1 = s + psize, *cbp = s + (uint64_t)npage * psize + (uint64_t)cb * psize;
++	w32(cbp, 0x58, 0xFFFFFFFF);                 /* FSR: clear */
++	w32(cbp, 0x20, 0);                          /* TTBR0 */
++	w32(cbp, 0x24, 0);
++	w32(cbp, 0x30, 0);                          /* TCR */
++	w32(cbp, 0x10, 0);                          /* TCR2 */
++	w32(cbp, 0x38, 0);                          /* MAIR */
++	w32(cbp, 0x3C, 0);
++	w32(gr1, 0x800 + 4 * cb, CB_CLONE_CBA2R);
++	w32(gr1, 0x000 + 4 * cb, CB_CLONE_CBAR);
++	w32(cbp, 0x0, CB_CLONE_SCTLR);              /* SCTLR last */
++	w32(s, 0xC00 + 4 * slot, cb);               /* S2CR: type 0 (translate), this bank */
++	w32(s, 0x800 + 4 * slot, (1u << 31) | (mask << 16) | sid);   /* SMR valid last */
++	w32(s, 0x70, 0);                            /* sTLBGSYNC */
++	uint32_t n;
++	for (n = 0; n < 100000 && (r32(s, 0x74) & 1) != 0; n++) {
++		IODelay(1);
++	}
++	smr = r32(s, 0x800 + 4 * slot);
++	s2cr = r32(s, 0xC00 + 4 * slot);
++	bool ok = (smr >> 31) != 0 && smmu_sid_match(smr, sid, mask) && ((s2cr >> 16) & 3) == 0 && (s2cr & 0x3F) == cb;
++	LOG("smmu: %s identity (sid %x mask %x) CB%u SMR%u: SMR %08x S2CR %08x SCTLR %08x -> %s", name, sid, mask, cb,
++	    slot, smr, s2cr, r32(cbp, 0x0), ok ? "OK" : "NOT as written");
++	return ok;
++}
++
++/* ---------------- copy engines (ath10k ce.c, WCN3990: 64-bit descriptors, shadow regs, RRI in DDR) */
++
++#define CE_PA               (0x0C800000ull + 0x240000)
++#define CE_COUNT            12
++#define SHADOW_PA           (0x0C800000ull + 0x32000)
++#define SR_BASE_LO          0x00
++#define SR_BASE_HI          0x04
++#define SR_SIZE             0x08
++#define DR_BASE_LO          0x0C
++#define DR_BASE_HI          0x10
++#define DR_SIZE             0x14
++#define CTRL1               0x18
++#define SR_WR_IDX           0x3C
++#define DR_WR_IDX           0x40
++#define CUR_SRRI            0x44
++#define CUR_DRRI            0x48
++#define SRC_WM              0x4C
++#define DST_WM              0x50
++#define WRAP_RRI_LO         0xC004
++#define WRAP_RRI_HI         0xC008
++#define CTRL1_DMAX          0x0000FFFFu
++#define CTRL1_SRC_SWAP      (1u << 17)
++#define CTRL1_DST_SWAP      (1u << 18)
++#define CTRL1_RRI_UPD       (1u << 19)
++#define ADDR_HI_MASK        0x1Fu
++#define ATTR_DIS_INTR       0x08
++#define RX_BUF_SIZE         2048
++#define RX_POST             32
++#define TX_SLOTS_MAX        64
++
++struct ce_desc { uint64_t addr; uint16_t nbytes, flags; uint32_t toeplitz; } __attribute__((packed));
++struct ce_attr { uint16_t src_n, src_max, dst_n, flags; };
++
++/* host_ce_config_wlan (ath10k snoc.c) */
++static const struct ce_attr ce_attr[CE_COUNT] = {
++	{ 16, 2048, 0, 0 }, { 0, 2048, 512, 0 }, { 0, 2048, 64, 0 }, { 32, 2048, 0, 0 },
++	{ 2048, 256, 0, ATTR_DIS_INTR }, { 0, 512, 512, 0 }, { 0, 0, 0, 0 }, { 2, 2048, 2, 0 },
++	{ 0, 2048, 128, 0 }, { 0, 2048, 512, 0 }, { 0, 2048, 512, 0 }, { 0, 2048, 512, 0 },
++};
++
++struct ce_state {
++	volatile struct ce_desc *src, *dst;
++	uint64_t src_pa, dst_pa, rx_pa, tx_pa;
++	uint32_t src_n, dst_n, src_wr, dst_wr, dst_sw;
++	uint8_t *rx_buf, *tx_buf;
++	uint32_t rx, tx, tx_full;
++};
++static struct ce_state ce[CE_COUNT];
++static volatile uint8_t *ce_regs, *ce_shadow;
++static volatile uint32_t *ce_rri;
++static uint64_t ce_rri_pa;
++static bool ce_up;
++
++static bool ce_host_rx(uint32_t c) { return ce_attr[c].dst_n != 0 && c != 7; }
++static bool ce_host_tx(uint32_t c) { return c == 0 || c == 3 || c == 4; }
++static uint32_t ce_tx_slots(uint32_t c) { return MIN(ce[c].src_n, (uint32_t)TX_SLOTS_MAX); }
++static uint32_t ce_tx_sz(uint32_t c) { return ce_attr[c].src_max; }
++static uint32_t pow2(uint32_t n) { uint32_t p = 1; while (p < n) { p <<= 1; } return p; }
++static uint32_t ce_rd(uint32_t c, uint32_t o) { return r32(ce_regs, c * 0x1000 + o); }
++static void ce_wr(uint32_t c, uint32_t o, uint32_t v) { w32(ce_regs, c * 0x1000 + o, v); }
++
++static void
++ce_post(uint32_t c)
++{
++	struct ce_state *s = &ce[c];
++	uint32_t slot = s->dst_wr;
++	s->dst[slot].addr = s->rx_pa + (uint64_t)(slot % RX_POST) * RX_BUF_SIZE;
++	s->dst[slot].nbytes = 0;
++	s->dst_wr = (slot + 1) & (s->dst_n - 1);
++}
++
++static bool
++ce_start(void)
++{
++	uint64_t off = 0x1000, pa = 0;              /* RRI in the first page */
++
++	if (ce_up) {
++		return true;
++	}
++	ce_regs = (volatile uint8_t *)ml_io_map(CE_PA, (CE_COUNT + 1) * 0x1000);
++	ce_shadow = (volatile uint8_t *)ml_io_map(SHADOW_PA, 0x1000);
++	for (uint32_t c = 0; c < CE_COUNT; c++) {
++		ce[c].src_n = ce_attr[c].src_n ? pow2(ce_attr[c].src_n) : 0;
++		ce[c].dst_n = ce_attr[c].dst_n ? pow2(ce_attr[c].dst_n) : 0;
++		off += ((uint64_t)ce[c].src_n * sizeof(struct ce_desc) + 0xfff) & ~0xfffull;
++		off += ((uint64_t)ce[c].dst_n * sizeof(struct ce_desc) + 0xfff) & ~0xfffull;
++		off += ce_host_rx(c) ? RX_POST * RX_BUF_SIZE : 0;
++		off += ce_host_tx(c) ? ce_tx_slots(c) * ce_tx_sz(c) : 0;
++	}
++	uint8_t *va = (uint8_t *)pool_alloc(off, &pa);
++	if (ce_regs == NULL || ce_shadow == NULL || va == NULL) {
++		LOG("ce: map/alloc failed (%llu bytes)", off);
++		return false;
++	}
++	LOG("ce: host memory %llx + %llx", pa, off);
++	ce_rri = (volatile uint32_t *)va;
++	ce_rri_pa = pa;
++	off = 0x1000;
++	for (uint32_t c = 0; c < CE_COUNT; c++) {
++		struct ce_state *s = &ce[c];
++		if (s->src_n != 0) {
++			s->src = (volatile struct ce_desc *)(va + off);
++			s->src_pa = pa + off;
++			off += ((uint64_t)s->src_n * sizeof(struct ce_desc) + 0xfff) & ~0xfffull;
++		}
++		if (s->dst_n != 0) {
++			s->dst = (volatile struct ce_desc *)(va + off);
++			s->dst_pa = pa + off;
++			off += ((uint64_t)s->dst_n * sizeof(struct ce_desc) + 0xfff) & ~0xfffull;
++		}
++		if (ce_host_rx(c)) {
++			s->rx_buf = va + off;
++			s->rx_pa = pa + off;
++			off += RX_POST * RX_BUF_SIZE;
++		}
++		if (ce_host_tx(c)) {
++			s->tx_buf = va + off;
++			s->tx_pa = pa + off;
++			off += ce_tx_slots(c) * ce_tx_sz(c);
++		}
++	}
++	/* the CE writes its read indices to ce_rri[ce] (src [15:0], dst [31:16]) */
++	w32(ce_regs, WRAP_RRI_LO, (uint32_t)ce_rri_pa);
++	w32(ce_regs, WRAP_RRI_HI, (uint32_t)(ce_rri_pa >> 32) & ADDR_HI_MASK);
++	for (uint32_t c = 0; c < CE_COUNT; c++) {
++		ce_wr(c, CTRL1, ce_rd(c, CTRL1) | CTRL1_RRI_UPD);
++	}
++	for (uint32_t c = 0; c < CE_COUNT; c++) {
++		struct ce_state *s = &ce[c];
++		if (s->src_n != 0) {                    /* ath10k_ce_init_src_ring */
++			s->src_wr = ce_rd(c, SR_WR_IDX) & (s->src_n - 1);
++			ce_wr(c, SR_BASE_LO, (uint32_t)s->src_pa);
++			ce_wr(c, SR_BASE_HI, (uint32_t)(s->src_pa >> 32) & ADDR_HI_MASK);
++			ce_wr(c, SR_SIZE, s->src_n);
++			ce_wr(c, CTRL1, (ce_rd(c, CTRL1) & ~(CTRL1_DMAX | CTRL1_SRC_SWAP)) | ce_attr[c].src_max);
++			ce_wr(c, SRC_WM, s->src_n);
++		}
++		if (s->dst_n != 0) {                    /* ath10k_ce_init_dest_ring */
++			s->dst_sw = ce_rd(c, CUR_DRRI) & (s->dst_n - 1);
++			s->dst_wr = ce_rd(c, DR_WR_IDX) & (s->dst_n - 1);
++			ce_wr(c, DR_BASE_LO, (uint32_t)s->dst_pa);
++			ce_wr(c, DR_BASE_HI, (ce_rd(c, DR_BASE_HI) & ~ADDR_HI_MASK) | ((uint32_t)(s->dst_pa >> 32) & ADDR_HI_MASK));
++			ce_wr(c, DR_SIZE, s->dst_n);
++			ce_wr(c, CTRL1, ce_rd(c, CTRL1) & ~CTRL1_DST_SWAP);
++			ce_wr(c, DST_WM, s->dst_n);
++		}
++	}
++	for (uint32_t c = 0; c < CE_COUNT; c++) {   /* ath10k_snoc_rx_post */
++		if (!ce_host_rx(c)) {
++			continue;
++		}
++		for (uint32_t i = 0; i < RX_POST; i++) {
++			ce_post(c);
++		}
++		mb();
++		ce_wr(c, DR_WR_IDX, ce[c].dst_wr);
++	}
++	ce_up = true;
++	LOG("t=%u ms: ce: %u rings programmed, rx posted", g_ms, CE_COUNT);
++	return true;
++}
++
++static void htc_rx(uint32_t c, const uint8_t *d, uint32_t len);
++
++static bool
++ce_poll(void)
++{
++	bool any = false;
++	if (!ce_up) {
++		return false;
++	}
++	for (uint32_t c = 0; c < CE_COUNT; c++) {
++		struct ce_state *s = &ce[c];
++		if (!ce_host_rx(c)) {
++			continue;
++		}
++		for (int k = 0; k < 16; k++) {
++			uint32_t slot = s->dst_sw, n = s->dst[slot].nbytes;
++			if (n == 0) {
++				break;
++			}
++			mb();                               /* payload after the descriptor */
++			s->dst[slot].nbytes = 0;
++			s->dst_sw = (slot + 1) & (s->dst_n - 1);
++			s->rx++;
++			htc_rx(c, s->rx_buf + (slot % RX_POST) * RX_BUF_SIZE, n);
++			ce_post(c);
++			mb();
++			ce_wr(c, DR_WR_IDX, s->dst_wr);
++			any = true;
++		}
++	}
++	return any;
++}
++
++static bool
++ce_send(uint32_t c, const void *data, uint32_t len, uint32_t transfer_id)
++{
++	if (!ce_up || c >= CE_COUNT || !ce_host_tx(c) || len > ce_tx_sz(c)) {
++		return false;
++	}
++	struct ce_state *s = &ce[c];
++	uint32_t mask = s->src_n - 1, sw = ce_rri[c] & 0xFFFF;
++	if (((sw - 1 - s->src_wr) & mask) == 0 || ((s->src_wr - sw) & mask) >= ce_tx_slots(c) - 1) {
++		s->tx_full++;
++		return false;
++	}
++	uint32_t slot = s->src_wr;
++	memcpy(s->tx_buf + (slot % ce_tx_slots(c)) * ce_tx_sz(c), data, len);
++	volatile struct ce_desc *d = &s->src[slot];
++	d->addr = s->tx_pa + (uint64_t)(slot % ce_tx_slots(c)) * ce_tx_sz(c);
++	d->nbytes = (uint16_t)len;
++	d->flags = (uint16_t)((transfer_id << 4) & 0xFFF0);
++	d->toeplitz = 0;
++	s->src_wr = (slot + 1) & mask;
++	s->tx++;
++	mb();
++	*(volatile uint32_t *)(ce_shadow + 4 * c) = s->src_wr;
++	mb();
++	return true;
++}
++
++/* ---------------- HTC (ath10k htc.c) */
++
++#define HTC_MSG_READY       1
++#define HTC_MSG_CONNECT     2
++#define HTC_MSG_CONNECT_RESP 3
++#define HTC_MSG_SETUP_COMPLETE_EX 5
++#define HTC_FLAG_NEED_CREDIT_UPDATE 0x01
++#define HTC_FLAG_TRAILER    0x02
++#define HTC_CONN_NO_CREDIT_FLOW 0x0008
++#define SVC_RSVD_CTRL       0x0001
++#define SVC_WMI_CONTROL     0x0100
++#define SVC_HTT_DATA        0x0300
++#define EP_MAX              8
++
++struct htc_hdr { uint8_t eid, flags; uint16_t len; uint8_t trailer, seq; uint16_t pad; } __attribute__((packed));
++struct htc_ep { uint16_t svc, max_msg; uint8_t ul, dl, seq, credits; bool up, credit_flow; uint32_t rx; };
++static struct htc_ep ep[EP_MAX];
++static uint8_t wmi_eid = 0xFF, htt_eid = 0xFF;
++static bool htc_ready, htc_setup;
++
++static bool
++htc_send(uint8_t eid, const void *payload, uint32_t len)
++{
++	static uint8_t buf[2048];
++	struct htc_hdr *h = (struct htc_hdr *)buf;
++	if (eid >= EP_MAX || len + sizeof(*h) > sizeof(buf)) {
++		return false;
++	}
++	struct htc_ep *e = &ep[eid];
++	if (e->credit_flow) {
++		if (e->credits == 0) {
++			return false;
++		}
++		e->credits--;
++	}
++	bzero(h, sizeof(*h));
++	h->eid = eid;
++	h->len = (uint16_t)len;
++	h->flags = e->credit_flow ? HTC_FLAG_NEED_CREDIT_UPDATE : 0;
++	h->seq = e->seq++;
++	memcpy(buf + sizeof(*h), payload, len);
++	if (!ce_send(e->ul, buf, (uint32_t)sizeof(*h) + len, eid)) {
++		LOG("htc: send on ep %u (ce%u) FAILED", eid, e->ul);
++		return false;
++	}
++	return true;
++}
++
++static void
++htc_connect(uint16_t svc)
++{
++	uint8_t m[8] = {};
++	uint16_t id = HTC_MSG_CONNECT, flags = svc == SVC_WMI_CONTROL ? (uint16_t)(1u << 8) : HTC_CONN_NO_CREDIT_FLOW;
++	memcpy(m, &id, 2);
++	memcpy(m + 2, &svc, 2);
++	memcpy(m + 4, &flags, 2);
++	htc_send(0, m, sizeof(m));
++}
++
++/* WMI waits here while the endpoint has no credit */
++#define WMIQ_LEN 6
++#define WMIQ_MAX 2040
++static uint8_t wmiq[WMIQ_LEN][WMIQ_MAX];
++static uint16_t wmiq_len[WMIQ_LEN];
++static uint32_t wmiq_head, wmiq_tail;
++
++static void
++wmiq_pump(void)
++{
++	while (wmiq_head != wmiq_tail && wmi_eid != 0xFF && ep[wmi_eid].credits != 0) {
++		uint32_t i = wmiq_head % WMIQ_LEN;
++		if (!htc_send(wmi_eid, wmiq[i], wmiq_len[i])) {
++			break;
++		}
++		wmiq_head++;
++	}
++}
++
++static bool
++htc_wmi_send(const void *data, uint32_t len)
++{
++	if (wmi_eid == 0xFF || len > WMIQ_MAX) {
++		return false;
++	}
++	if (wmiq_head == wmiq_tail && ep[wmi_eid].credits != 0) {
++		return htc_send(wmi_eid, data, len);
++	}
++	if (wmiq_tail - wmiq_head >= WMIQ_LEN) {
++		LOG("htc: wmi queue full, message dropped");
++		return false;
++	}
++	uint32_t i = wmiq_tail++ % WMIQ_LEN;
++	memcpy(wmiq[i], data, len);
++	wmiq_len[i] = (uint16_t)len;
++	return true;
++}
++
++static void wmi_rx(const uint8_t *d, uint32_t len);
++
++static void
++htc_rx(uint32_t c, const uint8_t *d, uint32_t len)
++{
++	const struct htc_hdr *h = (const struct htc_hdr *)d;
++	const uint8_t *p = d + sizeof(*h);
++	if (len < sizeof(*h)) {
++		return;
++	}
++	uint32_t plen = MIN((uint32_t)h->len, len - (uint32_t)sizeof(*h));
++	if ((h->flags & HTC_FLAG_TRAILER) != 0 && h->trailer <= plen) {
++		const uint8_t *t = p + plen - h->trailer;   /* records {id, len, data}; id 1 = credits */
++		for (uint32_t o = 0; o + 2 <= h->trailer && o + 2 + t[o + 1] <= h->trailer; o += 2 + t[o + 1]) {
++			if (t[o] == 1) {
++				for (uint32_t i = 0; i + 1 < t[o + 1]; i += 2) {
++					if (t[o + 2 + i] < EP_MAX) {
++						ep[t[o + 2 + i]].credits = (uint8_t)(ep[t[o + 2 + i]].credits + t[o + 3 + i]);
++					}
++				}
++			}
++		}
++		plen -= h->trailer;
++		wmiq_pump();
++	}
++	if (h->eid < EP_MAX) {
++		ep[h->eid].rx++;
++	}
++	if (h->eid == 0) {
++		uint16_t msg = 0;
++		if (plen >= 2) {
++			memcpy(&msg, p, 2);
++		}
++		if (msg == HTC_MSG_READY && plen >= 8) {
++			uint16_t cc, cs;
++			memcpy(&cc, p + 2, 2);
++			memcpy(&cs, p + 4, 2);
++			htc_ready = true;
++			ep[0].svc = SVC_RSVD_CTRL;
++			ep[0].ul = 0;
++			ep[0].dl = 2;
++			ep[0].up = true;
++			LOG("t=%u ms: *** HTC READY: credits %u x %u, %u endpoints ***", g_ms, cc, cs, p[6]);
++			htc_connect(SVC_HTT_DATA);          /* ath10k_core_start: htt, then wmi */
++		} else if (msg == HTC_MSG_CONNECT_RESP && plen >= 8) {
++			uint16_t svc, max;
++			memcpy(&svc, p + 2, 2);
++			memcpy(&max, p + 6, 2);
++			uint8_t status = p[4], eid = p[5];
++			LOG("t=%u ms: htc: connect resp svc %x status %u eid %u max_msg %u", g_ms, svc, status, eid, max);
++			if (status != 0 || eid >= EP_MAX) {
++				return;
++			}
++			ep[eid].svc = svc;
++			ep[eid].max_msg = max;
++			ep[eid].ul = svc == SVC_WMI_CONTROL ? 3 : 4;
++			ep[eid].dl = svc == SVC_WMI_CONTROL ? 2 : 1;
++			ep[eid].up = true;
++			ep[eid].credit_flow = svc == SVC_WMI_CONTROL;
++			ep[eid].credits = ep[eid].credit_flow ? 1 : 0;
++			if (svc == SVC_HTT_DATA) {
++				htt_eid = eid;
++				htc_connect(SVC_WMI_CONTROL);
++			} else if (svc == SVC_WMI_CONTROL) {
++				wmi_eid = eid;
++				uint8_t m[12] = {};
++				uint16_t id = HTC_MSG_SETUP_COMPLETE_EX;
++				memcpy(m, &id, 2);
++				htc_setup = htc_send(0, m, sizeof(m));
++				LOG("t=%u ms: htc: SETUP_COMPLETE_EX %s", g_ms, htc_setup ? "sent" : "FAILED");
++			}
++		}
++	} else if (h->eid == wmi_eid) {
++		wmi_rx(p, plen);
++	}
++	/* HTT (data path) comes later */
++}
++
++/* ---------------- WMI (TLV, ath10k wmi-tlv.c) and the passive scan */
++
++#define WMI_EV_SERVICE_READY 0x1
++#define WMI_EV_READY        0x2
++#define WMI_EV_SERVICE_AVAILABLE 0x3
++#define WMI_EV_SCAN         0x3001
++#define WMI_EV_MGMT_RX      0x7001
++#define WMI_CMD_INIT        0x1
++#define CMD_START_SCAN      0x3001
++#define CMD_SCAN_CHAN_LIST  0x3003
++#define CMD_VDEV_CREATE     0x5001
++#define TAG_ARRAY_UINT32    0x10
++#define TAG_ARRAY_BYTE      0x11
++#define TAG_ARRAY_STRUCT    0x12
++#define TAG_ARRAY_FIXED_STRUCT 0x13
++#define TAG_SERVICE_READY   0x20
++#define TAG_HOST_MEM_REQ    0x22
++#define TAG_READY_EVENT     0x23
++#define TAG_SCAN_EVENT      0x24
++#define TAG_MGMT_RX_HDR     0x2C
++#define TAG_INIT_CMD        0x4A
++#define TAG_RESOURCE_CONFIG 0x4B
++#define TAG_HOST_MEM_CHUNK  0x4C
++#define TAG_START_SCAN_CMD  0x4D
++#define TAG_SCAN_CHAN_LIST_CMD 0x4F
++#define TAG_CHANNEL         0x50
++#define TAG_VDEV_CREATE_CMD 0x56
++#define TAG_SERVICE_AVAILABLE 0x22F
++#define ABI_VER0            0x01000000u
++#define ABI_VER1            53
++#define ABI_NS0             0x5F414351u         /* "QCA_" */
++#define ABI_NS1             0x00004C4Du         /* "ML" */
++#define SVC_RX_FULL_REORDER 65
++#define SVC_EXTEND_ADDRESS  179
++#define NUM_PEERS           33
++#define NUM_VDEVS           4
++#define MAX_MEM_REQS        8
++#define MAX_MEM_TOTAL       (4u << 20)
++
++struct wmi_mem_req { uint32_t req_id, unit_size, num_unit_info, num_units; };
++static uint32_t wmi_svc_map[32], wmi_svc_ext[4], wmi_nreq;
++static struct wmi_mem_req wmi_req[MAX_MEM_REQS];
++static uint64_t wmi_chunk_pa[MAX_MEM_REQS];
++static uint32_t wmi_chunk_len[MAX_MEM_REQS];
++static bool wmi_init_sent, wmi_ready, wmi_seen_bmap, wmi_seen_reqs;
++static uint8_t wmi_mac[6];
++
++static bool
++wmi_svc(uint32_t bit)
++{
++	if (bit < 128) {
++		return (wmi_svc_map[bit / 4] & (1u << (bit % 4))) != 0;
++	}
++	bit -= 128;
++	return bit < 128 && (wmi_svc_ext[bit / 32] & (1u << (bit % 32))) != 0;
++}
++
++static uint8_t *
++wmi_put_tlv(uint8_t *p, uint16_t tag, uint32_t len)
++{
++	uint16_t l = (uint16_t)len;
++	memcpy(p, &l, 2);
++	memcpy(p + 2, &tag, 2);
++	return p + 4;
++}
++
++static uint8_t *
++put32(uint8_t *p, uint32_t v)
++{
++	memcpy(p, &v, 4);
++	return p + 4;
++}
++
++static bool
++wmi_send(uint32_t cmd, const void *tlvs, uint32_t len)
++{
++	static uint8_t m[2048];
++	if (len + 4 > sizeof(m)) {
++		return false;
++	}
++	put32(m, cmd & 0xFFFFFF);
++	memcpy(m + 4, tlvs, len);
++	return htc_wmi_send(m, len + 4);
++}
++
++/* walk the TLVs of SERVICE_READY (ath10k_wmi_tlv_svc_rdy_parse) */
++static void
++wmi_svc_ready(const uint8_t *p, uint32_t len)
++{
++	for (uint32_t o = 0; o + 4 <= len;) {
++		uint16_t l, tag;
++		memcpy(&l, p + o, 2);
++		memcpy(&tag, p + o + 2, 2);
++		if (o + 4 + l > len) {
++			break;
++		}
++		const uint8_t *v = p + o + 4;
++		if (tag == TAG_SERVICE_READY && l >= 16) {
++			uint32_t fw, a0, rf;
++			memcpy(&fw, v, 4);
++			memcpy(&a0, v + 4, 4);
++			memcpy(&rf, v + 4 + 24 + 8, 4);
++			LOG("wmi: fw %08x abi %08x rf_chains %u", fw, a0, rf);
++		} else if (tag == TAG_ARRAY_UINT32 && !wmi_seen_bmap) {
++			wmi_seen_bmap = true;
++			memcpy(wmi_svc_map, v, MIN((uint32_t)l, (uint32_t)sizeof(wmi_svc_map)));
++		} else if (tag == TAG_ARRAY_STRUCT && !wmi_seen_reqs) {
++			wmi_seen_reqs = true;
++			for (uint32_t q = 0; q + 4 <= l;) {
++				uint16_t ql, qt;
++				memcpy(&ql, v + q, 2);
++				memcpy(&qt, v + q + 2, 2);
++				if (q + 4 + ql > l) {
++					break;
++				}
++				if (qt == TAG_HOST_MEM_REQ && ql >= sizeof(struct wmi_mem_req) && wmi_nreq < MAX_MEM_REQS) {
++					memcpy(&wmi_req[wmi_nreq], v + q + 4, sizeof(struct wmi_mem_req));
++					LOG("wmi: mem_req %u: id %u unit %u info %x units %u", wmi_nreq, wmi_req[wmi_nreq].req_id,
++					    wmi_req[wmi_nreq].unit_size, wmi_req[wmi_nreq].num_unit_info, wmi_req[wmi_nreq].num_units);
++					wmi_nreq++;
++				}
++				q += 4 + ql;
++			}
++		}
++		o += 4 + l;
++	}
++}
++
++static void
++wmi_send_init(void)
++{
++	static uint8_t m[1024];
++	uint8_t *p = m;
++	uint32_t total = 0, n = wmi_nreq;
++	uint64_t pa = 0;
++
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t units = wmi_req[i].num_units;
++		if (wmi_req[i].num_unit_info & 6) {
++			units = NUM_PEERS + 1;
++		} else if (wmi_req[i].num_unit_info & 1) {
++			units = NUM_VDEVS + 1;
++		}
++		wmi_chunk_len[i] = units * ((wmi_req[i].unit_size + 3) & ~3u);
++		total += (wmi_chunk_len[i] + 0xfff) & ~0xfffu;
++	}
++	if (total != 0 && (total > MAX_MEM_TOTAL || pool_alloc(total, &pa) == NULL)) {
++		LOG("wmi: host memory %u bytes not given", total);
++		n = 0;
++	}
++	for (uint32_t i = 0, off = 0; i < n; i++) {
++		wmi_chunk_pa[i] = pa + off;
++		off += (wmi_chunk_len[i] + 0xfff) & ~0xfffu;
++	}
++	bzero(m, sizeof(m));
++	p = wmi_put_tlv(p, TAG_INIT_CMD, 24 + 4);
++	p = put32(p, ABI_VER0);
++	p = put32(p, ABI_VER1);
++	p = put32(p, ABI_NS0);
++	p = put32(p, ABI_NS1);
++	p = put32(p, 0);
++	p = put32(p, 0);
++	p = put32(p, n);
++	/* wmi_tlv_resource_config, 44 x u32, ath10k values for wcn3990 */
++	uint32_t rc[44] = {};
++	rc[0] = NUM_VDEVS;
++	rc[1] = NUM_PEERS;
++	if (wmi_svc(SVC_RX_FULL_REORDER)) {
++		rc[2] = NUM_VDEVS;
++		rc[3] = NUM_VDEVS;
++	}
++	rc[4] = 2;                                  /* peer keys */
++	rc[5] = NUM_PEERS * 2;                      /* tids */
++	rc[6] = 16;                                 /* ast skid limit */
++	rc[7] = 0x7;                                /* tx chain mask */
++	rc[8] = 0x7;                                /* rx chain mask */
++	rc[9] = 0x64; rc[10] = 0x64; rc[11] = 0x64; rc[12] = 0x28;
++	rc[13] = 1;                                 /* rx decap: native wifi */
++	rc[14] = 4;                                 /* scan max pending */
++	rc[15] = NUM_VDEVS;                         /* bmiss offload */
++	rc[16] = NUM_VDEVS;                         /* roam offload */
++	rc[17] = 8;                                 /* roam ap profiles */
++	rc[21] = 0x400;                             /* tx dbglog size */
++	rc[22] = 2;                                 /* wds entries */
++	rc[27] = 2;                                 /* gtk offload */
++	rc[28] = 1024 + 32;                         /* msdu descs */
++	rc[29] = 2;                                 /* frag entries */
++	rc[30] = 1;                                 /* tdls vdevs */
++	rc[31] = 0x20;                              /* tdls conn table */
++	rc[32] = 2;                                 /* beacon tx offload */
++	rc[33] = 5;                                 /* mcast filter entries */
++	rc[34] = 22;                                /* wow filters */
++	rc[35] = 6;                                 /* keepalive patterns */
++	rc[37] = 1;
++	rc[38] = 1;
++	rc[43] = 1u << 9;                           /* MGMT_BUNDLE_TX_COMPL */
++	p = wmi_put_tlv(p, TAG_RESOURCE_CONFIG, sizeof(rc));
++	memcpy(p, rc, sizeof(rc));
++	p += sizeof(rc);
++	p = wmi_put_tlv(p, TAG_ARRAY_STRUCT, n * 20);
++	for (uint32_t i = 0; i < n; i++) {
++		uint8_t *c = wmi_put_tlv(p, TAG_HOST_MEM_CHUNK, 16);
++		c = put32(c, wmi_req[i].req_id);
++		c = put32(c, (uint32_t)wmi_chunk_pa[i]);
++		c = put32(c, wmi_chunk_len[i]);
++		put32(c, wmi_svc(SVC_EXTEND_ADDRESS) ? (uint32_t)(wmi_chunk_pa[i] >> 32) : 0);
++		p += 20;
++	}
++	wmi_init_sent = wmi_send(WMI_CMD_INIT, m, (uint32_t)(p - m));
++	LOG("t=%u ms: wmi: INIT (%u chunks, %u bytes host memory) %s", g_ms, n, total, wmi_init_sent ? "sent" : "FAILED");
++}
++
++/* scan: 2.4 GHz 1-13, 5 GHz UNII-1/2/2e/3 */
++static const uint16_t scan_freqs[] = {
++	2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
++	5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320,
++	5500, 5520, 5540, 5560, 5580, 5600, 5620, 5640, 5660, 5680, 5700,
++	5745, 5765, 5785, 5805, 5825,
++};
++#define NFREQ ((uint32_t)(sizeof(scan_freqs) / sizeof(scan_freqs[0])))
++static const uint8_t our_mac[6] = { 0x02, 0x54, 0x4F, 0x50, 0x41, 0x5A };   /* locally administered */
++struct bss { uint8_t bssid[6]; char ssid[33]; uint8_t chan; int8_t rssi; uint16_t seen; };
++static struct bss bss[64];
++static uint32_t nbss, scans, scan_frames;
++static bool scan_started, scanning;
++static unsigned next_scan_ms;
++
++static bool
++scan_send_start(void)
++{
++	static uint8_t m[512];
++	uint8_t *p = m, *c;
++	bzero(m, sizeof(m));
++	c = wmi_put_tlv(p, TAG_START_SCAN_CMD, 100);
++	c = put32(c, 0xA000 | (scans + 1));         /* scan_id */
++	c = put32(c, 0xA000 | 1);                   /* scan_req_id */
++	c = put32(c, 0);                            /* vdev */
++	c = put32(c, 1);                            /* priority low */
++	c = put32(c, 0x001 | 0x002 | 0x004 | 0x008 | 0x100 | 0x010);   /* events */
++	c = put32(c, 50);                           /* dwell active */
++	c = put32(c, 150);                          /* dwell passive */
++	c = put32(c, 50);                           /* min rest */
++	c = put32(c, 500);                          /* max rest */
++	c = put32(c, 0);
++	c = put32(c, 0);
++	c = put32(c, 0);
++	c = put32(c, 20000);                        /* max scan time */
++	c = put32(c, 5);                            /* probe delay */
++	c = put32(c, (0x01 | 0x10) ^ 0x20);         /* passive, chan stat; probe-req filter inverted on TLV */
++	c = put32(c, 0);
++	c = put32(c, NFREQ);
++	c = put32(c, 1);                            /* bssids */
++	c = put32(c, 0);                            /* ssids */
++	c = put32(c, 0);                            /* ie_len */
++	c = put32(c, 3);                            /* num_probes */
++	p = c + 16;                                 /* mac addr + mask: zero */
++	c = wmi_put_tlv(p, TAG_ARRAY_UINT32, NFREQ * 4);
++	for (uint32_t i = 0; i < NFREQ; i++) {
++		c = put32(c, scan_freqs[i]);
++	}
++	p = wmi_put_tlv(c, TAG_ARRAY_FIXED_STRUCT, 0);
++	c = wmi_put_tlv(p, TAG_ARRAY_FIXED_STRUCT, 8);  /* bssid: broadcast */
++	memset(c, 0xFF, 6);
++	p = wmi_put_tlv(c + 8, TAG_ARRAY_BYTE, 0);
++	return wmi_send(CMD_START_SCAN, m, (uint32_t)(p - m));
++}
++
++static void
++scan_start(void)
++{
++	static uint8_t m[1536];
++	uint8_t *p = m, *c;
++
++	if (scan_started) {
++		return;
++	}
++	scan_started = true;
++	/* channel list, every channel passive: nothing is transmitted */
++	p = put32(wmi_put_tlv(p, TAG_SCAN_CHAN_LIST_CMD, 4), NFREQ);
++	p = wmi_put_tlv(p, TAG_ARRAY_STRUCT, NFREQ * (4 + 24));
++	for (uint32_t i = 0; i < NFREQ; i++) {
++		uint32_t mode = scan_freqs[i] < 4000 ? 1 : 0;
++		uint32_t flags = mode | (1u << 7) | (1u << 11) | (scan_freqs[i] < 4000 ? 0 : (1u << 12));
++		c = wmi_put_tlv(p, TAG_CHANNEL, 24);
++		c = put32(c, scan_freqs[i]);
++		c = put32(c, scan_freqs[i]);
++		c = put32(c, 0);
++		c = put32(c, flags);
++		c = put32(c, (40u << 8) | (40u << 16));
++		p = put32(c, 40u << 8);
++	}
++	bool a = wmi_send(CMD_SCAN_CHAN_LIST, m, (uint32_t)(p - m));
++	uint8_t v[4 + 20] = {};
++	c = wmi_put_tlv(v, TAG_VDEV_CREATE_CMD, 20);
++	c = put32(c, 0);                            /* vdev 0 */
++	c = put32(c, 2);                            /* station */
++	c = put32(c, 0);
++	memcpy(c, our_mac, 6);
++	bool b = wmi_send(CMD_VDEV_CREATE, v, sizeof(v));
++	scanning = scan_send_start();
++	LOG("t=%u ms: scan: chan list (%u ch) %s, vdev %s, passive scan %s", g_ms, NFREQ, a ? "ok" : "FAILED",
++	    b ? "ok" : "FAILED", scanning ? "requested" : "FAILED");
++}
++
++static void
++scan_event(const uint8_t *t, uint32_t len)
++{
++	uint16_t tag;
++	uint32_t e[6];
++	if (len < 4 + 24) {
++		return;
++	}
++	memcpy(&tag, t + 2, 2);
++	if (tag != TAG_SCAN_EVENT) {
++		return;
++	}
++	memcpy(e, t + 4, sizeof(e));
++	if (e[0] == 0x008 || e[0] == 0x100 || e[0] == 0x004) {
++		return;                                 /* foreign channel / exit / bss channel */
++	}
++	if (e[0] == 0x001) {
++		LOG("t=%u ms: scan: STARTED", g_ms);
++	}
++	if (e[0] == 0x002 || e[0] == 0x040 || e[0] == 0x010) {
++		scanning = false;
++		scans++;
++		LOG("t=%u ms: *** scan %u done (event %x): %u networks, %u beacons/probe responses ***", g_ms, scans, e[0], nbss, scan_frames);
++		next_scan_ms = scans < 3 ? g_ms + 10000 : 0;
++	}
++}
++
++static void
++scan_mgmt_rx(const uint8_t *t, uint32_t len)
++{
++	uint32_t hdr[6];
++	const uint8_t *f = NULL;
++	uint32_t flen = 0;
++	bool have_hdr = false;
++
++	for (uint32_t o = 0; o + 4 <= len;) {
++		uint16_t l, tag;
++		memcpy(&l, t + o, 2);
++		memcpy(&tag, t + o + 2, 2);
++		if (o + 4 + l > len) {
++			break;
++		}
++		if (tag == TAG_MGMT_RX_HDR && l >= 24 && !have_hdr) {
++			memcpy(hdr, t + o + 4, sizeof(hdr));
++			have_hdr = true;
++		} else if (tag == TAG_ARRAY_BYTE && f == NULL) {
++			f = t + o + 4;
++			flen = l;
++		}
++		o += 4 + l;
++	}
++	if (!have_hdr || f == NULL) {
++		return;
++	}
++	flen = MIN(hdr[4], flen);
++	if (flen < 36 || (f[0] & 0x0C) != 0 || ((f[0] >> 4) != 8 && (f[0] >> 4) != 5)) {
++		return;                                 /* beacons and probe responses only */
++	}
++	scan_frames++;
++	int32_t rssi = (int32_t)hdr[1] - 95;
++	uint32_t chan = hdr[0];
++	char ssid[33] = "";
++	for (uint32_t o = 36; o + 2 <= flen && o + 2 + f[o + 1] <= flen; o += 2 + f[o + 1]) {
++		if (f[o] == 0) {
++			uint32_t n = MIN((uint32_t)f[o + 1], 32u);
++			for (uint32_t i = 0; i < n; i++) {
++				uint8_t ch = f[o + 2 + i];
++				ssid[i] = (ch >= 0x20 && ch != 0x7F) ? (char)ch : '?';
++			}
++			ssid[n] = 0;
++			if (n == 0 || f[o + 2] == 0) {
++				strlcpy(ssid, "<hidden>", sizeof(ssid));
++			}
++		} else if (f[o] == 3 && f[o + 1] == 1) {
++			chan = f[o + 2];
++		}
++	}
++	for (uint32_t i = 0; i < nbss; i++) {
++		if (memcmp(bss[i].bssid, f + 16, 6) == 0) {
++			bss[i].seen++;
++			if (rssi > bss[i].rssi) {
++				bss[i].rssi = (int8_t)rssi;
++			}
++			return;
++		}
++	}
++	if (nbss >= 64) {
++		return;
++	}
++	struct bss *b = &bss[nbss++];
++	memcpy(b->bssid, f + 16, 6);
++	strlcpy(b->ssid, ssid, sizeof(b->ssid));
++	b->chan = (uint8_t)chan;
++	b->rssi = (int8_t)rssi;
++	b->seen = 1;
++	LOG("t=%u ms: net %2u: %02x:%02x:%02x:**:**:** ch %3u %4d dBm '%s'", g_ms, nbss, b->bssid[0], b->bssid[1],
++	    b->bssid[2], b->chan, b->rssi, b->ssid);
++}
++
++static void
++wmi_rx(const uint8_t *d, uint32_t len)
++{
++	uint32_t id;
++	if (len < 4) {
++		return;
++	}
++	memcpy(&id, d, 4);
++	id &= 0xFFFFFF;
++	switch (id) {
++	case WMI_EV_SERVICE_AVAILABLE: {
++		uint16_t tag;
++		memcpy(&tag, d + 6, 2);
++		if (len >= 12 + sizeof(wmi_svc_ext) && tag == TAG_SERVICE_AVAILABLE) {
++			memcpy(wmi_svc_ext, d + 12, sizeof(wmi_svc_ext));
++		}
++		break;
++	}
++	case WMI_EV_SERVICE_READY:
++		LOG("t=%u ms: wmi: SERVICE_READY, %u bytes", g_ms, len);
++		wmi_svc_ready(d + 4, len - 4);
++		if (!wmi_init_sent) {
++			wmi_send_init();
++		}
++		break;
++	case WMI_EV_READY:
++		for (uint32_t o = 4; o + 4 <= len;) {
++			uint16_t l, tag;
++			memcpy(&l, d + o, 2);
++			memcpy(&tag, d + o + 2, 2);
++			if (o + 4 + l > len) {
++				break;
++			}
++			if (tag == TAG_READY_EVENT && l >= 24 + 8 + 4) {
++				memcpy(wmi_mac, d + o + 4 + 24, 6);
++				wmi_ready = true;
++			}
++			o += 4 + l;
++		}
++		LOG("t=%u ms: *** WMI READY (fw MAC %02x:%02x:%02x:%02x:%02x:%02x) ***", g_ms, wmi_mac[0], wmi_mac[1],
++		    wmi_mac[2], wmi_mac[3], wmi_mac[4], wmi_mac[5]);
++		if (wmi_ready) {
++			scan_start();                       /* HTT (data path) is not needed for a scan */
++		}
++		break;
++	case WMI_EV_SCAN:
++		scan_event(d + 4, len - 4);
++		break;
++	case WMI_EV_MGMT_RX:
++		scan_mgmt_rx(d + 4, len - 4);
++		break;
++	default:
++		break;
++	}
++}
++
++/* from the watch loop */
++static void
++radio_poll(unsigned ms)
++{
++	(void)ms;
++	if (!ce_up) {
++		return;
++	}
++	(void)ce_poll();
++	if (scan_started && !scanning && next_scan_ms != 0 && g_ms >= next_scan_ms) {
++		next_scan_ms = 0;
++		scanning = scan_send_start();
++		LOG("t=%u ms: scan: passive scan %u %s", g_ms, scans + 1, scanning ? "requested" : "FAILED");
++	}
++}
++
+ static void
+ svc_announce(void)
+ {
+@@ -3495,6 +4478,7 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 		}
+ 		if (glink) {
+ 			glink_poll(part, ms);
++			radio_poll(ms);
+ 		}
+ 		if (glink && (ms == 3000 || ms == 20000)) {
+ 			glink_summary();                /* early, before the iOS UI covers the console */
+@@ -3743,6 +4727,10 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ 	smem = (uint8_t *)smem_map->getVirtualAddress();
+ 	pool = (uint8_t *)pool_map->getVirtualAddress();
+ 	LOG("SMEM version %u", *(volatile uint32_t *)(smem + 64 + 7 * 4) >> 16);
++	if (wifi_enabled() && !smmu_identity(WLAN_SID, WLAN_SID_MASK, "WLAN")) {
++		LOG("wifi: no SMMU stream for WLAN, the radio stays off");
++		wifi_on = 0;
++	}
+ 	if (modem_boot()) {
+ 		modem_watch(smem_partition(0, 1), watch);
+ 	}
+-- 
+2.43.0
+
