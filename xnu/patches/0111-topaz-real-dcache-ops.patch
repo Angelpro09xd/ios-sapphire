@@ -1,0 +1,67 @@
+From 99a393bd7d0baa4ea4cb14d7919f3d70a5c83df0 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 14:43:40 +0300
+Subject: [PATCH] topaz-0111: real dcache clean/flush for display buffers
+
+---
+ osfmk/arm/caches.c | 42 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/osfmk/arm/caches.c b/osfmk/arm/caches.c
+index 89d83a0..9bbdac8 100644
+--- a/osfmk/arm/caches.c
++++ b/osfmk/arm/caches.c
+@@ -549,10 +549,48 @@ platform_cache_flush_wimg(
+ 
+ #endif  /* __ARM_COHERENT_IO__ */
+ 
+-/* topaz: display/DSI buffers (MDP and DSI DMA read DRAM behind the caches) */
++/*
++ * topaz: cache maintenance that really happens. This kernel is built with the
++ * Apple SoC config (__ARM_COHERENT_IO__), where clean_dcache/flush_dcache are
++ * no-ops; the Qualcomm display (MDP), DSI command DMA and GPU SMMU read DRAM
++ * behind the caches, so their buffers are cleaned (dc cvac) or cleaned and
++ * invalidated (dc civac) to the point of coherency by these.
++ */
+ void sweet_dcache_clean(vm_offset_t addr, unsigned length);
++void sweet_dcache_flush(vm_offset_t addr, unsigned length);
++
++static void
++sweet_dcache_range(vm_offset_t addr, unsigned length, bool invalidate)
++{
++	uint64_t ctr;
++	vm_offset_t line, end;
++
++	if (length == 0) {
++		__builtin_arm_dsb(DSB_SY);
++		return;
++	}
++	__asm__ volatile ("mrs %0, ctr_el0" : "=r"(ctr));
++	line = 4UL << ((ctr >> 16) & 0xf);              /* DminLine */
++	end = addr + length;
++	__builtin_arm_dsb(DSB_SY);
++	for (vm_offset_t va = addr & ~(line - 1); va < end; va += line) {
++		if (invalidate) {
++			__asm__ volatile ("dc civac, %0" :: "r"(va) : "memory");
++		} else {
++			__asm__ volatile ("dc cvac, %0" :: "r"(va) : "memory");
++		}
++	}
++	__builtin_arm_dsb(DSB_SY);
++}
++
+ void
+ sweet_dcache_clean(vm_offset_t addr, unsigned length)
+ {
+-	clean_dcache(addr, length, FALSE);
++	sweet_dcache_range(addr, length, false);
++}
++
++void
++sweet_dcache_flush(vm_offset_t addr, unsigned length)
++{
++	sweet_dcache_range(addr, length, true);
+ }
+-- 
+2.43.0
+
