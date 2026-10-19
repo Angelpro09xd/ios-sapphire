@@ -1,0 +1,169 @@
+From dc450699f22e14ff0f49e1420e9c79178d175672 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 09:03:37 +0300
+Subject: [PATCH] topaz-0099: on-screen surfaces stay in use; console flushed
+ per vsync
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 53 +++++++++++++++++++++++++++
+ osfmk/console/video_console.c         | 32 +++++++++++++++-
+ 2 files changed, 84 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 14d0f8e..b05edde 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -39,6 +39,31 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void sweet_console_retarget(vm_offset_t va);   /* osfmk/console/video_console.c */
+ extern "C" void (*sweet_console_show_hook)(void);
++extern "C" void sweet_console_flush_dirty(void);
++
++/*
++ * topaz: a surface the MDP may still be fetching counts as in use, so
++ * CoreAnimation does not render into it. IOSurfaceClientIsInUse (iOS 16.7)
++ * reads the u64 at +0x18 of the shared state page; held from SwapEnd until
++ * one vsync after the next frame replaced it on the panel.
++ */
++static void
++sweet_hold(SweetSurface *s, bool on)
++{
++	OSAddAtomic64(on ? 1 : -1, (volatile SInt64 *)((uint8_t *)s->state->getBytesNoCopy() + 0x18));
++}
++
++static void
++sweet_hold_set(SweetSurface **set, bool on)
++{
++	for (uint32_t i = 0; i < 4; i++) {
++		if (set[i] != NULL && !on) {
++			sweet_hold(set[i], false);
++			set[i]->release();
++			set[i] = NULL;
++		}
++	}
++}
+ class AppleCLCD;
+ static AppleCLCD *sweet_cons_fb;
+ static void sweet_cons_show(void);
+@@ -142,6 +167,7 @@ public:
+ 	const uint8_t *fLastVA;       /* last directly scanned frame (panel window) */
+ 	uint32_t      fLastStride;
+ 	SweetSurface *fLastSurf;      /* keeps fLastVA alive */
++	SweetSurface *fPendHold[4], *fShowHold[4], *fRetireHold[4];   /* in-use holds */
+ 	void          fadeStep(const uint8_t *src, uint32_t srcStride, uint32_t step);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -345,17 +371,32 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *rec = NULL;
++	SweetSurface *taken[4] = {};
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+ 			fb->fDirty = false;
++			memcpy(taken, fb->fPendHold, sizeof(taken));
++			bzero(fb->fPendHold, sizeof(fb->fPendHold));
+ 		}
+ 	}
++	/* frames replaced at the previous vsync have been latched by now */
++	SweetSurface *retire[4];
++	memcpy(retire, fb->fRetireHold, sizeof(retire));
++	bzero(fb->fRetireHold, sizeof(fb->fRetireHold));
+ 	IOLockUnlock(fb->fLock);
++	sweet_hold_set(retire, false);
++	if (fb->fCons != NULL && fb->fScanPhys == fb->fConsPhys) {
++		sweet_console_flush_dirty();
++	}
+ 	if (rec != NULL) {
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		IOLockLock(fb->fLock);
++		memcpy(fb->fRetireHold, fb->fShowHold, sizeof(taken));
++		memcpy(fb->fShowHold, taken, sizeof(taken));
++		IOLockUnlock(fb->fLock);
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+@@ -400,10 +441,22 @@ static uint64_t sweet_fb_swap_count;
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	SweetSurface *held[4] = {};
++	uint32_t mask = get32(rec, 0x104);
++	for (uint32_t i = 0; i < 4 && i < SWEET_FB_LAYERS; i++) {
++		uint32_t sid = get32(rec, 0x54 + 4 * i);
++		if ((mask & (1u << i)) && sid != 0 && (held[i] = sweet_surface_copy(sid)) != NULL) {
++			sweet_hold(held[i], true);
++		}
++	}
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
++	SweetSurface *dropped[4];
++	memcpy(dropped, fPendHold, sizeof(dropped));      /* replaced before shown */
++	memcpy(fPendHold, held, sizeof(held));
+ 	IOLockUnlock(fLock);
++	sweet_hold_set(dropped, false);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+index 1dc46bf..de9cb80 100644
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -151,6 +151,8 @@ extern void flush_dcache64(addr64_t addr, unsigned count, int phys);
+ void sweet_console_retarget(vm_offset_t va);
+ void (*sweet_console_show_hook)(void);
+ static vm_offset_t sweet_shadow_va;
++static unsigned int sweet_dirty_top = ~0u, sweet_dirty_bottom;
++void sweet_console_flush_dirty(void);
+ static void (*sweet_orig_paint)(unsigned int, unsigned int, unsigned char, int, unsigned char, int);
+ static void (*sweet_orig_clear)(unsigned int, unsigned int, unsigned int, unsigned int, int);
+ static void (*sweet_orig_sdown)(int, unsigned int, unsigned int);
+@@ -3333,12 +3335,40 @@ sweet_flush_rows(unsigned int top, unsigned int bottom)
+ 	if (bottom > vinfo.v_rows) {
+ 		bottom = vinfo.v_rows;
+ 	}
++	if (!panic_active()) {
++		/* batched: AppleCLCD cleans the dirty rows once per vsync */
++		if (sweet_dirty_top > top) {
++			sweet_dirty_top = top;
++		}
++		if (sweet_dirty_bottom < bottom) {
++			sweet_dirty_bottom = bottom;
++		}
++		return;
++	}
+ 	flush_dcache64((addr64_t)(vinfo.v_baseaddr + top * band), (unsigned)((bottom - top) * band), FALSE);
+-	if (panic_active() && sweet_console_show_hook != NULL) {
++	if (sweet_console_show_hook != NULL) {
+ 		sweet_console_show_hook();
+ 	}
+ }
+ 
++/* Clean the rows drawn since the last call (AppleCLCD's vsync). */
++void
++sweet_console_flush_dirty(void)
++{
++	if (sweet_shadow_va == 0) {
++		return;
++	}
++	VCPUTC_LOCK_LOCK();
++	unsigned int top = sweet_dirty_top, bottom = sweet_dirty_bottom;
++	sweet_dirty_top = ~0u;
++	sweet_dirty_bottom = 0;
++	VCPUTC_LOCK_UNLOCK();
++	if (bottom > top && vinfo.v_rows != 0) {
++		uint64_t band = (uint64_t)(vinfo.v_height / vinfo.v_rows) * vinfo.v_rowbytes;
++		flush_dcache64((addr64_t)(vinfo.v_baseaddr + top * band), (unsigned)((bottom - top) * band), FALSE);
++	}
++}
++
+ static void
+ sweet_paint(unsigned int xx, unsigned int yy, unsigned char ch, int attrs, unsigned char chp, int attrsp)
+ {
+-- 
+2.43.0
+
