@@ -1,0 +1,2174 @@
+From cfa173776c7bbb9916afd2c32653de0b5dbc74ad Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 19:21:15 +0300
+Subject: [PATCH] topaz-0121: TopazModem: pd-mapper, tftp (modem_a, /readwrite
+ in RAM), rmtfs (EFS read-only)
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 2092 ++++++++++++++++++++++++++++++-
+ 1 file changed, 2087 insertions(+), 5 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index aa92151..e18599a 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -45,7 +45,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ /* middle DDR bank, RAM the kernel does not manage; below 0xF0000000 for TZ/the modem */
+ #define MODEM_POOL_BASE     0xE0000000ull
+-#define MODEM_POOL_SIZE     0x00400000ull       /* 4 MB: metadata now, rmtfs/tftp later */
++#define MODEM_POOL_SIZE     0x00800000ull       /* 8 MB: metadata, SCM args, rmtfs buffer */
+ 
+ #define SMEM_PA             0x46000000ull
+ #define SMEM_SIZE           0x00200000u
+@@ -404,6 +404,10 @@ smp2p_add_out(struct smp2p_hdr *o, const char *name, uint32_t value)
+ 	return &e[o->valid - 1].value;
+ }
+ 
++static bool svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *data, uint32_t len);
++static void svc_announce(void);
++static void svc_summary(void);
++
+ /* ---------------------------------------------------------------- GLINK over SMEM */
+ 
+ /*
+@@ -466,7 +470,7 @@ static unsigned g_ri_count;
+ static uint8_t g_asm[OUR_INTENT_SIZE];
+ static uint32_t g_asm_len;
+ static uint32_t q_ver = 1, q_modem_node = QRTR_NODE_BCAST;
+-static bool q_hello_sent, q_hello_rx;
++static bool q_hello_sent, q_hello_rx, q_announced;
+ static struct { uint32_t svc, inst, node, port; } q_srv[64];
+ static unsigned q_srv_count, g_rx_msgs, g_tx_msgs, q_resumes;
+ static unsigned g_ms;                           /* watch time, for the log */
+@@ -647,12 +651,14 @@ glink_send(const void *data, uint32_t len)
+ static void
+ qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *payload, uint32_t len)
+ {
+-	uint8_t buf[sizeof(struct qrtr_hdr_v1) + 512] = {};
++	uint32_t cap = (uint32_t)sizeof(struct qrtr_hdr_v1) + len + 4;
++	uint8_t *buf = (uint8_t *)IOMalloc(cap);
+ 	uint32_t n;
+ 
+-	if (len > 512) {
++	if (buf == NULL) {
+ 		return;
+ 	}
++	bzero(buf, cap);
+ 	if (q_ver == 2) {
+ 		struct qrtr_hdr_v2 *h = (struct qrtr_hdr_v2 *)buf;
+ 		h->version = 2;
+@@ -678,6 +684,7 @@ qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port
+ 	}
+ 	memcpy(buf + n, payload, len);
+ 	glink_send(buf, (n + len + 3) & ~3u);
++	IOFree(buf, cap);
+ }
+ 
+ static const char *
+@@ -750,7 +757,9 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 			struct qrtr_ctrl r = { QRTR_TYPE_RESUME_TX, QRTR_NODE_APPS, dst_port, 0, 0 };
+ 			qrtr_send(QRTR_TYPE_RESUME_TX, dst_port, src_node, src_port, &r, sizeof(r));
+ 		}
+-		(void)size;                             /* no QMI services of ours yet */
++		if (hlen + size <= len) {
++			(void)svc_rx(src_node, src_port, dst_port, p + hlen, size);
++		}
+ 		break;
+ 	case QRTR_TYPE_RESUME_TX:
+ 		q_resumes++;
+@@ -961,6 +970,10 @@ glink_poll(struct smem_part_hdr *part, unsigned ms)
+ 		qrtr_send(QRTR_TYPE_HELLO, QRTR_PORT_CTRL, q_modem_node, QRTR_PORT_CTRL, &c, sizeof(c));
+ 		q_hello_sent = true;
+ 		LOG("t=%u ms: sent qrtr HELLO to node %x", ms, q_modem_node);
++		if (q_hello_rx && !q_announced) {
++			svc_announce();
++			q_announced = true;
++		}
+ 	}
+ 	/* nobody opened IPCRTR after 2 s: open it from our side */
+ 	if (ms >= 2000 && !g_open_sent && g_rx != NULL) {
+@@ -975,11 +988,2080 @@ glink_summary(void)
+ 	LOG("glink: rx %u msgs, tx %u, chan %s, modem intents %u, txq %u drops %u; qrtr node %x hello %u, %u services, %u RESUME_TX",
+ 	    g_rx_msgs, g_tx_msgs, chan_up() ? "UP" : "down", g_ri_count, g_txq_tail - g_txq_head, g_txq_drops,
+ 	    q_modem_node, q_hello_rx, q_srv_count, q_resumes);
++	svc_summary();
+ 	for (unsigned i = 0; i < q_srv_count; i++) {
+ 		LOG("  service %x:%x node %u port %x %s", q_srv[i].svc, q_srv[i].inst, q_srv[i].node, q_srv[i].port, svc_name(q_srv[i].svc));
+ 	}
+ }
+ 
++/* ---------------------------------------------------------------- host services */
++
++/*
++ * What the modem expects from the apps processor (linux-msm userspace daemons), port of
++ * topaz-woa drivers/TopazModem/ModemSvc.c:
++ *  - pd-mapper: QMI servreg-locator 0x40 v0x101, maps "wlan/fw" etc. to msm/modem/wlan_pd;
++ *  - tftp (QRTR service 4096): /readonly/firmware/image/... read-only from modem_a,
++ *    /readwrite/... kept in RAM for the session (dropped writes starve modem_cfg);
++ *  - rmtfs (QMI 14): the modem's EFS, read-only from modemst1/modemst2/fsc/fsg on UFS, into a
++ *    3 MB buffer in our pool assigned to the modem through TrustZone. Writes are not persisted.
++ */
++#define PORT_PDM            0x4001
++#define PORT_TFTP           0x4002
++#define PORT_RMTFS          0x4003
++#define PORT_SESS           0x4100
++#define QMI_REQ             0
++#define QMI_RESP            2
++
++/* generated by fwtable_all.py from NON-HLOS.bin (HyperOS 2.0.208 modem_a): 657 files, 657 extents */
++static const struct { uint32_t off, len; } fw_ext[] = {
++	{ 0x25000, 0x4d4 },
++	{ 0x29000, 0x2098 },
++	{ 0x2d000, 0x14ef4 },
++	{ 0x45000, 0x5e9c0 },
++	{ 0xa5000, 0x18f388 },
++	{ 0x235000, 0x19f628 },
++	{ 0x3d5000, 0xb60 },
++	{ 0x3d9000, 0x63e4 },
++	{ 0x3e1000, 0x6f6c },
++	{ 0x3e9000, 0x12dc },
++	{ 0x3ed000, 0x104 },
++	{ 0x3f1000, 0xf2a0 },
++	{ 0x401000, 0x11ae4 },
++	{ 0x415000, 0xa4000 },
++	{ 0x4b9000, 0x170484 },
++	{ 0x62d000, 0x44004 },
++	{ 0x675000, 0x2dfb },
++	{ 0x679000, 0x1b60 },
++	{ 0x67d000, 0x2dc },
++	{ 0x681000, 0x1f60 },
++	{ 0x685000, 0x6fec },
++	{ 0x68d000, 0x3a56c },
++	{ 0x6c9000, 0x94000 },
++	{ 0x75d000, 0x4db23e },
++	{ 0xc39000, 0x15dd6a },
++	{ 0xd99000, 0x423c },
++	{ 0xda1000, 0x51a74 },
++	{ 0xdf5000, 0xb70 },
++	{ 0xdf9000, 0xd1f98 },
++	{ 0xecd000, 0x50230 },
++	{ 0xf21000, 0xe00 },
++	{ 0xf25000, 0x13f0 },
++	{ 0xf29000, 0x23810 },
++	{ 0xf4d000, 0x116400 },
++	{ 0x1065000, 0xd4 },
++	{ 0x1069000, 0x256c },
++	{ 0x15000, 0x193 },
++	{ 0x19000, 0x195 },
++	{ 0x1d000, 0x22b },
++	{ 0x76b1000, 0x66d8 },
++	{ 0x76b9000, 0x66d8 },
++	{ 0x76c1000, 0x66d8 },
++	{ 0x76c9000, 0x66d8 },
++	{ 0x76d1000, 0x66d8 },
++	{ 0x76d9000, 0x66d8 },
++	{ 0x76e1000, 0x66d8 },
++	{ 0x76e9000, 0x66d8 },
++	{ 0x76f1000, 0x66d8 },
++	{ 0x76f9000, 0x66d8 },
++	{ 0x7701000, 0x66d8 },
++	{ 0x7709000, 0x66d8 },
++	{ 0x7711000, 0x66d8 },
++	{ 0x7719000, 0x66d8 },
++	{ 0x7721000, 0x66d8 },
++	{ 0x7729000, 0x66d8 },
++	{ 0x7731000, 0x66d8 },
++	{ 0x7739000, 0x66d8 },
++	{ 0x7741000, 0x66d8 },
++	{ 0x7749000, 0x66d8 },
++	{ 0x7751000, 0x66d8 },
++	{ 0x7759000, 0x66d8 },
++	{ 0x7761000, 0x66d8 },
++	{ 0x7769000, 0x66d8 },
++	{ 0x7771000, 0x66d8 },
++	{ 0x7779000, 0x66d8 },
++	{ 0x7781000, 0x66d8 },
++	{ 0x7789000, 0x66d8 },
++	{ 0x7791000, 0x66d8 },
++	{ 0x7799000, 0x66d8 },
++	{ 0x77a1000, 0x66d8 },
++	{ 0x77a9000, 0x66d8 },
++	{ 0x77b1000, 0x66d8 },
++	{ 0x77b9000, 0x66d8 },
++	{ 0x77c1000, 0x66d8 },
++	{ 0x77c9000, 0x66d8 },
++	{ 0x77d1000, 0x66d8 },
++	{ 0x77d9000, 0x66d8 },
++	{ 0x77e1000, 0x66d8 },
++	{ 0x77e9000, 0x66d8 },
++	{ 0x77f1000, 0x66d8 },
++	{ 0x77f9000, 0x66d8 },
++	{ 0x7801000, 0x66d8 },
++	{ 0x7809000, 0x66d8 },
++	{ 0x7811000, 0x66d8 },
++	{ 0x7819000, 0x66d8 },
++	{ 0x7821000, 0x66d8 },
++	{ 0x7829000, 0x66d8 },
++	{ 0x7831000, 0x66d8 },
++	{ 0x7839000, 0x66d8 },
++	{ 0x7841000, 0x66d8 },
++	{ 0x106d000, 0x134 },
++	{ 0x1071000, 0x1b28 },
++	{ 0x1075000, 0x97d3 },
++	{ 0x1081000, 0x91 },
++	{ 0x1085000, 0x2b8 },
++	{ 0x1089000, 0x14c },
++	{ 0x108d000, 0x98 },
++	{ 0x1091000, 0x1cab },
++	{ 0x1095000, 0x1c5c },
++	{ 0x1099000, 0x1d4 },
++	{ 0x109d000, 0x1c18 },
++	{ 0x10a1000, 0x39898 },
++	{ 0x10dd000, 0x1a07c },
++	{ 0x10f9000, 0x44c },
++	{ 0x10fd000, 0x20db5c },
++	{ 0x130d000, 0x5b60 },
++	{ 0x1315000, 0x95378 },
++	{ 0x13ad000, 0xa20 },
++	{ 0x13b1000, 0xe614 },
++	{ 0x13c1000, 0x1dec },
++	{ 0x21000, 0x193 },
++	{ 0x760d000, 0x9c2df },
++	{ 0x13c5000, 0x200 },
++	{ 0x13c9000, 0x4e70 },
++	{ 0x13d1000, 0xa89d },
++	{ 0x13dd000, 0xc4 },
++	{ 0x13e1000, 0x391 },
++	{ 0x13e5000, 0x1c0 },
++	{ 0x13e9000, 0x130 },
++	{ 0x13ed000, 0x2231 },
++	{ 0x13f1000, 0x5070 },
++	{ 0x13f9000, 0x200 },
++	{ 0x13fd000, 0x1b28 },
++	{ 0x1401000, 0x109ed8 },
++	{ 0x150d000, 0x144 },
++	{ 0x1511000, 0x103760 },
++	{ 0x1615000, 0x468 },
++	{ 0x1619000, 0x130 },
++	{ 0x161d000, 0x24749 },
++	{ 0x1645000, 0x1d28 },
++	{ 0x1649000, 0x134 },
++	{ 0x164d000, 0x1b28 },
++	{ 0x1651000, 0x3b8c68 },
++	{ 0x1a0d000, 0x9b },
++	{ 0x1a11000, 0x2763a4 },
++	{ 0x1c89000, 0x230 },
++	{ 0x1c8d000, 0xa8 },
++	{ 0x1c91000, 0x268d6 },
++	{ 0x1cb9000, 0x1c5c },
++	{ 0x1cbd000, 0x134 },
++	{ 0x1cc1000, 0x1b28 },
++	{ 0x1cc5000, 0x1430b },
++	{ 0x1cdd000, 0xd4 },
++	{ 0x1ce1000, 0x6bb4 },
++	{ 0x1ce9000, 0x430 },
++	{ 0x1ced000, 0x98 },
++	{ 0x1cf1000, 0x6c49 },
++	{ 0x1cf9000, 0x1c5c },
++	{ 0x1cfd000, 0x200 },
++	{ 0x1d01000, 0x1b28 },
++	{ 0x1d05000, 0x541d },
++	{ 0x1d0d000, 0xc2 },
++	{ 0x1d11000, 0x388 },
++	{ 0x1d15000, 0x1c0 },
++	{ 0x1d19000, 0x130 },
++	{ 0x1d1d000, 0x137d },
++	{ 0x1d21000, 0x1d28 },
++	{ 0x1d25000, 0x200 },
++	{ 0x1d29000, 0x1b28 },
++	{ 0x1d2d000, 0xc0f5 },
++	{ 0x1d3d000, 0xc5 },
++	{ 0x1d41000, 0x4c60 },
++	{ 0x1d49000, 0x180 },
++	{ 0x1d4d000, 0x130 },
++	{ 0x1d51000, 0x10a9 },
++	{ 0x1d55000, 0x1d28 },
++	{ 0x1d59000, 0x134 },
++	{ 0x1d5d000, 0x1b28 },
++	{ 0x1d61000, 0x2bb74 },
++	{ 0x1d8d000, 0x89 },
++	{ 0x1d91000, 0xe47c },
++	{ 0x1da1000, 0x188 },
++	{ 0x1da5000, 0x98 },
++	{ 0x1da9000, 0x68ee },
++	{ 0x1db1000, 0x1c5c },
++	{ 0x1db5000, 0x200 },
++	{ 0x1db9000, 0x1b28 },
++	{ 0x1dbd000, 0x1b20a },
++	{ 0x1dd9000, 0xbe },
++	{ 0x1ddd000, 0xc7c },
++	{ 0x1de1000, 0x298 },
++	{ 0x1de5000, 0x130 },
++	{ 0x1de9000, 0x3931 },
++	{ 0x1ded000, 0x1d28 },
++	{ 0x1df1000, 0x134 },
++	{ 0x1df5000, 0x1b28 },
++	{ 0x1df9000, 0xaf99 },
++	{ 0x1e05000, 0x8a },
++	{ 0x1e09000, 0xa88 },
++	{ 0x1e0d000, 0x174 },
++	{ 0x1e11000, 0x98 },
++	{ 0x1e15000, 0x231b },
++	{ 0x1e19000, 0x1c5c },
++	{ 0x1e1d000, 0x414 },
++	{ 0x1e21000, 0x1f78 },
++	{ 0x1e25000, 0x2930 },
++	{ 0x1e29000, 0x2518 },
++	{ 0x1e2d000, 0x4a3ac },
++	{ 0x1e79000, 0x119d8 },
++	{ 0x1e8d000, 0x100c },
++	{ 0x1e91000, 0x90b4 },
++	{ 0x1e9d000, 0x4f054 },
++	{ 0x1eed000, 0x143ee8 },
++	{ 0x2031000, 0x40000 },
++	{ 0x2071000, 0x540 },
++	{ 0x2075000, 0xe2210 },
++	{ 0x2159000, 0x2d },
++	{ 0x215d000, 0x7c },
++	{ 0x2161000, 0x9c1a0 },
++	{ 0x2201000, 0x61110 },
++	{ 0x2265000, 0x2d29a9 },
++	{ 0x2539000, 0x2d94cc },
++	{ 0x2815000, 0x10ec0 },
++	{ 0x2829000, 0x1722040 },
++	{ 0x3f4d000, 0xa07900 },
++	{ 0x4955000, 0x77a45 },
++	{ 0x49cd000, 0x15104 },
++	{ 0x49e5000, 0x1378 },
++	{ 0x49e9000, 0xb0 },
++	{ 0x49ed000, 0x7d52c },
++	{ 0x4a6d000, 0x238c },
++	{ 0x5351000, 0x588c },
++	{ 0x5335000, 0x4404 },
++	{ 0x5341000, 0x402c },
++	{ 0x5359000, 0x20 },
++	{ 0x535d000, 0x232 },
++	{ 0x5361000, 0x1 },
++	{ 0x537d000, 0xb4ac },
++	{ 0x5395000, 0xb838 },
++	{ 0x53ad000, 0xb7d8 },
++	{ 0x53c1000, 0xbdc8 },
++	{ 0x53d9000, 0xb50c },
++	{ 0x53f1000, 0xc048 },
++	{ 0x5409000, 0xc16c },
++	{ 0x5421000, 0xc328 },
++	{ 0x5439000, 0xbf28 },
++	{ 0x544d000, 0xc418 },
++	{ 0x5469000, 0xc2bc },
++	{ 0x5481000, 0xbb40 },
++	{ 0x5499000, 0xbd1c },
++	{ 0x54ad000, 0xbc08 },
++	{ 0x54c1000, 0xc464 },
++	{ 0x54d9000, 0xbc00 },
++	{ 0x5501000, 0xb7cc },
++	{ 0x54ed000, 0xb898 },
++	{ 0x5515000, 0xeb6c },
++	{ 0x552d000, 0xc05c },
++	{ 0x5545000, 0xb964 },
++	{ 0x5575000, 0xb948 },
++	{ 0x555d000, 0xbd34 },
++	{ 0x5589000, 0xaff0 },
++	{ 0x559d000, 0xbedc },
++	{ 0x55b5000, 0xc240 },
++	{ 0x55cd000, 0xf490 },
++	{ 0x55e5000, 0x1011c },
++	{ 0x5601000, 0xb388 },
++	{ 0x5615000, 0xb8b8 },
++	{ 0x5629000, 0xbc40 },
++	{ 0x563d000, 0xb8d8 },
++	{ 0x5651000, 0xb80c },
++	{ 0x5665000, 0xc2dc },
++	{ 0x567d000, 0xb7dc },
++	{ 0x5691000, 0xb940 },
++	{ 0x56a5000, 0xbcf4 },
++	{ 0x56c1000, 0xc4a4 },
++	{ 0x56d9000, 0xc794 },
++	{ 0x56f1000, 0xc148 },
++	{ 0x5711000, 0xd030 },
++	{ 0x5725000, 0xe098 },
++	{ 0x573d000, 0x6c5c },
++	{ 0x5749000, 0xcc88 },
++	{ 0x575d000, 0x5eb0 },
++	{ 0x5769000, 0x6c64 },
++	{ 0x5775000, 0xc664 },
++	{ 0x5789000, 0xc7e4 },
++	{ 0x579d000, 0x6c64 },
++	{ 0x57a9000, 0x5b60 },
++	{ 0x57b5000, 0x5e04 },
++	{ 0x57f1000, 0x119bc },
++	{ 0x57c9000, 0xa698 },
++	{ 0x57d9000, 0x11c50 },
++	{ 0x580d000, 0x7618 },
++	{ 0x5819000, 0xe4c0 },
++	{ 0x582d000, 0xe120 },
++	{ 0x5841000, 0x9fa0 },
++	{ 0x5851000, 0xa060 },
++	{ 0x5861000, 0x9cc4 },
++	{ 0x5871000, 0xe350 },
++	{ 0x5889000, 0xbcc0 },
++	{ 0x58a1000, 0x690c },
++	{ 0x58ad000, 0xd604 },
++	{ 0x58c5000, 0x52f4 },
++	{ 0x71a1000, 0xb7f4 },
++	{ 0x71b5000, 0xc568 },
++	{ 0x71cd000, 0xab94 },
++	{ 0x58dd000, 0xc878 },
++	{ 0x58f5000, 0xbbc0 },
++	{ 0x590d000, 0xbbf0 },
++	{ 0x5921000, 0xb824 },
++	{ 0x5931000, 0xb90c },
++	{ 0x5955000, 0xbbfc },
++	{ 0x5945000, 0xc304 },
++	{ 0x5965000, 0xbeec },
++	{ 0x5975000, 0xbe0c },
++	{ 0x5985000, 0xb88c },
++	{ 0x599d000, 0xb8f4 },
++	{ 0x59c9000, 0xbbe0 },
++	{ 0x59d9000, 0xbbf8 },
++	{ 0x59f1000, 0xc734 },
++	{ 0x59b1000, 0xb854 },
++	{ 0x6595000, 0xc7c4 },
++	{ 0x5a09000, 0xd034 },
++	{ 0x5b31000, 0xc4c8 },
++	{ 0x5b45000, 0xbf00 },
++	{ 0x5b55000, 0xb448 },
++	{ 0x5a25000, 0xcd68 },
++	{ 0x5a4d000, 0xcac8 },
++	{ 0x5a39000, 0xccfc },
++	{ 0x5a61000, 0xd02c },
++	{ 0x5a75000, 0xd688 },
++	{ 0x5a89000, 0xbff8 },
++	{ 0x5a99000, 0xca3c },
++	{ 0x5aad000, 0xcdc4 },
++	{ 0x5ac1000, 0xc82c },
++	{ 0x5ad9000, 0x5b58 },
++	{ 0x5ae9000, 0xca60 },
++	{ 0x5afd000, 0xca98 },
++	{ 0x5b19000, 0xbb48 },
++	{ 0x5b69000, 0xc688 },
++	{ 0x5b85000, 0xb7d8 },
++	{ 0x5b9d000, 0xbdf0 },
++	{ 0x5bad000, 0xbfe0 },
++	{ 0x5bc1000, 0xbc40 },
++	{ 0x5bd9000, 0xb944 },
++	{ 0x5be9000, 0xbecc },
++	{ 0x5c01000, 0xd440 },
++	{ 0x5c1d000, 0xbac8 },
++	{ 0x5c35000, 0xba58 },
++	{ 0x5c4d000, 0xb954 },
++	{ 0x5c5d000, 0xbf58 },
++	{ 0x5c6d000, 0xbec4 },
++	{ 0x5c7d000, 0xd450 },
++	{ 0x5c91000, 0xc0d0 },
++	{ 0x5ca5000, 0xbba4 },
++	{ 0x5cbd000, 0xc1cc },
++	{ 0x5cd5000, 0xc03c },
++	{ 0x5cf1000, 0xc018 },
++	{ 0x5d25000, 0xbce8 },
++	{ 0x5d3d000, 0xc0cc },
++	{ 0x5d0d000, 0xb5e4 },
++	{ 0x5d55000, 0xc828 },
++	{ 0x5df5000, 0xb3fc },
++	{ 0x5d71000, 0xb8f4 },
++	{ 0x5d89000, 0xc190 },
++	{ 0x5d9d000, 0xc94c },
++	{ 0x5db9000, 0xbf18 },
++	{ 0x5dc9000, 0xbb1c },
++	{ 0x5ddd000, 0xb95c },
++	{ 0x5e09000, 0xbb00 },
++	{ 0x5e1d000, 0xce10 },
++	{ 0x5e39000, 0xc678 },
++	{ 0x5e4d000, 0xc7e4 },
++	{ 0x5e61000, 0xc5dc },
++	{ 0x5e7d000, 0xb8b8 },
++	{ 0x5e95000, 0xbf04 },
++	{ 0x5ea5000, 0xb8fc },
++	{ 0x5eb5000, 0xc1d0 },
++	{ 0x5ec9000, 0xd5ac },
++	{ 0x5edd000, 0x6180 },
++	{ 0x5ee9000, 0xb84c },
++	{ 0x5ef9000, 0xdc88 },
++	{ 0x5f0d000, 0xb8f8 },
++	{ 0x5f1d000, 0xc9c0 },
++	{ 0x5f31000, 0xc5d0 },
++	{ 0x5f45000, 0xcbb4 },
++	{ 0x5f59000, 0xaf7c },
++	{ 0x5f6d000, 0xcc50 },
++	{ 0x5f89000, 0xb8cc },
++	{ 0x5f9d000, 0xcf44 },
++	{ 0x5fb9000, 0xb9d8 },
++	{ 0x5fcd000, 0xbc4c },
++	{ 0x5fe1000, 0xb8e8 },
++	{ 0x601d000, 0xc568 },
++	{ 0x5ff9000, 0xbe88 },
++	{ 0x6009000, 0xbd30 },
++	{ 0x6035000, 0xc150 },
++	{ 0x6051000, 0xbaf8 },
++	{ 0x6061000, 0xbcf8 },
++	{ 0x6071000, 0xbde0 },
++	{ 0x6085000, 0xb8c8 },
++	{ 0x609d000, 0xc2d0 },
++	{ 0x60b9000, 0xbd74 },
++	{ 0x6121000, 0xc7e0 },
++	{ 0x6149000, 0xc7dc },
++	{ 0x6135000, 0xc800 },
++	{ 0x615d000, 0xbf6c },
++	{ 0x616d000, 0xb4b8 },
++	{ 0x6185000, 0xbff8 },
++	{ 0x6195000, 0xc9a0 },
++	{ 0x61a9000, 0xbd20 },
++	{ 0x61bd000, 0xc8a4 },
++	{ 0x61d9000, 0xb288 },
++	{ 0x61e9000, 0xbdb0 },
++	{ 0x61fd000, 0xb9fc },
++	{ 0x620d000, 0xb4a0 },
++	{ 0x6225000, 0xbb18 },
++	{ 0x623d000, 0xb6c8 },
++	{ 0x624d000, 0xc754 },
++	{ 0x6261000, 0xb9a8 },
++	{ 0x6271000, 0xbda8 },
++	{ 0x6281000, 0xb8b8 },
++	{ 0x6291000, 0xb524 },
++	{ 0x62a1000, 0xbf44 },
++	{ 0x62b1000, 0xc224 },
++	{ 0x62c5000, 0xbf18 },
++	{ 0x62dd000, 0xc478 },
++	{ 0x62f1000, 0xc2b0 },
++	{ 0x6305000, 0xc7fc },
++	{ 0x6319000, 0xc314 },
++	{ 0x632d000, 0xcb54 },
++	{ 0x6341000, 0xca0c },
++	{ 0x6359000, 0xc144 },
++	{ 0x60d1000, 0xc8d4 },
++	{ 0x60e5000, 0xa828 },
++	{ 0x60f5000, 0xa7a8 },
++	{ 0x6109000, 0xb924 },
++	{ 0x6385000, 0xbb10 },
++	{ 0x6371000, 0xb9c4 },
++	{ 0x65ad000, 0xc0dc },
++	{ 0x6399000, 0xbf50 },
++	{ 0x63b1000, 0xbb34 },
++	{ 0x63c5000, 0xc2cc },
++	{ 0x63e1000, 0xbf60 },
++	{ 0x63f1000, 0xb818 },
++	{ 0x6401000, 0xc6b4 },
++	{ 0x6415000, 0xb91c },
++	{ 0x6425000, 0x5f6c },
++	{ 0x6435000, 0xc1cc },
++	{ 0x6449000, 0xcee0 },
++	{ 0x645d000, 0xc6e4 },
++	{ 0x6485000, 0xce40 },
++	{ 0x6471000, 0xc720 },
++	{ 0x6499000, 0xab68 },
++	{ 0x64a9000, 0xcca4 },
++	{ 0x64bd000, 0xab60 },
++	{ 0x64cd000, 0xc118 },
++	{ 0x64e1000, 0xc360 },
++	{ 0x64f5000, 0xcc98 },
++	{ 0x6509000, 0xc384 },
++	{ 0x651d000, 0xcec8 },
++	{ 0x6539000, 0xbdbc },
++	{ 0x654d000, 0xc5e0 },
++	{ 0x6565000, 0xb708 },
++	{ 0x6579000, 0xc064 },
++	{ 0x65c9000, 0xb368 },
++	{ 0x65dd000, 0xaee4 },
++	{ 0x65f1000, 0xa210 },
++	{ 0x6605000, 0x9bf4 },
++	{ 0x6621000, 0xc238 },
++	{ 0x6635000, 0x393c },
++	{ 0x663d000, 0xc638 },
++	{ 0x6655000, 0xbd84 },
++	{ 0x666d000, 0xbcb4 },
++	{ 0x6685000, 0xd9f0 },
++	{ 0x6699000, 0xda10 },
++	{ 0x66c1000, 0xe430 },
++	{ 0x66d5000, 0xebf0 },
++	{ 0x66ad000, 0xda28 },
++	{ 0x66e9000, 0xda40 },
++	{ 0x66fd000, 0xdd08 },
++	{ 0x6711000, 0xda34 },
++	{ 0x6725000, 0xda2c },
++	{ 0x6739000, 0xda30 },
++	{ 0x674d000, 0xd9d4 },
++	{ 0x6761000, 0xd8b8 },
++	{ 0x6775000, 0xeba8 },
++	{ 0x6789000, 0xd9cc },
++	{ 0x679d000, 0xda2c },
++	{ 0x67b1000, 0xd980 },
++	{ 0x67cd000, 0xfb3c },
++	{ 0x67e1000, 0xefa0 },
++	{ 0x67fd000, 0xbc00 },
++	{ 0x6829000, 0xb4b8 },
++	{ 0x6839000, 0xb7fc },
++	{ 0x6849000, 0xb578 },
++	{ 0x6859000, 0xb5fc },
++	{ 0x6869000, 0xbd6c },
++	{ 0x6879000, 0xb508 },
++	{ 0x6811000, 0xe110 },
++	{ 0x68a9000, 0xbd1c },
++	{ 0x68b9000, 0xe0c8 },
++	{ 0x68d5000, 0xbb24 },
++	{ 0x68e1000, 0xba68 },
++	{ 0x6891000, 0xa2c0 },
++	{ 0x68f9000, 0xbf00 },
++	{ 0x6911000, 0xc10c },
++	{ 0x692d000, 0xc114 },
++	{ 0x693d000, 0xb014 },
++	{ 0x6955000, 0xc7d0 },
++	{ 0x696d000, 0xb7f0 },
++	{ 0x697d000, 0xb7f0 },
++	{ 0x6991000, 0xb79c },
++	{ 0x69a5000, 0xb79c },
++	{ 0x69b9000, 0xbab4 },
++	{ 0x69cd000, 0xb8a0 },
++	{ 0x69e5000, 0xb9f0 },
++	{ 0x69f9000, 0xb958 },
++	{ 0x6a39000, 0xbb10 },
++	{ 0x6a11000, 0xbd94 },
++	{ 0x6a25000, 0xbd28 },
++	{ 0x6a51000, 0xb798 },
++	{ 0x6a65000, 0xb8dc },
++	{ 0x6a79000, 0xc2fc },
++	{ 0x6a91000, 0xb8b0 },
++	{ 0x6aa5000, 0xb420 },
++	{ 0x6ad5000, 0xbc18 },
++	{ 0x6ae9000, 0xb61c },
++	{ 0x6afd000, 0xb7e4 },
++	{ 0x6abd000, 0xb8d4 },
++	{ 0x6b15000, 0xb948 },
++	{ 0x6b29000, 0xb928 },
++	{ 0x6b41000, 0xd5fc },
++	{ 0x6b55000, 0xd4a0 },
++	{ 0x6b69000, 0xd5e4 },
++	{ 0x6b7d000, 0x61b8 },
++	{ 0x6b89000, 0xd490 },
++	{ 0x6ba5000, 0xc9c8 },
++	{ 0x6bc1000, 0x5454 },
++	{ 0x6bd5000, 0xbb7c },
++	{ 0x6bed000, 0xbff0 },
++	{ 0x6c01000, 0xf0dc },
++	{ 0x6c15000, 0xf0d8 },
++	{ 0x6c59000, 0xc434 },
++	{ 0x6c2d000, 0xd210 },
++	{ 0x6c41000, 0xba04 },
++	{ 0x6c71000, 0xc850 },
++	{ 0x6c89000, 0x116e8 },
++	{ 0x6cb1000, 0x132dc },
++	{ 0x6ca1000, 0x93f0 },
++	{ 0x6cd1000, 0xcec8 },
++	{ 0x6d11000, 0xc97c },
++	{ 0x6d29000, 0xb79c },
++	{ 0x6cf9000, 0xb8d8 },
++	{ 0x6ced000, 0xb964 },
++	{ 0x6d3d000, 0xbdc8 },
++	{ 0x6d51000, 0xc778 },
++	{ 0x6d6d000, 0x32cc },
++	{ 0x6d81000, 0xbed0 },
++	{ 0x7151000, 0xb904 },
++	{ 0x6d99000, 0xb850 },
++	{ 0x6dad000, 0xbaa4 },
++	{ 0x6dd5000, 0xbdec },
++	{ 0x6ded000, 0xc99c },
++	{ 0x6dc1000, 0xb3dc },
++	{ 0x6e49000, 0xca88 },
++	{ 0x6e09000, 0xc0b0 },
++	{ 0x6e25000, 0xbdd0 },
++	{ 0x6e35000, 0xbdd0 },
++	{ 0x6e61000, 0xbee4 },
++	{ 0x6e79000, 0xbdc0 },
++	{ 0x6e91000, 0xb8f0 },
++	{ 0x6ea5000, 0xba58 },
++	{ 0x6ebd000, 0xc208 },
++	{ 0x6f09000, 0xb250 },
++	{ 0x6f1d000, 0xbba4 },
++	{ 0x6f31000, 0xc720 },
++	{ 0x6ed9000, 0xb428 },
++	{ 0x6ef1000, 0xbbb8 },
++	{ 0x6f4d000, 0xc364 },
++	{ 0x6f69000, 0xbb8c },
++	{ 0x6f7d000, 0xd70c },
++	{ 0x6f99000, 0xc6e4 },
++	{ 0x7165000, 0xb950 },
++	{ 0x6fc9000, 0xb938 },
++	{ 0x6ff1000, 0xc2a4 },
++	{ 0x6fe1000, 0xc254 },
++	{ 0x6fb5000, 0xb9a4 },
++	{ 0x700d000, 0xb9c8 },
++	{ 0x7065000, 0xc388 },
++	{ 0x7021000, 0xbd54 },
++	{ 0x7039000, 0xbcb8 },
++	{ 0x707d000, 0xbb04 },
++	{ 0x7095000, 0xc010 },
++	{ 0x70a9000, 0xc030 },
++	{ 0x7051000, 0xa408 },
++	{ 0x70c5000, 0xc5f0 },
++	{ 0x70e1000, 0xb8f0 },
++	{ 0x70f9000, 0xbb30 },
++	{ 0x7111000, 0xbdbc },
++	{ 0x7125000, 0xb990 },
++	{ 0x7139000, 0xbb84 },
++	{ 0x7179000, 0xb7b0 },
++	{ 0x7189000, 0xb744 },
++	{ 0x71d9000, 0x20 },
++	{ 0x71dd000, 0x4a2c },
++	{ 0x71e5000, 0x378d },
++	{ 0x71e9000, 0x3ece },
++	{ 0x5309000, 0x2cf },
++	{ 0x76ad000, 0x2c9 },
++	{ 0x4a71000, 0x134 },
++	{ 0x4a75000, 0x1b28 },
++	{ 0x4a79000, 0x4c0c0 },
++	{ 0x4ac9000, 0x8f },
++	{ 0x4acd000, 0x3b80 },
++	{ 0x4ad1000, 0x238 },
++	{ 0x4ad5000, 0x98 },
++	{ 0x4ad9000, 0xb3c3 },
++	{ 0x4ae5000, 0x1c5c },
++	{ 0x4f29000, 0x3df2b6 },
++	{ 0x71ed000, 0x493ba },
++	{ 0x4ae9000, 0x134 },
++	{ 0x4aed000, 0x1b28 },
++	{ 0x4af1000, 0x55b1 },
++	{ 0x4af9000, 0x98 },
++	{ 0x4afd000, 0x460 },
++	{ 0x4b01000, 0xdc },
++	{ 0x4b05000, 0x98 },
++	{ 0x4b09000, 0x102c },
++	{ 0x4b0d000, 0x1c5c },
++	{ 0x4b11000, 0x134 },
++	{ 0x4b15000, 0x1b28 },
++	{ 0x4b19000, 0x43c7c },
++	{ 0x4b5d000, 0xcc },
++	{ 0x4b61000, 0x1688bc },
++	{ 0x4ccd000, 0x4c0 },
++	{ 0x4cd1000, 0x98 },
++	{ 0x4cd5000, 0xb1a5 },
++	{ 0x4ce1000, 0x1c5c },
++	{ 0x4ce5000, 0x200 },
++	{ 0x4ce9000, 0x1b28 },
++	{ 0x4ced000, 0x4ff70 },
++	{ 0x4d3d000, 0xf8 },
++	{ 0x4d41000, 0x16b250 },
++	{ 0x4ead000, 0x980 },
++	{ 0x4eb1000, 0x130 },
++	{ 0x4eb5000, 0x1452b },
++	{ 0x4ecd000, 0x1d28 },
++	{ 0x4ed1000, 0x200 },
++	{ 0x4ed5000, 0x1b28 },
++	{ 0x4ed9000, 0xcecd },
++	{ 0x4ee9000, 0xc2 },
++	{ 0x4eed000, 0x840 },
++	{ 0x4ef1000, 0x288 },
++	{ 0x4ef5000, 0x130 },
++	{ 0x4ef9000, 0x1b48 },
++	{ 0x4efd000, 0x1d28 },
++	{ 0x4f01000, 0x134 },
++	{ 0x4f05000, 0x1b28 },
++	{ 0x4f09000, 0x7d3b },
++	{ 0x4f11000, 0xbb },
++	{ 0x4f15000, 0x334 },
++	{ 0x4f19000, 0x10c },
++	{ 0x4f1d000, 0x98 },
++	{ 0x4f21000, 0x1510 },
++	{ 0x4f25000, 0x1c5c },
++	{ 0x7239000, 0x2ecfa },
++	{ 0x7269000, 0x3a39c0 },
++};
++static const struct { const char *path; uint32_t size; uint16_t ext, next; } fw_all[] = {
++	{ "image/adsp.b00", 0x4d4, 0, 1 },
++	{ "image/adsp.b01", 0x2098, 1, 1 },
++	{ "image/adsp.b02", 0x14ef4, 2, 1 },
++	{ "image/adsp.b03", 0x5e9c0, 3, 1 },
++	{ "image/adsp.b04", 0x18f388, 4, 1 },
++	{ "image/adsp.b05", 0x19f628, 5, 1 },
++	{ "image/adsp.b06", 0xb60, 6, 1 },
++	{ "image/adsp.b07", 0x63e4, 7, 1 },
++	{ "image/adsp.b08", 0x6f6c, 8, 1 },
++	{ "image/adsp.b09", 0x12dc, 9, 1 },
++	{ "image/adsp.b10", 0x104, 10, 1 },
++	{ "image/adsp.b12", 0xf2a0, 11, 1 },
++	{ "image/adsp.b13", 0x11ae4, 12, 1 },
++	{ "image/adsp.b14", 0xa4000, 13, 1 },
++	{ "image/adsp.b15", 0x170484, 14, 1 },
++	{ "image/adsp.b16", 0x44004, 15, 1 },
++	{ "image/adsp.b17", 0x2dfb, 16, 1 },
++	{ "image/adsp.b18", 0x1b60, 17, 1 },
++	{ "image/adsp.b19", 0x2dc, 18, 1 },
++	{ "image/adsp.b20", 0x1f60, 19, 1 },
++	{ "image/adsp.b21", 0x6fec, 20, 1 },
++	{ "image/adsp.b22", 0x3a56c, 21, 1 },
++	{ "image/adsp.b23", 0x94000, 22, 1 },
++	{ "image/adsp.b24", 0x4db23e, 23, 1 },
++	{ "image/adsp.b25", 0x15dd6a, 24, 1 },
++	{ "image/adsp.b26", 0x423c, 25, 1 },
++	{ "image/adsp.b27", 0x51a74, 26, 1 },
++	{ "image/adsp.b28", 0xb70, 27, 1 },
++	{ "image/adsp.b29", 0xd1f98, 28, 1 },
++	{ "image/adsp.b30", 0x50230, 29, 1 },
++	{ "image/adsp.b31", 0xe00, 30, 1 },
++	{ "image/adsp.b32", 0x13f0, 31, 1 },
++	{ "image/adsp.b33", 0x23810, 32, 1 },
++	{ "image/adsp.b34", 0x116400, 33, 1 },
++	{ "image/adsp.b35", 0xd4, 34, 1 },
++	{ "image/adsp.mdt", 0x256c, 35, 1 },
++	{ "image/adspr.jsn", 0x193, 36, 1 },
++	{ "image/adsps.jsn", 0x195, 37, 1 },
++	{ "image/adspua.jsn", 0x22b, 38, 1 },
++	{ "image/bdm7eu.bin", 0x66d8, 39, 1 },
++	{ "image/bdm7eut.bin", 0x66d8, 40, 1 },
++	{ "image/bdm7euu.bin", 0x66d8, 41, 1 },
++	{ "image/bdm7gl.bin", 0x66d8, 42, 1 },
++	{ "image/bdm7glt.bin", 0x66d8, 43, 1 },
++	{ "image/bdm7glu.bin", 0x66d8, 44, 1 },
++	{ "image/bdm7in.bin", 0x66d8, 45, 1 },
++	{ "image/bdm7int.bin", 0x66d8, 46, 1 },
++	{ "image/bdm7inu.bin", 0x66d8, 47, 1 },
++	{ "image/bdm7mx.bin", 0x66d8, 48, 1 },
++	{ "image/bdm7mxt.bin", 0x66d8, 49, 1 },
++	{ "image/bdm7mxu.bin", 0x66d8, 50, 1 },
++	{ "image/bdwlan.102", 0x66d8, 51, 1 },
++	{ "image/bdwlan.104", 0x66d8, 52, 1 },
++	{ "image/bdwlan.105", 0x66d8, 53, 1 },
++	{ "image/bdwlan.106", 0x66d8, 54, 1 },
++	{ "image/bdwlan.107", 0x66d8, 55, 1 },
++	{ "image/bdwlan.108", 0x66d8, 56, 1 },
++	{ "image/bdwlan.109", 0x66d8, 57, 1 },
++	{ "image/bdwlan.10e", 0x66d8, 58, 1 },
++	{ "image/bdwlan.10f", 0x66d8, 59, 1 },
++	{ "image/bdwlan.111", 0x66d8, 60, 1 },
++	{ "image/bdwlan.202", 0x66d8, 61, 1 },
++	{ "image/bdwlan.203", 0x66d8, 62, 1 },
++	{ "image/bdwlan.204", 0x66d8, 63, 1 },
++	{ "image/bdwlan.206", 0x66d8, 64, 1 },
++	{ "image/bdwlan.b04", 0x66d8, 65, 1 },
++	{ "image/bdwlan.b07", 0x66d8, 66, 1 },
++	{ "image/bdwlan.b09", 0x66d8, 67, 1 },
++	{ "image/bdwlan.b0a", 0x66d8, 68, 1 },
++	{ "image/bdwlan.b0b", 0x66d8, 69, 1 },
++	{ "image/bdwlan.b0d", 0x66d8, 70, 1 },
++	{ "image/bdwlan.b0e", 0x66d8, 71, 1 },
++	{ "image/bdwlan.b0f", 0x66d8, 72, 1 },
++	{ "image/bdwlan.b14", 0x66d8, 73, 1 },
++	{ "image/bdwlan.b15", 0x66d8, 74, 1 },
++	{ "image/bdwlan.b30", 0x66d8, 75, 1 },
++	{ "image/bdwlan.b31", 0x66d8, 76, 1 },
++	{ "image/bdwlan.b32", 0x66d8, 77, 1 },
++	{ "image/bdwlan.b33", 0x66d8, 78, 1 },
++	{ "image/bdwlan.b34", 0x66d8, 79, 1 },
++	{ "image/bdwlan.b35", 0x66d8, 80, 1 },
++	{ "image/bdwlan.b36", 0x66d8, 81, 1 },
++	{ "image/bdwlan.b37", 0x66d8, 82, 1 },
++	{ "image/bdwlan.b38", 0x66d8, 83, 1 },
++	{ "image/bdwlan.bin", 0x66d8, 84, 1 },
++	{ "image/bdwlans.202", 0x66d8, 85, 1 },
++	{ "image/bdwlant.202", 0x66d8, 86, 1 },
++	{ "image/bdwlanu.202", 0x66d8, 87, 1 },
++	{ "image/bdwlanu.206", 0x66d8, 88, 1 },
++	{ "image/bdwlanu.206", 0x66d8, 89, 1 },
++	{ "image/cardapp.b00", 0x134, 90, 1 },
++	{ "image/cardapp.b01", 0x1b28, 91, 1 },
++	{ "image/cardapp.b02", 0x97d3, 92, 1 },
++	{ "image/cardapp.b03", 0x91, 93, 1 },
++	{ "image/cardapp.b04", 0x2b8, 94, 1 },
++	{ "image/cardapp.b05", 0x14c, 95, 1 },
++	{ "image/cardapp.b06", 0x98, 96, 1 },
++	{ "image/cardapp.b07", 0x1cab, 97, 1 },
++	{ "image/cardapp.mdt", 0x1c5c, 98, 1 },
++	{ "image/cdsp.b00", 0x1d4, 99, 1 },
++	{ "image/cdsp.b01", 0x1c18, 100, 1 },
++	{ "image/cdsp.b02", 0x39898, 101, 1 },
++	{ "image/cdsp.b03", 0x1a07c, 102, 1 },
++	{ "image/cdsp.b04", 0x44c, 103, 1 },
++	{ "image/cdsp.b05", 0x20db5c, 104, 1 },
++	{ "image/cdsp.b06", 0x5b60, 105, 1 },
++	{ "image/cdsp.b08", 0x95378, 106, 1 },
++	{ "image/cdsp.b09", 0xa20, 107, 1 },
++	{ "image/cdsp.b11", 0xe614, 108, 1 },
++	{ "image/cdsp.mdt", 0x1dec, 109, 1 },
++	{ "image/cdspr.jsn", 0x193, 110, 1 },
++	{ "image/data.msc", 0x9c2df, 111, 1 },
++	{ "image/featenab.b00", 0x200, 112, 1 },
++	{ "image/featenab.b01", 0x4e70, 113, 1 },
++	{ "image/featenab.b02", 0xa89d, 114, 1 },
++	{ "image/featenab.b03", 0xc4, 115, 1 },
++	{ "image/featenab.b04", 0x391, 116, 1 },
++	{ "image/featenab.b05", 0x1c0, 117, 1 },
++	{ "image/featenab.b06", 0x130, 118, 1 },
++	{ "image/featenab.b07", 0x2231, 119, 1 },
++	{ "image/featenab.mdt", 0x5070, 120, 1 },
++	{ "image/fpctzapp.b00", 0x200, 121, 1 },
++	{ "image/fpctzapp.b01", 0x1b28, 122, 1 },
++	{ "image/fpctzapp.b02", 0x109ed8, 123, 1 },
++	{ "image/fpctzapp.b03", 0x144, 124, 1 },
++	{ "image/fpctzapp.b04", 0x103760, 125, 1 },
++	{ "image/fpctzapp.b05", 0x468, 126, 1 },
++	{ "image/fpctzapp.b06", 0x130, 127, 1 },
++	{ "image/fpctzapp.b07", 0x24749, 128, 1 },
++	{ "image/fpctzapp.mdt", 0x1d28, 129, 1 },
++	{ "image/goodixfp.b00", 0x134, 130, 1 },
++	{ "image/goodixfp.b01", 0x1b28, 131, 1 },
++	{ "image/goodixfp.b02", 0x3b8c68, 132, 1 },
++	{ "image/goodixfp.b03", 0x9b, 133, 1 },
++	{ "image/goodixfp.b04", 0x2763a4, 134, 1 },
++	{ "image/goodixfp.b05", 0x230, 135, 1 },
++	{ "image/goodixfp.b06", 0xa8, 136, 1 },
++	{ "image/goodixfp.b07", 0x268d6, 137, 1 },
++	{ "image/goodixfp.mdt", 0x1c5c, 138, 1 },
++	{ "image/gptest.b00", 0x134, 139, 1 },
++	{ "image/gptest.b01", 0x1b28, 140, 1 },
++	{ "image/gptest.b02", 0x1430b, 141, 1 },
++	{ "image/gptest.b03", 0xd4, 142, 1 },
++	{ "image/gptest.b04", 0x6bb4, 143, 1 },
++	{ "image/gptest.b05", 0x430, 144, 1 },
++	{ "image/gptest.b06", 0x98, 145, 1 },
++	{ "image/gptest.b07", 0x6c49, 146, 1 },
++	{ "image/gptest.mdt", 0x1c5c, 147, 1 },
++	{ "image/hdcpsrm.b00", 0x200, 148, 1 },
++	{ "image/hdcpsrm.b01", 0x1b28, 149, 1 },
++	{ "image/hdcpsrm.b02", 0x541d, 150, 1 },
++	{ "image/hdcpsrm.b03", 0xc2, 151, 1 },
++	{ "image/hdcpsrm.b04", 0x388, 152, 1 },
++	{ "image/hdcpsrm.b05", 0x1c0, 153, 1 },
++	{ "image/hdcpsrm.b06", 0x130, 154, 1 },
++	{ "image/hdcpsrm.b07", 0x137d, 155, 1 },
++	{ "image/hdcpsrm.mdt", 0x1d28, 156, 1 },
++	{ "image/loadalgo.b00", 0x200, 157, 1 },
++	{ "image/loadalgo.b01", 0x1b28, 158, 1 },
++	{ "image/loadalgo.b02", 0xc0f5, 159, 1 },
++	{ "image/loadalgo.b03", 0xc5, 160, 1 },
++	{ "image/loadalgo.b04", 0x4c60, 161, 1 },
++	{ "image/loadalgo.b05", 0x180, 162, 1 },
++	{ "image/loadalgo.b06", 0x130, 163, 1 },
++	{ "image/loadalgo.b07", 0x10a9, 164, 1 },
++	{ "image/loadalgo.mdt", 0x1d28, 165, 1 },
++	{ "image/mfido.b00", 0x134, 166, 1 },
++	{ "image/mfido.b01", 0x1b28, 167, 1 },
++	{ "image/mfido.b02", 0x2bb74, 168, 1 },
++	{ "image/mfido.b03", 0x89, 169, 1 },
++	{ "image/mfido.b04", 0xe47c, 170, 1 },
++	{ "image/mfido.b05", 0x188, 171, 1 },
++	{ "image/mfido.b06", 0x98, 172, 1 },
++	{ "image/mfido.b07", 0x68ee, 173, 1 },
++	{ "image/mfido.mdt", 0x1c5c, 174, 1 },
++	{ "image/miriskm.b00", 0x200, 175, 1 },
++	{ "image/miriskm.b01", 0x1b28, 176, 1 },
++	{ "image/miriskm.b02", 0x1b20a, 177, 1 },
++	{ "image/miriskm.b03", 0xbe, 178, 1 },
++	{ "image/miriskm.b04", 0xc7c, 179, 1 },
++	{ "image/miriskm.b05", 0x298, 180, 1 },
++	{ "image/miriskm.b06", 0x130, 181, 1 },
++	{ "image/miriskm.b07", 0x3931, 182, 1 },
++	{ "image/miriskm.mdt", 0x1d28, 183, 1 },
++	{ "image/mlipay.b00", 0x134, 184, 1 },
++	{ "image/mlipay.b01", 0x1b28, 185, 1 },
++	{ "image/mlipay.b02", 0xaf99, 186, 1 },
++	{ "image/mlipay.b03", 0x8a, 187, 1 },
++	{ "image/mlipay.b04", 0xa88, 188, 1 },
++	{ "image/mlipay.b05", 0x174, 189, 1 },
++	{ "image/mlipay.b06", 0x98, 190, 1 },
++	{ "image/mlipay.b07", 0x231b, 191, 1 },
++	{ "image/mlipay.mdt", 0x1c5c, 192, 1 },
++	{ "image/modem.b00", 0x414, 193, 1 },
++	{ "image/modem.b01", 0x1f78, 194, 1 },
++	{ "image/modem.b02", 0x2930, 195, 1 },
++	{ "image/modem.b03", 0x2518, 196, 1 },
++	{ "image/modem.b04", 0x4a3ac, 197, 1 },
++	{ "image/modem.b05", 0x119d8, 198, 1 },
++	{ "image/modem.b06", 0x100c, 199, 1 },
++	{ "image/modem.b07", 0x90b4, 200, 1 },
++	{ "image/modem.b08", 0x4f054, 201, 1 },
++	{ "image/modem.b09", 0x143ee8, 202, 1 },
++	{ "image/modem.b10", 0x40000, 203, 1 },
++	{ "image/modem.b11", 0x540, 204, 1 },
++	{ "image/modem.b12", 0xe2210, 205, 1 },
++	{ "image/modem.b14", 0x2d, 206, 1 },
++	{ "image/modem.b15", 0x7c, 207, 1 },
++	{ "image/modem.b16", 0x9c1a0, 208, 1 },
++	{ "image/modem.b17", 0x61110, 209, 1 },
++	{ "image/modem.b18", 0x2d29a9, 210, 1 },
++	{ "image/modem.b19", 0x2d94cc, 211, 1 },
++	{ "image/modem.b22", 0x10ec0, 212, 1 },
++	{ "image/modem.b23", 0x1722040, 213, 1 },
++	{ "image/modem.b24", 0xa07900, 214, 1 },
++	{ "image/modem.b25", 0x77a45, 215, 1 },
++	{ "image/modem.b26", 0x15104, 216, 1 },
++	{ "image/modem.b27", 0x1378, 217, 1 },
++	{ "image/modem.b28", 0xb0, 218, 1 },
++	{ "image/modem.b29", 0x7d52c, 219, 1 },
++	{ "image/modem.mdt", 0x238c, 220, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/generic/common/divar/cmcc_sub/sr_dsds/mcfg_hw.mbn", 0x588c, 221, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/generic/common/divar/la/7+7_mode/sr_dsds/mcfg_hw.mbn", 0x4404, 222, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/generic/common/divar/la/ss/mcfg_hw.mbn", 0x402c, 223, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/mbn_hw.dig", 0x20, 224, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/mbn_hw.txt", 0x232, 225, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_hw/oem_hw.txt", 0x1, 226, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/af/cellc/commerci/safrica/mcfg_sw.mbn", 0xb4ac, 227, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/af/kenya/airtel/commerci/mcfg_sw.mbn", 0xb838, 228, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/af/morocco/inwi/commerci/mcfg_sw.mbn", 0xb7d8, 229, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/af/morocco/orange/commerci/mcfg_sw.mbn", 0xbdc8, 230, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/af/moroccot/commerci/ma/mcfg_sw.mbn", 0xb50c, 231, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/airtel/commerci/mcfg_sw.mbn", 0xc048, 232, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/asiacell/commerci/mcfg_sw.mbn", 0xc16c, 233, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/bakcell/commerci/mcfg_sw.mbn", 0xc328, 234, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/beeline/commerci/mcfg_sw.mbn", 0xbf28, 235, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/beeline/uzbe/commerci/mcfg_sw.mbn", 0xc418, 236, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/cellcom/commerci/israel/mcfg_sw.mbn", 0xc2bc, 237, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/dcm/commerci/mcfg_sw.mbn", 0xbb40, 238, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/dialog/commerci/sl/mcfg_sw.mbn", 0xbd1c, 239, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/grameenp/commerci/mcfg_sw.mbn", 0xbc08, 240, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/htmobile/commerci/mcfg_sw.mbn", 0xc464, 241, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/idea/commerci/mcfg_sw.mbn", 0xbc00, 242, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/jazz/commerci/mcfg_sw.mbn", 0xb7cc, 243, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/jtl/commerci/mcfg_sw.mbn", 0xb898, 244, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/kddi/commerci/mcfg_sw.mbn", 0xeb6c, 245, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/kenya/commerci/mcfg_sw.mbn", 0xc05c, 246, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/mobitel/commerci/mcfg_sw.mbn", 0xb964, 247, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/ncell/commerci/nepal/mcfg_sw.mbn", 0xb948, 248, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/ntc/commerci/nepal/mcfg_sw.mbn", 0xbd34, 249, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/ooredoo/commerci/mcfg_sw.mbn", 0xaff0, 250, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/partner/commerci/mcfg_sw.mbn", 0xbedc, 251, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/pelephon/commerci/israel/mcfg_sw.mbn", 0xc240, 252, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/rakuten/commerci/mcfg_sw.mbn", 0xf490, 253, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/reliance/commerci/mcfg_sw.mbn", 0x1011c, 254, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/robi/commerci/mcfg_sw.mbn", 0xb388, 255, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/sbm/commerci/mcfg_sw.mbn", 0xb8b8, 256, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/tele2/commerci/mcfg_sw.mbn", 0xbc40, 257, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/telenor/commerci/mcfg_sw.mbn", 0xb8d8, 258, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/ucell/commerci/mcfg_sw.mbn", 0xb80c, 259, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/ufone/commerci/mcfg_sw.mbn", 0xc2dc, 260, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/uzmobile/commerci/mcfg_sw.mbn", 0xb7dc, 261, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/zain/commerci/mcfg_sw.mbn", 0xb940, 262, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/apac/zong/commerci/mcfg_sw.mbn", 0xbcf4, 263, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/aunz/optus/commerci/au/mcfg_sw.mbn", 0xc4a4, 264, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/aunz/telstra/commerci/mcfg_sw.mbn", 0xc794, 265, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/aunz/vodafone/commerci/mcfg_sw.mbn", 0xc148, 266, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/commerci/volte_cm/mcfg_sw.mbn", 0xd030, 267, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/commerci/volte_op/mcfg_sw.mbn", 0xe098, 268, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/agnss_lo/mcfg_sw.mbn", 0x6c5c, 269, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/conf_vol/mcfg_sw.mbn", 0xcc88, 270, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/eps_only/mcfg_sw.mbn", 0x5eb0, 271, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/lpp_loct/mcfg_sw.mbn", 0x6c64, 272, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/nsiot_4r/mcfg_sw.mbn", 0xc664, 273, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/nsiot_vo/mcfg_sw.mbn", 0xc7e4, 274, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/rrlp_loc/mcfg_sw.mbn", 0x6c64, 275, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/tgl_comb/mcfg_sw.mbn", 0x5b60, 276, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/w_irat_c/mcfg_sw.mbn", 0x5e04, 277, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/commerci/hvolte_o/mcfg_sw.mbn", 0x119bc, 278, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/commerci/openmkt/mcfg_sw.mbn", 0xa698, 279, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/commerci/volte_op/mcfg_sw.mbn", 0x11c50, 280, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/lab/cta/mcfg_sw.mbn", 0x7618, 281, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/lab/eps_only/mcfg_sw.mbn", 0xe4c0, 282, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/lab/noapn_vo/mcfg_sw.mbn", 0xe120, 283, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/lab/test/mcfg_sw.mbn", 0x9fa0, 284, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/lab/test_eps/mcfg_sw.mbn", 0xa060, 285, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/lab/test_no_/mcfg_sw.mbn", 0x9cc4, 286, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/lab/volte_co/mcfg_sw.mbn", 0xe350, 287, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/ctm/commerci/mcfg_sw.mbn", 0xbcc0, 288, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cu/commerci/openmkt/mcfg_sw.mbn", 0x690c, 289, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cu/commerci/volte/mcfg_sw.mbn", 0xd604, 290, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/china/cu/lab/test/mcfg_sw.mbn", 0x52f4, 291, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/common/row/commerci/mcfg_sw.mbn", 0xb7f4, 292, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/common/test/commerci/mcfg_sw.mbn", 0xc568, 293, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/common/w_one/commerci/mcfg_sw.mbn", 0xab94, 294, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/1and1/commerci/de/mcfg_sw.mbn", 0xc878, 295, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/2degress/commerci/mcfg_sw.mbn", 0xbbc0, 296, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/4ka/commerci/slovenia/mcfg_sw.mbn", 0xbbf0, 297, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/a1/at_comme/mcfg_sw.mbn", 0xb824, 298, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/a1/bulgaria/mcfg_sw.mbn", 0xb90c, 299, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/a1/commerci/mcfg_sw.mbn", 0xbbfc, 300, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/a1/commerci/slovenia/mcfg_sw.mbn", 0xc304, 301, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/a1/croatia_/mcfg_sw.mbn", 0xbeec, 302, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/a1/macedoni/mcfg_sw.mbn", 0xbe0c, 303, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/a1/serbia_c/mcfg_sw.mbn", 0xb88c, 304, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/bh/commerci/ba/mcfg_sw.mbn", 0xb8f4, 305, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/bite/commerci/latvia/mcfg_sw.mbn", 0xbbe0, 306, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/bite/commerci/lithuani/mcfg_sw.mbn", 0xbbf8, 307, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/bouygues/commerci/france/mcfg_sw.mbn", 0xc734, 308, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/btbd/commerci/mcfg_sw.mbn", 0xb854, 309, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/coop/commerci/italy/mcfg_sw.mbn", 0xc7c4, 310, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/cosmote/commerci/mcfg_sw.mbn", 0xd034, 311, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/digi/commerci/hungary/mcfg_sw.mbn", 0xc4c8, 312, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/digi/commerci/spain/mcfg_sw.mbn", 0xbf00, 313, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/digi/romania_/mcfg_sw.mbn", 0xb448, 314, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/austria/mcfg_sw.mbn", 0xcd68, 315, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/croatia/mcfg_sw.mbn", 0xcac8, 316, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/cz/mcfg_sw.mbn", 0xccfc, 317, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/greece/mcfg_sw.mbn", 0xd02c, 318, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/hungary/mcfg_sw.mbn", 0xd688, 319, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/macedoni/mcfg_sw.mbn", 0xbff8, 320, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/nl/mcfg_sw.mbn", 0xca3c, 321, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/pl/mcfg_sw.mbn", 0xcdc4, 322, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/slovakia/mcfg_sw.mbn", 0xc82c, 323, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/non_volt/commerci/mcfg_sw.mbn", 0x5b58, 324, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/volte/commerci/mcfg_sw.mbn", 0xca60, 325, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/volte/romania_/mcfg_sw.mbn", 0xca98, 326, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/du/commerci/uae/mcfg_sw.mbn", 0xbb48, 327, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/ee/commerci/mcfg_sw.mbn", 0xc688, 328, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/eir/commerci/ireland/mcfg_sw.mbn", 0xb7d8, 329, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/elisa/commerci/estonia/mcfg_sw.mbn", 0xbdf0, 330, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/elisa/commerci/fi/mcfg_sw.mbn", 0xbfe0, 331, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/enetwork/commerci/mcfg_sw.mbn", 0xbc40, 332, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/etisalat/commerci/egypt/mcfg_sw.mbn", 0xb944, 333, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/etisalat/commerci/uae/mcfg_sw.mbn", 0xbecc, 334, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/fastweb/commerci/italy/mcfg_sw.mbn", 0xd440, 335, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/free/volte/france/mcfg_sw.mbn", 0xbac8, 336, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/gibtel/commerci/gibra/mcfg_sw.mbn", 0xba58, 337, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/h3g/commerci/austria/mcfg_sw.mbn", 0xb954, 338, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/h3g/commerci/denmark/mcfg_sw.mbn", 0xbf58, 339, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/h3g/commerci/ireland/mcfg_sw.mbn", 0xbec4, 340, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/h3g/commerci/italy/mcfg_sw.mbn", 0xd450, 341, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/h3g/commerci/se/mcfg_sw.mbn", 0xc0d0, 342, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/h3g/commerci/uk/mcfg_sw.mbn", 0xbba4, 343, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/ice/commerci/norway/mcfg_sw.mbn", 0xc1cc, 344, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/kpn/commerci/mcfg_sw.mbn", 0xc03c, 345, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/kyvistar/volte/ukraine/mcfg_sw.mbn", 0xc018, 346, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/lebara/commerci/france/mcfg_sw.mbn", 0xbce8, 347, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/lifecell/volte/ukraine/mcfg_sw.mbn", 0xc0cc, 348, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/lmt/commerci/latvia/mcfg_sw.mbn", 0xb5e4, 349, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/meo/commerci/mcfg_sw.mbn", 0xc828, 350, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/moldcell/commerci/moldova/mcfg_sw.mbn", 0xb3fc, 351, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/mtel/commerci/ba/mcfg_sw.mbn", 0xb8f4, 352, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/mtn/commerci/ng/mcfg_sw.mbn", 0xc190, 353, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/mtn/commerci/safrica/mcfg_sw.mbn", 0xc94c, 354, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/mts/commerci/armenia/mcfg_sw.mbn", 0xbf18, 355, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/mts/commerci/belarus/mcfg_sw.mbn", 0xbb1c, 356, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/mts/volte/serbia/mcfg_sw.mbn", 0xb95c, 357, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/nos/commerci/mcfg_sw.mbn", 0xbb00, 358, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/nova/commerci/mcfg_sw.mbn", 0xce10, 359, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/o2/commerci/czech/mcfg_sw.mbn", 0xc678, 360, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/o2/commerci/slovakia/mcfg_sw.mbn", 0xc7e4, 361, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/o2/uk_comme/mcfg_sw.mbn", 0xc5dc, 362, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/ora/commerci/france/mcfg_sw.mbn", 0xb8b8, 363, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/commerci/belgium/mcfg_sw.mbn", 0xbf04, 364, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/commerci/caraibes/mcfg_sw.mbn", 0xb8fc, 365, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/commerci/egypt/mcfg_sw.mbn", 0xc1d0, 366, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/commerci/france/mcfg_sw.mbn", 0xd5ac, 367, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/commerci/group_no/mcfg_sw.mbn", 0x6180, 368, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/commerci/luxembou/mcfg_sw.mbn", 0xb84c, 369, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/commerci/poland/mcfg_sw.mbn", 0xdc88, 370, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/commerci/reunion/mcfg_sw.mbn", 0xb8f8, 371, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/commerci/romania/mcfg_sw.mbn", 0xc9c0, 372, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/commerci/slovakia/mcfg_sw.mbn", 0xc5d0, 373, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/commerci/spain/mcfg_sw.mbn", 0xcbb4, 374, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/moldova_/mcfg_sw.mbn", 0xaf7c, 375, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/play/poland_c/mcfg_sw.mbn", 0xcc50, 376, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/plintron/commerci/italy/mcfg_sw.mbn", 0xb8cc, 377, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/plus/poland_c/mcfg_sw.mbn", 0xcf44, 378, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/post/commerci/luxembou/mcfg_sw.mbn", 0xb9d8, 379, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/proximus/commerci/mcfg_sw.mbn", 0xbc4c, 380, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/proximus/volte/luxembou/mcfg_sw.mbn", 0xb8e8, 381, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/salt/commerci/mcfg_sw.mbn", 0xc568, 382, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/sfr/commerci/altice/mcfg_sw.mbn", 0xbe88, 383, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/sfr/commerci/fr/mcfg_sw.mbn", 0xbd30, 384, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/spark/commerci/mcfg_sw.mbn", 0xc150, 385, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/spusu/commerci/at/mcfg_sw.mbn", 0xbaf8, 386, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/spusu/commerci/it/mcfg_sw.mbn", 0xbcf8, 387, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/spusu/commerci/uk/mcfg_sw.mbn", 0xbde0, 388, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/sunrise/commerci/mcfg_sw.mbn", 0xb8c8, 389, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/swisscom/commerci/swiss/mcfg_sw.mbn", 0xc2d0, 390, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/tdc/commerci/denmark/mcfg_sw.mbn", 0xbd74, 391, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/tele2/commerci/estonia/mcfg_sw.mbn", 0xc7e0, 392, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/tele2/commerci/latvia/mcfg_sw.mbn", 0xc7dc, 393, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/tele2/commerci/lithuani/mcfg_sw.mbn", 0xc800, 394, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/tele2/commerci/nl/mcfg_sw.mbn", 0xbf6c, 395, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/tele2/commerci/sweden/mcfg_sw.mbn", 0xb4b8, 396, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telefoni/commerci/de/mcfg_sw.mbn", 0xbff8, 397, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telefoni/commerci/spain/mcfg_sw.mbn", 0xc9a0, 398, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telefoni/commerci/uk/mcfg_sw.mbn", 0xbd20, 399, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telefoni/non_volt/spain/mcfg_sw.mbn", 0xc8a4, 400, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telekom/commerci/argentin/mcfg_sw.mbn", 0xb288, 401, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telekom/commerci/slovenia/mcfg_sw.mbn", 0xbdb0, 402, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telemach/commerci/mcfg_sw.mbn", 0xb9fc, 403, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telemach/hr_comme/mcfg_sw.mbn", 0xb4a0, 404, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenet/volte/belgium/mcfg_sw.mbn", 0xbb18, 405, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/bulgaria/mcfg_sw.mbn", 0xb6c8, 406, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/denmark/mcfg_sw.mbn", 0xc754, 407, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/finland/mcfg_sw.mbn", 0xb9a8, 408, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/hungary/mcfg_sw.mbn", 0xbda8, 409, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/monteneg/mcfg_sw.mbn", 0xb8b8, 410, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/myanmar/mcfg_sw.mbn", 0xb524, 411, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/norway/mcfg_sw.mbn", 0xbf44, 412, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/serbia/mcfg_sw.mbn", 0xc224, 413, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/sweden/mcfg_sw.mbn", 0xbf18, 414, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telia/commerci/denmark/mcfg_sw.mbn", 0xc478, 415, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telia/commerci/estonia/mcfg_sw.mbn", 0xc2b0, 416, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telia/commerci/finland/mcfg_sw.mbn", 0xc7fc, 417, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telia/commerci/lithuani/mcfg_sw.mbn", 0xc314, 418, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telia/commerci/norway/mcfg_sw.mbn", 0xcb54, 419, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telia/commerci/sweden/mcfg_sw.mbn", 0xca0c, 420, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/telkom/commerci/mcfg_sw.mbn", 0xc144, 421, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/tim/commerci/italy/mcfg_sw.mbn", 0xc8d4, 422, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/tim/commerci/kena/mcfg_sw.mbn", 0xa828, 423, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/tim/commerci/welcome/mcfg_sw.mbn", 0xa7a8, 424, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/tmo/poland_c/mcfg_sw.mbn", 0xb924, 425, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/turkcell/commerci/mcfg_sw.mbn", 0xbb10, 426, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/turktele/commerci/mcfg_sw.mbn", 0xb9c4, 427, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vee/commerci/mcfg_sw.mbn", 0xc0dc, 428, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vimla/commerci/mcfg_sw.mbn", 0xbf50, 429, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/virgin/commerci/uk/mcfg_sw.mbn", 0xbb34, 430, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vivacom/commerci/mcfg_sw.mbn", 0xc2cc, 431, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/commerci/albania/mcfg_sw.mbn", 0xbf60, 432, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/commerci/hungary/mcfg_sw.mbn", 0xb818, 433, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/commerci/ireland/mcfg_sw.mbn", 0xc6b4, 434, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/india_vo/mcfg_sw.mbn", 0xb91c, 435, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/non_volt/mcfg_sw.mbn", 0x5f6c, 436, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/ctc/mcfg_sw.mbn", 0xc1cc, 437, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/cz/mcfg_sw.mbn", 0xcee0, 438, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/egypt/mcfg_sw.mbn", 0xc6e4, 439, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/germany/mcfg_sw.mbn", 0xce40, 440, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/gr/mcfg_sw.mbn", 0xc720, 441, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/italy/mcfg_sw.mbn", 0xab68, 442, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/netherla/mcfg_sw.mbn", 0xcca4, 443, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/portugal/mcfg_sw.mbn", 0xab60, 444, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/ro/mcfg_sw.mbn", 0xc118, 445, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/safrica/mcfg_sw.mbn", 0xc360, 446, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/spain/mcfg_sw.mbn", 0xcc98, 447, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/turkey/mcfg_sw.mbn", 0xc384, 448, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/uk/mcfg_sw.mbn", 0xcec8, 449, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/we/commerci/egypt/mcfg_sw.mbn", 0xbdbc, 450, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/wind/commerci/mcfg_sw.mbn", 0xc5e0, 451, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/yoigo/commerci/mcfg_sw.mbn", 0xb708, 452, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/eu/zeop/commerci/mcfg_sw.mbn", 0xc064, 453, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/korea/kt/commerci/mcfg_sw.mbn", 0xb368, 454, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/korea/lgu/commerci/mcfg_sw.mbn", 0xaee4, 455, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/korea/skt/commerci/mcfg_sw.mbn", 0xa210, 456, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/korea/tta/commerci/mcfg_sw.mbn", 0x9bf4, 457, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/amx/commerci/mx/mcfg_sw.mbn", 0xc238, 458, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/amx/non_volt/mcfg_sw.mbn", 0x393c, 459, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/amx/volte/mcfg_sw.mbn", 0xc638, 460, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/antel/commerci/mcfg_sw.mbn", 0xbd84, 461, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/brisanet/commerci/brazil/mcfg_sw.mbn", 0xbcb4, 462, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/arg/mcfg_sw.mbn", 0xd9f0, 463, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/brazil/mcfg_sw.mbn", 0xda10, 464, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/chile/mcfg_sw.mbn", 0xe430, 465, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/colombia/mcfg_sw.mbn", 0xebf0, 466, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/cri/mcfg_sw.mbn", 0xda28, 467, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/dominica/mcfg_sw.mbn", 0xda40, 468, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/ecuador/mcfg_sw.mbn", 0xdd08, 469, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/guatemal/mcfg_sw.mbn", 0xda34, 470, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/honduras/mcfg_sw.mbn", 0xda2c, 471, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/nicaragu/mcfg_sw.mbn", 0xda30, 472, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/panama/mcfg_sw.mbn", 0xd9d4, 473, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/paraguay/mcfg_sw.mbn", 0xd8b8, 474, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/peru/mcfg_sw.mbn", 0xeba8, 475, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/puerto/mcfg_sw.mbn", 0xd9cc, 476, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/salvador/mcfg_sw.mbn", 0xda2c, 477, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/claro/commerci/uruguay/mcfg_sw.mbn", 0xd980, 478, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/entel/commerci/chile/mcfg_sw.mbn", 0xfb3c, 479, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/entel/commerci/peru/mcfg_sw.mbn", 0xefa0, 480, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/liberty/commerci/pa/mcfg_sw.mbn", 0xbc00, 481, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/movistar/argentin/mcfg_sw.mbn", 0xb4b8, 482, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/movistar/chile_co/mcfg_sw.mbn", 0xb7fc, 483, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/movistar/ecuador_/mcfg_sw.mbn", 0xb578, 484, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/movistar/mx_comme/mcfg_sw.mbn", 0xb5fc, 485, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/movistar/panama_c/mcfg_sw.mbn", 0xbd6c, 486, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/movistar/uruguay_/mcfg_sw.mbn", 0xb508, 487, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/mx-att/commerci/mcfg_sw.mbn", 0xe110, 488, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/telefoni/commerci/colombia/mcfg_sw.mbn", 0xbd1c, 489, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/telefoni/commerci/peru/mcfg_sw.mbn", 0xe0c8, 490, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/tigo/commerci/guatemal/mcfg_sw.mbn", 0xbb24, 491, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/tigo/commerci/mcfg_sw.mbn", 0xba68, 492, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/tim/commerci/brazil/mcfg_sw.mbn", 0xa2c0, 493, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/unifique/commerci/brazil/mcfg_sw.mbn", 0xbf00, 494, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/vivo/commerci/brazil/mcfg_sw.mbn", 0xc10c, 495, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/wom/commerci/colombia/mcfg_sw.mbn", 0xc114, 496, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/latam/wom/commerci/mcfg_sw.mbn", 0xb014, 497, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/azerbaij/commerci/mcfg_sw.mbn", 0xc7d0, 498, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/bahrain/bahrain_/mcfg_sw.mbn", 0xb7f0, 499, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/bahrain/betelco_/mcfg_sw.mbn", 0xb7f0, 500, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/bahrain/viva/commerci/mcfg_sw.mbn", 0xb79c, 501, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/bahrain/zain/commerci/mcfg_sw.mbn", 0xb79c, 502, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/cyta/commerci/mcfg_sw.mbn", 0xbab4, 503, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/epic/commerci/mcfg_sw.mbn", 0xb8a0, 504, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/jordan/orange/commerci/mcfg_sw.mbn", 0xb9f0, 505, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/jordan/umniah/commerci/mcfg_sw.mbn", 0xb958, 506, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/kuwait/ooredoo/commerci/mcfg_sw.mbn", 0xbb10, 507, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/kuwait/viva/commerci/mcfg_sw.mbn", 0xbd94, 508, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/kuwait/zain/commerci/mcfg_sw.mbn", 0xbd28, 509, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/oman/omantel/commerci/mcfg_sw.mbn", 0xb798, 510, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/oman/ooredoo/commerci/mcfg_sw.mbn", 0xb8dc, 511, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/oman/vodafone/commerci/mcfg_sw.mbn", 0xc2fc, 512, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/primetel/commerci/mcfg_sw.mbn", 0xb8b0, 513, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/qatar/commerci/mcfg_sw.mbn", 0xb420, 514, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/saudi/mobily/commerci/mcfg_sw.mbn", 0xbc18, 515, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/saudi/salam/commerci/mcfg_sw.mbn", 0xb61c, 516, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/saudi/zain/commerci/mcfg_sw.mbn", 0xb7e4, 517, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mea/stc/commerci/sa/mcfg_sw.mbn", 0xb8d4, 518, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mexico/altan/commerci/mcfg_sw.mbn", 0xb948, 519, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/mexico/axtel/commerci/mcfg_sw.mbn", 0xb928, 520, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/att/american/mcfg_sw.mbn", 0xd5fc, 521, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/att/firstnet/mcfg_sw.mbn", 0xd4a0, 522, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/att/guam_cnm/mcfg_sw.mbn", 0xd5e4, 523, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/att/non_volt/mcfg_sw.mbn", 0x61b8, 524, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/att/volte/mcfg_sw.mbn", 0xd490, 525, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/bell/commerci/ca/mcfg_sw.mbn", 0xc9c8, 526, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/cbrs/commerci/us/mcfg_sw.mbn", 0x5454, 527, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/dish/commerci/us/mcfg_sw.mbn", 0xbb7c, 528, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/rogers/commerci/ca/mcfg_sw.mbn", 0xbff0, 529, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/sprint/commerci/mcfg_sw.mbn", 0xf0dc, 530, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/sprint/vowifi/mcfg_sw.mbn", 0xf0d8, 531, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/telus/commerci/ca/mcfg_sw.mbn", 0xc434, 532, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/tmo/commerci/mcfg_sw.mbn", 0xd210, 533, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/tmo/poland_c/mcfg_sw.mbn", 0xba04, 534, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/uscc/commerci/mcfg_sw.mbn", 0xc850, 535, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/verizon/cdmaless/mcfg_sw.mbn", 0x116e8, 536, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/verizon/hvolte/mcfg_sw.mbn", 0x132dc, 537, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/na/verizon/imsless/mcfg_sw.mbn", 0x93f0, 538, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/russia/beeline/gen_3gpp/mcfg_sw.mbn", 0xcec8, 539, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/russia/megafon/commerci/ru/mcfg_sw.mbn", 0xc97c, 540, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/russia/motiv/commerci/mcfg_sw.mbn", 0xb79c, 541, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/russia/mts/commerci/mcfg_sw.mbn", 0xb8d8, 542, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/russia/mts/commerci/ru/mcfg_sw.mbn", 0xb964, 543, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/russia/sberbank/commerci/mcfg_sw.mbn", 0xbdc8, 544, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/russia/tele2/commerci/mcfg_sw.mbn", 0xc778, 545, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sa/brazil/commerci/mcfg_sw.mbn", 0x32cc, 546, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/3hk/commerci/hk/mcfg_sw.mbn", 0xbed0, 547, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/airtel/commerci/lanka/mcfg_sw.mbn", 0xb904, 548, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/ais/commerci/thailand/mcfg_sw.mbn", 0xb850, 549, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/apt/commerci/mcfg_sw.mbn", 0xbaa4, 550, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/celcom/commerci/mcfg_sw.mbn", 0xbdec, 551, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/chunghwa/commerci/tw/mcfg_sw.mbn", 0xc99c, 552, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/cuhk/commerci/mcfg_sw.mbn", 0xb3dc, 553, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/digi/commerci/mcfg_sw.mbn", 0xca88, 554, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/dito/commerci/ph/mcfg_sw.mbn", 0xc0b0, 555, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/dtac/commerci/th/mcfg_sw.mbn", 0xbdd0, 556, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/dtac/commerci/volte/mcfg_sw.mbn", 0xbdd0, 557, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/fareasto/commerci/mcfg_sw.mbn", 0xbee4, 558, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/globe/commerci/ph/mcfg_sw.mbn", 0xbdc0, 559, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/hkt/commerci/hk/mcfg_sw.mbn", 0xb8f0, 560, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/indosat/commerci/mcfg_sw.mbn", 0xba58, 561, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/m1/commerci/sg/mcfg_sw.mbn", 0xc208, 562, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/maxis/commerci/malaysia/mcfg_sw.mbn", 0xb250, 563, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/metfone/commerci/mcfg_sw.mbn", 0xbba4, 564, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/mobifone/commerci/mcfg_sw.mbn", 0xc720, 565, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/mpt/commerci/myanmar/mcfg_sw.mbn", 0xb428, 566, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/mytel/commerci/myanmar/mcfg_sw.mbn", 0xbbb8, 567, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/nt/commerci/thailand/mcfg_sw.mbn", 0xc364, 568, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/p1/commerci/malaysia/mcfg_sw.mbn", 0xbb8c, 569, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/seatel/commerci/mcfg_sw.mbn", 0xd70c, 570, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/singtel/commerci/singapor/mcfg_sw.mbn", 0xc6e4, 571, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/smart/commerci/mcfg_sw.mbn", 0xb950, 572, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/smart_ph/commerci/mcfg_sw.mbn", 0xb938, 573, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/smartfre/commerci/mcfg_sw.mbn", 0xc2a4, 574, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/smartfre/commerci/vowifi/mcfg_sw.mbn", 0xc254, 575, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/smartone/commerci/hk/mcfg_sw.mbn", 0xb9a4, 576, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/starhub/commerci/sg/mcfg_sw.mbn", 0xb9c8, 577, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/telkomse/commerci/mcfg_sw.mbn", 0xc388, 578, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/tm/commerci/mcfg_sw.mbn", 0xbd54, 579, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/tpg/commerci/tpg/mcfg_sw.mbn", 0xbcb8, 580, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/tri/commerci/mcfg_sw.mbn", 0xbb04, 581, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/truemove/commerci/thailand/mcfg_sw.mbn", 0xc010, 582, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/truemove/commerci/volte/mcfg_sw.mbn", 0xc030, 583, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/tstar/commerci/tw/mcfg_sw.mbn", 0xa408, 584, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/umobile/commerci/malaysia/mcfg_sw.mbn", 0xc5f0, 585, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/vietnamo/commerci/vietnamo/mcfg_sw.mbn", 0xb8f0, 586, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/viettel/commerci/vietnam/mcfg_sw.mbn", 0xbb30, 587, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/vinaphon/commerci/vietnam/mcfg_sw.mbn", 0xbdbc, 588, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/xl/commerci/mcfg_sw.mbn", 0xb990, 589, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/sea/ytl/commerci/mcfg_sw.mbn", 0xbb84, 590, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/test/er_iot/mcfg_sw.mbn", 0xb7b0, 591, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/generic/test/nk_iot/mcfg_sw.mbn", 0xb744, 592, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/mbn_sw.dig", 0x20, 593, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/mbn_sw.txt", 0x4a2c, 594, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/oem_eea.txt", 0x378d, 595, 1 },
++	{ "image/modem_pr/mcfg/configs/mcfg_sw/oem_sw.txt", 0x3ece, 596, 1 },
++	{ "image/modemr.jsn", 0x2cf, 597, 1 },
++	{ "image/modemuw.jsn", 0x2c9, 598, 1 },
++	{ "image/otrpapp.b00", 0x134, 599, 1 },
++	{ "image/otrpapp.b01", 0x1b28, 600, 1 },
++	{ "image/otrpapp.b02", 0x4c0c0, 601, 1 },
++	{ "image/otrpapp.b03", 0x8f, 602, 1 },
++	{ "image/otrpapp.b04", 0x3b80, 603, 1 },
++	{ "image/otrpapp.b05", 0x238, 604, 1 },
++	{ "image/otrpapp.b06", 0x98, 605, 1 },
++	{ "image/otrpapp.b07", 0xb3c3, 606, 1 },
++	{ "image/otrpapp.mdt", 0x1c5c, 607, 1 },
++	{ "image/qdsp6m.qdb", 0x3df2b6, 608, 1 },
++	{ "image/rtic.mbn", 0x493ba, 609, 1 },
++	{ "image/secauth.b00", 0x134, 610, 1 },
++	{ "image/secauth.b01", 0x1b28, 611, 1 },
++	{ "image/secauth.b02", 0x55b1, 612, 1 },
++	{ "image/secauth.b03", 0x98, 613, 1 },
++	{ "image/secauth.b04", 0x460, 614, 1 },
++	{ "image/secauth.b05", 0xdc, 615, 1 },
++	{ "image/secauth.b06", 0x98, 616, 1 },
++	{ "image/secauth.b07", 0x102c, 617, 1 },
++	{ "image/secauth.mdt", 0x1c5c, 618, 1 },
++	{ "image/smplap32.b00", 0x134, 619, 1 },
++	{ "image/smplap32.b01", 0x1b28, 620, 1 },
++	{ "image/smplap32.b02", 0x43c7c, 621, 1 },
++	{ "image/smplap32.b03", 0xcc, 622, 1 },
++	{ "image/smplap32.b04", 0x1688bc, 623, 1 },
++	{ "image/smplap32.b05", 0x4c0, 624, 1 },
++	{ "image/smplap32.b06", 0x98, 625, 1 },
++	{ "image/smplap32.b07", 0xb1a5, 626, 1 },
++	{ "image/smplap32.mdt", 0x1c5c, 627, 1 },
++	{ "image/smplap64.b00", 0x200, 628, 1 },
++	{ "image/smplap64.b01", 0x1b28, 629, 1 },
++	{ "image/smplap64.b02", 0x4ff70, 630, 1 },
++	{ "image/smplap64.b03", 0xf8, 631, 1 },
++	{ "image/smplap64.b04", 0x16b250, 632, 1 },
++	{ "image/smplap64.b05", 0x980, 633, 1 },
++	{ "image/smplap64.b06", 0x130, 634, 1 },
++	{ "image/smplap64.b07", 0x1452b, 635, 1 },
++	{ "image/smplap64.mdt", 0x1d28, 636, 1 },
++	{ "image/soter64.b00", 0x200, 637, 1 },
++	{ "image/soter64.b01", 0x1b28, 638, 1 },
++	{ "image/soter64.b02", 0xcecd, 639, 1 },
++	{ "image/soter64.b03", 0xc2, 640, 1 },
++	{ "image/soter64.b04", 0x840, 641, 1 },
++	{ "image/soter64.b05", 0x288, 642, 1 },
++	{ "image/soter64.b06", 0x130, 643, 1 },
++	{ "image/soter64.b07", 0x1b48, 644, 1 },
++	{ "image/soter64.mdt", 0x1d28, 645, 1 },
++	{ "image/vsimapp.b00", 0x134, 646, 1 },
++	{ "image/vsimapp.b01", 0x1b28, 647, 1 },
++	{ "image/vsimapp.b02", 0x7d3b, 648, 1 },
++	{ "image/vsimapp.b03", 0xbb, 649, 1 },
++	{ "image/vsimapp.b04", 0x334, 650, 1 },
++	{ "image/vsimapp.b05", 0x10c, 651, 1 },
++	{ "image/vsimapp.b06", 0x98, 652, 1 },
++	{ "image/vsimapp.b07", 0x1510, 653, 1 },
++	{ "image/vsimapp.mdt", 0x1c5c, 654, 1 },
++	{ "image/widevine.mbn", 0x2ecfa, 655, 1 },
++	{ "image/wlanmdsp.mbn", 0x3a39c0, 656, 1 },
++};
++
++static int
++fw_all_find(const char *path)
++{
++	for (unsigned i = 0; i < sizeof(fw_all) / sizeof(fw_all[0]); i++) {
++		if (strcmp(fw_all[i].path, path) == 0) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++/* read n bytes at off of file i from modem_a (extent by extent) */
++static bool
++fw_all_read(int i, uint64_t off, void *dst, uint64_t n)
++{
++	uint64_t base = 0, done = 0;
++	for (unsigned k = 0; k < fw_all[i].next && done < n; k++) {
++		uint32_t eo = fw_ext[fw_all[i].ext + k].off, el = fw_ext[fw_all[i].ext + k].len;
++		if (off + done < base + el) {
++			uint64_t in = off + done - base, take = MIN((uint64_t)el - in, n - done);
++			if (sweet_ufs_read_part(fw_part, eo + in, (uint8_t *)dst + done, take) != 0) {
++				return false;
++			}
++			done += take;
++		}
++		base += el;
++	}
++	return done == n;
++}
++
++/* QMI */
++struct qmsg { uint8_t b[512]; uint32_t n; };
++
++static void
++qm_init(struct qmsg *m, uint16_t txn, uint16_t msg)
++{
++	m->b[0] = QMI_RESP;
++	memcpy(m->b + 1, &txn, 2);
++	memcpy(m->b + 3, &msg, 2);
++	m->n = 7;
++}
++
++static void
++qm_tlv(struct qmsg *m, uint8_t type, const void *v, uint16_t len)
++{
++	if (m->n + 3 + len > sizeof(m->b)) {
++		return;
++	}
++	m->b[m->n] = type;
++	memcpy(m->b + m->n + 1, &len, 2);
++	memcpy(m->b + m->n + 3, v, len);
++	m->n += 3 + len;
++}
++
++static void
++qm_result(struct qmsg *m, bool ok)
++{
++	uint16_t r[2] = { (uint16_t)(ok ? 0 : 1), (uint16_t)(ok ? 0 : 1) };
++	qm_tlv(m, 2, r, 4);
++}
++
++static void
++qm_send(struct qmsg *m, uint32_t src_port, uint32_t node, uint32_t port)
++{
++	uint16_t l = (uint16_t)(m->n - 7);
++	memcpy(m->b + 5, &l, 2);
++	qrtr_send(QRTR_TYPE_DATA, src_port, node, port, m->b, m->n);
++}
++
++static const uint8_t *
++qm_find(const uint8_t *d, uint32_t len, uint8_t type, uint16_t *tlen)
++{
++	uint32_t o = 7;
++	while (o + 3 <= len) {
++		uint16_t l;
++		memcpy(&l, d + o + 1, 2);
++		if (o + 3 + l > len) {
++			break;
++		}
++		if (d[o] == type) {
++			*tlen = l;
++			return d + o + 3;
++		}
++		o += 3 + l;
++	}
++	return NULL;
++}
++
++static void
++qm_string(const uint8_t *d, uint32_t len, uint8_t type, char *out, size_t max)
++{
++	uint16_t l = 0;
++	const uint8_t *v = qm_find(d, len, type, &l);
++	out[0] = 0;
++	if (v != NULL) {
++		l = (uint16_t)MIN((size_t)l, max - 1);
++		memcpy(out, v, l);
++		out[l] = 0;
++	}
++}
++
++/* pd-mapper */
++static const struct { const char *svc, *domain; } pd_map[] = {
++	{ "tms/servreg",       "msm/modem/root_pd" },
++	{ "tms/pdr_enabled",   "msm/modem/root_pd" },
++	{ "gps/gps_service",   "msm/modem/root_pd" },
++	{ "kernel/elf_loader", "msm/modem/wlan_pd" },
++	{ "tms/servreg",       "msm/modem/wlan_pd" },
++	{ "wlan/fw",           "msm/modem/wlan_pd" },
++};
++static unsigned pd_reqs;
++
++static void
++pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	struct qmsg m;
++	char name[80];
++	uint8_t list[256];
++	uint32_t n = 1, cnt = 0;
++	uint16_t v;
++
++	qm_init(&m, txn, msg);
++	if (msg != 0x21) {                      /* PFR etc.: just say OK */
++		LOG("t=%u ms: pd-mapper: msg %x", g_ms, msg);
++		qm_result(&m, true);
++		qm_send(&m, PORT_PDM, node, port);
++		return;
++	}
++	qm_string(d, len, 1, name, sizeof(name));
++	for (unsigned i = 0; i < sizeof(pd_map) / sizeof(pd_map[0]); i++) {
++		if (strcmp(pd_map[i].svc, name) == 0) {
++			uint32_t dl = (uint32_t)strlen(pd_map[i].domain), inst = 180, zero = 0;
++			list[n++] = (uint8_t)dl;
++			memcpy(list + n, pd_map[i].domain, dl);
++			n += dl;
++			memcpy(list + n, &inst, 4);
++			n += 4;
++			list[n++] = 0;                  /* service_data_valid */
++			memcpy(list + n, &zero, 4);
++			n += 4;
++			cnt++;
++		}
++	}
++	list[0] = (uint8_t)cnt;
++	qm_result(&m, true);
++	v = (uint16_t)cnt;
++	qm_tlv(&m, 0x10, &v, 2);
++	v = 1;
++	qm_tlv(&m, 0x11, &v, 2);
++	if (cnt != 0) {
++		qm_tlv(&m, 0x12, list, (uint16_t)n);
++	}
++	qm_send(&m, PORT_PDM, node, port);
++	pd_reqs++;
++	LOG("t=%u ms: pd-mapper: \"%s\" -> %u domain(s)", g_ms, name, cnt);
++}
++
++/* tftp */
++#define OP_RRQ   1
++#define OP_WRQ   2
++#define OP_DATA  3
++#define OP_ACK   4
++#define OP_ERROR 5
++#define OP_OACK  6
++
++struct tftp_sess {
++	bool used, write;
++	uint32_t port, node, rport;
++	int fi;                                 /* fw_all index, -1 = none */
++	int rw;                                 /* /readwrite file in RAM, -1 = none */
++	uint64_t size, sent;
++	uint32_t blk, rsize, wsize, seek;
++};
++static struct tftp_sess sess[16];
++static uint32_t next_sess_port = PORT_SESS;
++static unsigned tftp_reqs, tftp_missing, tftp_writes;
++
++struct rw_file { char path[96]; uint8_t *data; uint32_t size, cap; };
++static struct rw_file rw_files[12];
++
++static int
++rw_find(const char *path, bool create)
++{
++	for (int i = 0; i < 12; i++) {
++		if (rw_files[i].path[0] != 0 && strcmp(rw_files[i].path, path) == 0) {
++			return i;
++		}
++	}
++	for (int i = 0; create && i < 12; i++) {
++		if (rw_files[i].path[0] == 0) {
++			strlcpy(rw_files[i].path, path, sizeof(rw_files[i].path));
++			return i;
++		}
++	}
++	return -1;
++}
++
++static bool
++rw_write(int r, uint64_t off, const uint8_t *src, uint32_t n)
++{
++	struct rw_file *f = &rw_files[r];
++	uint64_t end = off + n;
++	if (off > 0x100000 || n > 0x100000) {
++		return false;
++	}
++	if (end > f->cap) {
++		uint32_t cap = (uint32_t)MAX(end, (uint64_t)f->cap * 2);
++		uint8_t *d = (uint8_t *)IOMalloc(cap);
++		if (d == NULL) {
++			return false;
++		}
++		bzero(d, cap);
++		if (f->data != NULL) {
++			memcpy(d, f->data, f->size);
++			IOFree(f->data, f->cap);
++		}
++		f->data = d;
++		f->cap = cap;
++	}
++	memcpy(f->data + off, src, n);
++	f->size = (uint32_t)MAX((uint64_t)f->size, end);
++	return true;
++}
++
++static void
++tftp_send(struct tftp_sess *s, const void *p, uint32_t len)
++{
++	qrtr_send(QRTR_TYPE_DATA, s->port, s->node, s->rport, p, len);
++}
++
++static void
++tftp_error(struct tftp_sess *s, uint16_t code, const char *msg)
++{
++	uint8_t b[64] = { 0, OP_ERROR, (uint8_t)(code >> 8), (uint8_t)code };
++	uint32_t l = (uint32_t)strlcpy((char *)b + 4, msg, sizeof(b) - 4) + 1;
++	tftp_send(s, b, 4 + l);
++}
++
++static void
++tftp_close(struct tftp_sess *s)
++{
++	bzero(s, sizeof(*s));
++}
++
++/* tqftpserv tftp_send_data() */
++static bool
++tftp_data(struct tftp_sess *s, uint32_t block, uint64_t offset, uint32_t resp_size)
++{
++	uint8_t *b = (uint8_t *)IOMalloc(s->blk + 4);
++	uint32_t n = s->blk, send;
++
++	if (b == NULL) {
++		return false;
++	}
++	b[0] = 0; b[1] = OP_DATA; b[2] = (uint8_t)(block >> 8); b[3] = (uint8_t)block;
++	if (offset >= s->size) {
++		n = 0;
++	} else {
++		n = (uint32_t)MIN((uint64_t)n, s->size - offset);
++		if (s->rw >= 0) {
++			memcpy(b + 4, rw_files[s->rw].data + offset, n);
++		} else if (!fw_all_read(s->fi, offset, b + 4, n)) {
++			LOG("tftp sess %x: read FAILED at %llu", s->port, offset);
++			IOFree(b, s->blk + 4);
++			tftp_error(s, 0, "Read error");
++			return false;
++		}
++	}
++	send = 4 + n;
++	if (resp_size != 0) {
++		if (4 + resp_size > send) {
++			IOFree(b, s->blk + 4);
++			return false;
++		}
++		send = 4 + resp_size;
++	}
++	tftp_send(s, b, send);
++	s->sent += send - 4;
++	IOFree(b, s->blk + 4);
++	return true;
++}
++
++static char *
++tftp_opt(char *p, char *end, const char *name, uint64_t val)
++{
++	char num[24];
++	snprintf(num, sizeof(num), "%llu", val);
++	size_t a = strlen(name) + 1, b = strlen(num) + 1;
++	if (p + a + b > end) {
++		return p;
++	}
++	memcpy(p, name, a);
++	memcpy(p + a, num, b);
++	return p + a + b;
++}
++
++/* the modem's path -> fw_all path: /readonly/firmware/image/x -> image/x */
++static bool
++tftp_map(const char *path, char *out, size_t max)
++{
++	static const char *pre[] = {
++		"/readonly/firmware/image/", "/readonly/vendor/firmware_mnt/image/", "/readonly/vendor/firmware/",
++	};
++	const char *rest = NULL;
++	size_t k;
++
++	for (unsigned i = 0; i < 3; i++) {
++		if (strncmp(path, pre[i], strlen(pre[i])) == 0) {
++			rest = path + strlen(pre[i]);
++			strlcpy(out, "image/", max);
++			break;
++		}
++	}
++	if (rest == NULL && strncmp(path, "/readonly/firmware/", 19) == 0) {
++		rest = path + 19;
++		out[0] = 0;
++	}
++	if (rest == NULL) {
++		return false;
++	}
++	k = strlen(out);
++	for (; *rest != 0 && k + 1 < max; rest++) {
++		char c = *rest;
++		out[k++] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
++	}
++	out[k] = 0;
++	return true;
++}
++
++static uint32_t
++dec(const char *p)
++{
++	uint32_t v = 0;
++	while (*p >= '0' && *p <= '9') {
++		v = v * 10 + (uint32_t)(*p++ - '0');
++	}
++	return v;
++}
++
++static void
++tftp_request(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
++{
++	char buf[512], *p, *end, *file, *mode, oack[256], *o, path[128];
++	uint16_t op = (uint16_t)(d[0] << 8 | d[1]);
++	struct tftp_sess *s = NULL;
++	bool opts, want_tsize = false;
++	uint32_t timeoutms = 1000;
++
++	if (len < 4 || len >= sizeof(buf)) {
++		return;
++	}
++	memcpy(buf, d, len);
++	buf[len] = 0;
++	end = buf + len;
++	file = buf + 2;
++	mode = file + strlen(file) + 1;
++	if (mode >= end) {
++		return;
++	}
++	p = mode + strlen(mode) + 1;
++	opts = p < end;
++	for (unsigned i = 0; i < 16; i++) {
++		if (!sess[i].used) {
++			s = &sess[i];
++			break;
++		}
++	}
++	if (s == NULL) {
++		LOG("tftp: out of sessions");
++		return;
++	}
++	bzero(s, sizeof(*s));
++	s->used = true;
++	s->write = op == OP_WRQ;
++	s->port = next_sess_port++;
++	s->node = node;
++	s->rport = port;
++	s->blk = 512;
++	s->wsize = 1;
++	s->rw = -1;
++	s->fi = -1;
++	while (p < end) {
++		char *name = p, *val = p + strlen(p) + 1;
++		if (val >= end) {
++			break;
++		}
++		uint32_t v = dec(val);
++		if (strcmp(name, "blksize") == 0) {
++			s->blk = MAX(8u, MIN(v, 16384u));
++		} else if (strcmp(name, "timeoutms") == 0) {
++			timeoutms = v;
++		} else if (strcmp(name, "tsize") == 0) {
++			want_tsize = true;
++		} else if (strcmp(name, "rsize") == 0) {
++			s->rsize = v;
++		} else if (strcmp(name, "wsize") == 0) {
++			s->wsize = MAX(1u, v);
++		} else if (strcmp(name, "seek") == 0) {
++			s->seek = v;
++		}
++		p = val + strlen(val) + 1;
++	}
++	tftp_reqs++;
++	if (strncmp(file, "/readwrite/", 11) == 0) {
++		s->rw = rw_find(file, s->write);
++	}
++	if (s->write) {
++		tftp_writes++;
++		LOG("t=%u ms: tftp WRQ %s seek %u%s", g_ms, file, s->seek, s->rw < 0 ? " (no RAM slot, dropped)" : "");
++		if (s->rw >= 0 && s->seek == 0) {
++			rw_files[s->rw].size = 0;       /* a write from the start replaces the file */
++		}
++	} else if (s->rw >= 0) {
++		s->size = rw_files[s->rw].size;
++		LOG("t=%u ms: tftp RRQ %s (RAM, %llu B)", g_ms, file, s->size);
++	} else {
++		if (!tftp_map(file, path, sizeof(path)) || (s->fi = fw_all_find(path)) < 0) {
++			tftp_missing++;
++			LOG("t=%u ms: tftp RRQ %s: not found", g_ms, file);
++			tftp_error(s, 1, "file not found");
++			tftp_close(s);
++			return;
++		}
++		s->size = fw_all[s->fi].size;
++		LOG("t=%u ms: tftp RRQ %s seek %u rsize %u blk %u w %u (%llu B)", g_ms, path, s->seek, s->rsize, s->blk, s->wsize, s->size);
++	}
++	if (!opts) {
++		if (s->write) {
++			uint8_t ack[4] = { 0, OP_ACK, 0, 0 };
++			tftp_send(s, ack, 4);
++		} else {
++			tftp_data(s, 1, 0, 0);
++		}
++		return;
++	}
++	o = oack;
++	*o++ = 0;
++	*o++ = OP_OACK;
++	o = tftp_opt(o, oack + sizeof(oack), "blksize", s->blk);
++	o = tftp_opt(o, oack + sizeof(oack), "timeoutms", timeoutms);
++	if (want_tsize && !s->write) {
++		o = tftp_opt(o, oack + sizeof(oack), "tsize", s->size);
++	}
++	o = tftp_opt(o, oack + sizeof(oack), "wsize", s->wsize);
++	if (s->rsize != 0) {
++		o = tftp_opt(o, oack + sizeof(oack), "rsize", s->rsize);
++	}
++	if (s->seek != 0) {
++		o = tftp_opt(o, oack + sizeof(oack), "seek", s->seek);
++	}
++	tftp_send(s, oack, (uint32_t)(o - oack));
++}
++
++/* traffic on a session port: ACKs for reads, DATA for writes (tqftpserv handle_reader) */
++static bool
++tftp_session(uint32_t dst_port, const uint8_t *d, uint32_t len)
++{
++	struct tftp_sess *s = NULL;
++	for (unsigned i = 0; i < 16; i++) {
++		if (sess[i].used && sess[i].port == dst_port) {
++			s = &sess[i];
++			break;
++		}
++	}
++	if (s == NULL || len < 4) {
++		return s != NULL;
++	}
++	uint16_t op = (uint16_t)(d[0] << 8 | d[1]), blk = (uint16_t)(d[2] << 8 | d[3]);
++	if (op == OP_ERROR) {
++		/* rsize 0 + tsize is a stat: the modem ends it with ERROR 9 "End of Transfer" */
++		if (blk != 9) {
++			LOG("t=%u ms: tftp sess %x: modem ERROR %u after %llu B", g_ms, s->port, blk, s->sent);
++		}
++		tftp_close(s);
++		return true;
++	}
++	if (s->write) {
++		if (op == OP_DATA) {
++			uint32_t payload = len - 4;
++			if (s->rw >= 0 && blk >= 1) {
++				(void)rw_write(s->rw, s->seek + (uint64_t)(blk - 1) * s->blk, d + 4, payload);
++			}
++			if ((blk % s->wsize) == 0 || payload < s->blk) {
++				uint8_t ack[4] = { 0, OP_ACK, (uint8_t)(blk >> 8), (uint8_t)blk };
++				tftp_send(s, ack, 4);
++			}
++			if (payload < s->blk) {
++				tftp_close(s);
++			}
++		}
++		return true;
++	}
++	if (op != OP_ACK) {
++		tftp_error(s, 4, "Expected ACK opcode");
++		tftp_close(s);
++		return true;
++	}
++	if (s->rsize == 0) {
++		/* the whole file: blocks until a short one */
++		uint64_t total = s->size > s->seek ? s->size - s->seek : 0;
++		uint32_t last = (uint32_t)(total / s->blk) + 1;
++		if ((uint32_t)blk >= last) {
++			tftp_close(s);
++			return true;
++		}
++		for (uint32_t i = blk + 1u; i <= blk + s->wsize && i <= last; i++) {
++			if (!tftp_data(s, i, s->seek + (uint64_t)(i - 1) * s->blk, 0)) {
++				break;
++			}
++		}
++		return true;
++	}
++	if ((uint64_t)blk * s->blk > s->rsize) {
++		tftp_close(s);
++		return true;
++	}
++	for (uint32_t i = blk; i < blk + s->wsize; i++) {
++		uint64_t off = s->seek + (uint64_t)i * s->blk;
++		uint32_t rs = (i + 1) * s->blk > s->rsize ? s->rsize % s->blk : 0;
++		if (!tftp_data(s, i + 1, off, rs) || (i + 1) * s->blk > s->rsize) {
++			break;
++		}
++	}
++	return true;
++}
++
++/* rmtfs */
++#define RMTFS_BUF_SIZE      0x300000            /* qcom,rmtfs_sharedmem size */
++#define VMID_HLOS           3
++#define VMID_MSS_MSA        15
++#define VMID_NAV            0x2B
++#define PERM_RW             6
++
++static const struct { const char *path, *part; } rmtfs_parts[] = {
++	{ "/boot/modem_fs1", "modemst1" },
++	{ "/boot/modem_fs2", "modemst2" },
++	{ "/boot/modem_fsc", "fsc" },
++	{ "/boot/modem_fsg", "fsg" },
++};
++static uint64_t rmtfs_pa;
++static uint8_t *rmtfs_va;
++static unsigned rmtfs_reads, rmtfs_writes, rmtfs_err;
++
++/* hyp_assign_phys: give the buffer to HLOS + modem + nav (SCM 0x0C/0x16) */
++static uint64_t
++scm_assign_to_modem(uint64_t addr, uint64_t size)
++{
++	static const uint32_t vmids[] = { VMID_HLOS, VMID_MSS_MSA, VMID_NAV };
++	uint64_t pa = 0, res = 0;
++	uint64_t *p = (uint64_t *)pool_alloc(0x1000, &pa);
++
++	if (p == NULL) {
++		return ~0ull;
++	}
++	p[0] = addr;                                /* 0x000: mem map {addr, size} */
++	p[1] = size;
++	uint32_t *src = (uint32_t *)(p + 8);        /* 0x040: src vmids */
++	src[0] = VMID_HLOS;
++	uint32_t *dst = (uint32_t *)(p + 16);       /* 0x080: {vmid, perm, ctx(8), ctx_size, unused} x3 */
++	for (unsigned i = 0; i < 3; i++) {
++		dst[6 * i] = vmids[i];
++		dst[6 * i + 1] = PERM_RW;
++	}
++	p[32] = 4;                                  /* 0x100: extended args: src size */
++	p[33] = pa + 0x80;                          /* dest */
++	p[34] = 3 * 24;                             /* dest size */
++	p[35] = 0;
++	mb();
++	uint64_t args[8] = { SCM_FN(0x0C, 0x16), 7 | (1 << 4) | (1 << 8) | (1 << 12), pa, 16, pa + 0x40, pa + 0x100, 0, 0 };
++	smc(args);
++	for (unsigned n = 0; args[0] == 1 && n < 100000; n++) {
++		uint64_t again[8] = { 1, 7 | (1 << 4) | (1 << 8) | (1 << 12), pa, 16, pa + 0x40, pa + 0x100, args[6], 0 };
++		memcpy(args, again, sizeof(args));
++		smc(args);
++	}
++	res = args[1];
++	LOG("SCM assign %llx+%llx to modem: ret=%llx res=%llx", addr, size, args[0], res);
++	return args[0] != 0 ? args[0] : res;
++}
++
++static void
++rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	struct qmsg m;
++	char path[64];
++	uint16_t l = 0;
++	const uint8_t *v;
++	uint32_t caller = 0, i;
++	bool ok = true;
++
++	qm_init(&m, txn, msg);
++	v = qm_find(d, len, 1, &l);
++	if (msg != 1 && v != NULL && l >= 4) {
++		memcpy(&caller, v, 4);
++	}
++	switch (msg) {
++	case 1:                                     /* OPEN */
++		qm_string(d, len, 1, path, sizeof(path));
++		for (i = 0; i < 4; i++) {
++			if (strcmp(path, rmtfs_parts[i].path) == 0) {
++				break;
++			}
++		}
++		if (i < 4) {
++			uint8_t probe[16];
++			ok = sweet_ufs_read_part(rmtfs_parts[i].part, 0, probe, sizeof(probe)) == 0;
++		} else {
++			ok = false;
++		}
++		LOG("t=%u ms: rmtfs: open %s -> %s", g_ms, path, ok ? rmtfs_parts[i].part : "FAILED");
++		qm_result(&m, ok);
++		if (ok) {
++			caller = i + 1;
++			qm_tlv(&m, 0x10, &caller, 4);
++		}
++		break;
++	case 2:                                     /* CLOSE */
++		qm_result(&m, true);
++		break;
++	case 3: {                                   /* RW_IOVEC */
++		uint16_t l2 = 0;
++		const uint8_t *dir = qm_find(d, len, 2, &l2);
++		const uint8_t *iov = qm_find(d, len, 3, &l2);
++		bool write = dir != NULL && *dir != 0;
++		ok = caller >= 1 && caller <= 4 && iov != NULL && rmtfs_pa != 0;
++		for (i = 0; ok && i < iov[0]; i++) {
++			uint32_t e[3];                      /* sector, phys, count */
++			memcpy(e, iov + 1 + 12 * i, 12);
++			uint64_t bytes = (uint64_t)e[2] * 512;
++			if (e[1] < rmtfs_pa || e[1] + bytes > rmtfs_pa + RMTFS_BUF_SIZE) {
++				ok = false;
++				break;
++			}
++			if (write) {
++				rmtfs_writes++;                 /* never written to the phone's EFS */
++			} else {
++				ok = sweet_ufs_read_part(rmtfs_parts[caller - 1].part, (uint64_t)e[0] * 512,
++				    rmtfs_va + (e[1] - rmtfs_pa), bytes) == 0;
++				rmtfs_reads++;
++			}
++		}
++		if (!ok && ++rmtfs_err <= 3) {
++			LOG("t=%u ms: rmtfs: iovec caller %u %s FAILED", g_ms, caller, write ? "write" : "read");
++		}
++		qm_result(&m, ok);
++		break;
++	}
++	case 4: {                                   /* ALLOC_BUFF */
++		if (rmtfs_pa == 0) {
++			rmtfs_va = (uint8_t *)pool_alloc(RMTFS_BUF_SIZE, &rmtfs_pa);   /* the modem owns it from now on */
++			if (rmtfs_va == NULL) {
++				rmtfs_pa = 0;
++			} else {
++				(void)scm_assign_to_modem(rmtfs_pa, RMTFS_BUF_SIZE);
++			}
++		}
++		LOG("t=%u ms: rmtfs: alloc for caller %u -> %llx", g_ms, caller, rmtfs_pa);
++		ok = rmtfs_pa != 0;
++		qm_result(&m, ok);
++		if (ok) {
++			uint64_t a = rmtfs_pa;
++			qm_tlv(&m, 0x10, &a, 8);
++		}
++		break;
++	}
++	case 5: {                                   /* GET_DEV_ERROR */
++		uint8_t st = 0;
++		qm_result(&m, true);
++		qm_tlv(&m, 0x10, &st, 1);
++		break;
++	}
++	default:
++		LOG("t=%u ms: rmtfs: msg %x", g_ms, msg);
++		qm_result(&m, false);
++		break;
++	}
++	qm_send(&m, PORT_RMTFS, node, port);
++}
++
++static void
++svc_announce(void)
++{
++	static const uint32_t svc[][3] = {
++		{ 0x40, 0x101, PORT_PDM },              /* servreg-locator, version 0x101 instance 0 */
++		{ 4096, 1,     PORT_TFTP },             /* tftp */
++		{ 14,   1,     PORT_RMTFS },            /* rmtfs */
++	};
++	for (unsigned i = 0; i < 3; i++) {
++		struct qrtr_ctrl c = { QRTR_TYPE_NEW_SERVER, svc[i][0], svc[i][1], QRTR_NODE_APPS, svc[i][2] };
++		qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, q_modem_node, QRTR_PORT_CTRL, &c, sizeof(c));
++	}
++	LOG("t=%u ms: announced pd-mapper 0x40, tftp 0x1000, rmtfs 0x0e", g_ms);
++}
++
++static bool
++svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *data, uint32_t len)
++{
++	if (dst_port == PORT_TFTP) {
++		if (len >= 2 && (data[1] == OP_RRQ || data[1] == OP_WRQ)) {
++			tftp_request(src_node, src_port, data, len);
++		}
++		return true;
++	}
++	if (dst_port >= PORT_SESS && dst_port < PORT_SESS + 0x10000) {
++		return tftp_session(dst_port, data, len);
++	}
++	if (len < 7 || data[0] != QMI_REQ) {
++		return false;
++	}
++	uint16_t txn, msg;
++	memcpy(&txn, data + 1, 2);
++	memcpy(&msg, data + 3, 2);
++	if (dst_port == PORT_PDM) {
++		pdm_rx(src_node, src_port, txn, msg, data, len);
++		return true;
++	}
++	if (dst_port == PORT_RMTFS) {
++		rmtfs_rx(src_node, src_port, txn, msg, data, len);
++		return true;
++	}
++	return false;
++}
++
++static void
++svc_summary(void)
++{
++	LOG("services: pd-mapper %u reqs; tftp %u reqs (%u missing, %u writes); rmtfs reads %u writes %u (not kept) errors %u",
++	    pd_reqs, tftp_reqs, tftp_missing, tftp_writes, rmtfs_reads, rmtfs_writes, rmtfs_err);
++}
++
+ /*
+  * After auth_and_reset: watch the modem's "slave-kernel" entry (bit0 fatal, bit1 ready,
+  * bit2 handover) and answer its IPA power query ("valid, AP IPA power off"): unanswered,
+-- 
+2.43.0
+
