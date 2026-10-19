@@ -1,0 +1,52 @@
+From 8a50d3b80c08889a84300ca44760fb1a6bb217c4 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 17:28:20 +0300
+Subject: [PATCH] topaz-0114: present the iPhone X screen (1125x2436) again,
+ 16-byte aligned panel window
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 7 ++++++-
+ iokit/Kernel/arm/hid/SweetHID.cpp     | 2 +-
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 03b8e38..6a18b58 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -271,7 +271,8 @@ AppleCLCD::start(IOService *provider)
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+-	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
++	/* x rounded down to 4 pixels: the panel window must start 16-byte aligned (MDP fetch) */
++	fOffX = ((int32_t)(fLogicalW - fWidth) / 2) & ~3;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+@@ -835,6 +836,10 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 	    s->width >= fWidth && s->height >= fHeight) {
+ 		/* full-screen surface: panel window at the logical offset */
+ 		uint32_t ox = (s->width - fWidth) / 2, oy = (s->height - fHeight) / 2;
++		if (s->width == fLogicalW && s->height == fLogicalH) {
++			ox = (uint32_t)fOffX;
++			oy = (uint32_t)fOffY;
++		}
+ 		uint64_t pa = s->scanoutPhys + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4;
+ 		if ((pa & 0xf) == 0 && pa + (uint64_t)fHeight * s->bytesPerRow < (1ull << 32)) {
+ 			uintptr_t va = s->kernelAddress();
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..d2f4fa1 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -436,7 +436,7 @@ SweetHIDTouch::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = native ? 1080 : 1125;
+ 	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
++	fOffX = ((fLogicalW - 1080) / 2) & ~3;           /* as SweetFramebuffer.cpp */
+ 	fOffY = (fLogicalH - 2400) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+-- 
+2.43.0
+
