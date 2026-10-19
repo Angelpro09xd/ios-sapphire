@@ -1,4 +1,4 @@
-From d0db1f63a40953e20fb908a732f3b67dae79eeee Mon Sep 17 00:00:00 2001
+From 98853e2f9772d39aaec517f9b107ed1ede330648 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Mon, 19 Oct 2026 10:46:44 +0300
 Subject: [PATCH] topaz-0107: display-only dcache clean (built for real), async
@@ -6,9 +6,9 @@ Subject: [PATCH] topaz-0107: display-only dcache clean (built for real), async
 
 ---
  iokit/Kernel/arm/SweetFramebuffer.cpp | 47 ++++++++++++++++++++-------
- osfmk/arm/caches.c                    | 37 ++++++++++++++++-----
+ osfmk/arm/caches.c                    | 40 ++++++++++++++++++-----
  osfmk/console/video_console.c         |  4 +--
- 3 files changed, 65 insertions(+), 23 deletions(-)
+ 3 files changed, 68 insertions(+), 23 deletions(-)
 
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 index 5a9f33c..989c16f 100644
@@ -148,7 +148,7 @@ index 5a9f33c..989c16f 100644
  				}
  			}
 diff --git a/osfmk/arm/caches.c b/osfmk/arm/caches.c
-index 6ef93ad..8251868 100644
+index 6ef93ad..89d83a0 100644
 --- a/osfmk/arm/caches.c
 +++ b/osfmk/arm/caches.c
 @@ -382,12 +382,15 @@ platform_cache_flush_wimg(
@@ -171,21 +171,17 @@ index 6ef93ad..8251868 100644
  static void
  sweet_dcache_op(vm_offset_t addr, unsigned length, boolean_t phys, bool invalidate)
  {
-@@ -413,17 +416,33 @@ sweet_dcache_op(vm_offset_t addr, unsigned length, boolean_t phys, bool invalida
+@@ -412,18 +415,29 @@ sweet_dcache_op(vm_offset_t addr, unsigned length, boolean_t phys, bool invalida
+ 	__builtin_arm_dsb(DSB_SY);
  }
  
- void
--flush_dcache(vm_offset_t addr, unsigned length, boolean_t phys)
-+sweet_dcache_clean(vm_offset_t addr, unsigned length)
-+{
-+	sweet_dcache_op(addr, length, FALSE, false);
-+}
 +
 +#if 0
 +
 +#endif
 +
-+void
+ void
+-flush_dcache(vm_offset_t addr, unsigned length, boolean_t phys)
 +flush_dcache(
 +	__unused vm_offset_t addr,
 +	__unused unsigned length,
@@ -210,6 +206,18 @@ index 6ef93ad..8251868 100644
  void
  flush_dcache(
  	__unused vm_offset_t addr,
+@@ -534,3 +548,11 @@ platform_cache_flush_wimg(
+ }
+ 
+ #endif  /* __ARM_COHERENT_IO__ */
++
++/* topaz: display/DSI buffers (MDP and DSI DMA read DRAM behind the caches) */
++void sweet_dcache_clean(vm_offset_t addr, unsigned length);
++void
++sweet_dcache_clean(vm_offset_t addr, unsigned length)
++{
++	clean_dcache(addr, length, FALSE);
++}
 diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 index df9605e..4193f57 100644
 --- a/osfmk/console/video_console.c
