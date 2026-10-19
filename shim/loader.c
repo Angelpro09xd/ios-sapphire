@@ -74,6 +74,31 @@ static int magic_ok(const char *m)
 	return 1;
 }
 
+/*
+ * Set a u64 property in the copied ADT. Properties are a 32-byte zero-padded
+ * name, a u32 length and the value at 4-byte alignment, so the value is
+ * written as two words (Device memory: no unaligned 8-byte stores).
+ */
+static int adt_set_u64(uintptr_t adt, uint64_t size, const char *name, uint64_t v)
+{
+	for (uintptr_t a = adt; a + 32 + 4 + 8 <= adt + size; a += 4) {
+		volatile const char *n = (volatile const char *)a;
+		int i = 0;
+		while (i < 32 && name[i] && n[i] == name[i])
+			i++;
+		if (name[i] || i == 32)
+			continue;
+		while (i < 32 && !n[i])
+			i++;
+		if (i != 32 || *(volatile uint32_t *)(a + 32) != 8)
+			continue;
+		*(volatile uint32_t *)(a + 36) = (uint32_t)v;
+		*(volatile uint32_t *)(a + 40) = (uint32_t)(v >> 32);
+		return 1;
+	}
+	return 0;
+}
+
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
 /* build.sh appends the payload to the Image at the first 4K boundary after _end */
@@ -135,8 +160,25 @@ const char *loader_boot(uintptr_t dtb)
 	con_hex("VIRT", p->virt_base);
 	con_hex("ENTRY", p->entry_va);
 
+	/*
+	 * The payload's RAM size is fixed at build time (mkadt.py --highmem:
+	 * 4 GiB at 0x1_40000000, from topaz). Fit it into the DDR bank ABL
+	 * reports, so a phone with less RAM there (sapphire, 6 GB) doesn't
+	 * hand xnu memory that isn't there.
+	 */
+	uint64_t mem_size = p->mem_size, bank_end;
+	int bank = fdt_mem_bank_end(dtb, p->phys_base, &bank_end);
+	if (bank == 0)
+		return "phys_base is in no DDR bank";
+	if (bank > 0 && bank_end - p->phys_base < mem_size) {
+		mem_size = (bank_end - p->phys_base) & ~(PAGE_16K - 1);
+		con_hex2("DDR", "end=", bank_end, "size=", mem_size);
+	} else if (bank < 0) {
+		con_str("DDR", "no /memory in ABL DTB, size as built");
+	}
+
 	/* The payload must not overlap where the kernel goes. */
-	if (rd_end > p->phys_base && rd_start < p->phys_base + p->mem_size)
+	if (rd_end > p->phys_base && rd_start < p->phys_base + mem_size)
 		return "ramdisk overlaps kernel memory";
 
 	for (uint32_t i = 0; i < p->nsegs; i++) {
@@ -151,6 +193,8 @@ const char *loader_boot(uintptr_t dtb)
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
 	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
+	if (mem_size != p->mem_size && !adt_set_u64(adt_pa, p->adt_size, "dram-size", mem_size))
+		return "no dram-size in ADT";
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
 
@@ -160,7 +204,7 @@ const char *loader_boot(uintptr_t dtb)
 	ba->Version = 2;
 	ba->virtBase = p->virt_base;
 	ba->physBase = p->phys_base;
-	ba->memSize = p->mem_size;
+	ba->memSize = mem_size;
 	ba->topOfKernelData = top;
 	ba->Video.v_baseAddr = FB_BASE;
 	ba->Video.v_display = 1;
@@ -172,7 +216,7 @@ const char *loader_boot(uintptr_t dtb)
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
-	ba->memSizeActual = p->mem_size;
+	ba->memSizeActual = mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
