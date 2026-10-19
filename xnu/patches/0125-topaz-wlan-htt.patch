@@ -1,0 +1,249 @@
+From 4c805a747af503279d373eab93c447019e459e34 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 20:00:35 +0300
+Subject: [PATCH] topaz-0125: WLAN: HTT setup (rx ring, frag bank, aggr) before
+ the scan
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 189 +++++++++++++++++++++++++++++++-
+ 1 file changed, 186 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 7b5a884..99ab541 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -3864,6 +3864,7 @@ htc_wmi_send(const void *data, uint32_t len)
+ }
+ 
+ static void wmi_rx(const uint8_t *d, uint32_t len);
++static void htt_rx(const uint8_t *p, uint32_t len);
+ 
+ static void
+ htc_rx(uint32_t c, const uint8_t *d, uint32_t len)
+@@ -3937,8 +3938,9 @@ htc_rx(uint32_t c, const uint8_t *d, uint32_t len)
+ 		}
+ 	} else if (h->eid == wmi_eid) {
+ 		wmi_rx(p, plen);
++	} else if (h->eid == htt_eid) {
++		htt_rx(p, plen);
+ 	}
+-	/* HTT (data path) comes later */
+ }
+ 
+ /* ---------------- WMI (TLV, ath10k wmi-tlv.c) and the passive scan */
+@@ -4245,6 +4247,186 @@ scan_start(void)
+ 	    b ? "ok" : "FAILED", scanning ? "requested" : "FAILED");
+ }
+ 
++/* ---------------- HTT setup (ath10k htt.c ath10k_htt_setup, 64-bit, WCN3990), after WMI READY */
++
++/*
++ * Without the host rx ring the radio receives (pdev rx_frame grows) but no frame reaches the
++ * firmware's rx path: no beacon, no scan result (topaz-woa v0.12). So, before the scan:
++ * VERSION_REQ -> VERSION_CONF (or 2 s), FRAG_DESC_BANK_CFG, RX_RING_CFG (host ring of buffer
++ * addresses + host-written alloc index), AGGR_CFG v2. All on the HTT endpoint (CE4).
++ */
++#define H2T_VERSION_REQ     0
++#define H2T_RX_RING_CFG     2
++#define H2T_AGGR_CFG        5
++#define H2T_FRAG_DESC_BANK_CFG 6
++#define T2H_VERSION_CONF    0x00
++#define T2H_RX_IN_ORD_PADDR_IND 0x12
++#define HTT_RING_SIZE       256
++#define HTT_BUF_SIZE        2048
++#define HTT_MAX_PENDING_TX  (1024 + 32)
++#define HTT_EXT_DESC_SIZE   72
++/* wcn3990 htt_rx_desc_v2 offsets in 4-byte words */
++#define OFF_ATTENTION       1
++#define OFF_FRAG_INFO       2
++#define OFF_MPDU_START      4
++#define OFF_MSDU_START      7
++#define OFF_MSDU_END        12
++#define OFF_MPDU_END        26
++#define OFF_PPDU_START      27
++#define OFF_PPDU_END        37
++#define OFF_HDR_STATUS      74
++#define OFF_MSDU_PAYLOAD    90
++
++static uint8_t *htt_blk, *htt_bank, *htt_buf;
++static uint64_t htt_ring_pa, htt_idx_pa, htt_bank_pa, htt_buf_pa;
++static volatile uint64_t *htt_ring;
++static volatile uint32_t *htt_idx;
++static uint32_t htt_alloc, htt_state, htt_msgs, htt_msdus, htt_req_ms;
++
++static bool htt_send(const void *d, uint32_t len) { return htt_eid != 0xFF && htc_send(htt_eid, d, len); }
++
++static void
++htt_post(uint64_t pa)
++{
++	*(volatile uint32_t *)(htt_buf + (pa - htt_buf_pa) + 4 * OFF_ATTENTION) = 0;
++	htt_ring[htt_alloc] = pa;
++	htt_alloc = (htt_alloc + 1) & (HTT_RING_SIZE - 1);
++}
++
++static void
++htt_publish(void)
++{
++	mb();                                       /* ring entries before the index */
++	*htt_idx = htt_alloc;
++	mb();
++}
++
++static uint8_t *put16(uint8_t *p, uint16_t v) { memcpy(p, &v, 2); return p + 2; }
++static uint8_t *put64(uint8_t *p, uint64_t v) { memcpy(p, &v, 8); return p + 8; }
++
++static void
++htt_configure(const char *why)
++{
++	uint8_t m[64] = {}, *p = m;
++
++	htt_state = 2;
++	/* ath10k_htt_send_frag_desc_bank_cfg_64 */
++	*p++ = H2T_FRAG_DESC_BANK_CFG;
++	*p++ = 0;
++	*p++ = 1;                                   /* num_banks */
++	*p++ = HTT_EXT_DESC_SIZE;
++	p = put64(p, htt_bank_pa);
++	p += 3 * 8;
++	p = put16(p, 0);
++	p = put16(p, HTT_MAX_PENDING_TX - 1);
++	p += 3 * 4;
++	p += 4 + 2 + 2;
++	*p++ = 1;
++	*p++ = 0;
++	bool a = htt_send(m, sizeof(m));
++	/* ath10k_htt_send_rx_ring_cfg_64 */
++	for (uint32_t i = 0; i < HTT_RING_SIZE - 1; i++) {
++		htt_post(htt_buf_pa + (uint64_t)i * HTT_BUF_SIZE);
++	}
++	uint8_t r[48] = {};
++	p = r;
++	*p++ = H2T_RX_RING_CFG;
++	*p++ = 1;
++	p = put16(p, 0);
++	p = put64(p, htt_idx_pa);
++	p = put64(p, htt_ring_pa);
++	p = put16(p, HTT_RING_SIZE);
++	p = put16(p, HTT_BUF_SIZE);
++	p = put16(p, 0xFFFF);                       /* every frame type, management included */
++	p = put16(p, 0);                            /* fw_idx_init_val */
++	p = put16(p, OFF_HDR_STATUS);
++	p = put16(p, OFF_MSDU_PAYLOAD);
++	p = put16(p, OFF_PPDU_START);
++	p = put16(p, OFF_PPDU_END);
++	p = put16(p, OFF_MPDU_START);
++	p = put16(p, OFF_MPDU_END);
++	p = put16(p, OFF_MSDU_START);
++	p = put16(p, OFF_MSDU_END);
++	p = put16(p, OFF_ATTENTION);
++	p = put16(p, OFF_FRAG_INFO);
++	htt_publish();
++	bool b = htt_send(r, sizeof(r));
++	uint8_t g[4] = { H2T_AGGR_CFG, 64, 3, 0 };
++	bool c = htt_send(g, sizeof(g));
++	LOG("t=%u ms: htt (%s): frag bank %s, rx ring cfg %s (%u bufs), aggr cfg %s", g_ms, why, a ? "ok" : "FAILED",
++	    b ? "ok" : "FAILED", HTT_RING_SIZE - 1, c ? "ok" : "FAILED");
++	scan_start();
++}
++
++static void
++htt_start(void)
++{
++	uint64_t pa = 0;
++	uint32_t ring = (HTT_RING_SIZE * 8 + 64 + 0xfff) & ~0xfffu;
++	uint32_t bank = (HTT_MAX_PENDING_TX * HTT_EXT_DESC_SIZE + 0xfff) & ~0xfffu;
++
++	if (htt_state != 0) {
++		return;
++	}
++	htt_blk = (uint8_t *)pool_alloc(ring + bank + HTT_RING_SIZE * HTT_BUF_SIZE, &pa);
++	if (htt_blk == NULL) {
++		LOG("htt: no memory, scanning without it");
++		scan_start();
++		return;
++	}
++	htt_ring = (volatile uint64_t *)htt_blk;
++	htt_ring_pa = pa;
++	htt_idx = (volatile uint32_t *)(htt_blk + HTT_RING_SIZE * 8);
++	htt_idx_pa = pa + HTT_RING_SIZE * 8;
++	htt_bank = htt_blk + ring;
++	htt_bank_pa = pa + ring;
++	htt_buf = htt_blk + ring + bank;
++	htt_buf_pa = pa + ring + bank;
++	htt_state = 1;
++	htt_req_ms = g_ms;
++	uint8_t m[4] = { H2T_VERSION_REQ, 0, 0, 0 };
++	LOG("t=%u ms: htt: VERSION_REQ %s", g_ms, htt_send(m, sizeof(m)) ? "sent" : "FAILED");
++}
++
++static void
++htt_rx(const uint8_t *p, uint32_t len)
++{
++	uint8_t type = len != 0 ? p[0] : 0xFF;
++	htt_msgs++;
++	if (type == T2H_VERSION_CONF && len >= 3) {
++		LOG("t=%u ms: *** HTT VERSION_CONF %u.%u ***", g_ms, p[2], p[1]);
++		if (htt_state == 1) {
++			htt_configure("version conf");
++		}
++		return;
++	}
++	if (type == T2H_RX_IN_ORD_PADDR_IND && len >= 8) {
++		uint16_t n;
++		memcpy(&n, p + 6, 2);
++		const uint8_t *d = p + 8;
++		for (uint32_t i = 0; i < n && 8 + (i + 1) * 12 <= len; i++, d += 12) {
++			uint64_t pa;
++			memcpy(&pa, d, 8);
++			if (pa < htt_buf_pa || pa >= htt_buf_pa + (uint64_t)HTT_RING_SIZE * HTT_BUF_SIZE ||
++			    ((pa - htt_buf_pa) % HTT_BUF_SIZE) != 0) {
++				continue;
++			}
++			htt_msdus++;
++			htt_post(pa);                       /* recycle: data frames are for later */
++		}
++		htt_publish();
++	}
++}
++
++static void
++htt_poll(void)
++{
++	if (htt_state == 1 && g_ms - htt_req_ms > 2000) {
++		LOG("t=%u ms: htt: no VERSION_CONF in 2 s, configuring anyway", g_ms);
++		htt_configure("timeout");
++	}
++}
++
+ static void
+ scan_event(const uint8_t *t, uint32_t len)
+ {
+@@ -4267,7 +4449,7 @@ scan_event(const uint8_t *t, uint32_t len)
+ 	if (e[0] == 0x002 || e[0] == 0x040 || e[0] == 0x010) {
+ 		scanning = false;
+ 		scans++;
+-		LOG("t=%u ms: *** scan %u done (event %x): %u networks, %u beacons/probe responses ***", g_ms, scans, e[0], nbss, scan_frames);
++		LOG("t=%u ms: *** scan %u done (event %x): %u networks, %u beacons/probe responses, %u htt msdus ***", g_ms, scans, e[0], nbss, scan_frames, htt_msdus);
+ 		next_scan_ms = scans < 3 ? g_ms + 10000 : 0;
+ 	}
+ }
+@@ -4386,7 +4568,7 @@ wmi_rx(const uint8_t *d, uint32_t len)
+ 		LOG("t=%u ms: *** WMI READY (fw MAC %02x:%02x:%02x:%02x:%02x:%02x) ***", g_ms, wmi_mac[0], wmi_mac[1],
+ 		    wmi_mac[2], wmi_mac[3], wmi_mac[4], wmi_mac[5]);
+ 		if (wmi_ready) {
+-			scan_start();                       /* HTT (data path) is not needed for a scan */
++			htt_start();                        /* the host rx ring first, then the scan */
+ 		}
+ 		break;
+ 	case WMI_EV_SCAN:
+@@ -4413,6 +4595,7 @@ radio_poll(unsigned ms)
+ 		return;
+ 	}
+ 	(void)ce_poll();
++	htt_poll();
+ 	if (scan_started && !scanning && next_scan_ms != 0 && g_ms >= next_scan_ms) {
+ 		next_scan_ms = 0;
+ 		scanning = scan_send_start();
+-- 
+2.43.0
+
