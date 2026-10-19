@@ -1,0 +1,197 @@
+From 6899948140fc903722f3746aec4ac6fe882be5de Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 20:12:25 +0300
+Subject: [PATCH] topaz-0126: TopazModem: radio API for the rest of the kernel
+ (scan on request, heard BSS with IEs, ready hook)
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 139 +++++++++++++++++++++++++++++---
+ 1 file changed, 127 insertions(+), 12 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 99ab541..7aba390 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -4164,9 +4164,13 @@ static const uint16_t scan_freqs[] = {
+ };
+ #define NFREQ ((uint32_t)(sizeof(scan_freqs) / sizeof(scan_freqs[0])))
+ static const uint8_t our_mac[6] = { 0x02, 0x54, 0x4F, 0x50, 0x41, 0x5A };   /* locally administered */
+-struct bss { uint8_t bssid[6]; char ssid[33]; uint8_t chan; int8_t rssi; uint16_t seen; };
++struct bss {
++	uint8_t bssid[6]; char ssid[33]; uint8_t chan; int8_t rssi; uint16_t seen;
++	uint8_t raw_ssid[32], raw_ssid_len; uint16_t freq, bintval, capab, ie_len; uint32_t last_ms; uint8_t ie[768];
++};
+ static struct bss bss[64];
+ static uint32_t nbss, scans, scan_frames;
++static volatile uint32_t api_scans_done;
+ static bool scan_started, scanning;
+ static unsigned next_scan_ms;
+ 
+@@ -4451,6 +4455,7 @@ scan_event(const uint8_t *t, uint32_t len)
+ 		scans++;
+ 		LOG("t=%u ms: *** scan %u done (event %x): %u networks, %u beacons/probe responses, %u htt msdus ***", g_ms, scans, e[0], nbss, scan_frames, htt_msdus);
+ 		next_scan_ms = scans < 3 ? g_ms + 10000 : 0;
++		api_scans_done++;
+ 	}
+ }
+ 
+@@ -4504,28 +4509,123 @@ scan_mgmt_rx(const uint8_t *t, uint32_t len)
+ 			chan = f[o + 2];
+ 		}
+ 	}
++	struct bss *b = NULL;
++	bool fresh = false;
+ 	for (uint32_t i = 0; i < nbss; i++) {
+ 		if (memcmp(bss[i].bssid, f + 16, 6) == 0) {
+-			bss[i].seen++;
+-			if (rssi > bss[i].rssi) {
+-				bss[i].rssi = (int8_t)rssi;
+-			}
++			b = &bss[i];
++			break;
++		}
++	}
++	if (b == NULL) {
++		if (nbss >= 64) {
+ 			return;
+ 		}
++		b = &bss[nbss++];
++		bzero(b, sizeof(*b));
++		memcpy(b->bssid, f + 16, 6);
++		fresh = true;
++	}
++	b->seen++;
++	b->rssi = (int8_t)rssi;
++	b->chan = (uint8_t)chan;
++	b->freq = (uint16_t)(chan == 14 ? 2484 : chan < 14 ? 2407 + 5 * chan : 5000 + 5 * chan);
++	b->last_ms = g_ms;
++	memcpy(&b->bintval, f + 32, 2);
++	memcpy(&b->capab, f + 34, 2);
++	b->ie_len = (uint16_t)MIN(flen - 36, (uint32_t)sizeof(b->ie));
++	memcpy(b->ie, f + 36, b->ie_len);
++	strlcpy(b->ssid, ssid, sizeof(b->ssid));
++	b->raw_ssid_len = 0;
++	for (uint32_t o = 36; o + 2 <= flen && o + 2 + f[o + 1] <= flen; o += 2 + f[o + 1]) {
++		if (f[o] == 0) {
++			b->raw_ssid_len = (uint8_t)MIN((uint32_t)f[o + 1], 32u);
++			memcpy(b->raw_ssid, f + o + 2, b->raw_ssid_len);
++			break;
++		}
+ 	}
+-	if (nbss >= 64) {
++	if (!fresh) {
+ 		return;
+ 	}
+-	struct bss *b = &bss[nbss++];
+-	memcpy(b->bssid, f + 16, 6);
+-	strlcpy(b->ssid, ssid, sizeof(b->ssid));
+-	b->chan = (uint8_t)chan;
+-	b->rssi = (int8_t)rssi;
+-	b->seen = 1;
+ 	LOG("t=%u ms: net %2u: %02x:%02x:%02x:**:**:** ch %3u %4d dBm '%s'", g_ms, nbss, b->bssid[0], b->bssid[1],
+ 	    b->bssid[2], b->chan, b->rssi, b->ssid);
+ }
+ 
++/* ---------------- the radio for the rest of the kernel (sys-independent C API) */
++
++/*
++ * What another part of the kernel may ask of the radio once it is up: a scan, and what the
++ * scans heard (each access point with its beacon's information elements, from which a reader
++ * tells the network's protection). The modem thread does the work; a caller's scan waits.
++ */
++extern "C" {
++struct topaz_wlan_bss {
++	uint8_t bssid[6];
++	uint8_t ssid[32], ssid_length;
++	uint16_t frequency;                         /* MHz */
++	int16_t rssi;                               /* dBm */
++	uint16_t beacon_interval, capability;
++	uint32_t age_ms;
++	uint16_t elements_length;
++	uint8_t elements[768];
++};
++void (*topaz_wlan_ready_hook)(void);
++bool topaz_wlan_ready(void);
++int topaz_wlan_scan(void);
++bool topaz_wlan_heard(unsigned index, struct topaz_wlan_bss *bss);
++void topaz_wlan_address(uint8_t address[6]);
++}
++
++static volatile bool api_scan_asked;
++static bool api_ready;
++
++bool
++topaz_wlan_ready(void)
++{
++	return api_ready;
++}
++
++void
++topaz_wlan_address(uint8_t address[6])
++{
++	memcpy(address, our_mac, 6);
++}
++
++int
++topaz_wlan_scan(void)
++{
++	if (!api_ready) {
++		return ENXIO;
++	}
++	uint32_t before = api_scans_done;
++	api_scan_asked = true;
++	for (int i = 0; i < 300 && api_scans_done == before; i++) {   /* 30 s */
++		IOSleep(100);
++	}
++	return api_scans_done != before ? 0 : ETIMEDOUT;
++}
++
++bool
++topaz_wlan_heard(unsigned index, struct topaz_wlan_bss *out)
++{
++	if (index >= nbss) {
++		return false;
++	}
++	const struct bss *b = &bss[index];
++	bzero(out, sizeof(*out));
++	memcpy(out->bssid, b->bssid, 6);
++	memcpy(out->ssid, b->raw_ssid, b->raw_ssid_len);
++	out->ssid_length = b->raw_ssid_len;
++	out->frequency = b->freq;
++	out->rssi = b->rssi;
++	out->beacon_interval = b->bintval;
++	out->capability = b->capab;
++	out->age_ms = g_ms - b->last_ms;
++	out->elements_length = MIN(b->ie_len, (uint16_t)sizeof(out->elements));
++	memcpy(out->elements, b->ie, out->elements_length);
++	return true;
++}
++
+ static void
+ wmi_rx(const uint8_t *d, uint32_t len)
+ {
+@@ -4596,6 +4696,21 @@ radio_poll(unsigned ms)
+ 	}
+ 	(void)ce_poll();
+ 	htt_poll();
++	if (scan_started && !api_ready) {
++		api_ready = true;
++		LOG("t=%u ms: wlan: radio ready for the rest of the kernel", g_ms);
++		if (topaz_wlan_ready_hook != NULL) {
++			topaz_wlan_ready_hook();
++		}
++	}
++	if (scan_started && !scanning && api_scan_asked) {
++		api_scan_asked = false;
++		next_scan_ms = 0;
++		scanning = scan_send_start();
++		if (!scanning) {
++			api_scans_done++;
++		}
++	}
+ 	if (scan_started && !scanning && next_scan_ms != 0 && g_ms >= next_scan_ms) {
+ 		next_scan_ms = 0;
+ 		scanning = scan_send_start();
+-- 
+2.43.0
+
