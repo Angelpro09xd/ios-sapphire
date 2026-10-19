@@ -1,0 +1,310 @@
+From 230ba8bdba53936a04e7610da91d1a3d0a18362e Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 17:50:41 +0300
+Subject: [PATCH] topaz-0115: modem firmware read-only from the stock modem_a
+ partition (no userdata changes)
+
+---
+ bsd/dev/sweet_ufs.c             | 101 +++++++++++++++++++++++
+ iokit/Kernel/arm/TopazModem.cpp | 140 +++++++++++++++++++-------------
+ 2 files changed, 184 insertions(+), 57 deletions(-)
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 467ce46..143db60 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -371,6 +371,107 @@ ufs_find_partition(const char *want)
+ 	return ENOENT;
+ }
+ 
++/*
++ * topaz: read-only access to other GPT partitions on LUNs 0-5 (modem firmware in
++ * modem_a, later the EFS copies). Never writes; the LUN0 GPT fence state is untouched.
++ */
++static struct { char name[37]; uint8_t lun; uint64_t first, nblocks; } part_cache[8];
++static unsigned part_cached;
++
++static int
++ufs_lookup_part(const char *want, unsigned *slot)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++
++	for (unsigned i = 0; i < part_cached; i++) {
++		if (strcmp(part_cache[i].name, want) == 0) {
++			*slot = i;
++			return 0;
++		}
++	}
++	if (part_cached == sizeof(part_cache) / sizeof(part_cache[0]) || strlen(want) > 36) {
++		return ENOSPC;
++	}
++	for (uint8_t lun = 0; lun < 6; lun++) {
++		su.lun = lun;
++		if (ufs_read_blocks(1, 1) != 0 || memcmp(b, "EFI PART", 8) != 0) {
++			continue;
++		}
++		uint64_t entry_lba;
++		uint32_t nent, esz;
++		memcpy(&entry_lba, b + 72, 8);
++		memcpy(&nent, b + 80, 4);
++		memcpy(&esz, b + 84, 4);
++		if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE ||
++		    ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK) != 0) {
++			continue;
++		}
++		for (uint32_t i = 0; i < nent; i++) {
++			const uint8_t *e = b + i * esz;
++			char name[37];
++			unsigned c;
++			for (c = 0; c < 36; c++) {
++				uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++				if (ch == 0 || ch > 0x7f) {
++					break;
++				}
++				name[c] = (char)ch;
++			}
++			name[c] = 0;
++			uint64_t first, last;
++			memcpy(&first, e + 32, 8);
++			memcpy(&last, e + 40, 8);
++			if (strcmp(name, want) != 0 || last < first) {
++				continue;
++			}
++			unsigned k = part_cached++;
++			strlcpy(part_cache[k].name, want, sizeof(part_cache[k].name));
++			part_cache[k].lun = lun;
++			part_cache[k].first = first;
++			part_cache[k].nblocks = last - first + 1;
++			printf("SWEET UFS: partition %s: LUN %u blocks 0x%llx+0x%llx (read-only)\n",
++			    want, lun, first, last - first + 1);
++			*slot = k;
++			return 0;
++		}
++	}
++	return ENOENT;
++}
++
++int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
++int
++sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len)
++{
++	unsigned slot = 0;
++	int error;
++
++	if (!su.ready) {
++		return EAGAIN;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	uint8_t saved = su.lun;
++	error = ufs_lookup_part(want, &slot);
++	uint64_t bytes = error ? 0 : part_cache[slot].nblocks * UFS_BLOCK;
++	if (!error && (off > bytes || len > bytes - off)) {
++		error = EINVAL;
++	}
++	for (uint64_t done = 0; !error && done < len;) {
++		uint64_t pos = off + done;
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t want_b = (uint32_t)MIN(len - done, (uint64_t)(BOUNCE_SIZE - skip));
++		uint32_t blocks = (skip + want_b + UFS_BLOCK - 1) / UFS_BLOCK;
++		su.lun = part_cache[slot].lun;
++		error = ufs_read_blocks(part_cache[slot].first + pos / UFS_BLOCK, blocks);
++		if (!error) {
++			memcpy((uint8_t *)dst + done, (const uint8_t *)(su.dma + DMA_BOUNCE) + skip, want_b);
++			done += want_b;
++		}
++	}
++	su.lun = saved;
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
+ static int
+ ufs_take_over_host(void)
+ {
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 9ec7ca5..4464704 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -20,16 +20,12 @@
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+-#include <sys/vnode.h>
+-#include <sys/fcntl.h>
+-#include <sys/proc.h>
++#include <libkern/crc.h>
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ #define LOG(fmt, ...)       IOLog("TopazModem: " fmt "\n", ##__VA_ARGS__)
+ 
+-#define FW_DIR              "/usr/share/firmware/topaz/modem/"
+-
+ #define PAS_ID_MODEM        4
+ #define SCM_FN(svc, cmd)    (0x42000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
+ #define SCM_SVC_PIL         0x02
+@@ -160,62 +156,86 @@ scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 
+ /* ---------------------------------------------------------------- firmware files */
+ 
+-/* Read FW_DIR name at offset 0 into dst (at most max bytes). Returns bytes read or -1. */
+-static int64_t
+-fw_read(const char *name, void *dst, uint64_t max)
++/*
++ * The firmware is read from the phone's stock modem partition (boot-arg modem_part=, default
++ * modem_a), read-only through sweet_ufs (bsd/dev/sweet_ufs.c): nothing has to be put on
++ * userdata. Where each file lies in that FAT16 volume was worked out on the host from the
++ * same NON-HLOS.bin (HyperOS 2.0.208; every file is one contiguous run); the CRC32 tells
++ * whether the phone's partition is that image.
++ */
++extern "C" int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
++
++static char fw_part[32] = "modem_a";
++static const struct { const char *name; uint32_t off, size, crc; } fw_files[] = {
++	{ "modem.b00", 0x1e1d000, 0x414, 0xaacde80c },
++	{ "modem.b01", 0x1e21000, 0x1f78, 0x80555ebe },
++	{ "modem.b02", 0x1e25000, 0x2930, 0x0858b3a0 },
++	{ "modem.b03", 0x1e29000, 0x2518, 0x93a2467e },
++	{ "modem.b04", 0x1e2d000, 0x4a3ac, 0xbf85c65c },
++	{ "modem.b05", 0x1e79000, 0x119d8, 0xf3637bd9 },
++	{ "modem.b06", 0x1e8d000, 0x100c, 0x89d24f27 },
++	{ "modem.b07", 0x1e91000, 0x90b4, 0xefeddcd9 },
++	{ "modem.b08", 0x1e9d000, 0x4f054, 0xeb2e2bdb },
++	{ "modem.b09", 0x1eed000, 0x143ee8, 0xc8344d45 },
++	{ "modem.b10", 0x2031000, 0x40000, 0x7e9db699 },
++	{ "modem.b11", 0x2071000, 0x540, 0x0030dad4 },
++	{ "modem.b12", 0x2075000, 0xe2210, 0x7d37ba08 },
++	{ "modem.b14", 0x2159000, 0x2d, 0x7a4002c7 },
++	{ "modem.b15", 0x215d000, 0x7c, 0x959b6a58 },
++	{ "modem.b16", 0x2161000, 0x9c1a0, 0xd902be24 },
++	{ "modem.b17", 0x2201000, 0x61110, 0xd2182ca7 },
++	{ "modem.b18", 0x2265000, 0x2d29a9, 0x672e3b04 },
++	{ "modem.b19", 0x2539000, 0x2d94cc, 0x916bcc13 },
++	{ "modem.b22", 0x2815000, 0x10ec0, 0x444b4456 },
++	{ "modem.b23", 0x2829000, 0x1722040, 0x3c3bc2a3 },
++	{ "modem.b24", 0x3f4d000, 0xa07900, 0x4001a993 },
++	{ "modem.b25", 0x4955000, 0x77a45, 0xda7bfa33 },
++	{ "modem.b26", 0x49cd000, 0x15104, 0x33437cee },
++	{ "modem.b27", 0x49e5000, 0x1378, 0x161303ae },
++	{ "modem.b28", 0x49e9000, 0xb0, 0x1e475201 },
++	{ "modem.b29", 0x49ed000, 0x7d52c, 0x7d6f01a3 },
++	{ "modem.mdt", 0x4a6d000, 0x238c, 0x8742d22b },
++};
++
++static int
++fw_find(const char *name)
+ {
+-	char path[96];
+-	vnode_t vp = NULLVP;
+-	vfs_context_t ctx = vfs_context_kernel();
+-	uint64_t done = 0;
+-	int err;
+-
+-	snprintf(path, sizeof(path), FW_DIR "%s", name);
+-	err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
+-	if (err != 0) {
+-		LOG("%s: open error %d", path, err);
+-		return -1;
+-	}
+-	/* through a cacheable bounce buffer: the destination is device-ish WC memory */
+-	const uint32_t chunk = 256 * 1024;
+-	uint8_t *bounce = (uint8_t *)IOMalloc(chunk);
+-	while (bounce != NULL && done < max) {
+-		int resid = 0, len = (int)MIN((uint64_t)chunk, max - done);
+-		err = vn_rdwr(UIO_READ, vp, (caddr_t)bounce, len, (off_t)done, UIO_SYSSPACE, 0,
+-		    vfs_context_ucred(ctx), &resid, current_proc());
+-		if (err != 0 || resid == len) {
+-			break;
++	for (unsigned i = 0; i < sizeof(fw_files) / sizeof(fw_files[0]); i++) {
++		if (strcmp(fw_files[i].name, name) == 0) {
++			return (int)i;
+ 		}
+-		memcpy((uint8_t *)dst + done, bounce, len - resid);
+-		done += len - resid;
+ 	}
+-	if (bounce != NULL) {
+-		IOFree(bounce, chunk);
+-	}
+-	vnode_close(vp, FREAD, ctx);
+-	return err != 0 ? -1 : (int64_t)done;
++	return -1;
+ }
+ 
+ static int64_t
+ fw_size(const char *name)
+ {
+-	char path[96];
+-	vnode_t vp = NULLVP;
+-	vfs_context_t ctx = vfs_context_kernel();
+-	off_t size = -1;
++	int i = fw_find(name);
++	return i < 0 ? -1 : (int64_t)fw_files[i].size;
++}
+ 
+-	snprintf(path, sizeof(path), FW_DIR "%s", name);
+-	if (vnode_lookup(path, 0, &vp, ctx) != 0) {
++/* Read the whole file name into dst (max bytes at most). Returns bytes read or -1. */
++static int64_t
++fw_read(const char *name, void *dst, uint64_t max)
++{
++	int i = fw_find(name), err;
++
++	if (i < 0 || fw_files[i].size > max) {
++		LOG("%s: not in the table or too big (%lld)", name, fw_size(name));
+ 		return -1;
+ 	}
+-	struct vnode_attr va;
+-	VATTR_INIT(&va);
+-	VATTR_WANTED(&va, va_data_size);
+-	if (vnode_getattr(vp, &va, ctx) == 0 && VATTR_IS_SUPPORTED(&va, va_data_size)) {
+-		size = (off_t)va.va_data_size;
++	err = sweet_ufs_read_part(fw_part, fw_files[i].off, dst, fw_files[i].size);
++	if (err != 0) {
++		LOG("%s: read from %s failed: %d", name, fw_part, err);
++		return -1;
++	}
++	uint32_t crc = crc32(0, dst, fw_files[i].size);
++	if (crc != fw_files[i].crc) {
++		/* TrustZone checks the signature anyway: say so and go on */
++		LOG("%s: crc32 %08x, expected %08x: %s is not the image this was made for", name, crc, fw_files[i].crc, fw_part);
+ 	}
+-	vnode_put(vp);
+-	return size;
++	return fw_files[i].size;
+ }
+ 
+ /* ---------------------------------------------------------------- SMEM */
+@@ -601,16 +621,22 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ 	unsigned watch = 60;
+ 
+ 	(void)PE_parse_boot_argn("modem_watch", &watch, sizeof(watch));
+-	/* the firmware lives on the root filesystem: wait for it */
+-	for (int i = 0; i < 300; i++) {
+-		vnode_t root = vfs_rootvnode();
+-		if (root != NULLVP) {
+-			vnode_put(root);
+-			if (fw_size("modem.mdt") > 0) {
+-				break;
++	(void)PE_parse_boot_argn("modem_part", fw_part, sizeof(fw_part));
++	/* sweet_ufs comes up with the root device; the modem is not needed before that */
++	{
++		uint8_t probe[16];
++		int err = EAGAIN;
++		for (int i = 0; i < 120 && err == EAGAIN; i++) {
++			err = sweet_ufs_read_part(fw_part, fw_files[0].off, probe, sizeof(probe));
++			if (err == EAGAIN) {
++				IOSleep(500);
+ 			}
+ 		}
+-		IOSleep(1000);
++		if (err != 0) {
++			LOG("partition %s: %d", fw_part, err);
++			thread_terminate(current_thread());
++			return;
++		}
+ 	}
+ 	smem_map = map_phys(SMEM_PA, SMEM_SIZE, true);
+ 	pool_map = map_phys(MODEM_POOL_BASE, MODEM_POOL_SIZE, true);
+-- 
+2.43.0
+
