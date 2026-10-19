@@ -1,0 +1,20 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index f5fb633..ff9d858 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -490,6 +490,15 @@ touch_focaltech(void)
+ 	if (n > st.s_maxn) {
+ 		st.s_maxn = n;
+ 	}
++	if (n > TOUCH_MAX && buf[3] == 0xffu) {
++		/*
++		 * topaz: with no contact the FT5452 (firmware as updated by HyperOS
++		 * 2.0.208) reports TD_STATUS 0xff and 0xff records. TopazTouch: a count
++		 * of 0 or > 10 means "release all", not an error.
++		 */
++		touch_report(0, x, y);
++		return 0;
++	}
+ 	if (n > TOUCH_MAX) {
+ 		/* topaz: show what the IC actually sends (rate-limited) */
+ 		static uint64_t last_dump;
