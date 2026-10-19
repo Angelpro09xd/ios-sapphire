@@ -1,5 +1,41 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE port (Redmi Note 13 4G, sapphire/sapphiren) - handoff 2026-10-19
+
+Branch `sapphire`, forked from ios-topaz `topaz` at 5b208e0.
+
+**Verified from the sapphire kernel DT/dtbo (Infinity X 17 tree,
+`device/xiaomi/sapphire-kernel/dtbs`, sapphiren overlay = dtbo entry 46,
+board-id 0x30022; decompiled copies in `../ios-sapphire-research/`, not in git):**
+same SoC as topaz (SM6225 khaje, msm-id 0x206/0x24a) and the same addresses:
+GIC 0xf200000/0xf300000, UFS 0x4804000, PS_HOLD 0x440b000, IMEM restart
+reason 0xc12565c, cpufreq-hw, splash region 0x5c000000+0xf00000.
+Touch: FocalTech `focaltech,fts` at 0x38 on `qupv3_se2_i2c` (i2c@4a88000),
+IRQ GPIO80, reset GPIO86, AVDD GPIO36 (identical to topaz).
+Volume up: PM6125 GPIO5. Panel `n7_38_0c_0a` 1080x2400 video mode, DSC 1.1
+(slice 540x20), 120/90/60 Hz, backlight max 0x7ff (the topaz m7 panels too).
+
+**Differences / unknowns (need the phone):**
+- DDR layout: `/memory` is filled in by ABL. The user's phone has ~6 GB;
+  `mkadt.py --highmem` assumes topaz's 4 GiB at 0x1_40000000. Read
+  `/sys/firmware/fdt` (root) and set the ADT RAM from it, or do roadmap
+  item 8 (shim reads /memory from the ABL DTB).
+- Touch raw range: topaz FT5452 reports 1350x3000 (patch 0083 scales x4/5).
+  The sapphire Linux DT says display-coords 17280x38400, which is the
+  Xiaomi driver's range, not necessarily the chip's. Check the chip id and
+  raw maxima with the patch 0089 diagnostics before changing 0083.
+- ABL: assumed to behave like topaz's (boot v4, drops the boot ramdisk).
+  First test = the diagnostic shim (`shim/build.sh` with no payload), RAM only.
+
+**Done:** 8cc24ec `tools/mkadt.py` sapphire identity. `shim/build.sh` builds
+on the server (aarch64-linux-gnu-gcc, `MKBOOTIMG="python3
+<aosp>/system/tools/mkbootimg/mkbootimg.py"`).
+
+**Blocked on the user:** a GitHub repo for the kernel CI (macOS runners) and
+`gh` auth to download artifacts; the iOS root image needs root + apfs-fuse +
+hfsprogs (not on the server: build it on the user's PC/WSL); device access
+over the adb tunnel; explicit OK before `fastboot flash userdata`.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
