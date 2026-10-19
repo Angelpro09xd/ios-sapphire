@@ -1,20 +1,20 @@
-From 8a38c136fc7d662ad61e6301e31512268ff8d4ae Mon Sep 17 00:00:00 2001
+From d0db1f63a40953e20fb908a732f3b67dae79eeee Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Mon, 19 Oct 2026 10:46:44 +0300
-Subject: [PATCH] topaz-0107: dcache clean only on display buffers; global
- stubs restored
+Subject: [PATCH] topaz-0107: display-only dcache clean (built for real), async
+ panel brightness
 
 ---
- iokit/Kernel/arm/SweetFramebuffer.cpp | 11 ++++-----
- osfmk/arm/caches.c                    | 33 ++++++++++++++++++++-------
- osfmk/console/video_console.c         |  4 ++--
- 3 files changed, 32 insertions(+), 16 deletions(-)
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 47 ++++++++++++++++++++-------
+ osfmk/arm/caches.c                    | 37 ++++++++++++++++-----
+ osfmk/console/video_console.c         |  4 +--
+ 3 files changed, 65 insertions(+), 23 deletions(-)
 
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 5a9f33c..2de5304 100644
+index 5a9f33c..989c16f 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -69,7 +69,7 @@ static AppleCLCD *sweet_cons_fb;
+@@ -69,13 +69,14 @@ static AppleCLCD *sweet_cons_fb;
  static void sweet_cons_show(void);
  class OSDictionary;
  static void sweet_bl_log(const char *who, OSDictionary *d);
@@ -23,7 +23,33 @@ index 5a9f33c..2de5304 100644
  extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
  
  #if defined(SWEET)
-@@ -342,7 +342,7 @@ AppleCLCD::start(IOService *provider)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <libkern/c++/OSCollectionIterator.h>
++#include <kern/thread_call.h>
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
+@@ -190,6 +191,9 @@ public:
+ 	uint64_t      fDsiBufPhys;
+ 	IOLock       *fBlLock;
+ 	uint32_t      fBlLevel;       /* panel DBV 1..0x7ff, kept while the display is off */
++	uint32_t      fBlSent;        /* last level sent to the panel */
++	thread_call_t fBlCall;        /* sends the latest level off backboardd's thread */
++	static void   blWork(thread_call_param_t p0, thread_call_param_t p1);
+ 	bool          dsiDcsLong(const uint8_t *payload, uint32_t len);
+ 	bool          dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len);
+ 	void          setPanelOn(bool on);
+@@ -291,6 +295,8 @@ AppleCLCD::start(IOService *provider)
+ 	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+ 	fBlLock = IOLockAlloc();
+ 	fBlLevel = 0x133;                       /* panel init level (stock DT) */
++	fBlSent = ~0u;
++	fBlCall = thread_call_allocate(&AppleCLCD::blWork, this);
+ 	if (fDsi != NULL) {
+ 		IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
+ 		setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
+@@ -342,7 +348,7 @@ AppleCLCD::start(IOService *provider)
  		if (fCons != NULL) {
  			uint8_t *c = (uint8_t *)fCons->getBytesNoCopy();
  			memcpy(c, (const void *)fPixels, fsz);  /* keep what the console drew */
@@ -32,7 +58,7 @@ index 5a9f33c..2de5304 100644
  			fConsPhys = fCons->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
  			sweet_cons_fb = this;
  			sweet_console_show_hook = sweet_cons_show;
-@@ -582,7 +582,7 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+@@ -582,7 +588,7 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
  	if (len) {
  		memcpy(p + 4, payload, len);
  	}
@@ -41,7 +67,56 @@ index 5a9f33c..2de5304 100644
  	uint32_t ctrl = dsi_rd(fDsi, 0x004), trig = dsi_rd(fDsi, 0x084);
  	if ((trig & 7) != 4) {
  		dsi_wr(fDsi, 0x084, (trig & ~7u) | 4);  /* DMA trigger: software */
-@@ -753,7 +753,7 @@ void
+@@ -596,10 +602,10 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ 	dsi_wr(fDsi, 0x03c, dma & ~(1u << 26));          /* high speed */
+ 	dsi_wr(fDsi, 0x090, 1);                          /* SW trigger */
+ 	bool done = false;
+-	for (int i = 0; i < 50 && !done; i++) {
++	for (int i = 0; i < 100 && !done; i++) {
+ 		done = (dsi_rd(fDsi, 0x110) & 1) != 0;
+ 		if (!done) {
+-			IODelay(1000);
++			IODelay(200);
+ 		}
+ 	}
+ 	dsi_wr(fDsi, 0x110, dsi_rd(fDsi, 0x110) | 1);
+@@ -661,14 +667,32 @@ AppleCLCD::setProperties(OSObject *properties)
+ 	}
+ 	IOLockLock(fLock);
+ 	fBlLevel = (uint32_t)level;
+-	bool off = fPowerOff;
+ 	IOLockUnlock(fLock);
+-	if (!off) {
+-		setPanelLevel((uint32_t)level);
++	/*
++	 * CoreBrightness runs inside backboardd and ramps the level in many small
++	 * synchronous steps; waiting for the DSI here stalled rendering. Only note
++	 * the level; a thread call sends the latest one.
++	 */
++	if (fBlCall != NULL) {
++		thread_call_enter(fBlCall);
+ 	}
+ 	return kIOReturnSuccess;
+ }
+ 
++void
++AppleCLCD::blWork(thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	AppleCLCD *fb = (AppleCLCD *)p0;
++	IOLockLock(fb->fLock);
++	uint32_t level = fb->fBlLevel;
++	bool off = fb->fPowerOff;
++	IOLockUnlock(fb->fLock);
++	if (!off && level != fb->fBlSent) {
++		fb->fBlSent = level;
++		fb->setPanelLevel(level);
++	}
++}
++
+ static void
+ sweet_bl_log(const char *who, OSDictionary *d)
+ {
+@@ -753,7 +777,7 @@ void
  AppleCLCD::flipBack(void)
  {
  	uint32_t idx = fFlipIdx ^ 1;
@@ -50,7 +125,7 @@ index 5a9f33c..2de5304 100644
  	scanFrom(fFlipPhys[idx], fRowBytes);
  	fFlipIdx = idx;
  }
-@@ -815,8 +815,7 @@ AppleCLCD::directPresent(const uint8_t *rec)
+@@ -815,8 +839,7 @@ AppleCLCD::directPresent(const uint8_t *rec)
  					flipFrom((const uint8_t *)(va + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4),
  					    s->bytesPerRow);
  				} else {
@@ -60,13 +135,27 @@ index 5a9f33c..2de5304 100644
  					scanFrom(pa, s->bytesPerRow);
  				}
  				ok = true;
+@@ -1112,10 +1135,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			IOLockUnlock(fFB->fLock);
+ 			if (changed && fFB->fDsi != NULL) {
+ 				if (off) {
+-					fFB->setPanelLevel(1);
+ 					fFB->setPanelOn(false);
+ 				} else {
+ 					fFB->setPanelOn(true);
++					fFB->fBlSent = level;
+ 					fFB->setPanelLevel(level);
+ 				}
+ 			}
 diff --git a/osfmk/arm/caches.c b/osfmk/arm/caches.c
-index 6ef93ad..25252f8 100644
+index 6ef93ad..8251868 100644
 --- a/osfmk/arm/caches.c
 +++ b/osfmk/arm/caches.c
-@@ -384,10 +384,14 @@ platform_cache_flush_wimg(
+@@ -382,12 +382,15 @@ platform_cache_flush_wimg(
  
- #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #else   /* __ARM_COHERENT_IO__ */
+ 
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
  /*
 - * topaz/sweet: Apple SoCs keep DMA coherent with the CPU caches, so these
 - * are no-ops upstream. The Qualcomm display (MDP) and other masters here
@@ -82,7 +171,7 @@ index 6ef93ad..25252f8 100644
  static void
  sweet_dcache_op(vm_offset_t addr, unsigned length, boolean_t phys, bool invalidate)
  {
-@@ -413,17 +417,30 @@ sweet_dcache_op(vm_offset_t addr, unsigned length, boolean_t phys, bool invalida
+@@ -413,17 +416,33 @@ sweet_dcache_op(vm_offset_t addr, unsigned length, boolean_t phys, bool invalida
  }
  
  void
@@ -91,6 +180,9 @@ index 6ef93ad..25252f8 100644
 +{
 +	sweet_dcache_op(addr, length, FALSE, false);
 +}
++
++#if 0
++
 +#endif
 +
 +void
