@@ -1,0 +1,533 @@
+From 45cc47150bb3c1c3e4de18de24bbf0a5589dfb0b Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 19:33:06 +0300
+Subject: [PATCH] topaz-0122: TopazModem: WLFW QMI to mission mode; serve the
+ modem for the whole session
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 425 +++++++++++++++++++++++++++++++-
+ 1 file changed, 415 insertions(+), 10 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index e18599a..431ec3b 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -407,6 +407,7 @@ smp2p_add_out(struct smp2p_hdr *o, const char *name, uint32_t value)
+ static bool svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *data, uint32_t len);
+ static void svc_announce(void);
+ static void svc_summary(void);
++static void wlfw_arrive(uint32_t node, uint32_t port);
+ 
+ /* ---------------------------------------------------------------- GLINK over SMEM */
+ 
+@@ -747,6 +748,7 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 		}
+ 		if (c->a == QMI_SVC_WLFW) {
+ 			LOG("t=%u ms: *** WLFW service 0x45 up: inst %x node %u port %x ***", g_ms, c->b, c->c, c->d);
++			wlfw_arrive(c->c, c->d);
+ 		} else if (c->a != 0) {
+ 			LOG("t=%u ms: service %x:%x port %x %s", g_ms, c->a, c->b, c->d, svc_name(c->a));
+ 		}
+@@ -2875,11 +2877,10 @@ static uint64_t rmtfs_pa;
+ static uint8_t *rmtfs_va;
+ static unsigned rmtfs_reads, rmtfs_writes, rmtfs_err;
+ 
+-/* hyp_assign_phys: give the buffer to HLOS + modem + nav (SCM 0x0C/0x16) */
++/* hyp_assign_phys (SCM 0x0C/0x16): from HLOS to the given VMIDs, read-write */
+ static uint64_t
+-scm_assign_to_modem(uint64_t addr, uint64_t size)
++scm_assign(uint64_t addr, uint64_t size, const uint32_t *vmids, unsigned count)
+ {
+-	static const uint32_t vmids[] = { VMID_HLOS, VMID_MSS_MSA, VMID_NAV };
+ 	uint64_t pa = 0, res = 0;
+ 	uint64_t *p = (uint64_t *)pool_alloc(0x1000, &pa);
+ 
+@@ -2891,13 +2892,13 @@ scm_assign_to_modem(uint64_t addr, uint64_t size)
+ 	uint32_t *src = (uint32_t *)(p + 8);        /* 0x040: src vmids */
+ 	src[0] = VMID_HLOS;
+ 	uint32_t *dst = (uint32_t *)(p + 16);       /* 0x080: {vmid, perm, ctx(8), ctx_size, unused} x3 */
+-	for (unsigned i = 0; i < 3; i++) {
++	for (unsigned i = 0; i < count && i < 8; i++) {
+ 		dst[6 * i] = vmids[i];
+ 		dst[6 * i + 1] = PERM_RW;
+ 	}
+ 	p[32] = 4;                                  /* 0x100: extended args: src size */
+ 	p[33] = pa + 0x80;                          /* dest */
+-	p[34] = 3 * 24;                             /* dest size */
++	p[34] = count * 24;                         /* dest size */
+ 	p[35] = 0;
+ 	mb();
+ 	uint64_t args[8] = { SCM_FN(0x0C, 0x16), 7 | (1 << 4) | (1 << 8) | (1 << 12), pa, 16, pa + 0x40, pa + 0x100, 0, 0 };
+@@ -2908,7 +2909,7 @@ scm_assign_to_modem(uint64_t addr, uint64_t size)
+ 		smc(args);
+ 	}
+ 	res = args[1];
+-	LOG("SCM assign %llx+%llx to modem: ret=%llx res=%llx", addr, size, args[0], res);
++	LOG("SCM assign %llx+%llx -> %u vmids: ret=%llx res=%llx", addr, size, count, args[0], res);
+ 	return args[0] != 0 ? args[0] : res;
+ }
+ 
+@@ -2985,7 +2986,8 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+ 			if (rmtfs_va == NULL) {
+ 				rmtfs_pa = 0;
+ 			} else {
+-				(void)scm_assign_to_modem(rmtfs_pa, RMTFS_BUF_SIZE);
++				static const uint32_t v[] = { VMID_HLOS, VMID_MSS_MSA, VMID_NAV };
++				(void)scm_assign(rmtfs_pa, RMTFS_BUF_SIZE, v, 3);
+ 			}
+ 		}
+ 		LOG("t=%u ms: rmtfs: alloc for caller %u -> %llx", g_ms, caller, rmtfs_pa);
+@@ -3011,6 +3013,404 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+ 	qm_send(&m, PORT_RMTFS, node, port);
+ }
+ 
++/* ---------------------------------------------------------------- WLFW (QMI 0x45) */
++
++/*
++ * The WLAN firmware service, the way ath10k qmi.c talks to it (port of topaz-woa Wlfw.c):
++ * ind_register -> host_cap -> msa_info (+ assign the MSA regions) -> msa_ready -> cap ->
++ * MSA_READY ind -> board data (bdwlan.*) -> cal_report -> FW_READY ind -> wlan_cfg (CE
++ * layout) -> wlan_mode mission. Nothing touches the WLAN registers here (CE comes next and
++ * only after mission mode: before it a register read hangs the bus).
++ */
++#define PORT_WLFWC          0x4004              /* our QMI client port towards WLFW */
++#define QMI_IND             4
++#define WLFW_IND_REGISTER   0x20
++#define WLFW_FW_READY_IND   0x21
++#define WLFW_WLAN_MODE      0x22
++#define WLFW_WLAN_CFG       0x23
++#define WLFW_CAP            0x24
++#define WLFW_BDF_DOWNLOAD   0x25
++#define WLFW_CAL_REPORT     0x26
++#define WLFW_MSA_READY_IND  0x2B
++#define WLFW_MSA_INFO       0x2D
++#define WLFW_MSA_READY      0x2E
++#define WLFW_HOST_CAP       0x34
++#define WLFW_MSA_BASE       0x51900000u         /* DTB wlan_msa_region, inside "PIL Reserved" */
++#define WLFW_MSA_SIZE       0x00100000u
++#define WLFW_CLIENT_ID      0x4b4e454c          /* ath10k ATH10K_QMI_CLIENT_ID */
++#define WLFW_SEG            6144                /* QMI_WLFW_MAX_DATA_SIZE_V01 */
++#define VMID_WLAN           0x18
++#define VMID_WLAN_CE        0x19
++
++static uint32_t w_node, w_port, w_board = 0xFF, w_bdf_seg;
++static uint16_t w_txn = 1;
++static bool w_msa_ind, w_cap_done, w_bdf_started, w_fw_ready, w_mission;
++static int w_bdf_fi = -1;
++static uint32_t w_bdf_len, w_bdf_off;
++static const char *w_step = "not started";
++
++struct wmsg { uint8_t *b; uint32_t n; };
++
++static bool
++wm_new(struct wmsg *m, uint16_t msg)
++{
++	m->b = (uint8_t *)IOMalloc(WLFW_SEG + 128);
++	if (m->b == NULL) {
++		return false;
++	}
++	bzero(m->b, WLFW_SEG + 128);
++	m->b[0] = QMI_REQ;
++	uint16_t t = w_txn++;
++	memcpy(m->b + 1, &t, 2);
++	memcpy(m->b + 3, &msg, 2);
++	m->n = 7;
++	return true;
++}
++
++static void
++wm_tlv(struct wmsg *m, uint8_t type, const void *v, uint16_t len)
++{
++	m->b[m->n] = type;
++	memcpy(m->b + m->n + 1, &len, 2);
++	if (len != 0) {
++		memcpy(m->b + m->n + 3, v, len);
++	}
++	m->n += 3 + len;
++}
++
++static void wm_u8(struct wmsg *m, uint8_t t, uint8_t v) { wm_tlv(m, t, &v, 1); }
++static void wm_u32(struct wmsg *m, uint8_t t, uint32_t v) { wm_tlv(m, t, &v, 4); }
++
++/* TLV with a u8 element count in front of an array */
++static void
++wm_array(struct wmsg *m, uint8_t type, uint8_t count, const void *v, uint16_t bytes)
++{
++	uint16_t l = (uint16_t)(1 + bytes);
++	m->b[m->n] = type;
++	memcpy(m->b + m->n + 1, &l, 2);
++	m->b[m->n + 3] = count;
++	memcpy(m->b + m->n + 4, v, bytes);
++	m->n += 4 + bytes;
++}
++
++static void
++wm_send(struct wmsg *m)
++{
++	uint16_t l = (uint16_t)(m->n - 7);
++	memcpy(m->b + 5, &l, 2);
++	qrtr_send(QRTR_TYPE_DATA, PORT_WLFWC, w_node, w_port, m->b, m->n);
++	IOFree(m->b, WLFW_SEG + 128);
++}
++
++static bool
++w_result(const uint8_t *d, uint32_t len, uint16_t *err)
++{
++	uint16_t l = 0;
++	const uint8_t *r = qm_find(d, len, 2, &l);
++	uint16_t res = 0xFFFF;
++	*err = 0xFFFF;
++	if (r != NULL && l >= 4) {
++		memcpy(&res, r, 2);
++		memcpy(err, r + 2, 2);
++	}
++	return res == 0;
++}
++
++static void
++w_simple(uint16_t msg, const char *step)
++{
++	struct wmsg m;
++	if (wm_new(&m, msg)) {
++		wm_send(&m);
++		w_step = step;
++	}
++}
++
++static void
++w_bdf_segment(void)
++{
++	struct wmsg m;
++	uint32_t chunk = MIN(w_bdf_len - w_bdf_off, (uint32_t)WLFW_SEG);
++	bool end = w_bdf_off + chunk >= w_bdf_len;
++
++	if (!wm_new(&m, WLFW_BDF_DOWNLOAD)) {
++		return;
++	}
++	wm_u8(&m, 0x01, 1);                         /* valid */
++	wm_u32(&m, 0x10, 0);                        /* file_id */
++	wm_u32(&m, 0x11, w_bdf_len);                /* total_size */
++	wm_u32(&m, 0x12, w_bdf_seg);                /* seg_id */
++	uint8_t *t = m.b + m.n;                     /* data: u16 len + bytes */
++	uint16_t tl = (uint16_t)(2 + chunk), dl = (uint16_t)chunk;
++	t[0] = 0x13;
++	memcpy(t + 1, &tl, 2);
++	memcpy(t + 3, &dl, 2);
++	if (!fw_all_read(w_bdf_fi, w_bdf_off, t + 5, chunk)) {
++		LOG("wlfw: board data read failed");
++		IOFree(m.b, WLFW_SEG + 128);
++		return;
++	}
++	m.n += 5 + chunk;
++	wm_u8(&m, 0x14, end ? 1 : 0);               /* end */
++	wm_send(&m);
++	w_bdf_off += chunk;
++	w_bdf_seg++;
++	w_step = "bdf download";
++}
++
++/* bdwlan.bNN for board ids < 0x100, bdwlan.NNN otherwise, bdwlan.bin as fallback */
++static void
++w_start_bdf(void)
++{
++	char name[40];
++	if (w_bdf_started || !w_msa_ind || !w_cap_done) {
++		return;
++	}
++	w_bdf_started = true;
++	if (w_board == 0xFF) {
++		snprintf(name, sizeof(name), "image/bdwlan.bin");
++	} else if (w_board < 0x100) {
++		snprintf(name, sizeof(name), "image/bdwlan.b%02x", w_board);
++	} else {
++		snprintf(name, sizeof(name), "image/bdwlan.%03x", w_board);
++	}
++	w_bdf_fi = fw_all_find(name);
++	if (w_bdf_fi < 0) {
++		LOG("wlfw: %s missing, using bdwlan.bin", name);
++		snprintf(name, sizeof(name), "image/bdwlan.bin");
++		w_bdf_fi = fw_all_find(name);
++	}
++	if (w_bdf_fi < 0) {
++		LOG("wlfw: no board data file");
++		return;
++	}
++	w_bdf_len = fw_all[w_bdf_fi].size;
++	w_bdf_off = 0;
++	w_bdf_seg = 0;
++	LOG("t=%u ms: wlfw: board data %s, %u bytes", g_ms, name, w_bdf_len);
++	w_bdf_segment();
++}
++
++/*
++ * ath10k_snoc_wlan_enable(): the copy-engine layout (Linux snoc.c target_ce_config_wlan,
++ * target_service_to_ce_map_wlan, target_shadow_reg_cfg_map). PIPEDIR 1 in, 2 out, 3 inout;
++ * flags bit 3 = DIS_INTR.
++ */
++static const uint32_t w_tgt_ce[12][5] = {
++	{ 0, 2, 32, 2048, 0 }, { 1, 1, 32, 2048, 0 }, { 2, 1, 64, 2048, 0 }, { 3, 2, 32, 2048, 0 },
++	{ 4, 2, 256, 256, 8 }, { 5, 2, 1024, 64, 8 }, { 6, 3, 32, 16384, 0 }, { 7, 4, 0, 0, 8 },
++	{ 8, 1, 32, 2048, 0 }, { 9, 1, 32, 2048, 0 }, { 10, 1, 32, 2048, 0 }, { 11, 1, 32, 2048, 0 },
++};
++static const uint32_t w_svc_ce[][3] = {
++	{ 0x104, 2, 3 }, { 0x104, 1, 2 }, { 0x102, 2, 3 }, { 0x102, 1, 2 }, { 0x101, 2, 3 }, { 0x101, 1, 2 },
++	{ 0x103, 2, 3 }, { 0x103, 1, 2 }, { 0x100, 2, 3 }, { 0x100, 1, 2 }, { 0x001, 2, 0 }, { 0x001, 1, 2 },
++	{ 0xFE00, 2, 0 }, { 0xFE00, 1, 2 }, { 0x300, 2, 4 }, { 0x300, 1, 1 }, { 0xFE00, 2, 5 }, { 0x301, 1, 9 },
++	{ 0x302, 1, 10 }, { 0x600, 1, 11 }, { 0, 0, 0 },
++};
++static const uint16_t w_shadow[12][2] = {
++	{ 0, 0x3C }, { 3, 0x3C }, { 4, 0x3C }, { 5, 0x3C }, { 7, 0x3C }, { 1, 0x40 },
++	{ 2, 0x40 }, { 7, 0x40 }, { 8, 0x40 }, { 9, 0x40 }, { 10, 0x40 }, { 11, 0x40 },
++};
++
++static void
++w_on_cap(const uint8_t *d, uint32_t len)
++{
++	uint16_t l = 0;
++	const uint8_t *v;
++	char s[80];
++	uint32_t a = 0, b = 0;
++
++	if ((v = qm_find(d, len, 0x10, &l)) != NULL && l >= 8) {
++		memcpy(&a, v, 4);
++		memcpy(&b, v + 4, 4);
++		LOG("wlfw: chip_id %x family %x", a, b);
++	}
++	if ((v = qm_find(d, len, 0x11, &l)) != NULL && l >= 4) {
++		memcpy(&w_board, v, 4);
++	}
++	LOG("wlfw: board_id %x", w_board);
++	if ((v = qm_find(d, len, 0x13, &l)) != NULL && l >= 5) {
++		size_t n = MIN((size_t)v[4], MIN((size_t)(l - 5), sizeof(s) - 1));
++		memcpy(s, v + 5, n);
++		s[n] = 0;
++		memcpy(&a, v, 4);
++		LOG("wlfw: fw_version %x built %s", a, s);
++	}
++	if ((v = qm_find(d, len, 0x14, &l)) != NULL) {
++		size_t n = MIN((size_t)l, sizeof(s) - 1);
++		memcpy(s, v, n);
++		s[n] = 0;
++		LOG("wlfw: fw_build_id %s", s);
++	}
++}
++
++static void
++w_on_msa_info(const uint8_t *d, uint32_t len)
++{
++	uint16_t l = 0;
++	const uint8_t *v = qm_find(d, len, 0x03, &l);
++	uint32_t n = (v != NULL && l >= 1) ? v[0] : 0;
++
++	LOG("wlfw: %u MSA region(s)", n);
++	IOSleep(20);                                /* ath10k: give the modem time before the XPU update */
++	for (uint32_t i = 0; i < n && 1 + 13 * (i + 1) <= l; i++) {
++		const uint8_t *e = v + 1 + 13 * i;      /* u64 addr, u32 size, u8 secure */
++		uint64_t addr;
++		uint32_t size;
++		memcpy(&addr, e, 8);
++		memcpy(&size, e + 8, 4);
++		uint8_t sec = e[12];
++		static const uint32_t vm[3] = { VMID_MSS_MSA, VMID_WLAN, VMID_WLAN_CE };
++		LOG(" MSA region %u: %llx + %x secure %u", i, addr, size, sec);
++		if (addr < WLFW_MSA_BASE || addr + size > (uint64_t)WLFW_MSA_BASE + WLFW_MSA_SIZE) {
++			LOG(" out of the MSA window, skipped");
++			continue;
++		}
++		(void)scm_assign(addr, size, vm, sec ? 2 : 3);
++	}
++}
++
++static void
++wlfw_arrive(uint32_t node, uint32_t port)
++{
++	if (w_node != 0 || w_port != 0) {
++		return;
++	}
++	w_node = node;
++	w_port = port;
++	struct wmsg m;
++	if (wm_new(&m, WLFW_IND_REGISTER)) {
++		wm_u8(&m, 0x10, 1);                     /* fw_ready_enable */
++		wm_u8(&m, 0x13, 1);                     /* msa_ready_enable */
++		wm_u32(&m, 0x15, WLFW_CLIENT_ID);       /* client_id */
++		wm_send(&m);
++		w_step = "ind_register sent";
++	}
++}
++
++static void
++wlfw_rx(const uint8_t *d, uint32_t len)
++{
++	uint16_t msg, err = 0, l = 0;
++	struct wmsg m;
++
++	if (len < 7) {
++		return;
++	}
++	memcpy(&msg, d + 3, 2);
++	if (d[0] == QMI_IND) {
++		if (msg == WLFW_MSA_READY_IND) {
++			LOG("t=%u ms: wlfw: MSA_READY indication", g_ms);
++			w_msa_ind = true;
++			w_start_bdf();
++		} else if (msg == WLFW_FW_READY_IND) {
++			w_fw_ready = true;
++			LOG("t=%u ms: *** WLAN FIRMWARE READY ***", g_ms);
++			if (wm_new(&m, WLFW_WLAN_CFG)) {
++				wm_array(&m, 0x11, 12, w_tgt_ce, sizeof(w_tgt_ce));
++				wm_array(&m, 0x12, (uint8_t)(sizeof(w_svc_ce) / sizeof(w_svc_ce[0])), w_svc_ce, sizeof(w_svc_ce));
++				wm_array(&m, 0x13, 12, w_shadow, sizeof(w_shadow));
++				wm_send(&m);
++				w_step = "wlan_cfg sent";
++			}
++		} else {
++			LOG("wlfw: indication %x", msg);
++		}
++		return;
++	}
++	if (d[0] != QMI_RESP) {
++		return;
++	}
++	bool ok = w_result(d, len, &err);
++	switch (msg) {
++	case WLFW_IND_REGISTER: {
++		const uint8_t *v = qm_find(d, len, 0x10, &l);
++		uint64_t st = 0;
++		if (v != NULL && l >= 8) {
++			memcpy(&st, v, 8);
++		}
++		LOG("t=%u ms: wlfw: ind_register %s err %u, fw_status %llx", g_ms, ok ? "ok" : "FAILED", err, st);
++		if (wm_new(&m, WLFW_HOST_CAP)) {
++			wm_u32(&m, 0x10, 0);                /* daemon_support = 0 */
++			wm_send(&m);
++			w_step = "host_cap sent";
++		}
++		break;
++	}
++	case WLFW_HOST_CAP:
++		LOG("wlfw: host_cap %s err %u", ok ? "ok" : "rejected (not fatal)", err);
++		if (wm_new(&m, WLFW_MSA_INFO)) {
++			uint64_t a = WLFW_MSA_BASE;
++			wm_tlv(&m, 0x01, &a, 8);            /* msa_addr */
++			wm_u32(&m, 0x02, WLFW_MSA_SIZE);
++			wm_send(&m);
++			w_step = "msa_info sent";
++		}
++		break;
++	case WLFW_MSA_INFO:
++		LOG("wlfw: msa_info %s err %u", ok ? "ok" : "FAILED", err);
++		if (ok) {
++			w_on_msa_info(d, len);
++			w_simple(WLFW_MSA_READY, "msa_ready sent");
++		}
++		break;
++	case WLFW_MSA_READY:
++		LOG("wlfw: msa_ready %s err %u", ok ? "ok" : "FAILED", err);
++		w_simple(WLFW_CAP, "cap sent");
++		break;
++	case WLFW_CAP:
++		LOG("wlfw: cap %s err %u", ok ? "ok" : "FAILED", err);
++		if (ok) {
++			w_on_cap(d, len);
++		}
++		w_cap_done = true;
++		w_step = "waiting MSA_READY ind";
++		w_start_bdf();
++		break;
++	case WLFW_BDF_DOWNLOAD:
++		if (!ok) {
++			LOG("wlfw: bdf segment %u FAILED err %u", w_bdf_seg - 1, err);
++			break;
++		}
++		if (w_bdf_off < w_bdf_len) {
++			w_bdf_segment();
++		} else {
++			LOG("wlfw: board data sent in %u segment(s)", w_bdf_seg);
++			if (wm_new(&m, WLFW_CAL_REPORT)) {
++				uint8_t none = 0;
++				wm_tlv(&m, 0x01, &none, 1);     /* meta_data_len = 0 */
++				wm_send(&m);
++				w_step = "cal_report sent";
++			}
++		}
++		break;
++	case WLFW_CAL_REPORT:
++		LOG("wlfw: cal_report %s err %u, waiting for FW_READY", ok ? "ok" : "FAILED", err);
++		w_step = "waiting FW_READY";
++		break;
++	case WLFW_WLAN_CFG:
++		LOG("wlfw: wlan_cfg %s err %u", ok ? "ok" : "FAILED", err);
++		if (ok && wm_new(&m, WLFW_WLAN_MODE)) {
++			wm_u32(&m, 0x01, 0);                /* mission */
++			wm_u8(&m, 0x10, 0);                 /* hw_debug */
++			wm_send(&m);
++			w_step = "wlan_mode sent";
++		}
++		break;
++	case WLFW_WLAN_MODE:
++		LOG("t=%u ms: wlfw: wlan_mode mission %s err %u", g_ms, ok ? "ok" : "FAILED", err);
++		if (ok) {
++			w_mission = true;
++			w_step = "WLAN ON (mission)";
++			LOG("*** WLAN ON (mission mode) ***");
++		}
++		break;
++	default:
++		LOG("wlfw: response %x %s err %u", msg, ok ? "ok" : "FAILED", err);
++		break;
++	}
++}
++
+ static void
+ svc_announce(void)
+ {
+@@ -3035,6 +3435,10 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+ 		}
+ 		return true;
+ 	}
++	if (dst_port == PORT_WLFWC) {
++		wlfw_rx(data, len);
++		return true;
++	}
+ 	if (dst_port >= PORT_SESS && dst_port < PORT_SESS + 0x10000) {
+ 		return tftp_session(dst_port, data, len);
+ 	}
+@@ -3058,6 +3462,7 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+ static void
+ svc_summary(void)
+ {
++	LOG("WLFW: %s%s", w_step, w_fw_ready ? " (firmware ready)" : "");
+ 	LOG("services: pd-mapper %u reqs; tftp %u reqs (%u missing, %u writes); rmtfs reads %u writes %u (not kept) errors %u",
+ 	    pd_reqs, tftp_reqs, tftp_missing, tftp_writes, rmtfs_reads, rmtfs_writes, rmtfs_err);
+ }
+@@ -3081,7 +3486,7 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 	}
+ 	ipa_out = smp2p_add_out(out, "ipa", 0);
+ 	bool glink = false;
+-	for (unsigned ms = 0; ms < seconds * 1000; ms++) {
++	for (unsigned ms = 0; seconds == 0 || ms < seconds * 1000; ms++) {
+ 		if (ready && !glink) {
+ 			glink = glink_start(part);
+ 			if (!glink) {
+@@ -3091,7 +3496,7 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 		if (glink) {
+ 			glink_poll(part, ms);
+ 		}
+-		if (glink && ms == 3000) {
++		if (glink && (ms == 3000 || ms == 20000)) {
+ 			glink_summary();                /* early, before the iOS UI covers the console */
+ 		}
+ 		if (in == NULL) {
+@@ -3306,7 +3711,7 @@ static void
+ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	IOMemoryMap *smem_map, *pool_map;
+-	unsigned watch = 60;
++	unsigned watch = 0;                         /* 0: serve the modem for the whole session */
+ 
+ 	(void)PE_parse_boot_argn("modem_watch", &watch, sizeof(watch));
+ 	(void)PE_parse_boot_argn("modem_part", fw_part, sizeof(fw_part));
+-- 
+2.43.0
+
