@@ -1,0 +1,35 @@
+From b203961fc8e8ca07b8b5d7206288058da8ebf8ef Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 19:07:13 +0300
+Subject: [PATCH] topaz-0119: boot-arg sweetfb_console=1 keeps the kernel
+ console on the panel
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6a18b58..4cbe94a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -879,7 +879,17 @@ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	static int console_only = -1;
+ 
++	/* boot-arg sweetfb_console=1: debugging, the panel keeps showing the kernel console */
++	if (console_only < 0) {
++		console_only = 0;
++		PE_parse_boot_argn("sweetfb_console", &console_only, sizeof(console_only));
++	}
++	if (console_only > 0 && fConsShown) {
++		(void)mask;
++		return;
++	}
+ 	fConsShown = false;
+ 	if (directPresent(rec)) {
+ 		if (!fConsolePaused) {
+-- 
+2.43.0
+
