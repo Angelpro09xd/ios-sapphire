@@ -1,0 +1,107 @@
+From eb27f465acf2b3b6ea02806182424a03ec685089 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 07:56:16 +0300
+Subject: [PATCH] topaz-0094: gold cluster to max cpufreq
+
+---
+ bsd/conf/files                    |  1 +
+ bsd/dev/sweet_cpufreq.c           | 54 +++++++++++++++++++++++++++++++
+ iokit/Kernel/arm/SweetBattery.cpp |  2 ++
+ 3 files changed, 57 insertions(+)
+ create mode 100644 bsd/dev/sweet_cpufreq.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 72a96d4..21cdb5c 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_i2c1.c			standard
++bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+new file mode 100644
+index 0000000..94c7552
+--- /dev/null
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -0,0 +1,54 @@
++/*
++ * topaz: run the Gold cluster at its top frequency. SM6225 cpufreq-hw
++ * (qcom,cpufreq-hw, freq-domain1 at 0xf523000; msm-4.19 qcom-cpufreq-hw.c
++ * layout): LUT at +0x110, 32-byte rows, PERF_STATE at +0x920.
++ * Nothing scales it down again: there is no XNU cpufreq driver yet.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int sweet_cpufreq_max(void);
++
++#define CPUFREQ_GOLD_PA         0x0f523000u
++#define CPUFREQ_FREQ_LUT        0x110u
++#define CPUFREQ_LUT_ROW         0x20u
++#define CPUFREQ_PERF_STATE      0x920u
++#define CPUFREQ_LUT_MAX         12
++
++int
++sweet_cpufreq_max(void)
++{
++	int on = 1;
++	PE_parse_boot_argn("sweetcpufreq", &on, sizeof(on));
++	if (!on) {
++		return 0;
++	}
++	vm_offset_t b = ml_io_map(CPUFREQ_GOLD_PA, 0x1000);
++	if (b == 0) {
++		return -1;
++	}
++	uint32_t best = 0, bestKHz = 0, prevKHz = 0;
++	for (uint32_t i = 0; i < CPUFREQ_LUT_MAX; i++) {
++		uint32_t v = *(volatile uint32_t *)(b + CPUFREQ_FREQ_LUT + i * CPUFREQ_LUT_ROW);
++		uint32_t src = (v >> 30) & 3u, lval = v & 0xffu;
++		uint32_t khz = src ? 19200u * lval : 300000u;
++		if (i > 0 && khz == prevKHz) {
++			break;          /* the LUT repeats its last entry */
++		}
++		prevKHz = khz;
++		if (khz > bestKHz) {
++			bestKHz = khz;
++			best = i;
++		}
++	}
++	uint32_t old = *(volatile uint32_t *)(b + CPUFREQ_PERF_STATE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(b + CPUFREQ_PERF_STATE) = best;
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("SWEET CPUFREQ: gold perf state %u -> %u (%u MHz)\n", old, best, bestKHz / 1000);
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 809857b..824c022 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -17,6 +17,7 @@ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ /* bsd/dev/sweet_i2c1.c: topaz battery bus (QUP0 SE1) */
+ extern "C" int sweet_i2c1_init(void);
++extern "C" int sweet_cpufreq_max(void);    /* bsd/dev/sweet_cpufreq.c */
+ extern "C" int sweet_i2c1_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len);
+ 
+ class SweetBattery : public IOPMPowerSource {
+@@ -322,6 +323,7 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
++	(void)sweet_cpufreq_max();
+ 	int real = 1;   /* topaz: real gauge by default; sweetbattery=0 for the static fallback */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_i2c1_init() == 0;
+-- 
+2.43.0
+
