@@ -1,0 +1,43 @@
+From e269c6e26da2dbad0dd2391067815a1eb1916922 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 18:18:24 +0300
+Subject: [PATCH] topaz-0117: TopazModem: hash segment from its own .bNN file
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index dd58974..df54e98 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -542,12 +542,23 @@ modem_boot(void)
+ 		uint64_t hdr = eh->e_phoff + eh->e_phnum * sizeof(struct elf32_phdr);
+ 		uint64_t meta_size = hdr + ph[hash].p_filesz;
+ 		meta = (uint8_t *)pool_alloc(meta_size, &meta_pa);
+-		if (meta == NULL || ph[hash].p_offset + ph[hash].p_filesz > (uint64_t)mdt_size) {
+-			LOG("metadata: alloc or split hash segment not supported");
++		if (meta == NULL) {
++			LOG("metadata: pool allocation of %llu bytes failed", meta_size);
+ 			goto out;
+ 		}
+ 		memcpy(meta, mdt, hdr);
+-		memcpy(meta + hdr, mdt + ph[hash].p_offset, ph[hash].p_filesz);
++		if (ph[hash].p_offset + ph[hash].p_filesz <= (uint64_t)mdt_size) {
++			memcpy(meta + hdr, mdt + ph[hash].p_offset, ph[hash].p_filesz);
++		} else {
++			/* split firmware: the hash segment is its own .bNN file (qcom_mdt_read_metadata) */
++			char hname[16];
++			snprintf(hname, sizeof(hname), "modem.b%02u", hash);
++			int64_t got = fw_read(hname, meta + hdr, ph[hash].p_filesz);
++			LOG("hash from %s: %lld of %u bytes", hname, got, ph[hash].p_filesz);
++			if (got != (int64_t)ph[hash].p_filesz) {
++				goto out;
++			}
++		}
+ 		mb();
+ 
+ 		st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), PAS_ID_MODEM, meta_pa, 0, &res);
+-- 
+2.43.0
+
