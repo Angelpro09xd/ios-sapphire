@@ -1,0 +1,145 @@
+From 8a38c136fc7d662ad61e6301e31512268ff8d4ae Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 10:46:44 +0300
+Subject: [PATCH] topaz-0107: dcache clean only on display buffers; global
+ stubs restored
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 11 ++++-----
+ osfmk/arm/caches.c                    | 33 ++++++++++++++++++++-------
+ osfmk/console/video_console.c         |  4 ++--
+ 3 files changed, 32 insertions(+), 16 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 5a9f33c..2de5304 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -69,7 +69,7 @@ static AppleCLCD *sweet_cons_fb;
+ static void sweet_cons_show(void);
+ class OSDictionary;
+ static void sweet_bl_log(const char *who, OSDictionary *d);
+-extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);  /* osfmk/arm/caches.c */
++extern "C" void sweet_dcache_clean(vm_offset_t addr, unsigned length);  /* osfmk/arm/caches.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ #if defined(SWEET)
+@@ -342,7 +342,7 @@ AppleCLCD::start(IOService *provider)
+ 		if (fCons != NULL) {
+ 			uint8_t *c = (uint8_t *)fCons->getBytesNoCopy();
+ 			memcpy(c, (const void *)fPixels, fsz);  /* keep what the console drew */
+-			flush_dcache64((addr64_t)(uintptr_t)c, (unsigned)fsz, FALSE);   /* for panics */
++			sweet_dcache_clean((vm_offset_t)(uintptr_t)c, (unsigned)fsz);   /* for panics */
+ 			fConsPhys = fCons->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+ 			sweet_cons_fb = this;
+ 			sweet_console_show_hook = sweet_cons_show;
+@@ -582,7 +582,7 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ 	if (len) {
+ 		memcpy(p + 4, payload, len);
+ 	}
+-	flush_dcache64((addr64_t)(uintptr_t)p, 64, FALSE);
++	sweet_dcache_clean((vm_offset_t)(uintptr_t)p, 64);
+ 	uint32_t ctrl = dsi_rd(fDsi, 0x004), trig = dsi_rd(fDsi, 0x084);
+ 	if ((trig & 7) != 4) {
+ 		dsi_wr(fDsi, 0x084, (trig & ~7u) | 4);  /* DMA trigger: software */
+@@ -753,7 +753,7 @@ void
+ AppleCLCD::flipBack(void)
+ {
+ 	uint32_t idx = fFlipIdx ^ 1;
+-	flush_dcache64((addr64_t)(uintptr_t)fFlip[idx]->getBytesNoCopy(), (unsigned)fFlip[idx]->getLength(), FALSE);
++	sweet_dcache_clean((vm_offset_t)(uintptr_t)fFlip[idx]->getBytesNoCopy(), (unsigned)fFlip[idx]->getLength());
+ 	scanFrom(fFlipPhys[idx], fRowBytes);
+ 	fFlipIdx = idx;
+ }
+@@ -815,8 +815,7 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 					flipFrom((const uint8_t *)(va + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4),
+ 					    s->bytesPerRow);
+ 				} else {
+-					flush_dcache64((addr64_t)(va + s->offset + (uint64_t)oy * s->bytesPerRow),
+-					    (unsigned)((uint64_t)fHeight * s->bytesPerRow), FALSE);
++					sweet_dcache_clean((vm_offset_t)(va + s->offset + (uint64_t)oy * s->bytesPerRow), (unsigned)((uint64_t)fHeight * s->bytesPerRow));
+ 					scanFrom(pa, s->bytesPerRow);
+ 				}
+ 				ok = true;
+diff --git a/osfmk/arm/caches.c b/osfmk/arm/caches.c
+index 6ef93ad..25252f8 100644
+--- a/osfmk/arm/caches.c
++++ b/osfmk/arm/caches.c
+@@ -384,10 +384,14 @@ platform_cache_flush_wimg(
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ /*
+- * topaz/sweet: Apple SoCs keep DMA coherent with the CPU caches, so these
+- * are no-ops upstream. The Qualcomm display (MDP) and other masters here
+- * read DRAM behind the caches: clean/invalidate to the point of coherency.
++ * topaz/sweet: Apple SoCs keep DMA coherent with the CPU caches, so
++ * flush_dcache/clean_dcache stay no-ops (making them real slowed the whole
++ * kernel to a crawl: XNU calls them on every pmap/IOMD path). Drivers whose
++ * hardware reads DRAM behind the caches (the MDP scanout, DSI command DMA)
++ * call sweet_dcache_clean() on just their buffers.
+  */
++void sweet_dcache_clean(vm_offset_t addr, unsigned length);
++
+ static void
+ sweet_dcache_op(vm_offset_t addr, unsigned length, boolean_t phys, bool invalidate)
+ {
+@@ -413,17 +417,30 @@ sweet_dcache_op(vm_offset_t addr, unsigned length, boolean_t phys, bool invalida
+ }
+ 
+ void
+-flush_dcache(vm_offset_t addr, unsigned length, boolean_t phys)
++sweet_dcache_clean(vm_offset_t addr, unsigned length)
++{
++	sweet_dcache_op(addr, length, FALSE, false);
++}
++#endif
++
++void
++flush_dcache(
++	__unused vm_offset_t addr,
++	__unused unsigned length,
++	__unused boolean_t phys)
+ {
+-	sweet_dcache_op(addr, length, phys, true);
++	__builtin_arm_dsb(DSB_SY);
+ }
+ 
+ void
+-clean_dcache(vm_offset_t addr, unsigned length, boolean_t phys)
++clean_dcache(
++	__unused vm_offset_t addr,
++	__unused unsigned length,
++	__unused boolean_t phys)
+ {
+-	sweet_dcache_op(addr, length, phys, false);
++	__builtin_arm_dsb(DSB_SY);
+ }
+-#else
++#if 0
+ void
+ flush_dcache(
+ 	__unused vm_offset_t addr,
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+index df9605e..4193f57 100644
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -147,7 +147,7 @@ static struct {
+  * iOS surfaces; each drawn text row is cleaned to memory right away, so text
+  * appears at cache speed and stays visible in a panic.
+  */
+-extern void flush_dcache64(addr64_t addr, unsigned count, int phys);
++extern void sweet_dcache_clean(vm_offset_t addr, unsigned length);
+ void sweet_console_retarget(vm_offset_t va);
+ void (*sweet_console_show_hook)(void);
+ static vm_offset_t sweet_shadow_va;
+@@ -3345,7 +3345,7 @@ sweet_flush_rows(unsigned int top, unsigned int bottom)
+ 		}
+ 		return;
+ 	}
+-	flush_dcache64((addr64_t)(vinfo.v_baseaddr + top * band), (unsigned)((bottom - top) * band), FALSE);
++	sweet_dcache_clean((vm_offset_t)(vinfo.v_baseaddr + top * band), (unsigned)((bottom - top) * band));
+ 	if (sweet_console_show_hook != NULL) {
+ 		sweet_console_show_hook();
+ 	}
+-- 
+2.43.0
+
