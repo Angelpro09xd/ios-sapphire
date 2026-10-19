@@ -1,0 +1,110 @@
+From e4e34a7a495bcb8c7d196a031b585c4f6938c604 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 09:36:29 +0300
+Subject: [PATCH] topaz-0102: console copied under the putc lock; iOS frames
+ copied and flipped
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 29 ++++++++++++++++++---------
+ osfmk/console/video_console.c         |  9 +++++++--
+ 2 files changed, 27 insertions(+), 11 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3066bd9..258168a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -39,7 +39,7 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void sweet_console_retarget(vm_offset_t va);   /* osfmk/console/video_console.c */
+ extern "C" void (*sweet_console_show_hook)(void);
+-extern "C" int sweet_console_take_dirty(void);
++extern "C" int sweet_console_copy_dirty(void *dst);
+ 
+ /*
+  * topaz: a surface the MDP may still be fetching counts as in use, so
+@@ -350,10 +350,12 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			if (step <= SWEET_FB_FADE_STEPS) {
+ 				fb->fFadeStep = step + 1;
+ 			}
+-			const uint8_t *src = fb->fLastVA ? fb->fLastVA :
++			bool front = fb->fFlip[0] != NULL && fb->fScanPhys == fb->fFlipPhys[fb->fFlipIdx];
++			const uint8_t *src = front ? (const uint8_t *)fb->fFlip[fb->fFlipIdx]->getBytesNoCopy() :
++			    fb->fLastVA ? fb->fLastVA :
+ 			    fb->fConsShown ?
+ 			    (const uint8_t *)fb->fCons->getBytesNoCopy() : (const uint8_t *)fb->fPixels;
+-			uint32_t srcStride = fb->fLastVA ? fb->fLastStride : fb->fRowBytes;
++			uint32_t srcStride = (!front && fb->fLastVA) ? fb->fLastStride : fb->fRowBytes;
+ 			IOLockUnlock(fb->fLock);
+ 			if (step <= SWEET_FB_FADE_STEPS) {
+ 				fb->fadeStep(src, srcStride, step);
+@@ -399,8 +401,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	bzero(fb->fRetireHold, sizeof(fb->fRetireHold));
+ 	IOLockUnlock(fb->fLock);
+ 	sweet_hold_set(retire, false);
+-	if (fb->fConsShown && sweet_console_take_dirty()) {
+-		fb->flipFrom((const uint8_t *)fb->fCons->getBytesNoCopy(), fb->fRowBytes);
++	if (fb->fConsShown && sweet_console_copy_dirty(fb->backBuffer())) {
++		fb->flipBack();
+ 	}
+ 	if (rec != NULL) {
+ 		fb->present(rec);
+@@ -580,10 +582,19 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 		if ((pa & 0xf) == 0 && pa + (uint64_t)fHeight * s->bytesPerRow < (1ull << 32)) {
+ 			uintptr_t va = s->kernelAddress();
+ 			if (va != 0) {
+-				/* the MDP does not snoop CPU caches */
+-				flush_dcache64((addr64_t)(va + s->offset + (uint64_t)oy * s->bytesPerRow),
+-				    (unsigned)((uint64_t)fHeight * s->bytesPerRow), FALSE);
+-				scanFrom(pa, s->bytesPerRow);
++				/*
++				 * Copy into our back buffer and flip: CoreAnimation may start the
++				 * next frame in this surface at once, so scanning it directly let
++				 * the panel show frames half drawn. Cached to cached, a few ms.
++				 */
++				if (fFlip[0] != NULL) {
++					flipFrom((const uint8_t *)(va + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4),
++					    s->bytesPerRow);
++				} else {
++					flush_dcache64((addr64_t)(va + s->offset + (uint64_t)oy * s->bytesPerRow),
++					    (unsigned)((uint64_t)fHeight * s->bytesPerRow), FALSE);
++					scanFrom(pa, s->bytesPerRow);
++				}
+ 				ok = true;
+ 				IOLockLock(fLock);
+ 				if (fLastSurf != s) {
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+index 4862bdf..df9605e 100644
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -152,7 +152,7 @@ void sweet_console_retarget(vm_offset_t va);
+ void (*sweet_console_show_hook)(void);
+ static vm_offset_t sweet_shadow_va;
+ static unsigned int sweet_dirty_top = ~0u, sweet_dirty_bottom;
+-int sweet_console_take_dirty(void);
++int sweet_console_copy_dirty(void *dst);
+ static void (*sweet_orig_paint)(unsigned int, unsigned int, unsigned char, int, unsigned char, int);
+ static void (*sweet_orig_clear)(unsigned int, unsigned int, unsigned int, unsigned int, int);
+ static void (*sweet_orig_sdown)(int, unsigned int, unsigned int);
+@@ -3356,13 +3356,18 @@ sweet_flush_rows(unsigned int top, unsigned int bottom)
+  * shadow into its back buffer and flips (the shadow itself is not scanned).
+  */
+ int
+-sweet_console_take_dirty(void)
++sweet_console_copy_dirty(void *dst)
+ {
+ 	if (sweet_shadow_va == 0) {
+ 		return 0;
+ 	}
++	/* under the putc lock: a scroll repaints the whole screen inside one
++	 * locked character, so the copy never catches it half done */
+ 	VCPUTC_LOCK_LOCK();
+ 	int dirty = sweet_dirty_bottom > sweet_dirty_top;
++	if (dirty) {
++		memcpy(dst, (const void *)sweet_shadow_va, (size_t)vinfo.v_rowbytes * vinfo.v_height);
++	}
+ 	sweet_dirty_top = ~0u;
+ 	sweet_dirty_bottom = 0;
+ 	VCPUTC_LOCK_UNLOCK();
+-- 
+2.43.0
+
