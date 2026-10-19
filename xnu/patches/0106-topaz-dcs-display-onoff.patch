@@ -1,17 +1,25 @@
-From 40f90d2c61e565b27039441d0944b6216af406bf Mon Sep 17 00:00:00 2001
+From 57a2d0371e8a05c2f98a746f736e8ff08a90c9d0 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Mon, 19 Oct 2026 10:22:21 +0300
 Subject: [PATCH] topaz-0106: DCS display off/on with the display power
 
 ---
- iokit/Kernel/arm/SweetFramebuffer.cpp | 40 +++++++++++++++++++++++----
- 1 file changed, 34 insertions(+), 6 deletions(-)
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 41 +++++++++++++++++++++++----
+ 1 file changed, 35 insertions(+), 6 deletions(-)
 
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index ff64ad5..b7b51b4 100644
+index ff64ad5..623385a 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -189,6 +189,8 @@ public:
+@@ -67,6 +67,7 @@ sweet_hold_set(SweetSurface **set, bool on)
+ class AppleCLCD;
+ static AppleCLCD *sweet_cons_fb;
+ static void sweet_cons_show(void);
++static void sweet_bl_log(const char *who, OSDictionary *d);
+ extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);  /* osfmk/arm/caches.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+@@ -189,6 +190,8 @@ public:
  	IOLock       *fBlLock;
  	uint32_t      fBlLevel;       /* panel DBV 1..0x7ff, kept while the display is off */
  	bool          dsiDcsLong(const uint8_t *payload, uint32_t len);
@@ -20,7 +28,7 @@ index ff64ad5..b7b51b4 100644
  	void          setPanelLevel(uint32_t level);
  	void addClient(IOMobileFramebufferUserClient *client);
  	void removeClient(IOMobileFramebufferUserClient *client);
-@@ -557,6 +559,16 @@ static inline void dsi_wr(volatile uint8_t *b, uint32_t o, uint32_t v)
+@@ -557,6 +560,16 @@ static inline void dsi_wr(volatile uint8_t *b, uint32_t o, uint32_t v)
  
  bool
  AppleCLCD::dsiDcsLong(const uint8_t *payload, uint32_t len)
@@ -37,7 +45,7 @@ index ff64ad5..b7b51b4 100644
  {
  	if (fDsi == NULL || fDsiBuf == NULL || len > 60) {
  		return false;
-@@ -564,11 +576,10 @@ AppleCLCD::dsiDcsLong(const uint8_t *payload, uint32_t len)
+@@ -564,11 +577,10 @@ AppleCLCD::dsiDcsLong(const uint8_t *payload, uint32_t len)
  	uint8_t *p = (uint8_t *)fDsiBuf->getBytesNoCopy();
  	uint32_t size = (4 + len + 3) & ~3u;
  	memset(p, 0xff, 64);
@@ -53,7 +61,7 @@ index ff64ad5..b7b51b4 100644
  	flush_dcache64((addr64_t)(uintptr_t)p, 64, FALSE);
  	uint32_t ctrl = dsi_rd(fDsi, 0x004), trig = dsi_rd(fDsi, 0x084);
  	if ((trig & 7) != 4) {
-@@ -598,6 +609,17 @@ AppleCLCD::dsiDcsLong(const uint8_t *payload, uint32_t len)
+@@ -598,6 +610,17 @@ AppleCLCD::dsiDcsLong(const uint8_t *payload, uint32_t len)
  	return done;
  }
  
@@ -71,7 +79,7 @@ index ff64ad5..b7b51b4 100644
  void
  AppleCLCD::setPanelLevel(uint32_t level)
  {
-@@ -1087,7 +1109,13 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -1087,7 +1110,13 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  			uint32_t level = fFB->fBlLevel;
  			IOLockUnlock(fFB->fLock);
  			if (changed && fFB->fDsi != NULL) {
