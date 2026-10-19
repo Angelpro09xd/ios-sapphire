@@ -1,0 +1,36 @@
+From 48630b318fb9c4e12f513f3545e1f06b6013bbdc Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 19:06:23 +0300
+Subject: [PATCH] topaz-0119: TopazModem: log services as they arrive, summary
+ at 3 s
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index c90212d..aa92151 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -740,6 +740,8 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 		}
+ 		if (c->a == QMI_SVC_WLFW) {
+ 			LOG("t=%u ms: *** WLFW service 0x45 up: inst %x node %u port %x ***", g_ms, c->b, c->c, c->d);
++		} else if (c->a != 0) {
++			LOG("t=%u ms: service %x:%x port %x %s", g_ms, c->a, c->b, c->d, svc_name(c->a));
+ 		}
+ 		break;
+ 	case QRTR_TYPE_DATA:
+@@ -1007,6 +1009,9 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 		if (glink) {
+ 			glink_poll(part, ms);
+ 		}
++		if (glink && ms == 3000) {
++			glink_summary();                /* early, before the iOS UI covers the console */
++		}
+ 		if (in == NULL) {
+ 			uint32_t sz = 0;
+ 			in = (struct smp2p_hdr *)smem_get(part, ITEM_SMP2P_IN, &sz);
+-- 
+2.43.0
+
