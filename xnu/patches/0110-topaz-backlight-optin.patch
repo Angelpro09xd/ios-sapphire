@@ -1,0 +1,32 @@
+From c1d56e08699fe8e2340beee7844d25071608cb9a Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 13:57:35 +0300
+Subject: [PATCH] topaz-0110: backlight service only with sweetbl=1
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 989c16f..474396f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -300,7 +300,14 @@ AppleCLCD::start(IOService *provider)
+ 	if (fDsi != NULL) {
+ 		IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
+ 		setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
+-		AppleARMBacklight *bl = OSTypeAlloc(AppleARMBacklight);
++		/*
++		 * Off unless sweetbl=1: with a backlight service CoreBrightness also
++		 * runs digital dimming, a colour filter over every frame, which the
++		 * CPU renderer cannot afford (the UI dropped to under 1 fps).
++		 */
++		uint32_t blOn = 0;
++		(void)PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
++		AppleARMBacklight *bl = blOn ? OSTypeAlloc(AppleARMBacklight) : NULL;
+ 		if (bl != NULL && bl->init()) {
+ 			bl->fFB = this;
+ 			bl->setProperty("backlight-control", true);
+-- 
+2.43.0
+
