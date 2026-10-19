@@ -1,0 +1,215 @@
+From aafff890960f94d6d0cc14a6bc8a834a413badc3 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 09:16:08 +0300
+Subject: [PATCH] topaz-0100: double-buffered kernel frames (console, fade)
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 80 +++++++++++++++++++--------
+ osfmk/console/video_console.c         | 20 +++----
+ 2 files changed, 68 insertions(+), 32 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b05edde..3066bd9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -39,7 +39,7 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void sweet_console_retarget(vm_offset_t va);   /* osfmk/console/video_console.c */
+ extern "C" void (*sweet_console_show_hook)(void);
+-extern "C" void sweet_console_flush_dirty(void);
++extern "C" int sweet_console_take_dirty(void);
+ 
+ /*
+  * topaz: a surface the MDP may still be fetching counts as in use, so
+@@ -160,8 +160,16 @@ public:
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 	/* topaz fade: cached copy of the last frame and a contiguous output frame */
+-	IOBufferMemoryDescriptor *fFadeOrig, *fFadeOut;
+-	uint64_t      fFadeOutPhys;
++	IOBufferMemoryDescriptor *fFadeOrig;
++	/* kernel-drawn frames (console, fade) are double buffered like iOS's:
++	 * built in the back buffer, then the MDP flips to it at vsync */
++	IOBufferMemoryDescriptor *fFlip[2];
++	uint64_t      fFlipPhys[2];
++	uint32_t      fFlipIdx;
++	bool          fConsShown;     /* console frames on the panel (no iOS frame yet) */
++	void          flipFrom(const uint8_t *src, uint32_t srcStride);
++	uint8_t      *backBuffer(void) { return (uint8_t *)fFlip[fFlipIdx ^ 1]->getBytesNoCopy(); }
++	void          flipBack(void);
+ 	IOBufferMemoryDescriptor *fCons;    /* console shadow frame (cached, contiguous) */
+ 	uint64_t      fConsPhys;
+ 	const uint8_t *fLastVA;       /* last directly scanned frame (panel window) */
+@@ -265,30 +273,34 @@ AppleCLCD::start(IOService *provider)
+ 		    fBootSrc, fBootStride);
+ 		sweet_scanout_set_geometry(fWidth, fHeight, fLogicalW, fLogicalH);
+ 		vm_size_t fsz = (vm_size_t)fRowBytes * fHeight;
++		for (int i = 0; i < 2; i++) {
++			fFlip[i] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++			    kIODirectionInOut | kIOMemoryPhysicallyContiguous, fsz, 0x00000000fffff000ull);
++			fFlipPhys[i] = fFlip[i] ? fFlip[i]->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
++		}
++		fFadeOrig = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, fsz, page_size);
+ 		fCons = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, fsz, 0x00000000fffff000ull);
++		if (fFlip[0] == NULL || fFlip[1] == NULL || fFadeOrig == NULL) {
++			OSSafeReleaseNULL(fFlip[0]);
++			OSSafeReleaseNULL(fFlip[1]);
++			OSSafeReleaseNULL(fFadeOrig);
++			OSSafeReleaseNULL(fCons);
++		}
+ 		if (fCons != NULL && fBootStride == fRowBytes) {
+ 			uint8_t *c = (uint8_t *)fCons->getBytesNoCopy();
+ 			memcpy(c, (const void *)fPixels, fsz);  /* keep what the console drew */
+-			flush_dcache64((addr64_t)(uintptr_t)c, (unsigned)fsz, FALSE);
++			flush_dcache64((addr64_t)(uintptr_t)c, (unsigned)fsz, FALSE);   /* for panics */
+ 			fConsPhys = fCons->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+ 			sweet_cons_fb = this;
+ 			sweet_console_show_hook = sweet_cons_show;
+-			scanFrom(fConsPhys, fRowBytes);
+ 			sweet_console_retarget((vm_offset_t)c);
+-			IOLog("SWEET FB: console on shadow frame %#llx\n", fConsPhys);
++			fConsShown = true;
++			flipFrom(c, fRowBytes);
++			IOLog("SWEET FB: console double buffered (shadow %#llx)\n", fConsPhys);
+ 		} else {
+ 			OSSafeReleaseNULL(fCons);
+ 		}
+-		fFadeOrig = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, fsz, page_size);
+-		fFadeOut = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, fsz, 0x00000000fffff000ull);
+-		if (fFadeOrig == NULL || fFadeOut == NULL) {
+-			OSSafeReleaseNULL(fFadeOrig);
+-			OSSafeReleaseNULL(fFadeOut);
+-		} else {
+-			fFadeOutPhys = fFadeOut->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+-		}
+ 	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+@@ -333,13 +345,13 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		 * topaz: fade in cached memory and flip whole frames to the MDP.
+ 		 * Fading the uncached boot framebuffer in place crawled down the panel.
+ 		 */
+-		if (fb->fFadeOut != NULL) {
++		if (fb->fFadeOrig != NULL) {
+ 			uint32_t step = fb->fFadeStep;
+ 			if (step <= SWEET_FB_FADE_STEPS) {
+ 				fb->fFadeStep = step + 1;
+ 			}
+ 			const uint8_t *src = fb->fLastVA ? fb->fLastVA :
+-			    (fb->fConsPhys != 0 && fb->fScanPhys == fb->fConsPhys) ?
++			    fb->fConsShown ?
+ 			    (const uint8_t *)fb->fCons->getBytesNoCopy() : (const uint8_t *)fb->fPixels;
+ 			uint32_t srcStride = fb->fLastVA ? fb->fLastStride : fb->fRowBytes;
+ 			IOLockUnlock(fb->fLock);
+@@ -387,8 +399,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	bzero(fb->fRetireHold, sizeof(fb->fRetireHold));
+ 	IOLockUnlock(fb->fLock);
+ 	sweet_hold_set(retire, false);
+-	if (fb->fCons != NULL && fb->fScanPhys == fb->fConsPhys) {
+-		sweet_console_flush_dirty();
++	if (fb->fConsShown && sweet_console_take_dirty()) {
++		fb->flipFrom((const uint8_t *)fb->fCons->getBytesNoCopy(), fb->fRowBytes);
+ 	}
+ 	if (rec != NULL) {
+ 		fb->present(rec);
+@@ -488,7 +500,7 @@ void
+ AppleCLCD::fadeStep(const uint8_t *src, uint32_t srcStride, uint32_t step)
+ {
+ 	uint8_t *orig = (uint8_t *)fFadeOrig->getBytesNoCopy();
+-	uint8_t *out = (uint8_t *)fFadeOut->getBytesNoCopy();
++	uint8_t *out = backBuffer();
+ 	if (step == 0) {
+ 		/* snapshot what is on screen (one slow read of the frame) */
+ 		for (uint32_t y = 0; y < fHeight; y++) {
+@@ -507,8 +519,31 @@ AppleCLCD::fadeStep(const uint8_t *src, uint32_t srcStride, uint32_t step)
+ 			o[x] = lo | (hi << 8);
+ 		}
+ 	}
+-	flush_dcache64((addr64_t)(uintptr_t)out, (unsigned)fFadeOut->getLength(), FALSE);
+-	scanFrom(fFadeOutPhys, fRowBytes);
++	flipBack();
++}
++
++/* Clean the back buffer and point the MDP at it (latched at its vsync). */
++void
++AppleCLCD::flipBack(void)
++{
++	uint32_t idx = fFlipIdx ^ 1;
++	flush_dcache64((addr64_t)(uintptr_t)fFlip[idx]->getBytesNoCopy(), (unsigned)fFlip[idx]->getLength(), FALSE);
++	scanFrom(fFlipPhys[idx], fRowBytes);
++	fFlipIdx = idx;
++}
++
++void
++AppleCLCD::flipFrom(const uint8_t *src, uint32_t srcStride)
++{
++	uint8_t *dst = backBuffer();
++	if (srcStride == fRowBytes) {
++		memcpy(dst, src, (size_t)fRowBytes * fHeight);
++	} else {
++		for (uint32_t y = 0; y < fHeight; y++) {
++			memcpy(dst + (uint64_t)y * fRowBytes, src + (uint64_t)y * srcStride, (size_t)fWidth * 4);
++		}
++	}
++	flipBack();
+ }
+ 
+ /*
+@@ -573,6 +608,7 @@ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 
++	fConsShown = false;
+ 	if (directPresent(rec)) {
+ 		if (!fConsolePaused) {
+ 			int quiet = 0;
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+index de9cb80..4862bdf 100644
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -152,7 +152,7 @@ void sweet_console_retarget(vm_offset_t va);
+ void (*sweet_console_show_hook)(void);
+ static vm_offset_t sweet_shadow_va;
+ static unsigned int sweet_dirty_top = ~0u, sweet_dirty_bottom;
+-void sweet_console_flush_dirty(void);
++int sweet_console_take_dirty(void);
+ static void (*sweet_orig_paint)(unsigned int, unsigned int, unsigned char, int, unsigned char, int);
+ static void (*sweet_orig_clear)(unsigned int, unsigned int, unsigned int, unsigned int, int);
+ static void (*sweet_orig_sdown)(int, unsigned int, unsigned int);
+@@ -3351,22 +3351,22 @@ sweet_flush_rows(unsigned int top, unsigned int bottom)
+ 	}
+ }
+ 
+-/* Clean the rows drawn since the last call (AppleCLCD's vsync). */
+-void
+-sweet_console_flush_dirty(void)
++/*
++ * Anything drawn since the last call? AppleCLCD's vsync then copies the
++ * shadow into its back buffer and flips (the shadow itself is not scanned).
++ */
++int
++sweet_console_take_dirty(void)
+ {
+ 	if (sweet_shadow_va == 0) {
+-		return;
++		return 0;
+ 	}
+ 	VCPUTC_LOCK_LOCK();
+-	unsigned int top = sweet_dirty_top, bottom = sweet_dirty_bottom;
++	int dirty = sweet_dirty_bottom > sweet_dirty_top;
+ 	sweet_dirty_top = ~0u;
+ 	sweet_dirty_bottom = 0;
+ 	VCPUTC_LOCK_UNLOCK();
+-	if (bottom > top && vinfo.v_rows != 0) {
+-		uint64_t band = (uint64_t)(vinfo.v_height / vinfo.v_rows) * vinfo.v_rowbytes;
+-		flush_dcache64((addr64_t)(vinfo.v_baseaddr + top * band), (unsigned)((bottom - top) * band), FALSE);
+-	}
++	return dirty;
+ }
+ 
+ static void
+-- 
+2.43.0
+
