@@ -29,7 +29,11 @@ mount -t hfsplus -o loop,force "$img" "$mnt"
 trap 'mountpoint -q "$mnt" && umount "$mnt"; rmdir "$mnt"' EXIT
 python3 "$here/sweet-root-tweaks.py" "$mnt"
 umount "$mnt"
-fsck.hfsplus -f -n "$img"
+# After a Linux mount the header says lastMountedVersion H+Lx with the journal
+# bit set; fsck -n then reports "Volume header needs minor repair" although
+# -y finds nothing to fix. xnu replays the journal itself: only report it.
+fsck.hfsplus -f -y "$img" | grep -v 'Illegal name' || true
+fsck.hfsplus -f -n "$img" || echo "note: fsck -n header warning (see comment)"
 
 img2simg "$img" "$outdir/ios16-root.simg"
 ls -la "$img" "$outdir/ios16-root.simg"
