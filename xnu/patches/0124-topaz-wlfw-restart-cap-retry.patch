@@ -1,0 +1,75 @@
+From f1a0aa151cd4328210cf066d4c94be52b54f9663 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 19:48:45 +0300
+Subject: [PATCH] topaz-0124: WLFW: redo the handshake when the WLAN PD
+ restarts; retry CAP, dump its error
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 30 ++++++++++++++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index cb34e86..7b5a884 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -3273,12 +3273,22 @@ w_on_msa_info(const uint8_t *d, uint32_t len)
+ 	}
+ }
+ 
++static unsigned w_arrivals, w_cap_tries, w_cap_retry_ms;
++
+ static void
+ wlfw_arrive(uint32_t node, uint32_t port)
+ {
+-	if (w_node != 0 || w_port != 0) {
++	if ((w_node != 0 || w_port != 0) && w_node == node && w_port == port) {
+ 		return;
+ 	}
++	if (w_arrivals++ != 0) {
++		/* the WLAN PD restarted (new server port): start the handshake again */
++		LOG("t=%u ms: WLFW back on port %x (restart %u, last step: %s): handshake again", g_ms, port, w_arrivals - 1, w_step);
++		w_msa_ind = w_cap_done = w_bdf_started = w_fw_ready = w_mission = false;
++		w_board = 0xFF;
++		w_cap_tries = 0;
++		w_cap_retry_ms = 0;
++	}
+ 	w_node = node;
+ 	w_port = port;
+ 	struct wmsg m;
+@@ -3362,9 +3372,21 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 		w_simple(WLFW_CAP, "cap sent");
+ 		break;
+ 	case WLFW_CAP:
+-		LOG("wlfw: cap %s err %u", ok ? "ok" : "FAILED", err);
++		LOG("t=%u ms: wlfw: cap %s err %u (try %u)", g_ms, ok ? "ok" : "FAILED", err, w_cap_tries + 1);
+ 		if (ok) {
+ 			w_on_cap(d, len);
++		} else {
++			char hx[3 * 24 + 1];
++			uint32_t n = MIN(len, 24u);
++			for (uint32_t i = 0; i < n; i++) {
++				snprintf(hx + 3 * i, 4, "%02x ", d[i]);
++			}
++			hx[3 * n] = 0;
++			LOG("wlfw: cap response %u bytes: %s", len, hx);
++			if (++w_cap_tries < 5) {
++				w_cap_retry_ms = g_ms + 500;    /* ask again from the poll loop */
++				break;
++			}
+ 		}
+ 		w_cap_done = true;
+ 		w_step = "waiting MSA_READY ind";
+@@ -4383,6 +4405,10 @@ static void
+ radio_poll(unsigned ms)
+ {
+ 	(void)ms;
++	if (w_cap_retry_ms != 0 && g_ms >= w_cap_retry_ms) {
++		w_cap_retry_ms = 0;
++		w_simple(WLFW_CAP, "cap sent again");
++	}
+ 	if (!ce_up) {
+ 		return;
+ 	}
+-- 
+2.43.0
+
