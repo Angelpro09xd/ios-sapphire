@@ -1,0 +1,74 @@
+From 5a9dbabfa9996323ff7430b5dbbd22f616007899 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 09:27:15 +0300
+Subject: [PATCH] topaz-0101: real dcache clean/flush (MDP is not cache
+ coherent)
+
+---
+ osfmk/arm/caches.c | 43 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 43 insertions(+)
+
+diff --git a/osfmk/arm/caches.c b/osfmk/arm/caches.c
+index b5b3ba9..6ef93ad 100644
+--- a/osfmk/arm/caches.c
++++ b/osfmk/arm/caches.c
+@@ -382,6 +382,48 @@ platform_cache_flush_wimg(
+ 
+ #else   /* __ARM_COHERENT_IO__ */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * topaz/sweet: Apple SoCs keep DMA coherent with the CPU caches, so these
++ * are no-ops upstream. The Qualcomm display (MDP) and other masters here
++ * read DRAM behind the caches: clean/invalidate to the point of coherency.
++ */
++static void
++sweet_dcache_op(vm_offset_t addr, unsigned length, boolean_t phys, bool invalidate)
++{
++	if (length == 0) {
++		return;
++	}
++	if (phys) {
++		addr = phystokv((pmap_paddr_t)addr);
++	}
++	uint64_t ctr;
++	__asm__ volatile ("mrs %0, ctr_el0" : "=r"(ctr));
++	vm_offset_t line = 4UL << ((ctr >> 16) & 0xf);
++	vm_offset_t end = addr + length;
++	__builtin_arm_dsb(DSB_SY);
++	for (vm_offset_t va = addr & ~(line - 1); va < end; va += line) {
++		if (invalidate) {
++			__asm__ volatile ("dc civac, %0" :: "r"(va) : "memory");
++		} else {
++			__asm__ volatile ("dc cvac, %0" :: "r"(va) : "memory");
++		}
++	}
++	__builtin_arm_dsb(DSB_SY);
++}
++
++void
++flush_dcache(vm_offset_t addr, unsigned length, boolean_t phys)
++{
++	sweet_dcache_op(addr, length, phys, true);
++}
++
++void
++clean_dcache(vm_offset_t addr, unsigned length, boolean_t phys)
++{
++	sweet_dcache_op(addr, length, phys, false);
++}
++#else
+ void
+ flush_dcache(
+ 	__unused vm_offset_t addr,
+@@ -399,6 +441,7 @@ clean_dcache(
+ {
+ 	__builtin_arm_dsb(DSB_SY);
+ }
++#endif
+ 
+ void
+ flush_dcache_syscall(
+-- 
+2.43.0
+
