@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Build the minimal Apple Device Tree that the TOPAZ xnu needs to boot.
+"""Build the minimal Apple Device Tree that the SAPPHIRE xnu needs to boot.
 
-Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the topaz (Redmi Note 12 4G, SM6225 khaje) live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+Only what the early boot path actually reads (see NOTES.md). sapphire
+(Redmi Note 13 4G, SM6225 khaje) shares every SoC MMIO address with topaz:
+GIC, UFS, splash region, touch bus and pins match its kernel DT and dtbo. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
 """
 import hashlib, os, struct, sys
 
@@ -31,7 +32,7 @@ GICD, GICD_SIZE = 0x0f200000, 0x10000
 GICR, GICR_SIZE = 0x0f300000, 0x100000
 # cont_splash_region left lit by ABL
 FB, FB_SIZE = 0x5c000000, 0xf00000
-SWEET_ECID = 0x544f50415a000001  # 'TOPAZ' + 1, synthetic
+SWEET_ECID = 0x5341505048000001  # 'SAPPH' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # Internal UFS host (ufshc@4804000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x04804000, 0x3000
@@ -41,7 +42,7 @@ VTIMER_INTID = 19
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
-BOOT_MANIFEST_HASH = hashlib.sha384(b'topaz boot manifest').digest()
+BOOT_MANIFEST_HASH = hashlib.sha384(b'sapphire boot manifest').digest()
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
@@ -91,8 +92,8 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),
         ('debug-enabled', u32(1)),
-        ('firmware-version', cstr('topaz-shim')),
-        ('system-firmware-version', cstr('topaz-shim')),
+        ('firmware-version', cstr('sapphire-shim')),
+        ('system-firmware-version', cstr('sapphire-shim')),
         # iBoot's SHA-384 of the boot manifest; /sbin/mount -P 1 exits unless
         # it exists (bind mounts /private/preboot/<hex>/usr/standalone/firmware,
         # tolerating a missing directory). Fixed stand-in value.
@@ -231,7 +232,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # SweetPlatformExpert and CPU IONameMatch still use them.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,topaz') + cstr('xiaomi,sweet') + cstr('qcom,khaje') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sapphire') + cstr('xiaomi,sweet') + cstr('qcom,khaje') + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
