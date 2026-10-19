@@ -1,4 +1,4 @@
-From 230ba8bdba53936a04e7610da91d1a3d0a18362e Mon Sep 17 00:00:00 2001
+From 0a93e334fe588de6faf8baa35da1b759539f5256 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Mon, 19 Oct 2026 17:50:41 +0300
 Subject: [PATCH] topaz-0115: modem firmware read-only from the stock modem_a
@@ -6,8 +6,8 @@ Subject: [PATCH] topaz-0115: modem firmware read-only from the stock modem_a
 
 ---
  bsd/dev/sweet_ufs.c             | 101 +++++++++++++++++++++++
- iokit/Kernel/arm/TopazModem.cpp | 140 +++++++++++++++++++-------------
- 2 files changed, 184 insertions(+), 57 deletions(-)
+ iokit/Kernel/arm/TopazModem.cpp | 142 +++++++++++++++++++-------------
+ 2 files changed, 186 insertions(+), 57 deletions(-)
 
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 index 467ce46..143db60 100644
@@ -122,10 +122,10 @@ index 467ce46..143db60 100644
  ufs_take_over_host(void)
  {
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
-index 9ec7ca5..4464704 100644
+index 9ec7ca5..e7dc937 100644
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
-@@ -20,16 +20,12 @@
+@@ -20,16 +20,14 @@
  #include <IOKit/IOMemoryDescriptor.h>
  #include <kern/thread.h>
  #include <pexpert/pexpert.h>
@@ -133,6 +133,8 @@ index 9ec7ca5..4464704 100644
 -#include <sys/fcntl.h>
 -#include <sys/proc.h>
 +#include <libkern/crc.h>
++#include <sys/param.h>
++#include <sys/errno.h>
  
  extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
  
@@ -143,7 +145,7 @@ index 9ec7ca5..4464704 100644
  #define PAS_ID_MODEM        4
  #define SCM_FN(svc, cmd)    (0x42000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
  #define SCM_SVC_PIL         0x02
-@@ -160,62 +156,86 @@ scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t
+@@ -160,62 +158,86 @@ scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t
  
  /* ---------------------------------------------------------------- firmware files */
  
@@ -274,7 +276,7 @@ index 9ec7ca5..4464704 100644
  }
  
  /* ---------------------------------------------------------------- SMEM */
-@@ -601,16 +621,22 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -601,16 +623,22 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
  	unsigned watch = 60;
  
  	(void)PE_parse_boot_argn("modem_watch", &watch, sizeof(watch));

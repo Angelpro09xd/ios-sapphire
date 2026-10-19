@@ -21,8 +21,8 @@ HIGH_MEM_SIZE = 0x100000000
 # --midmem (phone only): the middle and upper banks as one range, 0x80000000 +
 # 3G + 4G = 7G up to 0x2_40000000. No fixed carve-out is above 0x63900000, and it
 # gives the kernel RAM below 4 GiB, which the GPU needs (it does not reach above).
-MID_PHYS_BASE = 0x80000000
-MID_MEM_SIZE = 0x1c0000000
+MID_PHYS_BASE = int(__import__("os").environ.get("MIDBASE", "0x80000000"), 16)
+MID_MEM_SIZE = int(__import__("os").environ.get("MIDSIZE", "0x1c0000000"), 16)
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
