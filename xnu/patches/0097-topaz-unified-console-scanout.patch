@@ -1,4 +1,4 @@
-From c18dd3513b430f6e263c3f1472d31c5e498421c6 Mon Sep 17 00:00:00 2001
+From f27dd6cbae997eef96a1673c38c8bf7f6afa6b53 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Mon, 19 Oct 2026 08:31:42 +0300
 Subject: [PATCH] topaz-0097: console on a cached shadow frame scanned by the
@@ -6,8 +6,8 @@ Subject: [PATCH] topaz-0097: console on a cached shadow frame scanned by the
 
 ---
  iokit/Kernel/arm/SweetFramebuffer.cpp | 36 +++++++++-
- osfmk/console/video_console.c         | 98 +++++++++++++++++++++++++++
- 2 files changed, 133 insertions(+), 1 deletion(-)
+ osfmk/console/video_console.c         | 97 +++++++++++++++++++++++++++
+ 2 files changed, 132 insertions(+), 1 deletion(-)
 
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 index 79fd421..3861a97 100644
@@ -85,10 +85,10 @@ index 79fd421..3861a97 100644
  AppleCLCD::fadeStep(const uint8_t *src, uint32_t srcStride, uint32_t step)
  {
 diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
-index 84092bd..7d21a41 100644
+index 84092bd..1dc46bf 100644
 --- a/osfmk/console/video_console.c
 +++ b/osfmk/console/video_console.c
-@@ -140,6 +140,25 @@ static struct {
+@@ -140,6 +140,24 @@ static struct {
  	void (*update_color)(int color, boolean_t fore);
  } gc_ops;
  
@@ -100,7 +100,6 @@ index 84092bd..7d21a41 100644
 + * appears at cache speed and stays visible in a panic.
 + */
 +extern void flush_dcache64(addr64_t addr, unsigned count, int phys);
-+extern boolean_t panic_active(void);
 +void sweet_console_retarget(vm_offset_t va);
 +void (*sweet_console_show_hook)(void);
 +static vm_offset_t sweet_shadow_va;
@@ -114,7 +113,7 @@ index 84092bd..7d21a41 100644
  static unsigned char *gc_buffer_attributes;
  static unsigned char *gc_buffer_characters;
  static unsigned char *gc_buffer_colorcodes;
-@@ -2925,6 +2944,9 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
+@@ -2925,6 +2943,9 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
  			gc_ops.hide_cursor  = vc_reverse_cursor;
  			gc_ops.show_cursor  = vc_reverse_cursor;
  			gc_ops.update_color = vc_update_color;
@@ -124,7 +123,7 @@ index 84092bd..7d21a41 100644
  			gc_initialize(&vinfo);
  		}
  	}
-@@ -3300,3 +3322,79 @@ vc_set_progressmeter(int new_value)
+@@ -3300,3 +3321,79 @@ vc_set_progressmeter(int new_value)
  }
  
  #endif /* defined(XNU_TARGET_OS_OSX) */
