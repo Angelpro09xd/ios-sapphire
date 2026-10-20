@@ -230,6 +230,11 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     ])
 
     product_props = d22ap_product()
+    # Our framebuffer is sRGB 8-bit. With the iPhone X's 'P3' MobileGestalt says
+    # HasExtendedColorDisplay and WebKit renders page tiles into 10-bit surfaces
+    # ('w30r', 'b3a8') that this kernel does not provide: Safari pages stay blank.
+    if product_props:
+        product_props = [(k, cstr('sRGB') if k == 'artwork-display-gamut' else v) for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
