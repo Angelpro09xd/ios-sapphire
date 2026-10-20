@@ -1,0 +1,71 @@
+From 3fbb5fd036aeb8940400e3c07d4f1bba4c2a2ed3 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 20 Oct 2026 15:28:06 +0300
+Subject: [PATCH] topaz-0130: WLAN: join with a ready PMK (wifid hands one
+ over)
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 28 ++++++++++++++++++++++++++--
+ 1 file changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index c9065b4..821c3a5 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -5699,11 +5699,14 @@ w_rx_native(const uint8_t *f, uint32_t len)
+ /* ---- the C API */
+ extern "C" {
+ int topaz_wlan_join(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t *pass, unsigned pass_len);
++int topaz_wlan_join_pmk(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t pmk[32]);
+ int topaz_wlan_leave(void);
+ bool topaz_wlan_joined(void);
+ bool topaz_wlan_transmit(const uint8_t *frame, size_t length);
+ }
+ 
++static int w_join_with(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t *pmk);
++
+ /* Blocks until joined or failed (EAUTH: wrong passphrase; ENOENT: not heard; ETIMEDOUT). */
+ int
+ topaz_wlan_join(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t *pass, unsigned pass_len)
+@@ -5723,6 +5726,24 @@ topaz_wlan_join(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, co
+ 	if (pass_len != 0) {
+ 		w_pbkdf2_pmk(pass, pass_len, ssid, ssid_len, pmk);
+ 	}
++	int r = w_join_with(ssid, ssid_len, bssid, pass_len != 0 ? pmk : NULL);
++	bzero(pmk, sizeof(pmk));
++	return r;
++}
++
++/* the same with the PMK already made of the passphrase (what wifid hands over) */
++int
++topaz_wlan_join_pmk(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t pmk[32])
++{
++	if (!api_ready || ssid_len == 0 || ssid_len > 32) {
++		return api_ready ? EINVAL : ENXIO;
++	}
++	return w_join_with(ssid, ssid_len, bssid, pmk);
++}
++
++static int
++w_join_with(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t *pmk)
++{
+ 	while (s_state != S_IDLE && s_state != S_UP && s_join_asked) {
+ 		IOSleep(50);
+ 	}
+@@ -5733,8 +5754,11 @@ topaz_wlan_join(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, co
+ 	} else {
+ 		bzero(s_bssid, 6);
+ 	}
+-	memcpy(s_pmk, pmk, 32);
+-	bzero(pmk, sizeof(pmk));
++	if (pmk != NULL) {
++		memcpy(s_pmk, pmk, 32);
++	} else {
++		bzero(s_pmk, 32);
++	}
+ 	uint32_t before = s_join_done;
+ 	s_join_asked = true;
+ 	for (int i = 0; i < 300 && s_join_done == before; i++) {   /* 30 s */
+-- 
+2.43.0
+

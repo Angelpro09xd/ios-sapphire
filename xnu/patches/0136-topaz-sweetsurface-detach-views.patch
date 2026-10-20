@@ -1,0 +1,97 @@
+From aeb8c8675147a42304fd6b0c9a73c60113f53df5 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 20 Oct 2026 19:00:53 +0300
+Subject: [PATCH] topaz-0136: SweetSurface: trap 4 detaches the task's view; a
+ lookup before trap 5 gets a fresh one, trap 5 drops the detached view (a
+ racing lookup lost its state page)
+
+---
+ iokit/Kernel/arm/SweetSurface.cpp | 31 ++++++++++++++++++++++++-------
+ 1 file changed, 24 insertions(+), 7 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index a16d0eb..6a8fb9c 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -449,8 +449,9 @@ public:
+ 	IOMemoryMap  *data;
+ 	IOMemoryMap  *state;
+ 	uint32_t      count;
++	bool          detached;     /* trap 4 seen: the framework is releasing this view */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { detached = false; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ };
+ 
+@@ -498,7 +499,7 @@ class IOSurfaceRootUserClient : public IOUserClient {
+ 	IOLock  *fLock;
+ 	OSArray *fRefs;
+ 
+-	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index);
++	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index, bool detached = false);
+ 	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
+ 	IOReturn returnSurface(SweetSurface *s, IOExternalMethodArguments *args);
+ 	IOReturn create(IOExternalMethodArguments *args);
+@@ -519,7 +520,7 @@ public:
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
+-	IOReturn trapDetach(void *, void *, void *, void *, void *, void *);
++	IOReturn trapDetach(void *id, void *, void *, void *, void *, void *);
+ };
+ 
+ OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
+@@ -574,11 +575,11 @@ IOSurfaceRootUserClient::clientClose(void)
+ 
+ /* Lock held. */
+ SweetSurfaceRef *
+-IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index)
++IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index, bool detached)
+ {
+ 	for (unsigned int i = 0; i < fRefs->getCount(); i++) {
+ 		SweetSurfaceRef *ref = (SweetSurfaceRef *)fRefs->getObject(i);
+-		if (ref->surface->id == id) {
++		if (ref->surface->id == id && ref->detached == detached) {
+ 			if (index != NULL) {
+ 				*index = i;
+ 			}
+@@ -1382,9 +1383,22 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 	return ret;
+ }
+ 
++/*
++ * The framework drops a surface in two steps: trap 4 under its cache lock,
++ * trap 5 after it. A lookup in between must get a view of its own (not "you
++ * have it already"): trap 5 then takes the detached view away, not that one.
++ * Without this, a lookup racing a release got -1 ("cached") and then lost its
++ * state page under it (backboardd: IOSurfaceClientGetSeed on unmapped memory).
++ */
+ IOReturn
+-IOSurfaceRootUserClient::trapDetach(void *, void *, void *, void *, void *, void *)
++IOSurfaceRootUserClient::trapDetach(void *id, void *, void *, void *, void *, void *)
+ {
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, NULL);
++	if (ref != NULL) {
++		ref->detached = true;
++	}
++	IOLockUnlock(fLock);
+ 	return kIOReturnSuccess;
+ }
+ 
+@@ -1393,7 +1407,10 @@ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, v
+ {
+ 	unsigned int index;
+ 	IOLockLock(fLock);
+-	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, &index);
++	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, &index, true);
++	if (ref == NULL) {
++		ref = findRef((uint32_t)(uintptr_t)id, &index);
++	}
+ 	if (ref != NULL && --ref->count == 0) {
+ 		fRefs->removeObject(index);     /* unmaps and drops the user count */
+ 	}
+-- 
+2.43.0
+

@@ -1,0 +1,32 @@
+From 7fb898f4b3c188f87b457e65f0d9557cdda2a79d Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 20 Oct 2026 19:35:38 +0300
+Subject: [PATCH] topaz-0139: SweetSurface publishes IOSurfaceAddress surfaces
+ (they all had id 0: releasing one unmapped the others in backboardd)
+
+---
+ iokit/Kernel/arm/SweetSurface.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 00979e1..19ef8ab 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -810,6 +810,14 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			used = owned;
+ 		}
+ 		ret = sweet_surface_use_task_memory(s, fTask, client_address->unsigned64BitValue(), used);
++		/*
++		 * Published here: the two branches below only run for surfaces that still need
++		 * memory. Unpublished, every such surface had id 0, and the framework took them
++		 * all for one surface: releasing any of them unmapped the views of the others.
++		 */
++		if (ret == kIOReturnSuccess && !sweet_surface_publish(s)) {
++			ret = kIOReturnNoResources;
++		}
+ 		static uint32_t told;
+ 		if (told++ < 6) {
+ 			IOLog("SWEET SURF: create around client memory %#llx (%llu bytes) %ux%u fmt 0x%x -> 0x%x\n",
+-- 
+2.43.0
+
