@@ -1,0 +1,110 @@
+From 2a3c25f4a43ac3cb4da4c87eda0dc78a57624507 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 20 Oct 2026 14:32:02 +0300
+Subject: [PATCH] topaz-0127: sweetbusy=N: log the IOServices that keep IOKit
+ busy
+
+---
+ iokit/Kernel/arm/SweetBusy.cpp        | 54 +++++++++++++++++++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp |  4 +-
+ iokit/conf/files.arm64                |  1 +
+ 3 files changed, 58 insertions(+), 1 deletion(-)
+ create mode 100644 iokit/Kernel/arm/SweetBusy.cpp
+
+diff --git a/iokit/Kernel/arm/SweetBusy.cpp b/iokit/Kernel/arm/SweetBusy.cpp
+new file mode 100644
+index 0000000..61fc10c
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetBusy.cpp
+@@ -0,0 +1,54 @@
++/*
++ * topaz debugging: boot-arg sweetbusy=N prints, N seconds after the framebuffer starts and every
++ * 30 s after, every IOService that is still busy. configd (InterfaceNamer) waits for IOKit to
++ * quiesce before it names network interfaces, and everyone who lists interfaces waits for that.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IORegistryEntry.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++
++static uint32_t sweet_busy_secs;
++
++static void
++sweet_busy_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	IOSleep(sweet_busy_secs * 1000);
++	for (int round = 0; round < 10; round++) {
++		unsigned busy = 0;
++		IORegistryIterator *it = IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively);
++		if (it != NULL) {
++			IORegistryEntry *e;
++			while ((e = it->getNextObject()) != NULL) {
++				IOService *s = OSDynamicCast(IOService, e);
++				if (s != NULL && s->getBusyState() != 0) {
++					busy++;
++					IOLog("SWEET BUSY: %s <%s> busy %u\n", s->getName(), s->getMetaClass()->getClassName(), (unsigned)s->getBusyState());
++				}
++			}
++			it->release();
++		}
++		IOLog("SWEET BUSY: round %d: %u busy services\n", round, busy);
++		IOSleep(30000);
++	}
++	thread_terminate(current_thread());
++}
++
++extern "C" void
++sweet_busy_init(void)
++{
++	thread_t thread;
++	if (!PE_parse_boot_argn("sweetbusy", &sweet_busy_secs, sizeof(sweet_busy_secs)) || sweet_busy_secs == 0) {
++		return;
++	}
++	if (kernel_thread_start(sweet_busy_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#else
++extern "C" void sweet_busy_init(void) {}
++#endif
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4cbe94a..f469a3a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -39,7 +39,8 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void sweet_console_retarget(vm_offset_t va);   /* osfmk/console/video_console.c */
+ extern "C" void (*sweet_console_show_hook)(void);
+-extern "C" void topaz_modem_init(void);             /* iokit/Kernel/arm/TopazModem.cpp (boot-arg modem=1) */
++extern "C" void topaz_modem_init(void);
++extern "C" void sweet_busy_init(void);              /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */             /* iokit/Kernel/arm/TopazModem.cpp (boot-arg modem=1) */
+ extern "C" int sweet_console_copy_dirty(void *dst);
+ 
+ /*
+@@ -254,6 +255,7 @@ AppleCLCD::start(IOService *provider)
+ 		return false;
+ 	}
+ 	topaz_modem_init();
++	sweet_busy_init();
+ 	PE_current_console(&video);
+ 	fPhys = video.v_baseAddr;
+ 	fWidth = (uint32_t)video.v_width;
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 8b2b868..cc24c81 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -11,6 +11,7 @@ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitc
+ 
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/TopazModem.cpp                                  optional iokitcpp
++iokit/Kernel/arm/SweetBusy.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+-- 
+2.43.0
+
