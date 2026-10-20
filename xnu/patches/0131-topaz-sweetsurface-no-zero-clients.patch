@@ -1,0 +1,37 @@
+From f761f446a82802cb9912258f61cb29907891828f Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 20 Oct 2026 17:20:34 +0300
+Subject: [PATCH] topaz-0131: SweetSurface: refuse calls that answer with a
+ lock result (wrap client image/memory): no zeroed IOSurface clients
+
+---
+ iokit/Kernel/arm/SweetSurface.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index f10f548..baf027c 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -875,6 +875,19 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		return kIOReturnSuccess;
+ 	}
+ 	default:
++		/*
++		 * A call that answers with a lock result (wrap client image 6 and
++		 * memory 7, child surfaces) would hand IOSurface.framework a client
++		 * made of zeroes: no shared state (CoreAnimation's GL renderer reads
++		 * its EDR factor there and crashed at 0x30). Refused, the framework
++		 * returns NULL and its callers take their other path.
++		 */
++		if ((args->structureOutputDescriptor != NULL &&
++		    args->structureOutputDescriptor->getLength() >= SWEET_SURFACE_RESULT_SIZE) ||
++		    (args->structureOutput != NULL && args->structureOutputSize >= SWEET_SURFACE_RESULT_SIZE)) {
++			sweet_surf_log_once("sel (refused: lock result)", selector);
++			return kIOReturnUnsupported;
++		}
+ 		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+ 			args->scalarOutput[i] = 0;
+-- 
+2.43.0
+
