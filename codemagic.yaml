@@ -1,0 +1,70 @@
+# Codemagic build of the kernel: same steps as .github/workflows/xnu.yml,
+# for when GitHub Actions is not available. Free personal accounts get
+# 500 macOS M2 minutes a month; one kernel build is about 20 minutes.
+# Start it from the Codemagic UI (workflow "xnu", branch sapphire); the
+# kernel is in the build's artifacts as xnu-kernel.zip.
+workflows:
+  xnu:
+    name: xnu
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      # Xcode 15: its iig matches the xnu-8796 IORPC ABI (Xcode 16's does not)
+      xcode: 15.4
+      vars:
+        DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+        DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+        MACOS_VERSION: "13.5"
+        KERNEL_CONFIG: DEVELOPMENT
+        MACHINE_CONFIG: SWEET
+        MAKEFLAGS: -k
+        CCACHE_COMPILERCHECK: content
+        CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,file_macro,pch_defines
+        CCACHE_MAXSIZE: 3G
+    cache:
+      cache_paths:
+        - $CM_BUILD_DIR/.ccache
+    scripts:
+      - name: Fetch build script
+        script: |
+          set -e
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53"/' dxb/build.sh
+          grep -c 'OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53"' dxb/build.sh
+          sed -i '' 's|export CC="$(xcrun -find clang)"|export CC="$CCACHE_WRAP/clang"|; s|export CXX="$(xcrun -find clang++)"|export CXX="$CCACHE_WRAP/clang++"|' dxb/build.sh
+          grep -c 'export CC="$CCACHE_WRAP/clang"' dxb/build.sh
+      - name: Deps
+        script: |
+          set -e
+          brew install jq gum bash cmake ninja ccache
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          sw_vers
+          xcodebuild -version
+          xcrun --find iig
+          wrap="$CM_BUILD_DIR/ccache-bin"
+          mkdir -p "$wrap"
+          for t in clang clang++; do
+            printf '#!/bin/sh\nexec ccache %s "$@"\n' "$(xcrun -find $t)" > "$wrap/$t"
+            chmod +x "$wrap/$t"
+          done
+      - name: Build
+        script: |
+          set -e
+          export CCACHE_DIR="$CM_BUILD_DIR/.ccache" CCACHE_BASEDIR="$CM_BUILD_DIR" CCACHE_WRAP="$CM_BUILD_DIR/ccache-bin"
+          cd dxb
+          ccache -z
+          bash build.sh
+          ccache -s
+      - name: Collect
+        script: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+          ls -la out
+          (cd out && zip -qr ../xnu-kernel.zip .)
+    artifacts:
+      - xnu-kernel.zip
