@@ -40,9 +40,11 @@ workflows:
       - name: Deps
         script: |
           set -e
-          brew install jq gum bash cmake ninja ccache
-          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
-          sudo chmod +x /usr/local/bin/xcodes
+          # The image already has jq, gum, cmake, ccache and xcodes; its old
+          # Homebrew would build the rest from source (10+ minutes), so only
+          # ninja comes from pip.
+          pip3 install --break-system-packages ninja
+          for t in jq gum cmake ninja ccache xcodes; do command -v $t; done
           sw_vers
           xcodebuild -version
           xcrun --find iig
