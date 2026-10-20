@@ -1,0 +1,89 @@
+From 6c9bbe9e08b53e0e371b8b5f16892190389c8c2c Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 20 Oct 2026 18:47:43 +0300
+Subject: [PATCH] topaz-0135: SweetSurface: trap 4 only detaches (one release
+ dropped two references and unmapped surfaces in use); client memory as big as
+ IOSurfaceAllocSize says, held read-only when it cannot be written
+
+---
+ iokit/Kernel/arm/SweetSurface.cpp | 36 +++++++++++++++++++++++++------
+ 1 file changed, 29 insertions(+), 7 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 1513e67..a16d0eb 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -519,6 +519,7 @@ public:
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
++	IOReturn trapDetach(void *, void *, void *, void *, void *, void *);
+ };
+ 
+ OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
+@@ -793,6 +794,11 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 				used = (uint64_t)s->planes[i].offset + s->planes[i].size;
+ 			}
+ 		}
++		/* the memory is as big as its owner says (IOSurfaceAllocSize), not rounded up by us */
++		uint64_t owned = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
++		if (owned != 0) {
++			used = owned;
++		}
+ 		ret = sweet_surface_use_task_memory(s, fTask, client_address->unsigned64BitValue(), used);
+ 		static uint32_t told;
+ 		if (told++ < 6) {
+@@ -886,12 +892,16 @@ sweet_surface_use_task_memory(SweetSurface *s, task_t task, uint64_t address, ui
+ 	}
+ 	uint64_t first = trunc_page_64(address);
+ 	uint64_t length = round_page_64(address + size) - first;
+-	IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(first, length, kIODirectionInOut, task);
+-	if (md == NULL) {
+-		return kIOReturnNoMemory;
+-	}
+-	if (md->prepare() != kIOReturnSuccess) {
+-		md->release();
++	IOMemoryDescriptor *md = NULL;
++	IOReturn held = kIOReturnNoMemory;
++	/* writable if it can be; a picture that is only shown may be read-only memory */
++	for (int attempt = 0; attempt < 2 && held != kIOReturnSuccess; attempt++) {
++		OSSafeReleaseNULL(md);
++		md = IOMemoryDescriptor::withAddressRange(first, length, attempt == 0 ? kIODirectionInOut : kIODirectionOut, task);
++		held = md != NULL ? md->prepare() : kIOReturnNoMemory;
++	}
++	if (held != kIOReturnSuccess) {
++		OSSafeReleaseNULL(md);
+ 		return kIOReturnVMError;
+ 	}
+ 	s->memory = md;
+@@ -1372,6 +1382,12 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 	return ret;
+ }
+ 
++IOReturn
++IOSurfaceRootUserClient::trapDetach(void *, void *, void *, void *, void *, void *)
++{
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, void *)
+ {
+@@ -1390,7 +1406,13 @@ static IOExternalTrap sweet_surface_traps[] = {
+ 	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+-	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
++	/*
++	 * IOSurfaceClientRelease calls 4 and then 5 for one release: 4 only says the
++	 * client is about to go. Releasing at both dropped a surface's mapping while
++	 * another IOSurfaceRef of the task still used it (backboardd crashed in
++	 * IOSurfaceClientGetSeed reading the unmapped state page).
++	 */
++	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDetach },
+ 	[kSweetSurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+ };
+ 
+-- 
+2.43.0
+
