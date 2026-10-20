@@ -1,0 +1,147 @@
+From 49591d30e5bf1ba4da03ea1789f410e9e24d055b Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 20 Oct 2026 07:51:59 +0000
+Subject: [PATCH] sapphire-0129: USB on SM6225 (khaje)
+
+Port sweet's DWC3 device driver (CDC-ECM ue0, 192.168.7.2/24, live log
+over UDP) to the SM6225 addresses: GCC 0x1400000 with the USB30_PRIM
+GDSC at 0x1a004 and the gcc-sm6115 branch offsets, DWC3 at 0x4e00000,
+QSCRATCH at DWC3 + 0xf8800. The femto HS PHY is left as ABL set it up and
+is not read. The driver is opt-in: sweetusb=1 reports the state left by
+ABL, sweetusb=2 starts the USB device; it no longer needs sweethw=1.
+---
+ bsd/dev/sweet_ufs.c | 12 +++--------
+ bsd/dev/sweet_usb.c | 51 +++++++++++++++++----------------------------
+ 2 files changed, 22 insertions(+), 41 deletions(-)
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 143db60..6c91dbd 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -816,18 +816,12 @@ sweet_ufs_init(void)
+ 	/*
+ 	 * Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp).
+ 	 * Touch (FT5452 on QUP0 SE2) and keys (PM6125 over SPMI) are ported to
+-	 * topaz; sweettouch=0 / sweetkeys=0 disable them. USB still pokes SM7150
+-	 * MMIO (DWC3 at 0xa600000), so it only runs with sweethw=1.
++	 * topaz; sweettouch=0 / sweetkeys=0 disable them. USB (ported to SM6225)
++	 * is opt-in: sweetusb=1 reports its state, sweetusb=2 starts the device.
+ 	 */
+-	int hw = 0;
+-	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));
+ 	sweet_touch_init();
+ 	sweet_keys_init();
+-	if (hw == 1) {
+-		sweet_usb_probe();
+-	} else {
+-		printf("SWEET UFS: USB skipped (topaz, sweethw=0)\n");
+-	}
++	sweet_usb_probe();
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 9c42e45..2825351 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -2,9 +2,11 @@
+  * SWEET: USB bring-up, step 1 - read-only state probe.
+  *
+  * The phone's USB is a Synopsys DWC3 (USB 2.0 only, maximum-speed
+- * high-speed) at 0x0a600000 behind Qualcomm's dwc-usb3-msm wrapper, with a
+- * QUSB2 PHY at 0x088e2000; its power domain is the USB30_PRIM GDSC and its
+- * clocks come from GCC (offsets from Linux gcc-sdmmagpie.c). ABL uses this
++ * high-speed) behind Qualcomm's dwc-usb3-msm wrapper; its power domain is
++ * the USB30_PRIM GDSC and its clocks come from GCC. sapphire/topaz
++ * (SM6225 khaje): DWC3 at 0x04e00000, Synopsys femto HS PHY at 0x01613000
++ * (not read here), GCC offsets from Linux gcc-sm6115.c (the khaje GCC; the
++ * USB30_PRIM GDSC at 0x141a004 matches the phone's DT). ABL uses this
+  * controller for fastboot; this probe only reports what state it is left
+  * in after `fastboot boot`. It never writes a register, and it touches the
+  * DWC3 / PHY register blocks only when the GCC status registers say their
+@@ -39,28 +41,26 @@ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+-#define GCC_PA                  0x00100000
+-#define GCC_SIZE                0x00090000
+-#define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
++#define GCC_PA                  0x01400000
++#define GCC_SIZE                0x001f0000
++#define GCC_USB30_PRIM_GDSCR    0x1a004         /* bit 31: power on */
+ #define CBCR_CLK_OFF            (1u << 31)
+ 
+ static const struct {
+ 	const char *name;
+ 	uint32_t    off;
+ } usb_cbcr[] = {
+-	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0502c },
+-	{ "aggre-axi", 0x8201c },
+-	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
++	{ "master", 0x1a010 },
++	{ "sleep", 0x1a014 },
++	{ "utmi", 0x1a018 },
++	{ "cfg-noc-axi", 0x1a084 },
++	{ "sys-noc-axi", 0x1a080 },
++	{ "ahb2phy", 0x1d008 },
++	{ "clkref", 0x9f000 },
+ };
+ 
+-#define DWC3_PA                 0x0a600000
++#define DWC3_PA                 0x04e00000
+ #define DWC3_SIZE               0x0000d000
+-#define QUSB2_PA                0x088e2000
+-#define QUSB2_SIZE              0x00000400
+ 
+ static uint32_t
+ usb_rd(vm_offset_t base, uint32_t off)
+@@ -73,11 +73,11 @@ usb_rd(vm_offset_t base, uint32_t off)
+ void
+ sweet_usb_probe(void)
+ {
+-	int enabled = 1;
++	int enabled = 0;
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
+-	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
++	/* sweetusb=0 (default) off, 1 report state only, 2 also start the USB device */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		return;
+@@ -116,19 +116,6 @@ sweet_usb_probe(void)
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+-	if (cbcr[5] & CBCR_CLK_OFF) {
+-		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+-		return;
+-	}
+-	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+-	if (phy == 0) {
+-		return;
+-	}
+-	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+-	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+-	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+-	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+-	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
+ }
+ 
+ /*
+@@ -164,7 +151,7 @@ sweet_usb_probe(void)
+  * session; Linux dwc3-qcom forces that in software when the charger
+  * reports a cable (dwc3_qcom_vbus_override_enable).
+  */
+-#define QSCRATCH_PA             0x0a6f8800
++#define QSCRATCH_PA             0x04ef8800    /* DWC3 + 0xf8800 */
+ #define QSCRATCH_HS_PHY_CTRL    0x10
+ #define   UTMI_OTG_VBUS_VALID   (1u << 20)
+ #define   SW_SESSVLD_SEL        (1u << 28)
+-- 
+2.43.0
+
