@@ -8,3 +8,5 @@ shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
+# boot logs: SSIDs nearby, device identifiers
+logs/
