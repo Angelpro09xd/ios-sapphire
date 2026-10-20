@@ -9,8 +9,9 @@ workflows:
     instance_type: mac_mini_m2
     max_build_duration: 120
     environment:
-      # Xcode 15: its iig matches the xnu-8796 IORPC ABI (Xcode 16's does not)
-      xcode: 15.4
+      # oldest Xcode Codemagic offers; patch 0128 adds IORPC.kernelContent,
+      # which Xcode 16+ iig stubs need (Xcode 15 is no longer offered)
+      xcode: 16.0
       vars:
         DXB_REPO: https://github.com/blacktop/darwin-xnu-build
         DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
