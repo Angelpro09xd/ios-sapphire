@@ -40,28 +40,34 @@ workflows:
       - name: Deps
         script: |
           set -e
-          # The image already has jq, gum, cmake, ccache and xcodes; its old
-          # Homebrew would build the rest from source (10+ minutes), so only
-          # ninja comes from pip.
-          pip3 install --break-system-packages ninja
-          for t in jq gum cmake ninja ccache xcodes; do command -v $t; done
+          # The image's Homebrew is old and builds formulae from source (10+
+          # minutes), so no brew: cmake and ninja come from pip; gum and
+          # xcodes are only used interactively by build.sh, so stubs do.
+          pip3 install --break-system-packages cmake ninja
+          for t in gum xcodes; do
+            command -v $t || { sudo mkdir -p /usr/local/bin; printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/$t >/dev/null; sudo chmod +x /usr/local/bin/$t; }
+          done
+          for t in jq gum cmake ninja xcodes; do command -v $t; done
           sw_vers
           xcodebuild -version
           xcrun --find iig
           wrap="$CM_BUILD_DIR/ccache-bin"
           mkdir -p "$wrap"
+          # ccache when the image has it, plain clang otherwise
+          cc=$(command -v ccache || true)
           for t in clang clang++; do
-            printf '#!/bin/sh\nexec ccache %s "$@"\n' "$(xcrun -find $t)" > "$wrap/$t"
+            printf '#!/bin/sh\nexec %s %s "$@"\n' "$cc" "$(xcrun -find $t)" > "$wrap/$t"
             chmod +x "$wrap/$t"
           done
+          cat "$wrap/clang"
       - name: Build
         script: |
           set -e
           export CCACHE_DIR="$CM_BUILD_DIR/.ccache" CCACHE_BASEDIR="$CM_BUILD_DIR" CCACHE_WRAP="$CM_BUILD_DIR/ccache-bin"
           cd dxb
-          ccache -z
+          command -v ccache >/dev/null && ccache -z
           bash build.sh
-          ccache -s
+          command -v ccache >/dev/null && ccache -s || true
       - name: Collect
         script: |
           mkdir -p out
