@@ -1,0 +1,131 @@
+From 8b223aad132a511cee0c673b2a682627749c78fb Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 20 Oct 2026 12:00:15 +0000
+Subject: [PATCH] sapphire-0130: modem firmware table for sapphire, picked by
+ modem.mdt CRC
+
+sapphire (Redmi Note 13 4G) has the same SoC, carveouts (modem
+0x4ab00000+0x6900000, WLAN MSA 0x51900000, SMEM 0x46000000) and modem
+file set as topaz, but its NON-HLOS puts the files elsewhere in modem_a
+(FAT16, every file contiguous; offsets and CRC32 from the phone's
+partition). fw_pick() uses the table whose modem.mdt CRC matches.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 73 +++++++++++++++++++++++++++++++--
+ 1 file changed, 70 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 7aba390..b88e1cd 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -163,12 +163,15 @@ scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t
+  * modem_a), read-only through sweet_ufs (bsd/dev/sweet_ufs.c): nothing has to be put on
+  * userdata. Where each file lies in that FAT16 volume was worked out on the host from the
+  * same NON-HLOS.bin (HyperOS 2.0.208; every file is one contiguous run); the CRC32 tells
+- * whether the phone's partition is that image.
++ * whether the phone's partition is that image. sapphire (Redmi Note 13 4G, same SoC and
++ * carveouts) has the same file set at other places; fw_pick() chooses the table whose
++ * modem.mdt CRC matches the partition.
+  */
+ extern "C" int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
+ 
+ static char fw_part[32] = "modem_a";
+-static const struct { const char *name; uint32_t off, size, crc; } fw_files[] = {
++struct fw_file { const char *name; uint32_t off, size, crc; };
++static const struct fw_file fw_topaz[] = {
+ 	{ "modem.b00", 0x1e1d000, 0x414, 0xaacde80c },
+ 	{ "modem.b01", 0x1e21000, 0x1f78, 0x80555ebe },
+ 	{ "modem.b02", 0x1e25000, 0x2930, 0x0858b3a0 },
+@@ -198,11 +201,47 @@ static const struct { const char *name; uint32_t off, size, crc; } fw_files[] =
+ 	{ "modem.b29", 0x49ed000, 0x7d52c, 0x7d6f01a3 },
+ 	{ "modem.mdt", 0x4a6d000, 0x238c, 0x8742d22b },
+ };
++static const struct fw_file fw_sapphire[] = {
++	{ "modem.b00", 0x24a9000, 0x414, 0xb65bc268 },
++	{ "modem.b01", 0x24ad000, 0x1f78, 0x3095d3e5 },
++	{ "modem.b02", 0x24b1000, 0x2930, 0x43a8e621 },
++	{ "modem.b03", 0x24b5000, 0x2518, 0x93a2467e },
++	{ "modem.b04", 0x24b9000, 0x4a3ac, 0x1824a643 },
++	{ "modem.b05", 0x2505000, 0x119d8, 0x9b98d3c3 },
++	{ "modem.b06", 0x2519000, 0x100c, 0x4cdb81db },
++	{ "modem.b07", 0x251d000, 0x90b4, 0x45aafd29 },
++	{ "modem.b08", 0x2529000, 0x4f054, 0xa09c4e3a },
++	{ "modem.b09", 0x2579000, 0x143ee8, 0xf56ce8eb },
++	{ "modem.b10", 0x26bd000, 0x40000, 0xa1d37576 },
++	{ "modem.b11", 0x26fd000, 0x540, 0x1055fb61 },
++	{ "modem.b12", 0x2701000, 0xe2210, 0x66ec10c8 },
++	{ "modem.b14", 0x27e5000, 0x2d, 0x7a4002c7 },
++	{ "modem.b15", 0x27e9000, 0x7c, 0x959b6a58 },
++	{ "modem.b16", 0x27ed000, 0x9c1a0, 0xd902be24 },
++	{ "modem.b17", 0x288d000, 0x61110, 0xd2182ca7 },
++	{ "modem.b18", 0x28f1000, 0x2d4079, 0x04103884 },
++	{ "modem.b19", 0x2bc9000, 0x2da98c, 0x8f13126c },
++	{ "modem.b22", 0x2ea5000, 0x10ec0, 0x8c07d162 },
++	{ "modem.b23", 0x2eb9000, 0x1722040, 0x12610ed2 },
++	{ "modem.b24", 0x45dd000, 0xa07900, 0x489ef97e },
++	{ "modem.b25", 0x4fe5000, 0x778fb, 0xbcb83811 },
++	{ "modem.b26", 0x505d000, 0x15104, 0x33437cee },
++	{ "modem.b27", 0x5075000, 0x1378, 0x161303ae },
++	{ "modem.b28", 0x5079000, 0xb0, 0x1e475201 },
++	{ "modem.b29", 0x507d000, 0x7d52c, 0xc2f72f9c },
++	{ "modem.mdt", 0x50fd000, 0x238c, 0x8d38e54b },
++};
++static const struct { const char *phone; const struct fw_file *files; unsigned n; } fw_tables[] = {
++	{ "topaz", fw_topaz, sizeof(fw_topaz) / sizeof(fw_topaz[0]) },
++	{ "sapphire", fw_sapphire, sizeof(fw_sapphire) / sizeof(fw_sapphire[0]) },
++};
++static const struct fw_file *fw_files = fw_topaz;
++static unsigned fw_count = sizeof(fw_topaz) / sizeof(fw_topaz[0]);
+ 
+ static int
+ fw_find(const char *name)
+ {
+-	for (unsigned i = 0; i < sizeof(fw_files) / sizeof(fw_files[0]); i++) {
++	for (unsigned i = 0; i < fw_count; i++) {
+ 		if (strcmp(fw_files[i].name, name) == 0) {
+ 			return (int)i;
+ 		}
+@@ -217,6 +256,33 @@ fw_size(const char *name)
+ 	return i < 0 ? -1 : (int64_t)fw_files[i].size;
+ }
+ 
++/* Use the table whose modem.mdt (the last entry) matches the partition. */
++static void
++fw_pick(void)
++{
++	const uint32_t max = 0x4000;
++	uint8_t *mdt = (uint8_t *)IOMalloc(max);
++
++	if (mdt == NULL) {
++		return;
++	}
++	for (unsigned t = 0; t < sizeof(fw_tables) / sizeof(fw_tables[0]); t++) {
++		const struct fw_file *m = &fw_tables[t].files[fw_tables[t].n - 1];
++		if (m->size > max || sweet_ufs_read_part(fw_part, m->off, mdt, m->size) != 0) {
++			continue;
++		}
++		if (crc32(0, mdt, m->size) == m->crc) {
++			fw_files = fw_tables[t].files;
++			fw_count = fw_tables[t].n;
++			LOG("firmware: %s matches the %s table", fw_part, fw_tables[t].phone);
++			IOFree(mdt, max);
++			return;
++		}
++	}
++	IOFree(mdt, max);
++	LOG("firmware: %s matches no table, trying the topaz one", fw_part);
++}
++
+ /* Read the whole file name into dst (max bytes at most). Returns bytes read or -1. */
+ static int64_t
+ fw_read(const char *name, void *dst, uint64_t max)
+@@ -5039,6 +5105,7 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ 			return;
+ 		}
+ 	}
++	fw_pick();
+ 	smem_map = map_phys(SMEM_PA, SMEM_SIZE, true);
+ 	pool_map = map_phys(MODEM_POOL_BASE, MODEM_POOL_SIZE, true);
+ 	apcs = (volatile uint8_t *)ml_io_map(APCS_PA, 0x1000);
+-- 
+2.43.0
+
