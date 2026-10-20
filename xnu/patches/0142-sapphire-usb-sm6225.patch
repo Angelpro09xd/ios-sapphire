@@ -1,7 +1,7 @@
 From 49591d30e5bf1ba4da03ea1789f410e9e24d055b Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Tue, 20 Oct 2026 07:51:59 +0000
-Subject: [PATCH] sapphire-0129: USB on SM6225 (khaje)
+Subject: [PATCH] sapphire-0142: USB on SM6225 (khaje)
 
 Port sweet's DWC3 device driver (CDC-ECM ue0, 192.168.7.2/24, live log
 over UDP) to the SM6225 addresses: GCC 0x1400000 with the USB30_PRIM

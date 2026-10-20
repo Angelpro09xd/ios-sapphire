@@ -1,7 +1,7 @@
 From c9c3ee8f11bcc2a372b70dee421c3719577dbe73 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Tue, 20 Oct 2026 06:46:08 +0000
-Subject: [PATCH] sapphire-0128: IORPC.kernelContent for Xcode 16+ iig
+Subject: [PATCH] sapphire-0141: IORPC.kernelContent for Xcode 16+ iig
 
 Newer iig dispatch stubs take the decoded IORPCMessage from
 IORPC.kernelContent (added in later xnu); xnu-8796 has no such field.

@@ -1,7 +1,7 @@
 From 953d64aa3afaa7b4bf50b816d6ff221c05e7f315 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Mon, 19 Oct 2026 22:41:37 +0000
-Subject: [PATCH] sapphire-0127: Focaltech raw format and range from boot-args
+Subject: [PATCH] sapphire-0140: Focaltech raw format and range from boot-args
  (sweettouch_fbits/_rx/_ry), log the first raw contacts, clamp instead of
  dropping out-of-range frames
 

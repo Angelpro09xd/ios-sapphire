@@ -4,7 +4,7 @@
 
 A port of [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz) (itself a port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)) to the Xiaomi **Redmi Note 13 4G** (`sapphire` / `sapphiren`, Qualcomm **SM6225 "khaje"** / Snapdragon 685). Apple's open-source XNU kernel (xnu-8796) boots from RAM through a small boot shim, and on top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd and SpringBoard.
 
-The Redmi Note 12 4G (topaz) and the Redmi Note 13 4G share the SoC, the memory carve-outs and most of the board, so this fork follows the topaz branch and adds what differs on sapphire (patches 0127–0130, the shim's DDR handling and the tools below).
+The Redmi Note 12 4G (topaz) and the Redmi Note 13 4G share the SoC, the memory carve-outs and most of the board, so this fork follows the topaz branch and adds what differs on sapphire (patches 0140–0144, the shim's DDR handling and the tools below).
 
 > Experimental bring-up, not a usable phone OS. Many things are missing or stubbed, and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**. The kernel is started from RAM with `fastboot boot`; boot partitions do not need to be flashed.
 
@@ -15,9 +15,9 @@ The Redmi Note 12 4G (topaz) and the Redmi Note 13 4G share the SoC, the memory 
 | Boot | Stock Xiaomi ABL (unlocked) → `fastboot boot` of the shim (boot image v4) → XNU on the four Gold cores. The shim fits the RAM to the DDR bank ABL reports |
 | Storage | UFS host driver; the iOS root is a journaled HFS+ volume in `userdata`, read/write. Shutdown from Settings unmounts it cleanly |
 | GUI | Apple logo, lock screen, home screen, Settings, notification and control centers; rendered by the CPU (no GPU) |
-| Touch | FocalTech FT3519T (chip id `54:52`) on QUP0 SE2, calibrated for sapphire by boot args (patch 0127) |
-| USB | DWC3 in device mode as a CDC-ECM network card (patch 0129): `192.168.7.2` on the phone, live kernel log over UDP |
-| Modem | Firmware read from the stock `modem_a`, authenticated by TrustZone, modem up with its QMI services (patch 0130) |
+| Touch | FocalTech FT3519T (chip id `54:52`) on QUP0 SE2, calibrated for sapphire by boot args (patch 0140) |
+| USB | DWC3 in device mode as a CDC-ECM network card (patch 0142): `192.168.7.2` on the phone, live kernel log over UDP |
+| Modem | Firmware read from the stock `modem_a`, authenticated by TrustZone, modem up with its QMI services (patch 0143) |
 | Wi-Fi | WCN3988 firmware in mission mode and passive scan (2.4 and 5 GHz networks listed in the kernel log). No association yet |
 
 ## What does not work (yet)
@@ -51,7 +51,7 @@ You need a Redmi Note 13 4G (`sapphire`/`sapphiren`) with an **unlocked bootload
 
 XNU only builds with Apple's toolchain. Two ways:
 
-- **Codemagic** (`codemagic.yaml`, free personal tier: 500 macOS minutes a month, a build takes a few minutes): add this repository as an application, start the `xnu` workflow on `sapphire`, download `xnu-kernel.zip`. It uses Xcode 16; patch 0128 makes the kernel build with it.
+- **Codemagic** (`codemagic.yaml`, free personal tier: 500 macOS minutes a month, a build takes a few minutes): add this repository as an application, start the `xnu` workflow on `sapphire`, download `xnu-kernel.zip`. It uses Xcode 16; patch 0141 makes the kernel build with it.
 - **GitHub Actions** (`.github/workflows/xnu.yml`, macos-14 / Xcode 15):
 
   ```sh
@@ -123,10 +123,11 @@ nc -ukl 5140          # live kernel console
 
 | # / file | What |
 | --- | --- |
-| 0127 | Focaltech raw format and range from boot args, first raw contacts logged, out-of-range positions clamped instead of dropped |
-| 0128 | `IORPC.kernelContent` backport so the kernel builds with Xcode 16's `iig` |
-| 0129 | sweet's DWC3/CDC-ECM USB device on the SM6225 addresses; opt-in with `sweetusb` |
-| 0130 | sapphire's modem_a tables (modem image for PAS, all files for the tftp server and WLAN board data), picked by the `modem.mdt` CRC so topaz keeps working |
+| 0140 | Focaltech raw format and range from boot args, first raw contacts logged, out-of-range positions clamped instead of dropped |
+| 0141 | `IORPC.kernelContent` backport so the kernel builds with Xcode 16's `iig` |
+| 0142 | sweet's DWC3/CDC-ECM USB device on the SM6225 addresses; opt-in with `sweetusb` |
+| 0143 | sapphire's modem_a tables (modem image for PAS, all files for the tftp server and WLAN board data), picked by the `modem.mdt` CRC so topaz keeps working |
+| 0144 | Join the network named by boot args `wifi_ssid=` / `wifi_pass=` through upstream's WLAN station (0129/0130), for testing |
 | `shim/` | DDR bank end from ABL's `/memory` node; RAM size clamped to it |
 | `tools/mkadt.py` | sapphire identity in the ADT |
 | `tools/sapphire-boot.sh`, `sapphire-root.sh` | Boot image and root image for sapphire |
@@ -138,7 +139,7 @@ nc -ukl 5140          # live kernel console
 | Path | What |
 | --- | --- |
 | `shim/` | Bare-metal boot shim (C + asm), boot image v4, Gold hand-off, GIC setup, payload loader |
-| `xnu/patches/` | XNU patch series, applied in order: sweet's 0001–0079, topaz's 0080–0126, sapphire's 0127+ |
+| `xnu/patches/` | XNU patch series, applied in order: sweet's 0001–0079, topaz's 0080–0139, sapphire's 0140+ |
 | `codemagic.yaml`, `.github/workflows/xnu.yml` | Kernel builds |
 | `tools/` | ADT, payload, root image, boot image, log, modem and HFS+ tools |
 | `NOTES.md` | Engineering log (sweet, topaz, sapphire) |

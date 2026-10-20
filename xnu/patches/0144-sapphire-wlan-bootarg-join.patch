@@ -1,0 +1,72 @@
+From 2f2ad69d766a88086e63310e3682bed1e458b910 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 20 Oct 2026 21:32:27 +0000
+Subject: [PATCH] sapphire-0144: join the network from boot-args
+ wifi_ssid/wifi_pass
+
+For testing upstream's WLAN station (0129/0130) before wifid can ask:
+when the radio is ready a kernel thread reads wifi_ssid= and wifi_pass=
+(as strings) and calls topaz_wlan_join. The passphrase is never logged
+and is wiped after the join.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 37 +++++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 344f5ee..07745cc 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -7293,6 +7293,42 @@ wmi_rx(const uint8_t *d, uint32_t len)
+ 	}
+ }
+ 
++/*
++ * sapphire: join the network named by boot-args wifi_ssid= / wifi_pass= (no spaces) once the
++ * radio is up, for testing until wifid can ask. topaz_wlan_join waits for the modem thread, so
++ * it runs on a thread of its own. The passphrase is never logged and is wiped after the join.
++ */
++static void
++w_bootarg_join_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	char ssid[33] = "", pass[64] = "";
++
++	if (PE_parse_boot_arg_str("wifi_ssid", ssid, sizeof(ssid)) && ssid[0] != 0) {
++		(void)PE_parse_boot_arg_str("wifi_pass", pass, sizeof(pass));
++		size_t plen = strnlen(pass, sizeof(pass));
++		LOG("t=%u ms: boot-arg join: '%s' (%s)", g_ms, ssid, plen != 0 ? "WPA2-PSK" : "open");
++		int r = topaz_wlan_join((const uint8_t *)ssid, (unsigned)strnlen(ssid, 32), NULL, (const uint8_t *)pass,
++		    (unsigned)plen);
++		bzero(pass, sizeof(pass));
++		LOG("t=%u ms: boot-arg join: '%s' -> %d%s", g_ms, ssid, r, r == 0 ? " (joined)" : "");
++	}
++	thread_terminate(current_thread());
++}
++
++static void
++w_bootarg_join_start(void)
++{
++	char probe[2];
++	thread_t t;
++
++	if (!PE_parse_boot_arg_str("wifi_ssid", probe, sizeof(probe))) {
++		return;
++	}
++	if (kernel_thread_start(w_bootarg_join_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++
+ /* from the watch loop */
+ static void
+ radio_poll(unsigned ms)
+@@ -7316,6 +7352,7 @@ radio_poll(unsigned ms)
+ 		if (topaz_wlan_ready_hook != NULL) {
+ 			topaz_wlan_ready_hook();
+ 		}
++		w_bootarg_join_start();
+ 	}
+ 	if (api_ready) {
+ 		w_join_poll();
+-- 
+2.43.0
+
