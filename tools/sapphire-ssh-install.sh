@@ -48,16 +48,43 @@ install -m 600 -o 0 -g 0 "$keys" "$mnt/private/var/root/.ssh/authorized_keys"
 
 # sshd job in the launchd cache (new file, then rename over the old one)
 lp=$mnt/System/Library/xpc/launchd.plist
+# launchd only starts cache jobs keyed under /System/Library/...
 python3 -I - "$lp" "$stage/var/jb/Library/LaunchDaemons/com.openssh.sshd.plist" <<'EOF'
 import plistlib, sys
 lp, job = sys.argv[1], sys.argv[2]
 p = plistlib.load(open(lp, 'rb'))
+d = p['LaunchDaemons']
+sysd = '/System/Library/LaunchDaemons/'
 j = plistlib.load(open(job, 'rb'))
-j['StandardErrorPath'] = '/var/jb/var/log/sshd.log'
-p['LaunchDaemons']['/var/jb/Library/LaunchDaemons/com.openssh.sshd.plist'] = j
+j['Sockets'] = {'SSHListener': {'SockServiceName': 'ssh'}}
+j['StandardErrorPath'] = '/var/jb/var/log/sshd-inetd.log'
+d[sysd + 'com.openssh.sshd.plist'] = j
+d[sysd + 'com.openssh.sshd2222.plist'] = {
+    'Label': 'com.openssh.sshd2222',
+    'ProgramArguments': ['/var/jb/usr/sbin/sshd', '-D', '-e', '-p', '2222'],
+    'RunAtLoad': True, 'KeepAlive': True, 'ThrottleInterval': 30, 'UserName': 'root',
+    'POSIXSpawnType': 'Interactive',
+    'StandardOutPath': '/var/jb/var/log/sshd-2222.log',
+    'StandardErrorPath': '/var/jb/var/log/sshd-2222.log',
+}
+# USB debug console: a root shell on the USB network address only (needs sweetusb=2)
+path = '/var/jb/usr/local/bin:/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/sbin:/usr/bin:/bin:/usr/sbin:/sbin'
+d[sysd + 'org.sapphire.usbshell.plist'] = {
+    'Label': 'org.sapphire.usbshell',
+    'ProgramArguments': ['/var/jb/bin/sh', '-c', 'exec /var/jb/bin/bash -i 2>&1'],
+    'Sockets': {'Listener': {'SockNodeName': '192.168.7.2', 'SockServiceName': '2323',
+                             'SockFamily': 'IPv4', 'SockType': 'stream'}},
+    'inetdCompatibility': {'Wait': False},
+    'UserName': 'root', 'POSIXSpawnType': 'Interactive', 'SessionCreate': True,
+    'EnvironmentVariables': {'PATH': path, 'HOME': '/var/root', 'TERM': 'dumb'},
+}
+# no hardware: they respawn every few seconds
+for gone in ('com.apple.bluetoothd', 'com.apple.fairplayd.H2'):
+    for k in [k for k, v in d.items() if v.get('Label') == gone]:
+        del d[k]
 with open(lp + '.new', 'wb') as f:
     plistlib.dump(p, f, fmt=plistlib.FMT_BINARY)
-print('launchd.plist:', len(p['LaunchDaemons']), 'jobs')
+print('launchd.plist:', len(d), 'jobs')
 EOF
 mkdir -p "$mnt/private/var/jb/var/log"
 chown --reference="$lp" "$lp.new"
