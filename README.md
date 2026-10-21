@@ -23,7 +23,7 @@ The Redmi Note 12 4G (topaz) and the Redmi Note 13 4G share the SoC, the memory 
 ## What does not work (yet)
 
 - **Wi-Fi connection**: no association/WPA2, no data path, no network interface for iOS yet; the Wi-Fi switch in Settings does nothing.
-- **No GPU in use yet**: everything is drawn by the CPU, so it lags; wallpapers and Metal effects stay black. Patch 0145 brings the Adreno 610 up and **it executes commands** (zap shader through TrustZone, SQE microcode, `CP_ME_INIT`, a `CP_MEM_WRITE` read back from RAM; see "GPU bring-up"); nothing drives it from user space yet. The upstream project has the GPU drawing on topaz with patches it has not published.
+- **No GPU in use yet**: everything is drawn by the CPU, so it lags; wallpapers and Metal effects stay black. Patch 0145 brings the Adreno 610 up, **it executes commands and it has drawn**: zap shader through TrustZone, SQE microcode, `CP_ME_INIT`, and a 256×256 solid fill with the 2D blitter that the CPU reads back with every pixel right (see "GPU bring-up"); nothing drives it from user space yet. The upstream project has the GPU drawing on topaz with patches it has not published.
 - **SSH**: a Procursus rootless bootstrap with sshd can be installed (`tools/sapphire-ssh-install.sh`), but iOS does not resolve `root` for it yet ("Invalid user root").
 - **No Bluetooth, cellular data, audio, camera, sensors, GPS, SEP**; no real-time clock (the date starts at 31 December).
 - **Only 4 of 8 cores** (the Silver cores have no 16K translation granule).

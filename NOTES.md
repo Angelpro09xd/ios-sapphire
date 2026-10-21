@@ -58,6 +58,19 @@ over the adb tunnel; explicit OK before `fastboot flash userdata`.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
+**sapphire: THE GPU DREW — 65536 of 65536 pixels right on the first try (2026-10-21, kernel out-cm13 / 3de45b5, boot `sweetusb=2 gpu=3 gpu_delay=60`, `logs/sapphire-gpu3-firstdraw.txt`).**
+
+    --- first draw: 2D blitter, 256x256 RGBA8 at e1040000, colour ff8000ff
+      2D fill: done (rptr 99) after ~10 us, RBBM_STATUS 00e30df5
+      pixels: first ff0080ff, centre ff0080ff, last ff0080ff; 65536 of 65536 as expected (ff0080ff in memory)
+      RBBM_STATUS 00000001 CP_HW_FAULT 00000000 RBBM_INT_0_STATUS 00000000
+    *** the GPU drew: every pixel of the 2D fill is right ***
+    parking the GPU ... bus drained: GX halted, clients halted, AXI halted; panel commands all done
+
+The Adreno 610 rendered for the first time on this kernel: the 2D blitter wrote the whole surface over the CPU's `deadbeef`, in the byte order the format promises (R in the lowest byte), in about 10 µs for 99 dwords of commands, with no fault and nothing pending, and parked cleanly with the panel untouched. Mesa's sequence and the a610 values worked unmodified, which also says the rest of the bring-up (zap, SQE, identity SMMU, write-combined pool, CCU layout) is right.
+
+What this unlocks, in order: **copies** (2D blit from a source surface: `BLIT_OP_SCALE` with `SP_PS_2D_SRC_*`, the same machinery) and a demo the user can see — the GPU drawing into a buffer that ends up on the panel; then real GPU memory management (stage-1 SMMU page tables per context instead of the identity bank) and interrupts; then the 3D pipe (shaders, ir3) for real draws; and finally the bridge to iOS's compositor, which is where the project's real size is.
+
 **sapphire: the first draw is written, not yet run (2026-10-21, patch 0145).** After its `CP_MEM_WRITE` test, stage 3 now has the **2D blitter** fill a 256×256 RGBA8 buffer (`POOL_PA + 0x40000`, pitch 1024) with a solid colour (`ff8000ff`), into memory the CPU has first filled with `deadbeef`, and then reads every pixel back: `*** the GPU drew ***` only if all 65536 are right, otherwise the first wrong one with its coordinates. The 2D blitter is what freedreno uses for clears and copies, and a solid fill needs about twenty registers where a 3D draw needs hundreds. Every value comes from the Mesa 26.1 tree in `infinity/external/mesa3d` rather than from memory: the sequence is `fd6_clear_buffer` (emit_setup → emit_clear_color → emit_blit_setup → destination → emit_blit_fini → flushes), the offsets and fields from `registers/adreno/a6xx.xml` (`RB_A2D_BLT_CNTL` 0x8c00, `GRAS_A2D_BLT_CNTL` 0x8400, `SP_A2D_OUTPUT_INFO` 0xacc0, `RB_A2D_DEST_BUFFER_*` 0x8c17-0x8c1a, `GRAS_A2D_DEST_TL/BR` 0x8405/6, `RB_A2D_CLEAR_COLOR_DW0` 0x8c2c, `CP_BLIT` 0x2c op SCALE, `CP_SET_MARKER` 0x65 mode `RM6_BLIT2DSCALE`), the events from the A6XX table in `freedreno_gpu_event.h` (CCU clean = `PC_CCU_FLUSH_*_TS` with a seqno, cache clean = `CACHE_FLUSH_TS`, label = `DEBUG_LABEL`), and the a610's own values from `freedreno_devices.py`: one CCU, `a6xx_gen1_low` (no GMEM fast clear, 8 KB sysmem CCU caches → `RB_CCU_CNTL` = 0x01000001), `RB_DBG_ECO_CNTL` = `RB_DBG_ECO_CNTL_blit` = 0x04100000 (so no toggling around the blit), `RB_RBP_CNTL` = 1 and the raw magic registers its batches start with (`UCHE_CLIENT_PF` left as the kernel set it). Type-4 packets are new in the driver and follow Linux `PKT4()`. `gpu_draw=0` skips it.
 
 **sapphire: the yellow screen is fixed — stage 3 runs and parks cleanly (2026-10-21, kernel out-cm12 / c1e2bb9, boot `sweetusb=2 gpu=3 gpu_delay=60`, `logs/sapphire-gpu3-drained.txt`).** Same full stage 3 that turned the panel yellow three times out of three, now with the bus drained before the collapse:
