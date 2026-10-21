@@ -58,7 +58,28 @@ over the adb tunnel; explicit OK before `fastboot flash userdata`.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
-**sapphire: three deaths, the same line, and the GPU's interrupt is the suspect that fits (2026-10-21, boot `sweetusb=2 gpu=3 gpu_delay=20 gpu_slow=1200` with the real zap shader, ring in `logs/sapphire-gpu3-ring.txt`).** The stage-3 boot never reached the zap shader: the log ends on `gpucc_gx_cxo on: 00000001 running`, the last line of `power_up()`, exactly like the stage-4 boot, with 32 iOS lines after it and then nothing at all — no panic, no further line, iOS stopped too. So **the same death three times over** (both stage-2 panics, stage 4, stage 3), one survival, and the stage makes no difference because they all die before the stage matters. The USB console caught nothing this time (the device was not attached in time), but the persistent ring held the whole boot.
+**sapphire: the interrupt theory is wrong — the GIC never had that line enabled (2026-10-21, kernel out-cm8 / 8fe21fa, boot `sweetusb=2 gpu=2 gpu_delay=20 gpu_slow=1200`, full log `logs/sapphire-gpu2i-ok.txt`).** The new instrumentation answers it in one line:
+
+    GIC SPI 177 (INTID 209) with the GPU powered: enabled 0 pending 0 active 0 (words 00000000 ...)
+    RBBM_INT_0_STATUS 00000000 (what the GPU is asking for)
+
+Not enabled before the power-up, not enabled with the GPU running, nothing pending, nothing active, and the GPU asking for nothing. Masking it changed nothing because it was already masked, and in hindsight it could not have been otherwise: **xnu disables every SPI it does not claim** when it sets the distributor up, so there was nothing for the bootloader to leave behind. The masking stays in (a driver that cannot service an interrupt should not leave it armed) but it is not the fix, and `gpu_irq=1` is now only of historical interest.
+
+What that boot does show is a **healthy GPU**: the voted branches `gcc_gpu_memnoc_gfx` and `gcc_gpu_snoc_dvm_gfx` now read `00004221` / `00000001` running (they report CLK_OFF while being enabled, as upstream noted), both GDSCs `f8222000` PWR_ON with the clamp released, the core at GPLL0/2 = 300 MHz (`cfg 00000503`), `RBBM_STATUS 00000001`, and the always-on counter **+211513 in 10 ms**.
+
+And the scoreboard, which is the thing to keep looking at:
+
+| kernel | boot args | result |
+| --- | --- | --- |
+| cm6 | `gpu=2 gpu_delay=60` | panic, twice |
+| cm7 | `gpu=2 gpu_delay=20 gpu_slow=1200` | survived |
+| cm7 | `gpu=4 gpu_delay=20 gpu_slow=1200` | dead after `power_up()` |
+| cm7 | `gpu=3 gpu_delay=20 gpu_slow=1200` | dead after `power_up()` |
+| cm8 | `gpu=2 gpu_delay=20 gpu_slow=1200` | survived, twice |
+
+With the same args stage 2 is 3 for 3 and stages 3/4 are 0 for 2, which is suggestive but not much more than that (about one chance in ten by luck alone), and **no code between those two paths differs**: the deaths come after the last line of `power_up()` and before the first line of `dump_clocks("powered")`, which only re-reads registers read moments earlier, and the stage is not consulted until `first_reads()` is done. Worth weighing more than I did: with `gpu_slow=1200` **the GPU thread was asleep** when the machine died, about a second after the GX domain came up, with 32 to 49 iOS lines printed in between. So whatever kills it is **asynchronous** — the thread was not touching anything. That leaves the bus (a GPU whose SMMU faults every stream, which is what `gpu_smmu_early=1` is for) or a reset from outside the kernel's view, and rules out "the next register read hangs".
+
+**sapphire: three deaths, the same line, and the GPU's interrupt was the suspect that fit (2026-10-21, boot `sweetusb=2 gpu=3 gpu_delay=20 gpu_slow=1200` with the real zap shader, ring in `logs/sapphire-gpu3-ring.txt`).** The stage-3 boot never reached the zap shader: the log ends on `gpucc_gx_cxo on: 00000001 running`, the last line of `power_up()`, exactly like the stage-4 boot, with 32 iOS lines after it and then nothing at all — no panic, no further line, iOS stopped too. So **the same death three times over** (both stage-2 panics, stage 4, stage 3), one survival, and the stage makes no difference because they all die before the stage matters. The USB console caught nothing this time (the device was not attached in time), but the persistent ring held the whole boot.
 
 What this looks like matters: **a bad register read hangs the reader**, and the thread would stop while iOS carried on. Here iOS stops as well, mid-sentence, without a panic. That is what an **interrupt nobody handles** looks like — the CPU takes it, finds no handler, returns, and takes it again forever, so nothing is ever logged again and USB drops off the bus (which is what Windows reported as "unknown USB device" after the stage-4 death). The GPU has one: `kgsl-3d0` has `interrupts = <0 0xb1 4>`, SPI 177 — **INTID 209**, level triggered, in word 6 bit 17 of the GIC-500 distributor at `0xf200000` (`arm,gic-v3`, `reg = <0xf200000 0x10000 ...>`, confirmed in the live tree). Nothing in this kernel registers it, and whether the bootloader left it enabled is the bootloader's business. It being level triggered is the point: as long as the GPU asserts it, it never goes away by itself.
 
