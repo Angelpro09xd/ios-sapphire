@@ -21,7 +21,8 @@ else:
     start = total % size
     text = ring[start:] + ring[:start]
 out = text.decode('utf-8', 'replace').replace('\r', '')
-print(f'# version {version}, ring {size}, total {total} bytes, flush #{seq}'
+flush = 'PANIC flush (black box)' if seq == 0xFFFFFFFFFFFFFFFF else f'flush #{seq}'
+print(f'# version {version}, ring {size}, total {total} bytes, {flush}'
       f'{" (wrapped: oldest bytes lost)" if total > size else ""}', file=sys.stderr)
 if len(sys.argv) > 2:
     open(sys.argv[2], 'w').write(out)

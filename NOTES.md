@@ -58,6 +58,21 @@ over the adb tunnel; explicit OK before `fastboot flash userdata`.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
+**sapphire: every death is at 40-50 s, GPU touched or not, and it is a real panic with text on the screen (2026-10-21).** Two more boots with `gpu=3 gpu_delay=60` (no `gpu_slow`, kernel out-cm8) panicked at the Apple logo with the GPU thread still asleep — the sequence had not started — and the user saw the panic text drawn over the logo. Counting the `SWEET INTF1` lines (one every 5 s) gives the moment of death for every log we have:
+
+| boot | GPU at that moment | died at |
+| --- | --- | --- |
+| cm6 `gpu=2 gpu_delay=60` (panic ×2) | asleep, untouched | ~50 s |
+| cm7 `gpu=4` / `gpu=3` + `gpu_slow=1200` | just powered | ~40 s |
+| cm8 `gpu=3 gpu_delay=60` (panic ×2, `logs/` not kept: no GPU lines) | asleep, untouched | ~40 s |
+| cm7/cm8 `gpu=2 gpu_delay=20 gpu_slow=1200` (×3) | powered since 20 s | survived |
+
+So the GPU driver's code is not what dies: the deaths with `gpu_delay=60` happen before it runs. Something at ~40 s of boot panics the kernel in these boots, and the only boots that get past it are the ones where the GPU domain was already up — which reads like something in iOS reaching for the GPU (or its clocks) around then, and panicking when it is collapsed. The panic text will say; a photo is pending.
+
+The reason there is no record of any of these is now understood, and fixed in **patch 0146 (black box)**: this board has no iBoot panic region (`gPanicBase` stays 0, hence "gPanicBase is still not initialized"), so `SavePanicInfo()` on arm spins forever in its `while (!panic_info ...)` loop with the panic on the screen — which is exactly what the user sees, "se queda esperando que reinicie" — and the ring never gets flushed. By then the formatted panic string has already gone through `consdebug_putc` → console → `sweet_log_append` into the ring, so `SavePanicInfo()` now calls `sweet_log_panic_flush()` first: the same write as the log thread, without its mutex and without sleeping (`ufs_scsi` spins when interrupts are off), after a bounded wait for a doorbell a command may have left set. The header's seq is all ones and `tools/sweet-log.py` prints "PANIC flush (black box)". After this, every panic leaves its full text and the console before it in the last 4 MB of `userdata`, readable from recovery.
+
+Two more things found on the way: the log thread flushes every **10 s** (`SWEET_LOG_SECS`), not every second as assumed all along — there is a boot-arg `ufslogsecs`, and `tools/sapphire-boot.sh` now passes `ufslogsecs=1`; and the live USB log starts with only the last 64 KiB of the ring, so lines printed early (`starting in 60 s`) are not in the live capture when iOS has already logged more than that. The capture daemon on the PC (`~/ios-build/uslog.sh`, root, detached) plus `usbipd attach --wsl --auto-attach --hardware-id 1209:0001` now records every boot without anyone racing the 20 s; the hardware id is the kernel's own CDC-ECM device, so fastboot (Xiaomi's ids) is never taken.
+
 **sapphire: the interrupt theory is wrong — the GIC never had that line enabled (2026-10-21, kernel out-cm8 / 8fe21fa, boot `sweetusb=2 gpu=2 gpu_delay=20 gpu_slow=1200`, full log `logs/sapphire-gpu2i-ok.txt`).** The new instrumentation answers it in one line:
 
     GIC SPI 177 (INTID 209) with the GPU powered: enabled 0 pending 0 active 0 (words 00000000 ...)

@@ -1,0 +1,121 @@
+From 058ef90e251da9c1f80db07e018a5c197cac73a1 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 12:22:07 +0000
+Subject: [PATCH] sapphire-0146: black box: a panic writes the console ring to
+ the disk
+
+This board has no iBoot panic region (gPanicBase stays 0), so the panic
+path on arm ends in SavePanicInfo()'s wait-for-panic_info loop with the
+panic on the screen and nothing on the disk: the only record of a kernel
+panic is a photo, and the last ufslogsecs of console before it are gone
+with the RAM. By the time SavePanicInfo() runs the formatted panic
+string has already gone through consdebug_putc into the SWEET log ring,
+so it now calls sweet_log_panic_flush() first, which writes the ring to
+its blocks exactly like the log thread but without that thread's mutex
+(its holder is never coming back) and without sleeping (ufs_scsi spins
+when interrupts are off), after a bounded wait for a doorbell another
+command may have left set. The header's seq is all ones to say the flush
+came from a panic; tools/sweet-log.py says so.
+---
+ bsd/dev/sweet_ufs.c   | 59 +++++++++++++++++++++++++++++++++++++++++++
+ osfmk/arm/model_dep.c | 10 ++++++++
+ 2 files changed, 69 insertions(+)
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6c91dbd..c3924c6 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -948,6 +948,64 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++static bool sweet_log_on;
++
++/*
++ * Black box. Called from SavePanicInfo() (osfmk/arm/model_dep.c): the panic string has
++ * already gone through the console into the ring, every other CPU is halted and
++ * interrupts are off. The thread above cannot run any more, so this writes the ring the
++ * same way without its mutex (whoever holds it is never coming back) and without
++ * sleeping (ufs_scsi spins when interrupts are off). A command that thread left in
++ * flight gets a bounded wait for its doorbell first. The header's seq is all ones so the
++ * reader knows this flush came from a panic. Without this the only trace of a panic
++ * is the screen, and the last ufslogsecs of console before it are gone.
++ */
++void sweet_log_panic_flush(void);
++
++void
++sweet_log_panic_flush(void)
++{
++	static bool done;
++	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
++	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++	int error = 0;
++
++	if (done || !sweet_log_on) {
++		return;
++	}
++	done = true;
++	for (int i = 0; i < 3000 && (ufs_rd(REG_UTRLDBR) & 1); i++) {
++		delay(1000);
++	}
++	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++	uint64_t pos = total >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : 0;
++
++	while (pos < total && !error) {
++		uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
++		uint32_t blk = off / UFS_BLOCK;
++		uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
++		uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
++		    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++		memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
++		error = ufs_write_blocks(base + 1 + blk, n);
++		pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
++	}
++	if (!error) {
++		struct sweet_log_header h = {
++			.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++			.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ~0ull,
++		};
++		bzero(bounce, UFS_BLOCK);
++		memcpy(bounce, &h, sizeof(h));
++		error = ufs_write_blocks(base, 1);
++	}
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	printf("SWEET PANIC: console log %s to the partition (%llu bytes)\n",
++	    error ? "NOT written" : "written", total);
++}
++
+ static void
+ sweet_log_start(void)
+ {
+@@ -964,6 +1022,7 @@ sweet_log_start(void)
+ 	}
+ 	if (kernel_thread_start(sweet_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
++		sweet_log_on = true;
+ 	}
+ }
+ 
+diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
+index 39daaf8..99ef23a 100644
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -804,6 +804,16 @@ void
+ SavePanicInfo(
+ 	const char *message, __unused void *panic_data, uint64_t panic_options)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * No iBoot panic region on this board (gPanicBase stays 0), so the loop just
++	 * below never ends and the only record of a panic is the screen. The panic
++	 * string has already gone through the console into the SWEET log ring by
++	 * now: put the ring on the disk first (bsd/dev/sweet_ufs.c).
++	 */
++	extern void sweet_log_panic_flush(void);
++	sweet_log_panic_flush();
++#endif
+ 	/*
+ 	 * This should be initialized by the time we get here, but
+ 	 * if it is not, asserting about it will be of no use (it will
