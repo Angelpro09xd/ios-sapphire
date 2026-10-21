@@ -1,4 +1,4 @@
-From 29c4901131b3c37f2293b95819b843d9877486da Mon Sep 17 00:00:00 2001
+From 4edc46493318ddaf69ea6129002e68cac815548a Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 06:53:53 +0000
 Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
@@ -20,18 +20,18 @@ zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
 Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
 files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 853 ++++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireGpu.cpp      | 857 ++++++++++++++++++++++++++
  iokit/Kernel/arm/SweetFramebuffer.cpp |   2 +
  iokit/conf/files.arm64                |   1 +
- 3 files changed, 856 insertions(+)
+ 3 files changed, 860 insertions(+)
  create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 new file mode 100644
-index 0000000..3417c60
+index 0000000..24e161f
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -0,0 +1,853 @@
+@@ -0,0 +1,857 @@
 +/*
 + * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
 + *
@@ -511,6 +511,10 @@ index 0000000..3417c60
 +		return false;
 +	}
 +	memcpy(&phoff, meta + 28, 4);
++	if (phoff >= (uint32_t)mdt_size) {
++		LOG("  program headers at %x, past the %lld bytes read", phoff, mdt_size);
++		return false;
++	}
 +	uint16_t n16;
 +	memcpy(&n16, meta + 44, 2);
 +	phnum = n16;
@@ -713,7 +717,7 @@ index 0000000..3417c60
 +
 +	LOG("--- CP start");
 +	/* adreno_fw_create_bo copies the firmware from its second dword on */
-+	fw_size = fw_read("a630_sqe.fw", sqe, OFF_RING - OFF_SQE + 4);
++	fw_size = fw_read("a630_sqe.fw", sqe, OFF_RING - OFF_SQE);
 +	if (fw_size <= 4) {
 +		return false;
 +	}
@@ -836,7 +840,7 @@ index 0000000..3417c60
 +	smmu = (volatile uint8_t *)smmu_map->getVirtualAddress();
 +	ring = (uint32_t *)(pool + OFF_RING);
 +	test_buf = (uint32_t *)(pool + OFF_TEST);
-+	bzero(pool, POOL_SIZE);
++	bzero(pool, OFF_META + 0x4000);
 +
 +	/* the root device carries the firmware: sweet_ufs answers EAGAIN until it is up */
 +	for (int i = 0; i < 120; i++) {
