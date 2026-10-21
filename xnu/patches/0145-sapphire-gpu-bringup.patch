@@ -1,4 +1,4 @@
-From 52dc55971b3aaf259417ea9a1ecc90828789cceb Mon Sep 17 00:00:00 2001
+From b046f507c148fffb46f9696be8e1ab68af87d929 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 06:53:53 +0000
 Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
@@ -20,18 +20,18 @@ zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
 Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
 files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 1851 +++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireGpu.cpp      | 2009 +++++++++++++++++++++++++
  iokit/Kernel/arm/SweetFramebuffer.cpp |    2 +
  iokit/conf/files.arm64                |    1 +
- 3 files changed, 1854 insertions(+)
+ 3 files changed, 2012 insertions(+)
  create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 new file mode 100644
-index 0000000..e2de1ae
+index 0000000..264e308
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -0,0 +1,1851 @@
+@@ -0,0 +1,2009 @@
 +/*
 + * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
 + *
@@ -313,6 +313,7 @@ index 0000000..e2de1ae
 +static uint32_t stop_at, keep_running;
 +static uint32_t draw_first = 1;                 /* boot-arg gpu_draw=0 skips the 2D fill */
 +static bool stopped_early;
++static bool service_ok;                         /* stage 3 and the draw tests passed */
 +
 +static bool
 +stop_here(uint32_t step, const char *what)
@@ -1645,6 +1646,155 @@ index 0000000..e2de1ae
 +}
 +
 +/*
++ * The GPU as a service (boot-arg gpu_service=1, needs gpu_mmu=1): after its tests the GPU is
++ * not parked, and the rest of the kernel may hand it copies through sapphire_gpu_copy(). One
++ * lock covers the ring, the page tables and the windows. If a copy ever fails or times out the
++ * service turns itself off and every caller falls back to the CPU from then on.
++ *
++ * Sources are IOMemoryDescriptors (iOS surfaces: scattered pages), mapped page by page into
++ * one of four 16 MB windows of GPU addresses from 0x20000000, kept while the same memory comes
++ * back (same descriptor, same length, same first and last physical page) and replaced round
++ * robin otherwise. Destinations are physically contiguous below 4 GB (the panel's flip
++ * buffers) and are mapped at their own physical address, once.
++ */
++#define WIN_BASE            0x20000000ull
++#define WIN_SIZE            0x01000000ull       /* 16 MB: a 1125 x 2436 surface is 10.9 MB */
++#define WIN_COUNT           4u
++
++static uint32_t service;
++static volatile bool service_ready;
++static IOLock *service_lock;
++static struct {
++	IOMemoryDescriptor *md;
++	uint64_t len, first, last;
++} win[WIN_COUNT];
++static uint32_t win_next;
++static struct {
++	uint64_t base, size;
++} ident[4];
++static uint32_t ident_used;
++
++static bool
++map_identity(uint64_t base, uint64_t size)
++{
++	for (uint32_t i = 0; i < ident_used; i++) {
++		if (base >= ident[i].base && base + size <= ident[i].base + ident[i].size) {
++			return true;
++		}
++	}
++	if (ident_used == 4 || base + size > (1ull << 32)) {
++		return false;
++	}
++	for (uint64_t a = base & ~0xFFFull; a < base + size; a += 4096) {
++		uint64_t *l2 = pt_next(&pt_l1[(a >> 30) & 3]);
++		if (l2 == NULL) {
++			return false;
++		}
++		uint64_t e = l2[(a >> 21) & 511];
++		if ((e & 3) == PTE_TYPE_BLOCK && (e & PTE_ADDR_MASK & ~0x1FFFFFull) == (a & ~0x1FFFFFull)) {
++			continue;                       /* already inside an identity block */
++		}
++		if (!map_page_4k(a, a)) {
++			return false;
++		}
++	}
++	ident[ident_used].base = base;
++	ident[ident_used].size = size;
++	ident_used++;
++	return tlb_flush();
++}
++
++static uint64_t
++map_window(IOMemoryDescriptor *md)
++{
++	uint64_t len = md->getLength(), first, last, seg;
++
++	if (len == 0 || len > WIN_SIZE) {
++		return 0;
++	}
++	first = md->getPhysicalSegment(0, &seg, kIOMemoryMapperNone);
++	last = md->getPhysicalSegment((len - 1) & ~0xFFFull, &seg, kIOMemoryMapperNone);
++	for (uint32_t i = 0; i < WIN_COUNT; i++) {
++		if (win[i].md == md && win[i].len == len && win[i].first == first && win[i].last == last) {
++			return WIN_BASE + i * WIN_SIZE;
++		}
++	}
++	uint32_t i = win_next++ % WIN_COUNT;
++	uint64_t va = WIN_BASE + i * WIN_SIZE;
++	for (uint64_t off = 0; off < WIN_SIZE; off += 4096) {
++		uint64_t pa = off < len ? md->getPhysicalSegment(off, &seg, kIOMemoryMapperNone) : 0;
++		if (off < len && pa == 0) {
++			win[i].md = NULL;
++			return 0;
++		}
++		if (pa != 0 && !map_page_4k(va + off, pa)) {
++			win[i].md = NULL;
++			return 0;
++		}
++		if (pa == 0) {
++			/* past the end: no stale page from a previous surface stays reachable */
++			uint64_t *l2 = pt_next(&pt_l1[((va + off) >> 30) & 3]);
++			uint64_t *l3 = l2 != NULL ? pt_next(&l2[((va + off) >> 21) & 511]) : NULL;
++			if (l3 != NULL) {
++				l3[((va + off) >> 12) & 511] = 0;
++			}
++		}
++	}
++	win[i].md = md;
++	win[i].len = len;
++	win[i].first = first;
++	win[i].last = last;
++	return tlb_flush() ? va : 0;
++}
++
++/*
++ * Copy w x h RGBA8 pixels from src (offset src_off, src_pitch bytes a row) to dst_pa (dst_pitch a
++ * row), inside the contiguous destination [dst_base, dst_base + dst_size). The caller has cleaned
++ * the source rows from the CPU caches and invalidates the destination rows after. Returns false
++ * to have the caller copy with the CPU instead.
++ */
++bool sapphire_gpu_copy(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src_pitch, uint64_t dst_pa,
++    uint32_t dst_pitch, uint32_t w, uint32_t h, uint64_t dst_base, uint64_t dst_size);
++bool sapphire_gpu_ready(void);
++
++/* So a caller does not pay for cache maintenance before a copy the GPU would refuse. */
++bool
++sapphire_gpu_ready(void)
++{
++	return service_ready;
++}
++
++bool
++sapphire_gpu_copy(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src_pitch, uint64_t dst_pa,
++    uint32_t dst_pitch, uint32_t w, uint32_t h, uint64_t dst_base, uint64_t dst_size)
++{
++	static uint32_t told;
++	bool ok = false;
++
++	if (!service_ready || src == NULL || w == 0 || h == 0) {
++		return false;
++	}
++	IOLockLock(service_lock);
++	if (service_ready) {
++		uint64_t va = map_window(src);
++		bool dst_ok = map_identity(dst_base, dst_size);
++		if (va != 0 && dst_ok && src_off + (uint64_t)(h - 1) * src_pitch + w * 4u <= src->getLength()) {
++			ok = blit_copy(va + src_off, src_pitch, dst_pa, dst_pitch, w, h);
++			if (!ok) {
++				service_ready = false;
++				LOG("service: a copy failed, the GPU path is off; RBBM_STATUS %08x", grd(REG_RBBM_STATUS));
++				smmu_fault("service");
++			}
++		} else if (told++ < 4) {
++			LOG("service: cannot map this copy (window %llx, destination %s, %ux%u at +%llx of %llu bytes)", va,
++			    dst_ok ? "ok" : "NOT mapped", w, h, src_off, src->getLength());
++		}
++	}
++	IOLockUnlock(service_lock);
++	return ok;
++}
++
++/*
 + * boot-arg gpu_demo=1: the GPU paints three bars (red, green, blue) straight onto the boot
 + * framebuffer the panel scans out, over the Apple logo, where they stay until SpringBoard's first
 + * frame replaces them. The framebuffer is 1080 x 2400 BGRA with 4320 bytes a row, which the
@@ -1734,6 +1884,8 @@ index 0000000..e2de1ae
 +	(void)PE_parse_boot_argn("gpu_demo", &demo, sizeof(demo));
 +	(void)PE_parse_boot_argn("gpu_bench", &bench, sizeof(bench));
 +	(void)PE_parse_boot_argn("gpu_mmu", &mmu, sizeof(mmu));
++	(void)PE_parse_boot_argn("gpu_service", &service, sizeof(service));
++	service_lock = IOLockAlloc();
 +	if (PE_parse_boot_argn("gpu_delay", &delay_s, sizeof(delay_s)) && delay_s != 0) {
 +		LOG("starting in %u s", delay_s);
 +		IOSleep(delay_s * 1000);
@@ -1837,6 +1989,7 @@ index 0000000..e2de1ae
 +		LOG("*** the GPU executes commands ***");
 +		if (draw_first && blit_fill(0xFF8000FF)) {
 +			LOG("*** the GPU drew: every pixel of the 2D fill is right ***");
++			service_ok = true;
 +			if (demo) {
 +				demo_bars();
 +			}
@@ -1847,6 +2000,7 @@ index 0000000..e2de1ae
 +				LOG("*** the GPU reached scattered memory through its own page tables ***");
 +			} else if (mmu) {
 +				LOG("the GPU MMU test did not come out right");
++				service_ok = false;
 +			}
 +		} else if (draw_first) {
 +			LOG("the 2D fill did not come out right");
@@ -1854,8 +2008,12 @@ index 0000000..e2de1ae
 +	} else if (!stopped_early) {
 +		LOG("the command processor did not come up");
 +	}
-+	if (keep_running) {
-+		LOG("gpu_keep=1: the GPU stays up");
++	if (service && mmu && service_lock != NULL && service_ok) {
++		service_ready = true;
++		LOG("*** gpu_service: the GPU stays up and takes copies (%u page tables in use) ***", pt_used);
++	} else if (keep_running || service) {
++		LOG("%s: the GPU stays up%s", service ? "gpu_service" : "gpu_keep=1",
++		    service ? " but takes no work (needs gpu_mmu=1 and every test passed)" : "");
 +	} else {
 +		LOG("parking the GPU: RBBM_STATUS %08x", grd(REG_RBBM_STATUS));
 +		bus_drain();

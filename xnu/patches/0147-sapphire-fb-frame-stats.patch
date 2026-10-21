@@ -1,18 +1,26 @@
-From ecfd451dd4c1a5f034b5757518428ce6b83f82c2 Mon Sep 17 00:00:00 2001
+From 1ee49202c32a2de9704a801ac2c3acae553efb23 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 16:22:56 +0000
-Subject: [PATCH] sapphire-0147: time where a frame goes in AppleCLCD
+Subject: [PATCH] sapphire-0147: AppleCLCD frame timing, and the GPU copy of a
+ frame
 
-Every 5 s, the number of direct and composed frames and the average CPU
-time of the direct path's copy into the back buffer, of the cache clean
-for the MDP, and of the composed path, so it is known what handing those
-to the GPU could save. Boot-arg sweetfb_stats=0 turns it off.
+Every 5 s, the number of direct, CPU-composed and GPU-composed frames
+and the average time each part of them took, so it is known what the
+GPU saves. Boot-arg sweetfb_stats=0 turns it off.
+
+Boot-arg sweetfb_gpucopy=1: a frame with one layer has its copy into the
+back buffer done by the GPU (SapphireGpu.cpp sapphire_gpu_copy, with
+gpu_service=1 gpu_mmu=1), reading the surface's scattered pages through
+the GPU's page tables. The source rows are cleaned from the CPU caches
+before, the destination rows invalidated after, and the flip skips its
+clean since the GPU wrote RAM. Any failure leaves the frame to the CPU
+path, unchanged.
 ---
- iokit/Kernel/arm/SweetFramebuffer.cpp | 69 +++++++++++++++++++++++++++
- 1 file changed, 69 insertions(+)
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 137 ++++++++++++++++++++++++++
+ 1 file changed, 137 insertions(+)
 
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 835d1f1..c518662 100644
+index 835d1f1..a2fb441 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -82,6 +82,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -23,7 +31,7 @@ index 835d1f1..c518662 100644
  #include <IOKit/IOLocks.h>
  #include <IOKit/IOWorkLoop.h>
  #include <IOKit/IOTimerEventSource.h>
-@@ -820,10 +821,61 @@ AppleCLCD::flipBack(void)
+@@ -820,10 +821,89 @@ AppleCLCD::flipBack(void)
  	fFlipIdx = idx;
  }
  
@@ -34,10 +42,10 @@ index 835d1f1..c518662 100644
 + * could save.
 + */
 +static struct {
-+	uint64_t t0, copy, clean, comp, copy_max;
-+	uint32_t direct, composed;
++	uint64_t t0, copy, clean, comp, copy_max, g_clean, g_copy, g_inval;
++	uint32_t direct, composed, gpu;
 +	int on;
-+} sweet_fb_stats = { 0, 0, 0, 0, 0, 0, 0, -1 };
++} sweet_fb_stats = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1 };
 +
 +static uint64_t
 +sweet_fb_us(uint64_t a, uint64_t b)
@@ -58,12 +66,16 @@ index 835d1f1..c518662 100644
 +	if (sweet_fb_us(sweet_fb_stats.t0, now) < 5000000) {
 +		return;
 +	}
-+	uint32_t d = sweet_fb_stats.direct, c = sweet_fb_stats.composed;
-+	IOLog("SWEET FB: 5 s: %u direct frames (copy %llu us + clean %llu us avg, copy max %llu us), %u composed (%llu us avg); %llu ms of CPU\n",
++	uint32_t d = sweet_fb_stats.direct, c = sweet_fb_stats.composed, g = sweet_fb_stats.gpu;
++	IOLog("SWEET FB: 5 s: %u direct frames (copy %llu us + clean %llu us avg, copy max %llu us), %u composed by the CPU (%llu us avg), %u by the GPU (clean %llu + GPU %llu + invalidate %llu us avg); %llu ms of CPU\n",
 +	    d, d ? sweet_fb_stats.copy / d : 0, d ? sweet_fb_stats.clean / d : 0, sweet_fb_stats.copy_max, c,
-+	    c ? sweet_fb_stats.comp / c : 0, (sweet_fb_stats.copy + sweet_fb_stats.clean + sweet_fb_stats.comp) / 1000);
++	    c ? sweet_fb_stats.comp / c : 0, g, g ? sweet_fb_stats.g_clean / g : 0, g ? sweet_fb_stats.g_copy / g : 0,
++	    g ? sweet_fb_stats.g_inval / g : 0,
++	    (sweet_fb_stats.copy + sweet_fb_stats.clean + sweet_fb_stats.comp + sweet_fb_stats.g_clean +
++	    sweet_fb_stats.g_copy + sweet_fb_stats.g_inval) / 1000);
 +	sweet_fb_stats.copy = sweet_fb_stats.clean = sweet_fb_stats.comp = sweet_fb_stats.copy_max = 0;
-+	sweet_fb_stats.direct = sweet_fb_stats.composed = 0;
++	sweet_fb_stats.g_clean = sweet_fb_stats.g_copy = sweet_fb_stats.g_inval = 0;
++	sweet_fb_stats.direct = sweet_fb_stats.composed = sweet_fb_stats.gpu = 0;
 +	sweet_fb_stats.t0 = now;
 +}
 +
@@ -77,6 +89,30 @@ index 835d1f1..c518662 100644
 +	return sweet_fb_stats.on != 0;
 +}
 +
++/*
++ * boot-arg sweetfb_gpucopy=1: a frame with one layer has its copy into the back buffer done by
++ * the GPU (SapphireGpu.cpp, gpu_service=1 gpu_mmu=1), which reads the surface's scattered pages
++ * through its own page tables. The source rows are cleaned from the CPU caches first; the GPU
++ * writes RAM, so the destination rows are invalidated after and the flip skips its clean. Any
++ * failure leaves the frame to the CPU path below, unchanged.
++ */
++extern bool sapphire_gpu_copy(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src_pitch, uint64_t dst_pa,
++    uint32_t dst_pitch, uint32_t w, uint32_t h, uint64_t dst_base, uint64_t dst_size);
++extern bool sapphire_gpu_ready(void);
++extern "C" void sweet_dcache_flush(vm_offset_t addr, unsigned length);  /* osfmk/arm/caches.c */
++
++static int sweet_fb_gpucopy = -1;
++
++static bool
++sweet_fb_gpucopy_on(void)
++{
++	if (sweet_fb_gpucopy < 0) {
++		sweet_fb_gpucopy = 0;
++		PE_parse_boot_argn("sweetfb_gpucopy", &sweet_fb_gpucopy, sizeof(sweet_fb_gpucopy));
++	}
++	return sweet_fb_gpucopy != 0;
++}
++
  void
  AppleCLCD::flipFrom(const uint8_t *src, uint32_t srcStride)
  {
@@ -85,7 +121,7 @@ index 835d1f1..c518662 100644
  	if (srcStride == fRowBytes) {
  		memcpy(dst, src, (size_t)fRowBytes * fHeight);
  	} else {
-@@ -831,7 +883,18 @@ AppleCLCD::flipFrom(const uint8_t *src, uint32_t srcStride)
+@@ -831,7 +911,18 @@ AppleCLCD::flipFrom(const uint8_t *src, uint32_t srcStride)
  			memcpy(dst + (uint64_t)y * fRowBytes, src + (uint64_t)y * srcStride, (size_t)fWidth * 4);
  		}
  	}
@@ -104,7 +140,7 @@ index 835d1f1..c518662 100644
  }
  
  /*
-@@ -932,6 +995,7 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -932,6 +1023,7 @@ AppleCLCD::present(const uint8_t *rec)
  	IOLockLock(fLock);
  	fLastVA = NULL;
  	IOLockUnlock(fLock);
@@ -112,7 +148,64 @@ index 835d1f1..c518662 100644
  	/*
  	 * copy path (several layers): compose into the cached back buffer and
  	 * flip, like the direct path. Composing into the scanned, uncached boot
-@@ -1031,6 +1095,11 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -953,6 +1045,15 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 	}
+ 
++	uint32_t nlayers = 0;
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		if ((mask & (1u << layer)) && get32(rec, 0x54 + 4 * layer) != 0) {
++			nlayers++;
++		}
++	}
++	bool gpu_frame = fFlip[0] != NULL && nlayers == 1 && sweet_fb_gpucopy_on() && sapphire_gpu_ready();
++	bool gpu_used = false;
++
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -1019,6 +1120,26 @@ AppleCLCD::present(const uint8_t *rec)
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
++		if (src != 0 && bpe == 4 && gpu_frame) {
++			uint64_t soff = s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
++			uint32_t back = fFlipIdx ^ 1;
++			uint64_t t0 = mach_absolute_time();
++			sweet_dcache_clean((vm_offset_t)(src + soff), (unsigned)((uint64_t)(h - 1) * s->bytesPerRow + (uint64_t)w * 4));
++			uint64_t t1 = mach_absolute_time();
++			if (sapphire_gpu_copy(s->memory, soff, s->bytesPerRow,
++			    fFlipPhys[back] + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4, fRowBytes, (uint32_t)w, (uint32_t)h,
++			    fFlipPhys[back], (uint64_t)fRowBytes * fHeight)) {
++				uint64_t t2 = mach_absolute_time();
++				sweet_dcache_flush((vm_offset_t)(dst + (uint64_t)dy * fRowBytes), (unsigned)((uint64_t)h * fRowBytes));
++				gpu_used = true;
++				if (sweet_fb_stats_on()) {
++					sweet_fb_stats.g_clean += sweet_fb_us(t0, t1);
++					sweet_fb_stats.g_copy += sweet_fb_us(t1, t2);
++					sweet_fb_stats.g_inval += sweet_fb_us(t2, mach_absolute_time());
++				}
++				src = 0;                /* done: skip the CPU copy */
++			}
++		}
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(dst + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+@@ -1028,9 +1149,25 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	if (fFlip[0] != NULL && gpu_used) {
++		/* the GPU wrote RAM and the rows were invalidated: point the MDP at it, no clean */
++		uint32_t idx = fFlipIdx ^ 1;
++		scanFrom(fFlipPhys[idx], fRowBytes);
++		fFlipIdx = idx;
++		if (sweet_fb_stats_on()) {
++			sweet_fb_stats.gpu++;
++			sweet_fb_stats_tick();
++		}
++		return;
++	}
  	if (fFlip[0] != NULL) {
  		flipBack();
  	}

@@ -131,7 +131,7 @@ nc -ukl 5140          # live kernel console
 | 0144 | Join the network named by boot args `wifi_ssid=` / `wifi_pass=` through upstream's WLAN station (0129/0130), for testing |
 | 0145 | Adreno 610 bring-up staged by boot-arg `gpu=N`: clock tree, power-up, zap shader through TrustZone, identity SMMU bank, SQE microcode and a command the GPU executes (powered and answering on the phone; the command stages are blocked by the panic below) |
 | 0146 | Black box: a kernel panic writes the console ring (with the panic text) to the end of `userdata` before the panic path spins, since this board has no iBoot panic region. `tools/sweet-log.py` reports it as a PANIC flush |
-| 0147 | AppleCLCD frame timing: every 5 s, direct and composed frames with the average CPU time of the copy into the back buffer, the cache clean and the composed path (`sweetfb_stats=0` turns it off) |
+| 0147 | AppleCLCD frame timing (every 5 s: direct, CPU-composed and GPU-composed frames with the average time of each part; `sweetfb_stats=0` turns it off), and with `sweetfb_gpucopy=1` the GPU copy of single-layer frames |
 | `shim/` | DDR bank end from ABL's `/memory` node; RAM size clamped to it |
 | `tools/mkadt.py` | sapphire identity in the ADT |
 | `tools/sapphire-boot.sh`, `sapphire-root.sh` | Boot image and root image for sapphire |
@@ -174,6 +174,8 @@ after `gpu_delay` default to the behaviour that has already run, so a boot chang
 | `gpu_demo=1` | after the fill, the GPU paints three bars (red, green, blue) onto the boot framebuffer the panel scans out; with a small `gpu_delay` they appear over the Apple logo and stay until SpringBoard's first frame |
 | `gpu_bench=1` | after the fill, time a full-frame copy by the GPU (CoreAnimation-like cached source, 4608-byte rows, into the panel's 4320-byte layout) against the CPU memcpy and the cache maintenance either path needs, and check it row by row |
 | `gpu_mmu=1` | GPU virtual memory: stage-1 page tables in the GPU's SMMU context bank instead of the identity bank, then a test that maps 256 KB of scattered kernel memory at one GPU address, fills it with the blitter and checks it from the CPU |
+| `gpu_service=1` | with `gpu_mmu=1` and every test passed, the GPU is not parked: it stays up as a service that takes copies from the rest of the kernel (`sapphire_gpu_copy`) |
+| `sweetfb_gpucopy=1` | AppleCLCD hands the GPU the copy of every single-layer frame into the panel's back buffer, reading CoreAnimation's scattered surface through the GPU's page tables; any failure falls back to the CPU |
 | `gpu_irq=1` | leave the GPU's interrupt (SPI 177, INTID 209) alone. By default it is masked in the GIC distributor before anything is powered, and at the GPU once its registers answer: it is level triggered and nothing here handles it, which is what the deaths above look like |
 
 Both `gpu=3` and `gpu=4` need the microcode `a630_sqe.fw`, and `gpu=3` also needs this phone's

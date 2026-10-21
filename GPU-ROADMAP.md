@@ -14,7 +14,8 @@ render on the Adreno, three layers have to exist. This file is the plan; `NOTES.
 | Park the GPU cleanly (GBIF drain before collapse) | done |
 | 2D blitter: fills and copies, an image on the panel | done |
 | GPU virtual memory: stage-1 page tables in the GPU's SMMU context bank | done (`gpu_mmu=1`): scattered memory above 4 GB filled right |
-| **Map any IOSurface / user memory into the GPU's address space** | next |
+| Map any IOSurface / user memory into the GPU's address space | written: surface windows (`gpu_service=1`), first consumer the frame copy (`sweetfb_gpucopy=1`) |
+| A GPU service with one submission path and a lock | written (`gpu_service=1`) |
 | Interrupts (SPI 177) and fences instead of polling | |
 | A GPU service user space can open: buffer objects, command submission, waits | |
 | Per-process address spaces (TTBR switch from the ring, as msm does) | |
