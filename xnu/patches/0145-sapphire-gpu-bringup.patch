@@ -1,4 +1,4 @@
-From a13c11f22ca7d7aac03ad60ac228a777a36f8c03 Mon Sep 17 00:00:00 2001
+From 3f429d47c3a4f19f7a2d67de9b9db8243f565e12 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 06:53:53 +0000
 Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
@@ -20,18 +20,18 @@ zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
 Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
 files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 932 ++++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireGpu.cpp      | 964 ++++++++++++++++++++++++++
  iokit/Kernel/arm/SweetFramebuffer.cpp |   2 +
  iokit/conf/files.arm64                |   1 +
- 3 files changed, 935 insertions(+)
+ 3 files changed, 967 insertions(+)
  create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 new file mode 100644
-index 0000000..5368e69
+index 0000000..cfa60a4
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -0,0 +1,932 @@
+@@ -0,0 +1,964 @@
 +/*
 + * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
 + *
@@ -43,6 +43,9 @@ index 0000000..5368e69
 + *
 + * Staged by boot-arg gpu=N, because reading a GPU register while its power domain or its
 + * clocks are off hangs the bus (the same trap as the WLAN copy engines before mission mode):
++ *
++ * gpu_slow=N waits N ms after each step so the persistent log catches up with it, and
++ * gpu_delay=N waits N seconds before starting so the live console over USB is already up.
 + *
 + *   gpu=1   clock tree only; never touches 0x5900000
 + *   gpu=2   + power up, then the first GPU reads (RBBM_STATUS, CP_ALWAYS_ON_COUNTER)
@@ -199,6 +202,21 @@ index 0000000..5368e69
 +static uint32_t *ring, *test_buf;
 +static uint32_t ring_wptr;
 +static unsigned scm_resumes;
++static uint32_t slow_ms;                        /* boot-arg gpu_slow: see step_done() */
++
++/*
++ * The persistent log is written to userdata about once a second, so a step that hangs or
++ * panics the phone takes the lines around it with it: the last boot left nothing after
++ * "starting in N s". gpu_slow=N waits N ms after each step, which gives that writer time to
++ * put the step's line on disk before the next one runs. 1200 is a good value.
++ */
++static void
++step_done(void)
++{
++	if (slow_ms != 0) {
++		IOSleep(slow_ms);
++	}
++}
 +
 +static inline void
 +gmb(void)
@@ -371,6 +389,7 @@ index 0000000..5368e69
 +	rmw(b, off, 0, CBCR_EN);
 +	ok = poll(b, off, CBCR_OFF, 0, 200);
 +	LOG("  %s on: %08x %s", name, rd(b, off), ok ? "running" : "STILL OFF");
++	step_done();
 +	return ok;
 +}
 +
@@ -397,6 +416,7 @@ index 0000000..5368e69
 +	ok = poll(gpucc, status, GDSC_PWR_ON, GDSC_PWR_ON, 500);
 +	LOG("  %s on: gdscr %08x status %08x %s", name, rd(gpucc, gdscr), rd(gpucc, status),
 +	    ok ? "PWR_ON" : "NO PWR_ON");
++	step_done();
 +	return ok;
 +}
 +
@@ -411,6 +431,7 @@ index 0000000..5368e69
 +	ok = poll(gpucc, cmd, RCG_UPDATE, 0, 500);
 +	LOG("  %s src %u div %u: cmd %08x cfg %08x %s", name, src, div, rd(gpucc, cmd), rd(gpucc, cmd + 4),
 +	    ok ? "updated" : "UPDATE STUCK");
++	step_done();
 +	return ok;
 +}
 +
@@ -421,8 +442,11 @@ index 0000000..5368e69
 +
 +	LOG("--- power up");
 +	/* GCC side: GPLL0 to the GPU CC, and the GPU's bus clocks */
++	LOG("  about to vote GPLL0 to the GPU (GCC 79004 = %08x)", rd(gcc, 0x79004));
++	step_done();
 +	rmw(gcc, 0x79004, 0, 1u << 15);
 +	LOG("  gcc vote 79004 = %08x (gpu_gpll0_clk_src)", rd(gcc, 0x79004));
++	step_done();
 +	branch_on(gcc, 0x71154, "gcc_bimc_gpu_axi");
 +	branch_on(gcc, 0x3600c, "gcc_gpu_memnoc_gfx");      /* voted branch: may read off until used */
 +	branch_on(gcc, 0x36018, "gcc_gpu_snoc_dvm_gfx");
@@ -437,6 +461,7 @@ index 0000000..5368e69
 +	}
 +	rcg_set(0x1120, SRC_GPLL0, 3, "gmu_clk_src (200 MHz)");
 +	rmw(gpucc, 0x1098, 0xFF0, 0xFF0);                   /* cx_gmu wakeup/sleep delays, as Linux probes */
++	step_done();
 +	branch_on(gpucc, 0x1098, "gpucc_cx_gmu");
 +	branch_on(gpucc, 0x5000, "gpucc_hlos1_vote_gpu_smmu");
 +	/* GX domain, then the core clock from GPLL0 (the GPU CC PLLs are left unconfigured) */
@@ -445,6 +470,7 @@ index 0000000..5368e69
 +	}
 +	ok &= rcg_set(0x101c, SRC_GPLL0, 2, "gx_gfx3d_clk_src (300 MHz)");
 +	rmw(gpucc, 0x1054, 0, (1u << 14) | (1u << 13));     /* force mem core / periph on */
++	step_done();
 +	ok &= branch_on(gpucc, 0x1054, "gpucc_gx_gfx3d");
 +	branch_on(gpucc, 0x1060, "gpucc_gx_cxo");
 +	return ok;
@@ -469,8 +495,10 @@ index 0000000..5368e69
 +{
 +	uint32_t lo1, hi1, lo2, hi2;
 +
-+	LOG("--- first GPU reads");
++	LOG("--- first GPU reads: about to touch %llx for the first time", GPU_PA);
++	step_done();
 +	LOG("  RBBM_STATUS   %08x", grd(REG_RBBM_STATUS));
++	step_done();
 +	LOG("  CP_HW_FAULT   %08x", grd(REG_CP_HW_FAULT));
 +	lo1 = grd(REG_CP_ALWAYS_ON_COUNTER);
 +	hi1 = grd(REG_CP_ALWAYS_ON_COUNTER + 1);
@@ -855,11 +883,13 @@ index 0000000..5368e69
 +	 * AppleCLCD::start, long before USB networking carries the console, so its log would
 +	 * only be readable from recovery; with a delay it lands in the live log instead.
 +	 */
++	(void)PE_parse_boot_argn("gpu_slow", &slow_ms, sizeof(slow_ms));
 +	if (PE_parse_boot_argn("gpu_delay", &delay_s, sizeof(delay_s)) && delay_s != 0) {
 +		LOG("starting in %u s", delay_s);
 +		IOSleep(delay_s * 1000);
 +	}
-+	LOG("stage %u (Adreno 610 v2, regs %llx, GPU CC %llx)", stage, GPU_PA, GPUCC_PA);
++	LOG("stage %u (Adreno 610 v2, regs %llx, GPU CC %llx), %u ms after each step", stage, GPU_PA, GPUCC_PA,
++	    slow_ms);
 +
 +	gcc_map = map_phys(GCC_PA, GCC_SIZE);
 +	gpucc_map = map_phys(GPUCC_PA, GPUCC_SIZE);
@@ -891,6 +921,8 @@ index 0000000..5368e69
 +		return;
 +	}
 +	gpu = (volatile uint8_t *)gpu_map->getVirtualAddress();
++	LOG("GPU registers mapped");
++	step_done();
 +	first_reads();
 +	if (stage < 3) {
 +		LOG("stage 2: the GPU is powered and answering; stopping here");
