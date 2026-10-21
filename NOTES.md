@@ -58,6 +58,21 @@ over the adb tunnel; explicit OK before `fastboot flash userdata`.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
+**sapphire: THE GPU EXECUTES COMMANDS (2026-10-21, kernel out-cm10 / 5481aa7, boot `sweetusb=2 gpu=3 gpu_delay=60`, live log on the PC at `~/ios-build/logs/boot-20261021-144632.txt`, not yet copied here).** With the pool mapped write-combined, stage 3 ran end to end on the first try, in milliseconds, with no panic and the phone alive afterwards:
+
+    zap shader (PAS 13): shutdown ret ffcfffb8 (nothing to shut down), init_image ret 0 res 0,
+      mem_setup 55a15000+1000 ret 0 res 0, segment loaded at 55a15000, auth_and_reset ret 0 res 0
+    CP start: sqe 32500 bytes at e1000000, SMMU SMR0 80010000 CBAR0 0001f000 CB0 SCTLR 000000e0
+      SQE started: RBBM_STATUS 00c00015, CP_ME_INIT done (rptr 9) in ~10 us,
+      CP_SET_SECURE_MODE 0 done (rptr 11), CP_MEM_WRITE done (rptr 15), test buffer c0ffee00
+    *** the GPU executes commands ***
+
+So: **TrustZone accepts this phone's signed zap shader from the device tree** (the real `a610_zap` found in `vendor_b`), the vendor's 32504-byte `a630_sqe.fw` runs on the SQE, the identity SMMU bank carries the ring and the buffers, and the command processor leaves secure mode and writes RAM on request. Everything topaz-woa's G1 did under Windows now runs on this kernel. One loose end in the log: after the test the context bank reports `FSR 00000400 FAR 00014810281091c0 FSYNR0 00000520` — a fault on a garbage address the CP touched after `CP_ME_INIT` (no preemption records, no scratch memory given to it yet); nothing failed because of it, but the CP needs its scratch buffers before real work.
+
+Two observations from the user: (1) during this boot the panel lit up **every pixel in blue, yellow and fluorescent colours** — a thing they have seen before on this phone when changing display bits in AOSP, so it reads as display-side, not a crash. It did not happen in any stage-2 boot, so it comes from what stage 3 adds: the zap shader through TrustZone and `CP_SET_SECURE_MODE`, which touch the secure-content paths the display pipeline also uses (XPU / content protection), or `hw_init_regs` (GBIF QoS, UCHE ranges). To be bisected with `gpu=4` once that works, and otherwise by stopping before `CP_SET_SECURE_MODE`. (2) **`gpu=4` (no zap) hangs** right after `CP_ME_INIT: done` — the next step is the write to `RBBM_SECVID_TRUST_CNTL` without a zap shader, exactly the gamble Linux warns about: on this phone the bootloader leaves the GPU secure and that write wedges it, and the phone stays at the Apple logo (PC: `~/ios-build/logs/boot-20261021-144840.txt`). `gpu=4` is therefore dead on sapphire; `gpu=3` is the path.
+
+Next: give the CP its scratch memory and read `RBBM_INT_0_STATUS` after each command; then the interrupt (SPI 177) instead of polling `RB_RPTR`; then a first draw from a freedreno command stream into a buffer the CPU can read; then find what stage 3 does to the panel.
+
 **sapphire: THE BLACK BOX CAUGHT IT, AND IT WAS OURS: `bzero` on the GPU pool mapped as device memory (2026-10-21, kernel out-cm9 / 528bb2f, boot `sweetusb=2 gpu=3 gpu_delay=60`, `logs/sapphire-gpu3-panic-blackbox.txt`).** First panic ever recovered from this phone, 131 KB with `PANIC flush (black box)` in the header, and it overturns the entry below it:
 
     SapphireGpu:   CP_ALWAYS_ON_COUNTER 0000000000001cdd -> 0000000000034bd9 in 10 ms (delta 208636, 19.2 MHz = ~192000)
