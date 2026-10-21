@@ -1,4 +1,4 @@
-From 7b9141a29c0d40a0cc7abb7cb61b295248fd92c4 Mon Sep 17 00:00:00 2001
+From 516f409a05d87b776e0aa661ed241f2b7b28f0dc Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 06:53:53 +0000
 Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
@@ -20,18 +20,18 @@ zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
 Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
 files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 997 ++++++++++++++++++++++++++
- iokit/Kernel/arm/SweetFramebuffer.cpp |   2 +
- iokit/conf/files.arm64                |   1 +
- 3 files changed, 1000 insertions(+)
+ iokit/Kernel/arm/SapphireGpu.cpp      | 1019 +++++++++++++++++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp |    2 +
+ iokit/conf/files.arm64                |    1 +
+ 3 files changed, 1022 insertions(+)
  create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 new file mode 100644
-index 0000000..ab3f5ec
+index 0000000..308b9dc
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -0,0 +1,997 @@
+@@ -0,0 +1,1019 @@
 +/*
 + * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
 + *
@@ -46,7 +46,10 @@ index 0000000..ab3f5ec
 + *
 + * gpu_slow=N waits N ms after each step so the persistent log catches up with it,
 + * gpu_delay=N waits N seconds before starting so the live console over USB is already up,
-+ * and gpu_div=N runs the core at GPLL0/N (2 = 300 MHz, 8 = 75 MHz) for a rail nothing votes.
++ * gpu_div=N runs the core at GPLL0/N (2 = 300 MHz, 8 = 75 MHz), and gpu_smmu_early=1 puts the
++ * identity context bank in before the GX domain. The last two default to what has run before:
++ * a boot that dies with every clock up and nothing else to show for it has to be bisected one
++ * variable at a time.
 + *
 + *   gpu=1   clock tree only; never touches 0x5900000
 + *   gpu=2   + power up, then the first GPU reads (RBBM_STATUS, CP_ALWAYS_ON_COUNTER)
@@ -212,6 +215,16 @@ index 0000000..ab3f5ec
 + * (75 MHz) is the slowest useful setting; the divider field holds 2 * div - 1.
 + */
 +static uint32_t core_div = 2;
++/*
++ * boot-arg gpu_smmu_early: program the identity context bank as soon as its clock is voted,
++ * before the GX domain comes up, instead of in cp_start(). The GPU's SMMU comes out of the
++ * bootloader with every stream faulting, so anything the GPU does on the bus between the GX
++ * domain coming up and cp_start() is a fault with no context bank behind it, and a NoC error
++ * on this SoC resets it without the CPU seeing anything. Off by default: it changes the order
++ * of the one sequence that has worked.
++ */
++static uint32_t smmu_early;
++static bool smmu_identity(void);
 +
 +/*
 + * The persistent log is written to userdata about once a second, so a step that hangs or
@@ -476,6 +489,11 @@ index 0000000..ab3f5ec
 +	step_done();
 +	branch_on(gpucc, 0x1098, "gpucc_cx_gmu");
 +	branch_on(gpucc, 0x5000, "gpucc_hlos1_vote_gpu_smmu");
++	if (smmu_early != 0 && smmu != NULL) {
++		LOG("  gpu_smmu_early: the identity bank goes in before the GX domain");
++		smmu_identity();
++		step_done();
++	}
 +	/* GX domain, then the core clock from GPLL0 (the GPU CC PLLs are left unconfigured) */
 +	if (!gdsc_on(0x100c, 0x1008, 0x1508, 0x100c, "gpu_gx_gdsc")) {
 +		return false;
@@ -917,6 +935,7 @@ index 0000000..ab3f5ec
 +	if (PE_parse_boot_argn("gpu_div", &core_div, sizeof(core_div)) && (core_div < 2 || core_div > 16)) {
 +		core_div = 2;
 +	}
++	(void)PE_parse_boot_argn("gpu_smmu_early", &smmu_early, sizeof(smmu_early));
 +	if (PE_parse_boot_argn("gpu_delay", &delay_s, sizeof(delay_s)) && delay_s != 0) {
 +		LOG("starting in %u s", delay_s);
 +		IOSleep(delay_s * 1000);
@@ -939,6 +958,11 @@ index 0000000..ab3f5ec
 +		return;
 +	}
 +
++	/* mapped before the power-up only so gpu_smmu_early has it; the registers need the vote */
++	smmu_map = map_phys(SMMU_PA, SMMU_SIZE);
++	if (smmu_map != NULL) {
++		smmu = (volatile uint8_t *)smmu_map->getVirtualAddress();
++	}
 +	if (!power_up()) {
 +		LOG("power-up failed, the GPU stays off");
 +		power_down();
@@ -969,7 +993,6 @@ index 0000000..ab3f5ec
 +		return;
 +	}
 +	pool_map = map_phys(POOL_PA, POOL_SIZE);
-+	smmu_map = map_phys(SMMU_PA, SMMU_SIZE);
 +	if (pool_map == NULL || smmu_map == NULL) {
 +		LOG("the buffer pool or the SMMU could not be mapped");
 +		power_down();
@@ -977,7 +1000,6 @@ index 0000000..ab3f5ec
 +		return;
 +	}
 +	pool = (uint8_t *)pool_map->getVirtualAddress();
-+	smmu = (volatile uint8_t *)smmu_map->getVirtualAddress();
 +	ring = (uint32_t *)(pool + OFF_RING);
 +	test_buf = (uint32_t *)(pool + OFF_TEST);
 +	bzero(pool, OFF_META + 0x4000);
