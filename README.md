@@ -173,6 +173,7 @@ after `gpu_delay` default to the behaviour that has already run, so a boot chang
 | `gpu_draw=0` | skip the first draw (a 256×256 solid fill with the 2D blitter, read back by the CPU) that stage 3 now does after its test |
 | `gpu_demo=1` | after the fill, the GPU paints three bars (red, green, blue) onto the boot framebuffer the panel scans out; with a small `gpu_delay` they appear over the Apple logo and stay until SpringBoard's first frame |
 | `gpu_bench=1` | after the fill, time a full-frame copy by the GPU (CoreAnimation-like cached source, 4608-byte rows, into the panel's 4320-byte layout) against the CPU memcpy and the cache maintenance either path needs, and check it row by row |
+| `gpu_mmu=1` | GPU virtual memory: stage-1 page tables in the GPU's SMMU context bank instead of the identity bank, then a test that maps 256 KB of scattered kernel memory at one GPU address, fills it with the blitter and checks it from the CPU |
 | `gpu_irq=1` | leave the GPU's interrupt (SPI 177, INTID 209) alone. By default it is masked in the GIC distributor before anything is powered, and at the GPU once its registers answer: it is level triggered and nothing here handles it, which is what the deaths above look like |
 
 Both `gpu=3` and `gpu=4` need the microcode `a630_sqe.fw`, and `gpu=3` also needs this phone's

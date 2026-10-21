@@ -1,4 +1,4 @@
-From 3b0bf4ec7a5e0aee8d608cafb3e7ca44072968e1 Mon Sep 17 00:00:00 2001
+From 52dc55971b3aaf259417ea9a1ecc90828789cceb Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 06:53:53 +0000
 Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
@@ -20,18 +20,18 @@ zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
 Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
 files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 1629 +++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireGpu.cpp      | 1851 +++++++++++++++++++++++++
  iokit/Kernel/arm/SweetFramebuffer.cpp |    2 +
  iokit/conf/files.arm64                |    1 +
- 3 files changed, 1632 insertions(+)
+ 3 files changed, 1854 insertions(+)
  create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 new file mode 100644
-index 0000000..1d93a91
+index 0000000..e2de1ae
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -0,0 +1,1629 @@
+@@ -0,0 +1,1851 @@
 +/*
 + * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
 + *
@@ -135,6 +135,8 @@ index 0000000..1d93a91
 +#define OFF_META            0x19000u            /* zap metadata, read by TrustZone */
 +#define OFF_FENCE           0x18100u            /* where the CCU/cache flush events write their seqno */
 +#define OFF_DRAW            0x40000u            /* what the 2D blitter fills: 256 x 256 RGBA8, 256 KB */
++#define OFF_PT              0x80000u            /* GPU page tables: 128 pages of 4 KB */
++#define PT_PAGES            128u
 +#define DRAW_W              256u
 +#define DRAW_H              256u
 +#define DRAW_PITCH          (DRAW_W * 4u)       /* bytes; the blitter wants a multiple of 64 */
@@ -903,6 +905,146 @@ index 0000000..1d93a91
 + * physical ones, which is all the ring and the buffers below 4 GB need. Real stage-1 page
 + * tables come later, when a user space driver allocates its own buffers.
 + */
++/*
++ * GPU virtual memory: stage-1 page tables in the GPU's SMMU context bank, so the GPU can reach
++ * memory that is not physically contiguous (everything iOS allocates). Boot-arg gpu_mmu=1.
++ *
++ * Format and register values are Linux's: drivers/iommu/io-pgtable-arm.c (ARM_64_LPAE_S1,
++ * 4 KB granule, a walker that is not cache coherent) and drivers/iommu/arm/arm-smmu
++ * (arm_smmu_write_context_bank, with Qualcomm's Adreno write_sctlr). The a610 has
++ * ADRENO_QUIRK_4GB_VA, so the GPU's addresses are 32 bits: T0SZ = 32, the walk starts at level
++ * 1 (VA[31:30], 4 entries), then level 2 (2 MB) and level 3 (4 KB). Output addresses are 36
++ * bits, which covers all of this phone's RAM.
++ *
++ * The tables live in the pool, which is write-combined: the CPU's stores reach RAM at the next
++ * dsb, and the walker reads RAM (TCR IRGN0/ORGN0 = non-cacheable), so no cache maintenance.
++ * Everything that worked with the identity bank stays at VA = PA (the pool, the boot
++ * framebuffer) as 2 MB blocks; other memory gets 4 KB pages anywhere below 4 GB.
++ */
++#define PTE_TYPE_TABLE      3ull                /* also TYPE_PAGE at level 3 */
++#define PTE_TYPE_BLOCK      1ull
++#define PTE_ADDR_MASK       0x0000fffffffff000ull
++/* AttrIndx 0 (MAIR NC), AP_UNPRIV, SH_OS, AF, nG: Linux's prot for non-cached read/write */
++#define PTE_RW_NC           ((1ull << 6) | (2ull << 8) | (1ull << 10) | (1ull << 11))
++#define SMMU_MAIR0          0xf404ff44u         /* NC, WBRWA, device, INC_OWBRWA */
++#define SMMU_TCR            ((2u << 12) | (1u << 23) | 32u)  /* SH0 OS, EPD1, T0SZ 32, TG0 4 KB, NC walks */
++#define SMMU_TCR2           ((7u << 15) | 1u)   /* SEP upstream, PASIZE 36 bits */
++#define SMMU_CBAR_S1        ((1u << 16) | (0xFu << 12) | (3u << 8))  /* S1 trans S2 bypass, WB, NSH */
++#define SMMU_SCTLR_XLATE    (0x1000u | 0x100u | 0x40u | 0x20u | 0x4u | 0x2u | 0x1u)  /* ASIDPNE HUPCF CFIE CFRE AFE TRE M */
++
++static uint32_t mmu;
++static uint32_t pt_used;
++static uint64_t *pt_l1;
++static uint64_t pt_l1_pa;
++
++static uint64_t
++pt_alloc(uint64_t **va)
++{
++	if (pt_used >= PT_PAGES) {
++		return 0;
++	}
++	uint32_t off = OFF_PT + pt_used++ * 4096u;
++	*va = (uint64_t *)(pool + off);
++	bzero(*va, 4096);
++	return POOL_PA + off;
++}
++
++static uint64_t *
++pt_next(uint64_t *e)
++{
++	if (*e == 0) {
++		uint64_t *t;
++		uint64_t pa = pt_alloc(&t);
++		if (pa == 0) {
++			return NULL;
++		}
++		*e = pa | PTE_TYPE_TABLE;
++		return t;
++	}
++	if ((*e & 3) != PTE_TYPE_TABLE) {
++		return NULL;                            /* a block is already there */
++	}
++	return (uint64_t *)(pool + ((*e & PTE_ADDR_MASK) - POOL_PA));
++}
++
++static bool
++map_block_2m(uint64_t va, uint64_t pa)
++{
++	uint64_t *l2 = pt_next(&pt_l1[(va >> 30) & 3]);
++	if (l2 == NULL || va >= (1ull << 32)) {
++		return false;
++	}
++	l2[(va >> 21) & 511] = (pa & ~0x1FFFFFull) | PTE_TYPE_BLOCK | PTE_RW_NC;
++	return true;
++}
++
++static bool
++map_page_4k(uint64_t va, uint64_t pa)
++{
++	uint64_t *l2 = pt_next(&pt_l1[(va >> 30) & 3]);
++	uint64_t *l3 = l2 != NULL ? pt_next(&l2[(va >> 21) & 511]) : NULL;
++	if (l3 == NULL || va >= (1ull << 32)) {
++		return false;
++	}
++	l3[(va >> 12) & 511] = (pa & PTE_ADDR_MASK) | PTE_TYPE_TABLE | PTE_RW_NC;
++	return true;
++}
++
++/* TLBIASID 0, then TLBSYNC and wait for TLBSTATUS.SACTIVE to clear. */
++static bool
++tlb_flush(void)
++{
++	gmb();
++	wr(smmu, 0x8610, 0);
++	wr(smmu, 0x87f0, 0);
++	return poll(smmu, 0x87f4, 1, 0, 1000);
++}
++
++static bool
++smmu_pagetables(void)
++{
++	PE_Video video;
++
++	if (smmu == NULL) {
++		return false;
++	}
++	pt_used = 0;
++	pt_l1_pa = pt_alloc(&pt_l1);
++	bool ok = map_block_2m(POOL_PA, POOL_PA);
++	PE_current_console(&video);
++	uint64_t fb = video.v_baseAddr, fb_end = fb + (uint64_t)video.v_rowBytes * video.v_height;
++	for (uint64_t a = fb & ~0x1FFFFFull; ok && fb != 0 && a < fb_end; a += 0x200000) {
++		ok = map_block_2m(a, a);
++	}
++	if (!ok) {
++		LOG("  SMMU: the identity blocks did not fit the page tables");
++		return false;
++	}
++	gmb();
++	wr(smmu, 0x8000, 0);                        /* CB0 off while it changes */
++	wr(smmu, 0x8058, 0xFFFFFFFF);               /* CB0 FSR: clear */
++	wr(smmu, 0x1800, 1);                        /* CBA2R0: VA64 */
++	wr(smmu, 0x1000, SMMU_CBAR_S1);             /* CBAR0 */
++	wr(smmu, 0x8010, SMMU_TCR2);
++	wr(smmu, 0x8030, SMMU_TCR);
++	wr(smmu, 0x8020, (uint32_t)pt_l1_pa);
++	wr(smmu, 0x8024, (uint32_t)(pt_l1_pa >> 32));  /* TTBR0, ASID 0 */
++	wr(smmu, 0x8028, 0);
++	wr(smmu, 0x802C, 0);                        /* TTBR1 */
++	wr(smmu, 0x8038, SMMU_MAIR0);
++	wr(smmu, 0x803C, 0);
++	gmb();
++	wr(smmu, 0x8000, SMMU_SCTLR_XLATE);
++	gmb();
++	wr(smmu, 0x0C00, 0);                        /* S2CR0: translate through CB0 */
++	wr(smmu, 0x0800, (1u << 31) | (1u << 16));  /* SMR0: SID 0, mask 1 */
++	ok = tlb_flush();
++	LOG("  SMMU page tables: L1 at %llx, %u tables used, identity for the pool and %llx-%llx; CB0 SCTLR %08x TCR %08x TCR2 %08x TTBR0 %08x%08x, TLB sync %s",
++	    pt_l1_pa, pt_used, fb, fb_end, rd(smmu, 0x8000), rd(smmu, 0x8030), rd(smmu, 0x8010), rd(smmu, 0x8024),
++	    rd(smmu, 0x8020), ok ? "done" : "STUCK");
++	return true;
++}
++
 +static bool
 +smmu_identity(void)
 +{
@@ -1060,7 +1202,7 @@ index 0000000..1d93a91
 +	    POOL_PA + OFF_RING, POOL_PA + OFF_TEST);
 +	step_done();
 +
-+	if (!smmu_identity()) {
++	if (!(mmu ? smmu_pagetables() : smmu_identity())) {
 +		return false;
 +	}
 +	step_done();
@@ -1429,6 +1571,80 @@ index 0000000..1d93a91
 +}
 +
 +/*
++ * The test GPU virtual memory exists for: 256 KB of ordinary kernel memory, allocated without
++ * asking for contiguity (so scattered over physical pages the way iOS surfaces are), mapped
++ * page by page at one contiguous GPU address, filled by the 2D blitter through that address and
++ * read back by the CPU through its own mapping. The identity bank could never do this.
++ */
++#define MMU_TEST_VA         0x10000000ull       /* below RAM: no overlap with the identity blocks */
++
++static bool
++mmu_test(void)
++{
++	IOBufferMemoryDescriptor *m = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut,
++	    DRAW_W * DRAW_H * 4, 4096);
++	uint32_t runs = 0, good = 0, bad_at = 0xFFFFFFFF, bad_val = 0;
++	uint64_t prev = 0, lo = ~0ull, hi = 0;
++	const uint32_t rgba = 0x20C0FFFFu;
++	bool ok = true;
++
++	LOG("--- gpu_mmu: %u KB of scattered memory at GPU address %llx", DRAW_W * DRAW_H * 4 / 1024, MMU_TEST_VA);
++	if (m == NULL) {
++		LOG("  no memory");
++		return false;
++	}
++	uint32_t *cpu = (uint32_t *)m->getBytesNoCopy();
++	for (uint32_t off = 0; ok && off < DRAW_W * DRAW_H * 4; off += 4096) {
++		uint64_t len = 0;
++		uint64_t pa = m->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
++		if (pa == 0) {
++			ok = false;
++			break;
++		}
++		if (pa != prev + 4096) {
++			runs++;
++		}
++		prev = pa;
++		lo = pa < lo ? pa : lo;
++		hi = pa > hi ? pa : hi;
++		ok = map_page_4k(MMU_TEST_VA + off, pa);
++	}
++	if (!ok || !tlb_flush()) {
++		LOG("  mapping failed (%u tables used)", pt_used);
++		m->release();
++		return false;
++	}
++	LOG("  %u pages in %u physical runs, between %llx and %llx; %u page tables in use", DRAW_W * DRAW_H * 4 / 4096,
++	    runs, lo, hi + 4095, pt_used);
++	for (uint32_t i = 0; i < DRAW_W * DRAW_H; i++) {
++		cpu[i] = 0xDEADBEEF;
++	}
++	sweet_dcache_flush((vm_offset_t)cpu, DRAW_W * DRAW_H * 4);  /* in RAM, nothing dirty left behind */
++
++	blit_begin(rgba);
++	blit_rect(MMU_TEST_VA, DRAW_PITCH, 0, 0, DRAW_W - 1, DRAW_H - 1);
++	ok = blit_end("2D fill through the GPU MMU");
++	sweet_dcache_flush((vm_offset_t)cpu, DRAW_W * DRAW_H * 4);  /* drop any line the CPU still holds */
++	for (uint32_t i = 0; ok && i < DRAW_W * DRAW_H; i++) {
++		if (cpu[i] == __builtin_bswap32(rgba)) {
++			good++;
++		} else if (bad_at == 0xFFFFFFFF) {
++			bad_at = i;
++			bad_val = cpu[i];
++		}
++	}
++	LOG("  pixels: %u of %u as expected (%08x); first %08x, last %08x", good, DRAW_W * DRAW_H,
++	    __builtin_bswap32(rgba), cpu[0], cpu[DRAW_W * DRAW_H - 1]);
++	if (bad_at != 0xFFFFFFFF) {
++		LOG("  first wrong pixel: #%u (page %u, x %u, y %u) = %08x", bad_at, bad_at * 4 / 4096, bad_at % DRAW_W,
++		    bad_at / DRAW_W, bad_val);
++	}
++	smmu_fault("after the MMU test");
++	m->release();
++	return ok && good == DRAW_W * DRAW_H;
++}
++
++/*
 + * boot-arg gpu_demo=1: the GPU paints three bars (red, green, blue) straight onto the boot
 + * framebuffer the panel scans out, over the Apple logo, where they stay until SpringBoard's first
 + * frame replaces them. The framebuffer is 1080 x 2400 BGRA with 4320 bytes a row, which the
@@ -1517,6 +1733,7 @@ index 0000000..1d93a91
 +	(void)PE_parse_boot_argn("gpu_draw", &draw_first, sizeof(draw_first));
 +	(void)PE_parse_boot_argn("gpu_demo", &demo, sizeof(demo));
 +	(void)PE_parse_boot_argn("gpu_bench", &bench, sizeof(bench));
++	(void)PE_parse_boot_argn("gpu_mmu", &mmu, sizeof(mmu));
 +	if (PE_parse_boot_argn("gpu_delay", &delay_s, sizeof(delay_s)) && delay_s != 0) {
 +		LOG("starting in %u s", delay_s);
 +		IOSleep(delay_s * 1000);
@@ -1625,6 +1842,11 @@ index 0000000..1d93a91
 +			}
 +			if (bench) {
 +				bench_copy();
++			}
++			if (mmu && mmu_test()) {
++				LOG("*** the GPU reached scattered memory through its own page tables ***");
++			} else if (mmu) {
++				LOG("the GPU MMU test did not come out right");
 +			}
 +		} else if (draw_first) {
 +			LOG("the 2D fill did not come out right");
