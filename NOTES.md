@@ -58,7 +58,22 @@ over the adb tunnel; explicit OK before `fastboot flash userdata`.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
-**sapphire: every death is at 40-50 s, GPU touched or not, and it is a real panic with text on the screen (2026-10-21).** Two more boots with `gpu=3 gpu_delay=60` (no `gpu_slow`, kernel out-cm8) panicked at the Apple logo with the GPU thread still asleep — the sequence had not started — and the user saw the panic text drawn over the logo. Counting the `SWEET INTF1` lines (one every 5 s) gives the moment of death for every log we have:
+**sapphire: THE BLACK BOX CAUGHT IT, AND IT WAS OURS: `bzero` on the GPU pool mapped as device memory (2026-10-21, kernel out-cm9 / 528bb2f, boot `sweetusb=2 gpu=3 gpu_delay=60`, `logs/sapphire-gpu3-panic-blackbox.txt`).** First panic ever recovered from this phone, 131 KB with `PANIC flush (black box)` in the header, and it overturns the entry below it:
+
+    SapphireGpu:   CP_ALWAYS_ON_COUNTER 0000000000001cdd -> 0000000000034bd9 in 10 ms (delta 208636, 19.2 MHz = ~192000)
+    Unaligned kernel data abort. at pc 0xfffffe0007bc7a44, lr 0xfffffe0007ae6ab0
+      x0: 0xfffffe4e4aca4000  x2: 0x000000000001cf80  x16: 0x00000000e1000000 ...
+      esr: 0x96000061  far: 0xfffffe4e4aca4040
+
+`pc` = `_bzero + 0x44`, `lr` = `gpu_thread + 0x1110` (symbolicated against out-cm9 with a 20-line Mach-O symtab reader). `x16` is `POOL_PA`, `far` is the pool's VA + 0x40, `x2` is what `bzero(pool, OFF_META + 0x4000)` still had to write, and ESR's DFSC 0x21 is an **alignment fault**: xnu's `bzero` zeroes with `dc zva` and vector stores, which are illegal on device memory, and `map_phys()` mapped everything, the pool included, with `kIOMapInhibitCache`. So:
+
+- The GPU is fine. Every line of stage 3 up to and including `first_reads()` is healthy (counter +208636 in 10 ms), and the panic is the first instruction of the code that only stages 3 and 4 run: mapping the pool and clearing it. That is why **stage 2 survived every time and stages 3/4 died every time**, and why "no code differs" was wrong: the code after `first_reads()` differs, and it was the very next thing.
+- The deaths looked like "a second after the last line, with the thread asleep" only because the ring was flushed every **10 s** (not 1) and the live USB thread polls every 100 ms: the sequence prints 40 lines in a millisecond and panics in the next, so neither channel ever had the last lines. The `INTF1` arithmetic that put the deaths at "40 s before the GPU ran" was wrong for the same reason (captures start at USB-up, the display's counter starts earlier). With `gpu_delay=20 gpu_slow=1200` the pool mapping came ~43 s in, with `gpu_delay=60` at 60 s; same panic.
+- The interrupt, the rail, the bus and "something in iOS at 40 s" were all wrong. `gpu_irq`, `gpu_div` and `gpu_smmu_early` stay as knobs but none of them was ever going to help. The two cm6 `gpu=2 gpu_delay=60` panics from the morning are the one thing this does not explain (stage 2 never maps the pool); worth one `gpu=2 gpu_delay=60` boot with the black box when convenient, and not worth more than that.
+
+Fix in 0145: `map_phys(pa, size, ram)` — registers stay `kIOMapInhibitCache`, the pool and the zap region are `kIOMapWriteCombineCache` (normal non-cacheable memory, what TopazModem and SweetSurface use for RAM the hardware shares; the GPU sees every store after `dsb` with no cache maintenance). The patch rebuilds and `gpu=3` should now get to the zap shader and the CP for the first time.
+
+**sapphire: every death was thought to be at 40-50 s, GPU touched or not — superseded by the entry above (2026-10-21).** Two more boots with `gpu=3 gpu_delay=60` (no `gpu_slow`, kernel out-cm8) panicked at the Apple logo with the GPU thread still asleep — the sequence had not started — and the user saw the panic text drawn over the logo. Counting the `SWEET INTF1` lines (one every 5 s) gives the moment of death for every log we have:
 
 | boot | GPU at that moment | died at |
 | --- | --- | --- |

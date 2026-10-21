@@ -1,4 +1,4 @@
-From 9623999d7a53afbce89a1e72aa7ddbb0fc4c9457 Mon Sep 17 00:00:00 2001
+From 8a5dfee5f1c805674cbd69142473ccfb403c82c2 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 06:53:53 +0000
 Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
@@ -20,18 +20,18 @@ zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
 Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
 files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 1107 +++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireGpu.cpp      | 1115 +++++++++++++++++++++++++
  iokit/Kernel/arm/SweetFramebuffer.cpp |    2 +
  iokit/conf/files.arm64                |    1 +
- 3 files changed, 1110 insertions(+)
+ 3 files changed, 1118 insertions(+)
  create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 new file mode 100644
-index 0000000..05836fc
+index 0000000..787d3ab
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -0,0 +1,1107 @@
+@@ -0,0 +1,1115 @@
 +/*
 + * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
 + *
@@ -338,7 +338,7 @@ index 0000000..05836fc
 +}
 +
 +static IOMemoryMap *
-+map_phys(uint64_t pa, uint64_t size)
++map_phys(uint64_t pa, uint64_t size, bool ram)
 +{
 +	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa, size, kIODirectionInOut);
 +	IOMemoryMap *m;
@@ -346,7 +346,15 @@ index 0000000..05836fc
 +	if (md == NULL) {
 +		return NULL;
 +	}
-+	m = md->map(kIOMapInhibitCache);
++	/*
++	 * Registers are device memory (kIOMapInhibitCache). RAM the GPU shares is not: xnu's
++	 * bzero and memcpy use dc zva and vector stores, which are alignment faults on device
++	 * memory ("Unaligned kernel data abort" in bzero, from the first bzero of the pool,
++	 * what stage 3 and 4 died of before). Write-combined is normal non-cacheable memory,
++	 * which is what TopazModem and SweetSurface use for theirs, and the GPU sees every
++	 * store after a dsb with no cache maintenance.
++	 */
++	m = md->map(ram ? kIOMapWriteCombineCache : kIOMapInhibitCache);
 +	md->release();
 +	return m;
 +}
@@ -761,7 +769,7 @@ index 0000000..05836fc
 +		return false;
 +	}
 +
-+	zap_map = map_phys(ZAP_PA, ZAP_SIZE);
++	zap_map = map_phys(ZAP_PA, ZAP_SIZE, true);
 +	if (zap_map == NULL) {
 +		LOG("  the zap region could not be mapped");
 +		return false;
@@ -1022,8 +1030,8 @@ index 0000000..05836fc
 +	LOG("stage %u (Adreno 610 v2, regs %llx, GPU CC %llx), core GPLL0/%u = %u MHz, %u ms after each step",
 +	    stage, GPU_PA, GPUCC_PA, core_div, 600 / core_div, slow_ms);
 +
-+	gcc_map = map_phys(GCC_PA, GCC_SIZE);
-+	gpucc_map = map_phys(GPUCC_PA, GPUCC_SIZE);
++	gcc_map = map_phys(GCC_PA, GCC_SIZE, false);
++	gpucc_map = map_phys(GPUCC_PA, GPUCC_SIZE, false);
 +	if (gcc_map == NULL || gpucc_map == NULL) {
 +		LOG("the clock controllers could not be mapped");
 +		thread_terminate(current_thread());
@@ -1031,7 +1039,7 @@ index 0000000..05836fc
 +	}
 +	gcc = (volatile uint8_t *)gcc_map->getVirtualAddress();
 +	gpucc = (volatile uint8_t *)gpucc_map->getVirtualAddress();
-+	gicd_map = map_phys(GICD_PA, GICD_SIZE);
++	gicd_map = map_phys(GICD_PA, GICD_SIZE, false);
 +	if (gicd_map != NULL) {
 +		gicd = (volatile uint8_t *)gicd_map->getVirtualAddress();
 +	}
@@ -1047,7 +1055,7 @@ index 0000000..05836fc
 +		step_done();
 +	}
 +	/* mapped before the power-up only so gpu_smmu_early has it; the registers need the vote */
-+	smmu_map = map_phys(SMMU_PA, SMMU_SIZE);
++	smmu_map = map_phys(SMMU_PA, SMMU_SIZE, false);
 +	if (smmu_map != NULL) {
 +		smmu = (volatile uint8_t *)smmu_map->getVirtualAddress();
 +	}
@@ -1058,7 +1066,7 @@ index 0000000..05836fc
 +		return;
 +	}
 +	dump_clocks("powered");
-+	gpu_map = map_phys(GPU_PA, GPU_SIZE);
++	gpu_map = map_phys(GPU_PA, GPU_SIZE, false);
 +	if (gpu_map == NULL) {
 +		LOG("the GPU registers could not be mapped");
 +		power_down();
@@ -1080,7 +1088,7 @@ index 0000000..05836fc
 +		thread_terminate(current_thread());
 +		return;
 +	}
-+	pool_map = map_phys(POOL_PA, POOL_SIZE);
++	pool_map = map_phys(POOL_PA, POOL_SIZE, true);
 +	if (pool_map == NULL || smmu_map == NULL) {
 +		LOG("the buffer pool or the SMMU could not be mapped");
 +		power_down();
