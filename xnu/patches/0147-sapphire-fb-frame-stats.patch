@@ -1,4 +1,4 @@
-From 1ee49202c32a2de9704a801ac2c3acae553efb23 Mon Sep 17 00:00:00 2001
+From 78f595593a6df367577e3987eb27f3fce0989b2a Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 16:22:56 +0000
 Subject: [PATCH] sapphire-0147: AppleCLCD frame timing, and the GPU copy of a
@@ -16,11 +16,11 @@ before, the destination rows invalidated after, and the flip skips its
 clean since the GPU wrote RAM. Any failure leaves the frame to the CPU
 path, unchanged.
 ---
- iokit/Kernel/arm/SweetFramebuffer.cpp | 137 ++++++++++++++++++++++++++
- 1 file changed, 137 insertions(+)
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 147 ++++++++++++++++++++++++++
+ 1 file changed, 147 insertions(+)
 
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 835d1f1..a2fb441 100644
+index 835d1f1..d6eabfe 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -82,6 +82,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -148,7 +148,7 @@ index 835d1f1..a2fb441 100644
  	/*
  	 * copy path (several layers): compose into the cached back buffer and
  	 * flip, like the direct path. Composing into the scanned, uncached boot
-@@ -953,6 +1045,15 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -953,6 +1045,21 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  	}
  
@@ -158,27 +158,35 @@ index 835d1f1..a2fb441 100644
 +			nlayers++;
 +		}
 +	}
-+	bool gpu_frame = fFlip[0] != NULL && nlayers == 1 && sweet_fb_gpucopy_on() && sapphire_gpu_ready();
++	/*
++	 * Without flip buffers (they need 2 x 10 MB of contiguous memory, which is not there at
++	 * boot on this phone) the frame goes straight into the boot framebuffer the panel scans:
++	 * contiguous, already mapped in the GPU, and write-combined for the CPU, so the GPU's
++	 * writes need no invalidate.
++	 */
++	bool gpu_frame = nlayers == 1 && sweet_fb_gpucopy_on() && sapphire_gpu_ready();
 +	bool gpu_used = false;
 +
  	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
  		uint32_t id = get32(rec, 0x54 + 4 * layer);
  		const uint8_t *a = rec + 0x64 + 16 * layer;
-@@ -1019,6 +1120,26 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -1019,6 +1126,28 @@ AppleCLCD::present(const uint8_t *rec)
  		    s->memory == NULL || last > s->memory->getLength()) {
  			src = 0;
  		}
 +		if (src != 0 && bpe == 4 && gpu_frame) {
 +			uint64_t soff = s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
-+			uint32_t back = fFlipIdx ^ 1;
++			uint64_t dbase = fFlip[0] != NULL ? fFlipPhys[fFlipIdx ^ 1] : fPhys;
 +			uint64_t t0 = mach_absolute_time();
 +			sweet_dcache_clean((vm_offset_t)(src + soff), (unsigned)((uint64_t)(h - 1) * s->bytesPerRow + (uint64_t)w * 4));
 +			uint64_t t1 = mach_absolute_time();
 +			if (sapphire_gpu_copy(s->memory, soff, s->bytesPerRow,
-+			    fFlipPhys[back] + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4, fRowBytes, (uint32_t)w, (uint32_t)h,
-+			    fFlipPhys[back], (uint64_t)fRowBytes * fHeight)) {
++			    dbase + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4, fRowBytes, (uint32_t)w, (uint32_t)h,
++			    dbase, (uint64_t)fRowBytes * fHeight)) {
 +				uint64_t t2 = mach_absolute_time();
-+				sweet_dcache_flush((vm_offset_t)(dst + (uint64_t)dy * fRowBytes), (unsigned)((uint64_t)h * fRowBytes));
++				if (fFlip[0] != NULL) {
++					sweet_dcache_flush((vm_offset_t)(dst + (uint64_t)dy * fRowBytes), (unsigned)((uint64_t)h * fRowBytes));
++				}
 +				gpu_used = true;
 +				if (sweet_fb_stats_on()) {
 +					sweet_fb_stats.g_clean += sweet_fb_us(t0, t1);
@@ -191,15 +199,17 @@ index 835d1f1..a2fb441 100644
  		if (src != 0 && bpe == 4) {
  			for (int32_t y = 0; y < h; y++) {
  				memcpy((void *)(dst + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
-@@ -1028,9 +1149,25 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -1028,9 +1157,27 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  		s->release();
  	}
-+	if (fFlip[0] != NULL && gpu_used) {
-+		/* the GPU wrote RAM and the rows were invalidated: point the MDP at it, no clean */
-+		uint32_t idx = fFlipIdx ^ 1;
-+		scanFrom(fFlipPhys[idx], fRowBytes);
-+		fFlipIdx = idx;
++	if (gpu_used) {
++		/* the GPU wrote RAM (and the rows were invalidated): point the MDP at it, no clean */
++		if (fFlip[0] != NULL) {
++			uint32_t idx = fFlipIdx ^ 1;
++			scanFrom(fFlipPhys[idx], fRowBytes);
++			fFlipIdx = idx;
++		}
 +		if (sweet_fb_stats_on()) {
 +			sweet_fb_stats.gpu++;
 +			sweet_fb_stats_tick();
