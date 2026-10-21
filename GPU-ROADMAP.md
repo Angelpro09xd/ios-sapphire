@@ -22,6 +22,34 @@ render on the Adreno, three layers have to exist. This file is the plan; `NOTES.
 
 ## 2. A Metal driver for the Adreno
 
+What the iOS 16.7.16 binaries say (dyld shared cache, `ipsw` 3.1.739):
+
+- `getMetalPluginClassForService()` in Metal reads `MetalPluginName` from the accelerator service,
+  loads `/System/Library/Extensions/<name>.bundle` with `[NSBundle bundleWithPath:]`, takes
+  `MetalPluginClassName` with `classNamed:` (else `principalClass`), and **requires
+  `[cls isSubclassOfClass:[_MTLDevice class]]`**; the device is `[[cls alloc] initWithAcceleratorPort:]`.
+- Apple's driver for this GPU family has exactly that shape: `AGXPrincipalDevice` (entry point,
+  `initWithAcceleratorPort:` only) → `AGXA11Device : AGXA11FamilyDevice : IOGPUMetalDevice :
+  _MTLDevice`, with queues, command buffers, encoders, buffers and textures subclassing
+  IOGPU.framework's `IOGPUMetal*` classes. IOGPU does the generic work and talks to the kernel
+  (`IOGPUDeviceCreateWithAPIProperty(port, "Metal")`); AGX adds the GPU-specific encoding.
+- `-[_MTLDevice initWithAcceleratorPort:]` is abstract; `IOGPUMetalDevice`'s does `[super init]`
+  (a real `-[_MTLDevice init]`) and only then opens IOGPU. So a device of our own needs nothing of
+  IOGPU to exist.
+- The port already publishes an empty `IOAcceleratorES` (SweetFramebuffer.cpp); with `sweetmetal=1`
+  (0147) it names `SapphireMetal` / `SapphireMTLDevice`.
+
+| Step | State |
+| --- | --- |
+| A device that loads and logs every message iOS sends it (`metal/`, built on Linux with clang + ld64.lld, no SDK) | built, symbols checked against the device's libraries |
+| From that list: queues, command buffers, buffers, textures, blits on layer 1's GPU service | |
+| Render encoders and pipelines for what CoreAnimation draws | |
+
+The layering choice ahead: subclass IOGPU's `IOGPUMetal*` classes (their resource and submission
+machinery for free, at the price of implementing Apple's private IOGPU kernel interface), or
+`_MTLDevice` and friends directly over a small interface of our own (less to match, more to
+write). The logging device's trace is what decides it.
+
 Metal looks for an IOService with a `MetalPluginName` and loads that bundle from
 `/System/Library/Extensions`. A bundle of our own, loaded in place of `AGXMetalA11`, would
 implement the device, command queues, buffers, textures, render and blit encoders on top of

@@ -1,0 +1,13 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64-ios ]
+install-name:    '/usr/lib/libobjc.A.dylib'
+current-version: 228
+exports:
+  - targets:     [ arm64-ios ]
+    symbols:     [ _objc_msgSend, _objc_msgSendSuper, _objc_msgSendSuper2, _objc_getClass, _objc_getProtocol,
+                   _protocol_copyMethodDescriptionList, _protocol_copyProtocolList, _protocol_getName,
+                   _class_addMethod, _class_getInstanceMethod, _method_getImplementation, _class_getSuperclass,
+                   _sel_getName, _sel_registerName, __objc_msgForward, __objc_empty_cache ]
+    objc-classes: [ NSObject ]
+...

@@ -1,26 +1,30 @@
-From 78f595593a6df367577e3987eb27f3fce0989b2a Mon Sep 17 00:00:00 2001
+From 0090025184c1398a2336bc8f653cdadf69be864e Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 16:22:56 +0000
-Subject: [PATCH] sapphire-0147: AppleCLCD frame timing, and the GPU copy of a
- frame
+Subject: [PATCH] sapphire-0147: AppleCLCD frame timing, the GPU copy of a
+ frame, a Metal driver's name
 
 Every 5 s, the number of direct, CPU-composed and GPU-composed frames
 and the average time each part of them took, so it is known what the
 GPU saves. Boot-arg sweetfb_stats=0 turns it off.
 
 Boot-arg sweetfb_gpucopy=1: a frame with one layer has its copy into the
-back buffer done by the GPU (SapphireGpu.cpp sapphire_gpu_copy, with
+back buffer, or straight into the boot framebuffer when there are no
+flip buffers, done by the GPU (SapphireGpu.cpp sapphire_gpu_copy, with
 gpu_service=1 gpu_mmu=1), reading the surface's scattered pages through
-the GPU's page tables. The source rows are cleaned from the CPU caches
-before, the destination rows invalidated after, and the flip skips its
-clean since the GPU wrote RAM. Any failure leaves the frame to the CPU
-path, unchanged.
+the GPU's page tables. Source rows are cleaned from the CPU caches
+before; any failure leaves the frame to the CPU path, unchanged.
+
+Boot-arg sweetmetal=1: the accelerator service names a Metal driver,
+MetalPluginName SapphireMetal and MetalPluginClassName
+SapphireMTLDevice, so Metal loads that bundle from
+/System/Library/Extensions instead of passing the service over.
 ---
- iokit/Kernel/arm/SweetFramebuffer.cpp | 147 ++++++++++++++++++++++++++
- 1 file changed, 147 insertions(+)
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 162 +++++++++++++++++++++++++-
+ 1 file changed, 161 insertions(+), 1 deletion(-)
 
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 835d1f1..d6eabfe 100644
+index 835d1f1..edcd849 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -82,6 +82,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -31,7 +35,31 @@ index 835d1f1..d6eabfe 100644
  #include <IOKit/IOLocks.h>
  #include <IOKit/IOWorkLoop.h>
  #include <IOKit/IOTimerEventSource.h>
-@@ -820,10 +821,89 @@ AppleCLCD::flipBack(void)
+@@ -345,9 +346,22 @@ AppleCLCD::start(IOService *provider)
+ 	IOAcceleratorES *accel = accelOn ? OSTypeAlloc(IOAcceleratorES) : NULL;
+ 	if (accel != NULL && accel->init()) {
+ 		accel->setName("sgx");
++		/*
++		 * boot-arg sweetmetal=1: name a Metal driver, so Metal (getMetalPluginClassForService)
++		 * loads /System/Library/Extensions/SapphireMetal.bundle and makes its SapphireMTLDevice
++		 * the system device (metal/ in the repository). Without it the service stays empty and
++		 * Metal passes it over, as before.
++		 */
++		uint32_t metal = 0;
++		(void)PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal));
++		if (metal) {
++			accel->setProperty("MetalPluginName", "SapphireMetal");
++			accel->setProperty("MetalPluginClassName", "SapphireMTLDevice");
++		}
+ 		if (accel->attach(this)) {
+ 			accel->registerService();
+-			IOLog("SWEET FB: empty IOAcceleratorES published (no 30 s wait in CAMetalContextCreate)\n");
++			IOLog("SWEET FB: IOAcceleratorES published, %s\n", metal ? "Metal driver SapphireMetal" :
++			    "empty (no 30 s wait in CAMetalContextCreate)");
+ 		}
+ 	}
+ 	OSSafeReleaseNULL(accel);
+@@ -820,10 +834,89 @@ AppleCLCD::flipBack(void)
  	fFlipIdx = idx;
  }
  
@@ -121,7 +149,7 @@ index 835d1f1..d6eabfe 100644
  	if (srcStride == fRowBytes) {
  		memcpy(dst, src, (size_t)fRowBytes * fHeight);
  	} else {
-@@ -831,7 +911,18 @@ AppleCLCD::flipFrom(const uint8_t *src, uint32_t srcStride)
+@@ -831,7 +924,18 @@ AppleCLCD::flipFrom(const uint8_t *src, uint32_t srcStride)
  			memcpy(dst + (uint64_t)y * fRowBytes, src + (uint64_t)y * srcStride, (size_t)fWidth * 4);
  		}
  	}
@@ -140,7 +168,7 @@ index 835d1f1..d6eabfe 100644
  }
  
  /*
-@@ -932,6 +1023,7 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -932,6 +1036,7 @@ AppleCLCD::present(const uint8_t *rec)
  	IOLockLock(fLock);
  	fLastVA = NULL;
  	IOLockUnlock(fLock);
@@ -148,7 +176,7 @@ index 835d1f1..d6eabfe 100644
  	/*
  	 * copy path (several layers): compose into the cached back buffer and
  	 * flip, like the direct path. Composing into the scanned, uncached boot
-@@ -953,6 +1045,21 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -953,6 +1058,21 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  	}
  
@@ -170,7 +198,7 @@ index 835d1f1..d6eabfe 100644
  	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
  		uint32_t id = get32(rec, 0x54 + 4 * layer);
  		const uint8_t *a = rec + 0x64 + 16 * layer;
-@@ -1019,6 +1126,28 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -1019,6 +1139,28 @@ AppleCLCD::present(const uint8_t *rec)
  		    s->memory == NULL || last > s->memory->getLength()) {
  			src = 0;
  		}
@@ -199,7 +227,7 @@ index 835d1f1..d6eabfe 100644
  		if (src != 0 && bpe == 4) {
  			for (int32_t y = 0; y < h; y++) {
  				memcpy((void *)(dst + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
-@@ -1028,9 +1157,27 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -1028,9 +1170,27 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  		s->release();
  	}

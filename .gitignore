@@ -10,3 +10,4 @@ xnu/out-*/
 __pycache__/
 # boot logs: SSIDs nearby, device identifiers
 logs/
+metal/out/

@@ -176,6 +176,7 @@ after `gpu_delay` default to the behaviour that has already run, so a boot chang
 | `gpu_mmu=1` | GPU virtual memory: stage-1 page tables in the GPU's SMMU context bank instead of the identity bank, then a test that maps 256 KB of scattered kernel memory at one GPU address, fills it with the blitter and checks it from the CPU |
 | `gpu_service=1` | with `gpu_mmu=1` and every test passed, the GPU is not parked: it stays up as a service that takes copies from the rest of the kernel (`sapphire_gpu_copy`) |
 | `sweetfb_gpucopy=1` | AppleCLCD hands the GPU the copy of every single-layer frame into the panel's back buffer, reading CoreAnimation's scattered surface through the GPU's page tables; any failure falls back to the CPU |
+| `sweetmetal=1` | the accelerator service names a Metal driver (`MetalPluginName` SapphireMetal), so Metal loads `/System/Library/Extensions/SapphireMetal.bundle` (built from `metal/`, installed with `tools/sapphire-root-install.sh`) |
 | `gpu_irq=1` | leave the GPU's interrupt (SPI 177, INTID 209) alone. By default it is masked in the GIC distributor before anything is powered, and at the GPU once its registers answer: it is level triggered and nothing here handles it, which is what the deaths above look like |
 
 Both `gpu=3` and `gpu=4` need the microcode `a630_sqe.fw`, and `gpu=3` also needs this phone's
