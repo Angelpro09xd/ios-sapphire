@@ -1,0 +1,126 @@
+From ecfd451dd4c1a5f034b5757518428ce6b83f82c2 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 16:22:56 +0000
+Subject: [PATCH] sapphire-0147: time where a frame goes in AppleCLCD
+
+Every 5 s, the number of direct and composed frames and the average CPU
+time of the direct path's copy into the back buffer, of the cache clean
+for the MDP, and of the composed path, so it is known what handing those
+to the GPU could save. Boot-arg sweetfb_stats=0 turns it off.
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 69 +++++++++++++++++++++++++++
+ 1 file changed, 69 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 835d1f1..c518662 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -82,6 +82,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #include <kern/thread_call.h>
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
++#include <kern/clock.h>
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+@@ -820,10 +821,61 @@ AppleCLCD::flipBack(void)
+ 	fFlipIdx = idx;
+ }
+ 
++/*
++ * Where a frame's time goes (boot-arg sweetfb_stats=0 turns it off): the CPU copy of the frame
++ * into the back buffer, the cache clean for the MDP, and the composed (several layers) path,
++ * summed over 5 s and logged with the frame count, so it is known what handing them to the GPU
++ * could save.
++ */
++static struct {
++	uint64_t t0, copy, clean, comp, copy_max;
++	uint32_t direct, composed;
++	int on;
++} sweet_fb_stats = { 0, 0, 0, 0, 0, 0, 0, -1 };
++
++static uint64_t
++sweet_fb_us(uint64_t a, uint64_t b)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(b - a, &ns);
++	return ns / 1000;
++}
++
++static void
++sweet_fb_stats_tick(void)
++{
++	uint64_t now = mach_absolute_time();
++	if (sweet_fb_stats.t0 == 0) {
++		sweet_fb_stats.t0 = now;
++		return;
++	}
++	if (sweet_fb_us(sweet_fb_stats.t0, now) < 5000000) {
++		return;
++	}
++	uint32_t d = sweet_fb_stats.direct, c = sweet_fb_stats.composed;
++	IOLog("SWEET FB: 5 s: %u direct frames (copy %llu us + clean %llu us avg, copy max %llu us), %u composed (%llu us avg); %llu ms of CPU\n",
++	    d, d ? sweet_fb_stats.copy / d : 0, d ? sweet_fb_stats.clean / d : 0, sweet_fb_stats.copy_max, c,
++	    c ? sweet_fb_stats.comp / c : 0, (sweet_fb_stats.copy + sweet_fb_stats.clean + sweet_fb_stats.comp) / 1000);
++	sweet_fb_stats.copy = sweet_fb_stats.clean = sweet_fb_stats.comp = sweet_fb_stats.copy_max = 0;
++	sweet_fb_stats.direct = sweet_fb_stats.composed = 0;
++	sweet_fb_stats.t0 = now;
++}
++
++static bool
++sweet_fb_stats_on(void)
++{
++	if (sweet_fb_stats.on < 0) {
++		sweet_fb_stats.on = 1;
++		PE_parse_boot_argn("sweetfb_stats", &sweet_fb_stats.on, sizeof(sweet_fb_stats.on));
++	}
++	return sweet_fb_stats.on != 0;
++}
++
+ void
+ AppleCLCD::flipFrom(const uint8_t *src, uint32_t srcStride)
+ {
+ 	uint8_t *dst = backBuffer();
++	uint64_t t0 = mach_absolute_time();
+ 	if (srcStride == fRowBytes) {
+ 		memcpy(dst, src, (size_t)fRowBytes * fHeight);
+ 	} else {
+@@ -831,7 +883,18 @@ AppleCLCD::flipFrom(const uint8_t *src, uint32_t srcStride)
+ 			memcpy(dst + (uint64_t)y * fRowBytes, src + (uint64_t)y * srcStride, (size_t)fWidth * 4);
+ 		}
+ 	}
++	uint64_t t1 = mach_absolute_time();
+ 	flipBack();
++	if (sweet_fb_stats_on()) {
++		uint64_t t2 = mach_absolute_time(), cp = sweet_fb_us(t0, t1);
++		sweet_fb_stats.copy += cp;
++		sweet_fb_stats.clean += sweet_fb_us(t1, t2);
++		if (cp > sweet_fb_stats.copy_max) {
++			sweet_fb_stats.copy_max = cp;
++		}
++		sweet_fb_stats.direct++;
++		sweet_fb_stats_tick();
++	}
+ }
+ 
+ /*
+@@ -932,6 +995,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	IOLockLock(fLock);
+ 	fLastVA = NULL;
+ 	IOLockUnlock(fLock);
++	uint64_t comp_t0 = mach_absolute_time();
+ 	/*
+ 	 * copy path (several layers): compose into the cached back buffer and
+ 	 * flip, like the direct path. Composing into the scanned, uncached boot
+@@ -1031,6 +1095,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 	if (fFlip[0] != NULL) {
+ 		flipBack();
+ 	}
++	if (sweet_fb_stats_on()) {
++		sweet_fb_stats.comp += sweet_fb_us(comp_t0, mach_absolute_time());
++		sweet_fb_stats.composed++;
++		sweet_fb_stats_tick();
++	}
+ }
+ 
+ bool

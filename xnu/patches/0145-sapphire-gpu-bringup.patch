@@ -1,4 +1,4 @@
-From e84134fbb11cec660e37c5ce91a03668a78647fa Mon Sep 17 00:00:00 2001
+From 3b0bf4ec7a5e0aee8d608cafb3e7ca44072968e1 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 06:53:53 +0000
 Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
@@ -20,18 +20,18 @@ zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
 Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
 files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 1466 +++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireGpu.cpp      | 1629 +++++++++++++++++++++++++
  iokit/Kernel/arm/SweetFramebuffer.cpp |    2 +
  iokit/conf/files.arm64                |    1 +
- 3 files changed, 1469 insertions(+)
+ 3 files changed, 1632 insertions(+)
  create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 new file mode 100644
-index 0000000..04dde34
+index 0000000..1d93a91
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -0,0 +1,1466 @@
+@@ -0,0 +1,1629 @@
 +/*
 + * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
 + *
@@ -75,7 +75,9 @@ index 0000000..04dde34
 +
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
 +#include <kern/thread.h>
++#include <kern/clock.h>
 +#include <pexpert/pexpert.h>
 +#include <libkern/crc.h>
 +#include <sys/param.h>
@@ -185,6 +187,8 @@ index 0000000..04dde34
 +#define REG_RB_A2D_PIXEL_CNTL       0x8c01
 +#define REG_RB_A2D_DEST_BUFFER_INFO 0x8c17      /* + BASE (64-bit) at 0x8c18, PITCH at 0x8c1a */
 +#define REG_RB_A2D_CLEAR_COLOR_DW0  0x8c2c      /* DW0..DW3 */
++#define REG_TPL1_A2D_SRC_TEXTURE_INFO 0xb4c0    /* + SIZE 0xb4c1, BASE (64-bit) 0xb4c2, PITCH 0xb4c4 */
++#define REG_GRAS_A2D_SRC_XMIN       0x8401      /* + XMAX, YMIN, YMAX: coordinate << 8 */
 +#define REG_GRAS_A2D_BLT_CNTL       0x8400
 +#define REG_GRAS_A2D_DEST_TL        0x8405      /* + BR at 0x8406 */
 +#define REG_SP_A2D_OUTPUT_INFO      0xacc0
@@ -1156,10 +1160,10 @@ index 0000000..04dde34
 + * and submits, so the pixels are in RAM when it returns.
 + */
 +static void
-+blit_begin(uint32_t rgba)
++blit_setup(bool solid, uint32_t rgba)
 +{
 +	uint32_t fmt = FMT6_8_8_8_8_UNORM;
-+	uint32_t blt = (0xFu << 20) | (fmt << 8) | (1u << 7);  /* MASK, COLOR_FORMAT, IFMT UNORM8, SOLID_COLOR */
++	uint32_t blt = (0xFu << 20) | (fmt << 8) | (solid ? (1u << 7) : 0);  /* MASK, COLOR_FORMAT, IFMT UNORM8, SOLID_COLOR */
 +
 +	/* the a610's batch-start registers (freedreno_devices.py magic_regs / raw_magic_regs) */
 +	reg1(0x9804, 0xf);                          /* PC_MODE_CNTL */
@@ -1187,16 +1191,24 @@ index 0000000..04dde34
 +	reg1(REG_RB_CCU_CNTL, (1u << 0) | ((0x2000u >> 12) << 23));
 +
 +	/* emit_clear_color (R2D_UNORM8: one byte per dword, in the format's channel order) */
-+	emit(pkt4(REG_RB_A2D_CLEAR_COLOR_DW0, 4));
-+	emit((rgba >> 24) & 0xff);
-+	emit((rgba >> 16) & 0xff);
-+	emit((rgba >> 8) & 0xff);
-+	emit(rgba & 0xff);
++	if (solid) {
++		emit(pkt4(REG_RB_A2D_CLEAR_COLOR_DW0, 4));
++		emit((rgba >> 24) & 0xff);
++		emit((rgba >> 16) & 0xff);
++		emit((rgba >> 8) & 0xff);
++		emit(rgba & 0xff);
++	}
 +	/* emit_blit_setup */
 +	reg1(REG_RB_A2D_BLT_CNTL, blt);
 +	reg1(REG_GRAS_A2D_BLT_CNTL, blt);
 +	reg1(REG_SP_A2D_OUTPUT_INFO, (fmt << 3) | (0xFu << 12));  /* IFMT_TYPE FLOAT, COLOR_FORMAT, MASK */
 +	reg1(REG_RB_A2D_PIXEL_CNTL, 0);
++}
++
++static void
++blit_begin(uint32_t rgba)
++{
++	blit_setup(true, rgba);
 +}
 +
 +/* One rectangle [x0, x1] x [y0, y1] of a linear surface: base 64-byte aligned, pitch a multiple of 64. */
@@ -1267,6 +1279,153 @@ index 0000000..04dde34
 +	LOG("  RBBM_STATUS %08x CP_HW_FAULT %08x RBBM_INT_0_STATUS %08x", grd(REG_RBBM_STATUS), grd(REG_CP_HW_FAULT),
 +	    grd(REG_RBBM_INT_0_STATUS));
 +	return good == DRAW_W * DRAW_H;
++}
++
++/*
++ * A copy of a w x h RGBA8 rectangle between two linear surfaces, as Mesa's emit_blit_buffer does
++ * one (TPL1_A2D_SRC_TEXTURE_* for the source, GRAS_A2D_SRC_* its rectangle, then the same
++ * destination and CP_BLIT). Both bases must be 64-byte aligned and both pitches multiples of 64,
++ * so a pitch that is not (the panel's 4320) is split as the demo does: k interleaved surfaces of
++ * pitch k x pitch, each base rounded down to 64 bytes with the difference moved into x.
++ */
++static bool
++blit_copy(uint64_t src, uint32_t spitch, uint64_t dst, uint32_t dpitch, uint32_t w, uint32_t h)
++{
++	uint32_t k = ((spitch | dpitch) & 63) == 0 ? 1 : 2;
++
++	if (((k * spitch) & 63) != 0 || ((k * dpitch) & 63) != 0 || (src & 3) != 0 || (dst & 3) != 0 ||
++	    w + 16 > 0x4000 || h > 2 * 0x3fff) {
++		LOG("  blit_copy: pitches %u/%u or size %ux%u do not fit the blitter", spitch, dpitch, w, h);
++		return false;
++	}
++	blit_setup(false, 0);
++	for (uint32_t j = 0; j < k && j < h; j++) {
++		uint64_t s0 = src + (uint64_t)j * spitch, d0 = dst + (uint64_t)j * dpitch;
++		uint32_t sx = (uint32_t)(s0 & 63) / 4, dx = (uint32_t)(d0 & 63) / 4;
++		uint32_t n = (h - j + k - 1) / k;
++		uint64_t sb = s0 & ~63ull, db = d0 & ~63ull;
++
++		emit(pkt4(REG_TPL1_A2D_SRC_TEXTURE_INFO, 5));        /* INFO, SIZE, BASE lo/hi, PITCH */
++		emit(FMT6_8_8_8_8_UNORM | (1u << 20) | (1u << 22));   /* LINEAR, WZYX, UNK20, UNK22 as Mesa */
++		emit((sx + w) | (n << 15));                           /* WIDTH, HEIGHT */
++		emit((uint32_t)sb);
++		emit((uint32_t)(sb >> 32));
++		emit(((k * spitch) >> 6) << 9);                       /* PITCH, bits 9..23, in 64-byte units */
++		emit(pkt4(REG_GRAS_A2D_SRC_XMIN, 4));
++		emit(sx << 8);
++		emit((sx + w - 1) << 8);
++		emit(0);
++		emit((n - 1) << 8);
++		blit_rect(db, k * dpitch, dx, 0, dx + w - 1, n - 1);
++	}
++	return blit_end("copy");
++}
++
++/*
++ * boot-arg gpu_bench=1: is the GPU worth handing AppleCLCD's per-frame copy? That copy is a
++ * full 1080 x 2400 frame (10 MB) from CoreAnimation's surface into the flip buffer, memcpy then a
++ * cache clean for the MDP, every frame. The GPU writes RAM behind the caches, so taking it over
++ * costs a clean of the source and an invalidate of the destination instead. This times each of
++ * those on the real buffers' sizes, the GPU copy of the boot framebuffer into a contiguous 10 MB
++ * buffer, and checks that copy against its source, row by row.
++ */
++static uint32_t bench;
++extern "C" void sweet_dcache_clean(vm_offset_t addr, unsigned length);
++extern "C" void sweet_dcache_flush(vm_offset_t addr, unsigned length);
++
++static uint64_t
++us_since(uint64_t t0)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return ns / 1000;
++}
++
++static void
++bench_copy(void)
++{
++	PE_Video video;
++	IOBufferMemoryDescriptor *a = NULL, *b = NULL;
++
++	PE_current_console(&video);
++	uint32_t w = (uint32_t)video.v_width, h = (uint32_t)video.v_height, dpitch = (uint32_t)video.v_rowBytes;
++	uint32_t spitch = (w * 4 + 511) & ~511u;        /* CoreAnimation's surfaces: 1125 px in 4608 bytes */
++	size_t dsize = (size_t)dpitch * h, ssize = (size_t)spitch * h;
++
++	LOG("--- gpu_bench: one %ux%u frame, source %u bytes a row (%zu), destination %u (%zu)", w, h, spitch,
++	    ssize, dpitch, dsize);
++	a = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, dsize, 0x00000000fffff000ull);
++	b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, ssize, 0x00000000fffff000ull);
++	if (a == NULL || b == NULL || w == 0 || h == 0) {
++		LOG("  no memory for the benchmark");
++		OSSafeReleaseNULL(a);
++		OSSafeReleaseNULL(b);
++		return;
++	}
++	uint8_t *av = (uint8_t *)a->getBytesNoCopy(), *bv = (uint8_t *)b->getBytesNoCopy();
++	uint64_t apa = a->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++	uint64_t bpa = b->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++	uint64_t t, t_cpy, t_cpy_clean, t_src_clean, t_dst_flush, t_gpu, t_inv;
++	uint32_t bad_rows = 0, first_bad = 0xFFFFFFFF;
++
++	/* the flip path today: memcpy cached -> cached, row by row (pitches differ), then clean for the MDP */
++	memset(bv, 0x5a, ssize);
++	memset(av, 0, dsize);
++	t = mach_absolute_time();
++	for (uint32_t y = 0; y < h; y++) {
++		memcpy(av + (uint64_t)y * dpitch, bv + (uint64_t)y * spitch, (size_t)w * 4);
++	}
++	t_cpy = us_since(t);
++	t = mach_absolute_time();
++	sweet_dcache_clean((vm_offset_t)av, (unsigned)dsize);
++	t_cpy_clean = us_since(t);
++
++	/* a frame as CoreAnimation leaves one: written by the CPU, in its cache; every pixel unique */
++	for (uint32_t y = 0; y < h; y++) {
++		uint32_t *row = (uint32_t *)(bv + (uint64_t)y * spitch);
++		for (uint32_t x = 0; x < w; x++) {
++			row[x] = (y << 12) ^ x ^ 0xA5000000u;
++		}
++	}
++	memset(av, 0x11, dsize);                    /* the destination dirty in the cache too */
++
++	/* the GPU path: clean the source, flush the destination, copy, drop the destination's lines */
++	t = mach_absolute_time();
++	sweet_dcache_clean((vm_offset_t)bv, (unsigned)ssize);
++	t_src_clean = us_since(t);
++	t = mach_absolute_time();
++	sweet_dcache_flush((vm_offset_t)av, (unsigned)dsize);
++	t_dst_flush = us_since(t);
++	t = mach_absolute_time();
++	bool ok = blit_copy(bpa, spitch, apa, dpitch, w, h);
++	t_gpu = us_since(t);
++	t = mach_absolute_time();
++	sweet_dcache_flush((vm_offset_t)av, (unsigned)dsize);
++	t_inv = us_since(t);
++
++	for (uint32_t y = 0; ok && y < h; y++) {
++		if (memcmp(av + (uint64_t)y * dpitch, bv + (uint64_t)y * spitch, (size_t)w * 4) != 0) {
++			if (first_bad == 0xFFFFFFFF) {
++				first_bad = y;
++			}
++			bad_rows++;
++		}
++	}
++	LOG("  CPU today:  copy %llu us + clean %llu us = %llu us a frame", t_cpy, t_cpy_clean, t_cpy + t_cpy_clean);
++	LOG("  GPU copy:   %s in %llu us (submit to idle, the CPU polling), %u of %u rows exactly like the source",
++	    ok ? "done" : "FAILED", t_gpu, ok ? h - bad_rows : 0, h);
++	if (ok && bad_rows) {
++		const uint32_t *gr = (const uint32_t *)(av + (uint64_t)first_bad * dpitch);
++		const uint32_t *sr = (const uint32_t *)(bv + (uint64_t)first_bad * spitch);
++		LOG("  first row that differs: %u: x0 %08x (want %08x), x%u %08x (want %08x)", first_bad, gr[0], sr[0],
++		    w - 1, gr[w - 1], sr[w - 1]);
++	}
++	LOG("  GPU path:   clean source %llu us + flush dest %llu us + GPU %llu us + drop dest %llu us = %llu us a frame",
++	    t_src_clean, t_dst_flush, t_gpu, t_inv, t_src_clean + t_dst_flush + t_gpu + t_inv);
++	OSSafeReleaseNULL(a);
++	OSSafeReleaseNULL(b);
 +}
 +
 +/*
@@ -1357,6 +1516,7 @@ index 0000000..04dde34
 +	(void)PE_parse_boot_argn("gpu_keep", &keep_running, sizeof(keep_running));
 +	(void)PE_parse_boot_argn("gpu_draw", &draw_first, sizeof(draw_first));
 +	(void)PE_parse_boot_argn("gpu_demo", &demo, sizeof(demo));
++	(void)PE_parse_boot_argn("gpu_bench", &bench, sizeof(bench));
 +	if (PE_parse_boot_argn("gpu_delay", &delay_s, sizeof(delay_s)) && delay_s != 0) {
 +		LOG("starting in %u s", delay_s);
 +		IOSleep(delay_s * 1000);
@@ -1462,6 +1622,9 @@ index 0000000..04dde34
 +			LOG("*** the GPU drew: every pixel of the 2D fill is right ***");
 +			if (demo) {
 +				demo_bars();
++			}
++			if (bench) {
++				bench_copy();
 +			}
 +		} else if (draw_first) {
 +			LOG("the 2D fill did not come out right");

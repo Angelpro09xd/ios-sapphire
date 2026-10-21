@@ -4,7 +4,7 @@
 
 A port of [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz) (itself a port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)) to the Xiaomi **Redmi Note 13 4G** (`sapphire` / `sapphiren`, Qualcomm **SM6225 "khaje"** / Snapdragon 685). Apple's open-source XNU kernel (xnu-8796) boots from RAM through a small boot shim, and on top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd and SpringBoard.
 
-The Redmi Note 12 4G (topaz) and the Redmi Note 13 4G share the SoC, the memory carve-outs and most of the board, so this fork follows the topaz branch and adds what differs on sapphire (patches 0140–0146, the shim's DDR handling and the tools below).
+The Redmi Note 12 4G (topaz) and the Redmi Note 13 4G share the SoC, the memory carve-outs and most of the board, so this fork follows the topaz branch and adds what differs on sapphire (patches 0140–0147, the shim's DDR handling and the tools below).
 
 > Experimental bring-up, not a usable phone OS. Many things are missing or stubbed, and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**. The kernel is started from RAM with `fastboot boot`; boot partitions do not need to be flashed.
 
@@ -131,6 +131,7 @@ nc -ukl 5140          # live kernel console
 | 0144 | Join the network named by boot args `wifi_ssid=` / `wifi_pass=` through upstream's WLAN station (0129/0130), for testing |
 | 0145 | Adreno 610 bring-up staged by boot-arg `gpu=N`: clock tree, power-up, zap shader through TrustZone, identity SMMU bank, SQE microcode and a command the GPU executes (powered and answering on the phone; the command stages are blocked by the panic below) |
 | 0146 | Black box: a kernel panic writes the console ring (with the panic text) to the end of `userdata` before the panic path spins, since this board has no iBoot panic region. `tools/sweet-log.py` reports it as a PANIC flush |
+| 0147 | AppleCLCD frame timing: every 5 s, direct and composed frames with the average CPU time of the copy into the back buffer, the cache clean and the composed path (`sweetfb_stats=0` turns it off) |
 | `shim/` | DDR bank end from ABL's `/memory` node; RAM size clamped to it |
 | `tools/mkadt.py` | sapphire identity in the ADT |
 | `tools/sapphire-boot.sh`, `sapphire-root.sh` | Boot image and root image for sapphire |
@@ -171,6 +172,7 @@ after `gpu_delay` default to the behaviour that has already run, so a boot chang
 | `gpu_keep=1` | leave the GPU running at the end; by default it is parked (GBIF bus drained, GX and CX collapsed) |
 | `gpu_draw=0` | skip the first draw (a 256×256 solid fill with the 2D blitter, read back by the CPU) that stage 3 now does after its test |
 | `gpu_demo=1` | after the fill, the GPU paints three bars (red, green, blue) onto the boot framebuffer the panel scans out; with a small `gpu_delay` they appear over the Apple logo and stay until SpringBoard's first frame |
+| `gpu_bench=1` | after the fill, time a full-frame copy by the GPU (CoreAnimation-like cached source, 4608-byte rows, into the panel's 4320-byte layout) against the CPU memcpy and the cache maintenance either path needs, and check it row by row |
 | `gpu_irq=1` | leave the GPU's interrupt (SPI 177, INTID 209) alone. By default it is masked in the GIC distributor before anything is powered, and at the GPU once its registers answer: it is level triggered and nothing here handles it, which is what the deaths above look like |
 
 Both `gpu=3` and `gpu=4` need the microcode `a630_sqe.fw`, and `gpu=3` also needs this phone's
