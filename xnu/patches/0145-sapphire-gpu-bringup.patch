@@ -1,4 +1,4 @@
-From 51a27707e388800de9a89c7649a7c664c123354e Mon Sep 17 00:00:00 2001
+From a13c11f22ca7d7aac03ad60ac228a777a36f8c03 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 06:53:53 +0000
 Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
@@ -20,18 +20,18 @@ zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
 Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
 files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 931 ++++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireGpu.cpp      | 932 ++++++++++++++++++++++++++
  iokit/Kernel/arm/SweetFramebuffer.cpp |   2 +
  iokit/conf/files.arm64                |   1 +
- 3 files changed, 934 insertions(+)
+ 3 files changed, 935 insertions(+)
  create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 new file mode 100644
-index 0000000..3c98ccb
+index 0000000..5368e69
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -0,0 +1,931 @@
+@@ -0,0 +1,932 @@
 +/*
 + * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
 + *
@@ -114,6 +114,7 @@ index 0000000..3c98ccb
 +#define GDSC_COLLAPSE       (1u << 0)
 +#define GDSC_PWR_ON         (1u << 31)
 +#define RCG_UPDATE          (1u << 0)
++#define RCG_ROOT_OFF        (1u << 31)
 +#define SRC_GPLL0           5                   /* GPLL0_OUT_MAIN in the GPU CC parent maps */
 +
 +/* A6xx registers, dword offsets (registers/adreno/a6xx.xml) */
@@ -354,7 +355,7 @@ index 0000000..3c98ccb
 +		switch (r->kind) {
 +		case 1: state = (v & CBCR_OFF) ? " off" : " running"; break;
 +		case 2: state = (v & GDSC_PWR_ON) ? " PWR_ON" : " collapsed"; break;
-+		case 3: state = (v & RCG_UPDATE) ? " update pending" : " root on"; break;
++		case 3: state = (v & RCG_ROOT_OFF) ? " root off" : (v & RCG_UPDATE) ? " update pending" : " root on"; break;
 +		case 4: state = (v & 1) ? " outctrl" : " unconfigured"; break;
 +		default: break;
 +		}
