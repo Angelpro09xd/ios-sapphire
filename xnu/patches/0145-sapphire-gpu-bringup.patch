@@ -1,4 +1,4 @@
-From 516f409a05d87b776e0aa661ed241f2b7b28f0dc Mon Sep 17 00:00:00 2001
+From 9623999d7a53afbce89a1e72aa7ddbb0fc4c9457 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 06:53:53 +0000
 Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
@@ -20,18 +20,18 @@ zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
 Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
 files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 1019 +++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireGpu.cpp      | 1107 +++++++++++++++++++++++++
  iokit/Kernel/arm/SweetFramebuffer.cpp |    2 +
  iokit/conf/files.arm64                |    1 +
- 3 files changed, 1022 insertions(+)
+ 3 files changed, 1110 insertions(+)
  create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 new file mode 100644
-index 0000000..308b9dc
+index 0000000..05836fc
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -0,0 +1,1019 @@
+@@ -0,0 +1,1107 @@
 +/*
 + * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
 + *
@@ -47,9 +47,11 @@ index 0000000..308b9dc
 + * gpu_slow=N waits N ms after each step so the persistent log catches up with it,
 + * gpu_delay=N waits N seconds before starting so the live console over USB is already up,
 + * gpu_div=N runs the core at GPLL0/N (2 = 300 MHz, 8 = 75 MHz), and gpu_smmu_early=1 puts the
-+ * identity context bank in before the GX domain. The last two default to what has run before:
++ * identity context bank in before the GX domain. Those two default to what has run before:
 + * a boot that dies with every clock up and nothing else to show for it has to be bisected one
-+ * variable at a time.
++ * variable at a time. gpu_irq=1 is the exception, because it only turns off something this
++ * driver has no business leaving on: the GPU's interrupt, masked by default in the GIC before
++ * anything is powered and at the GPU itself as soon as its registers answer.
 + *
 + *   gpu=1   clock tree only; never touches 0x5900000
 + *   gpu=2   + power up, then the first GPU reads (RBBM_STATUS, CP_ALWAYS_ON_COUNTER)
@@ -96,6 +98,22 @@ index 0000000..308b9dc
 +#define SMMU_PA             0x059A0000ull       /* kgsl-smmu, SMMU-500 */
 +#define SMMU_SIZE           0x00010000u
 +
++/*
++ * The GIC-500 distributor, and the GPU's interrupt in it. The device tree gives kgsl
++ * "interrupts = <0 0xb1 4>": SPI 177, level high, so INTID 177 + 32 = 209, which lives in
++ * word 6 (209 / 32) of each GICD bitmap, bit 17. Nothing in this kernel handles it.
++ */
++#define GICD_PA             0x0F200000ull
++#define GICD_SIZE           0x00010000u
++#define GICD_ISENABLER      0x0100u
++#define GICD_ICENABLER      0x0180u
++#define GICD_ISPENDR        0x0200u
++#define GICD_ICPENDR        0x0280u
++#define GICD_ISACTIVER      0x0300u
++#define GPU_INTID           (177u + 32u)
++#define GPU_INT_WORD        (4u * (GPU_INTID / 32u))
++#define GPU_INT_BIT         (1u << (GPU_INTID % 32u))
++
 +/* DT gpu_region@55A15000 (topaz has the same region at 0x55B15000) */
 +#define ZAP_PA              0x55A15000ull
 +#define ZAP_SIZE            0x00002000u
@@ -125,6 +143,8 @@ index 0000000..308b9dc
 +#define SRC_GPLL0           5                   /* GPLL0_OUT_MAIN in the GPU CC parent maps */
 +
 +/* A6xx registers, dword offsets (registers/adreno/a6xx.xml) */
++#define REG_RBBM_INT_CLEAR_CMD  0x0037
++#define REG_RBBM_INT_0_MASK     0x0038
 +#define REG_RBBM_INT_0_STATUS   0x0201
 +#define REG_RBBM_STATUS         0x0210
 +#define REG_CP_RB_BASE          0x0800
@@ -224,6 +244,19 @@ index 0000000..308b9dc
 + * of the one sequence that has worked.
 + */
 +static uint32_t smmu_early;
++/*
++ * boot-arg gpu_irq=1 leaves the GPU's interrupt alone; by default it is masked in the GIC
++ * before anything is powered. Three boots have now died in the same place: the step after
++ * the power-up, which only re-reads registers that were just read, with the phone stopping
++ * dead mid-sentence and iOS with it, no panic and no further line. That is not what a bad
++ * register read looks like (that hangs the reader), it is what an interrupt nobody handles
++ * looks like: the GPU's is level triggered, so if it is asserted and enabled in the
++ * distributor the CPU re-takes it forever and nothing ever logs again. Whether it is enabled
++ * at all is the bootloader's business, so the state goes in the log either way.
++ */
++static uint32_t gpu_irq;
++static IOMemoryMap *gicd_map;
++static volatile uint8_t *gicd;
 +static bool smmu_identity(void);
 +
 +/*
@@ -386,6 +419,38 @@ index 0000000..308b9dc
 +	{ 1, 0, 0x1540,  "gpucc_cx_gds_hw_ctrl" },
 +};
 +
++/* The GPU's line in the distributor: enabled, pending, active. */
++static void
++gic_report(const char *when)
++{
++	if (gicd == NULL) {
++		return;
++	}
++	LOG("  GIC SPI 177 (INTID %u) %s: enabled %u pending %u active %u (words %08x %08x %08x)", GPU_INTID, when,
++	    (rd(gicd, GICD_ISENABLER + GPU_INT_WORD) & GPU_INT_BIT) != 0,
++	    (rd(gicd, GICD_ISPENDR + GPU_INT_WORD) & GPU_INT_BIT) != 0,
++	    (rd(gicd, GICD_ISACTIVER + GPU_INT_WORD) & GPU_INT_BIT) != 0,
++	    rd(gicd, GICD_ISENABLER + GPU_INT_WORD), rd(gicd, GICD_ISPENDR + GPU_INT_WORD),
++	    rd(gicd, GICD_ISACTIVER + GPU_INT_WORD));
++}
++
++/*
++ * Writing a 1 to ICENABLER/ICPENDR clears that interrupt's enable and pending bits and
++ * leaves every other line alone, which is why these registers are a bitmap of ones to act on
++ * rather than a value to store.
++ */
++static void
++gic_mask_gpu(void)
++{
++	if (gicd == NULL) {
++		return;
++	}
++	wr(gicd, GICD_ICENABLER + GPU_INT_WORD, GPU_INT_BIT);
++	wr(gicd, GICD_ICPENDR + GPU_INT_WORD, GPU_INT_BIT);
++	gmb();
++	gic_report("masked");
++}
++
 +static void
 +dump_clocks(const char *when)
 +{
@@ -503,6 +568,9 @@ index 0000000..308b9dc
 +	step_done();
 +	ok &= branch_on(gpucc, 0x1054, "gpucc_gx_gfx3d");
 +	branch_on(gpucc, 0x1060, "gpucc_gx_cxo");
++	/* the line three boots have died just after this point */
++	gic_report("with the GPU powered");
++	step_done();
 +	return ok;
 +}
 +
@@ -528,6 +596,16 @@ index 0000000..308b9dc
 +	LOG("--- first GPU reads: about to touch %llx for the first time", GPU_PA);
 +	step_done();
 +	LOG("  RBBM_STATUS   %08x", grd(REG_RBBM_STATUS));
++	step_done();
++	LOG("  RBBM_INT_0_STATUS %08x (what the GPU is asking for)", grd(REG_RBBM_INT_0_STATUS));
++	if (gpu_irq == 0) {
++		/* and now at the source, not only in the distributor */
++		gwr(REG_RBBM_INT_0_MASK, 0);
++		gwr(REG_RBBM_INT_CLEAR_CMD, 0xFFFFFFFF);
++		gmb();
++		LOG("  interrupts masked at the GPU too: INT_0_STATUS %08x", grd(REG_RBBM_INT_0_STATUS));
++		gic_report("after masking at the GPU");
++	}
 +	step_done();
 +	LOG("  CP_HW_FAULT   %08x", grd(REG_CP_HW_FAULT));
 +	lo1 = grd(REG_CP_ALWAYS_ON_COUNTER);
@@ -936,6 +1014,7 @@ index 0000000..308b9dc
 +		core_div = 2;
 +	}
 +	(void)PE_parse_boot_argn("gpu_smmu_early", &smmu_early, sizeof(smmu_early));
++	(void)PE_parse_boot_argn("gpu_irq", &gpu_irq, sizeof(gpu_irq));
 +	if (PE_parse_boot_argn("gpu_delay", &delay_s, sizeof(delay_s)) && delay_s != 0) {
 +		LOG("starting in %u s", delay_s);
 +		IOSleep(delay_s * 1000);
@@ -952,12 +1031,21 @@ index 0000000..308b9dc
 +	}
 +	gcc = (volatile uint8_t *)gcc_map->getVirtualAddress();
 +	gpucc = (volatile uint8_t *)gpucc_map->getVirtualAddress();
++	gicd_map = map_phys(GICD_PA, GICD_SIZE);
++	if (gicd_map != NULL) {
++		gicd = (volatile uint8_t *)gicd_map->getVirtualAddress();
++	}
++	gic_report("as the bootloader left it");
 +	dump_clocks("as the bootloader left it");
 +	if (stage < 2) {
 +		thread_terminate(current_thread());
 +		return;
 +	}
 +
++	if (gpu_irq == 0) {
++		gic_mask_gpu();
++		step_done();
++	}
 +	/* mapped before the power-up only so gpu_smmu_early has it; the registers need the vote */
 +	smmu_map = map_phys(SMMU_PA, SMMU_SIZE);
 +	if (smmu_map != NULL) {

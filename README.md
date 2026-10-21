@@ -166,6 +166,7 @@ after `gpu_delay` default to the behaviour that has already run, so a boot chang
 | `gpu_slow=N` | wait N ms after every step (1200 works), so the once-a-second log writer puts each step on disk before the next one runs |
 | `gpu_div=N` | run the core at GPLL0/N: 2 = 300 MHz (the default), 8 = 75 MHz |
 | `gpu_smmu_early=1` | program the identity SMMU bank as soon as its clock is voted, before the GX domain, so the GPU never sees the bus without a context bank |
+| `gpu_irq=1` | leave the GPU's interrupt (SPI 177, INTID 209) alone. By default it is masked in the GIC distributor before anything is powered, and at the GPU once its registers answer: it is level triggered and nothing here handles it, which is what the deaths above look like |
 
 Both `gpu=3` and `gpu=4` need the microcode `a630_sqe.fw`, and `gpu=3` also needs this phone's
 signed `a610_zap` shader. Both come off the phone's own `/vendor/firmware`, which is an EROFS
