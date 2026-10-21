@@ -89,7 +89,7 @@ tools/sapphire-boot.sh xnu/out/kernel.development.sweet sapphire-wifi.img "sweet
 | `sweettouch_rx=8640 sweettouch_ry=9600` | sapphire's raw touch range (X 0..2159, Y 0..2399, 2 fraction bits) |
 | `sweetusb=1` / `sweetusb=2` | USB: report the controller state / start the CDC-ECM device |
 | `modem=1 wifi=1` | Boot the modem from `modem_a` and bring up the WLAN firmware (read-only on the phone's partitions) |
-| `gpu=1` / `2` / `3` | Adreno 610: log the clock tree / also power it up and read it / also run a command on it (see "GPU bring-up") |
+| `gpu=1` / `2` / `3` | Adreno 610: log the clock tree / also power it up and read it / also run a command on it. `gpu_delay`, `gpu_slow`, `gpu_div` and `gpu_smmu_early` go with them (see "GPU bring-up") |
 | `launchd_unsecure_cache=1`, `wdt=-1 wdt_test=no_user_checkin` | launchd without AMFI; no hardware watchdog |
 
 ### 4. Put the root on the phone and boot
@@ -154,6 +154,18 @@ staged by `gpu=N` and each stage is meant to be read in the kernel log before go
 | `gpu=2` | Powers up (GPLL0 vote, CX GDSC, cxo/ahb, GMU RCG, SMMU vote, GX GDSC, core clock at 300 MHz), then reads the GPU | `RBBM_STATUS`, and `CP_ALWAYS_ON_COUNTER` growing by ~192000 in 10 ms (19.2 MHz) |
 | `gpu=3` | Zap shader through TrustZone (PAS 13, region `0x55A15000` from the device tree), identity SMMU bank for the GPU's stream (SID 0 mask 1, as `gfx3d_user` in the device tree), SQE microcode, 32 KB ring, `CP_ME_INIT`, `CP_SET_SECURE_MODE 0`, `CP_MEM_WRITE` | `*** the GPU executes commands ***`, with `c0ffee00` read back from RAM |
 | `gpu=4` | The same without the zap shader: leaves secure mode by writing `RBBM_SECVID_TRUST_CNTL`, as Linux does for a device that has no zap firmware. A first test with only the open microcode, and a gamble Linux warns about: if the bootloader left the GPU secure, that write is refused | the same, or a permissions violation |
+
+Stage 2 works: the GPU is powered and its always-on counter runs. What is not solved is that
+most boots which get that far **kill the phone about a second later**, with every clock reading
+what it should and nothing else in the log. Four more boot args exist for that, and the three
+after `gpu_delay` default to the behaviour that has already run, so a boot changes one thing:
+
+| Arg | What it does |
+| --- | --- |
+| `gpu_delay=N` | wait N seconds before starting, so the bring-up log goes out over the live USB console instead of only into the ring at the end of `userdata` |
+| `gpu_slow=N` | wait N ms after every step (1200 works), so the once-a-second log writer puts each step on disk before the next one runs |
+| `gpu_div=N` | run the core at GPLL0/N: 2 = 300 MHz (the default), 8 = 75 MHz |
+| `gpu_smmu_early=1` | program the identity SMMU bank as soon as its clock is voted, before the GX domain, so the GPU never sees the bus without a context bank |
 
 Both `gpu=3` and `gpu=4` need the microcode `a630_sqe.fw` (it is in
 [linux-firmware](https://gitlab.com/kernel-firmware/linux-firmware) as `qcom/a630_sqe.fw`, and the

@@ -13,8 +13,11 @@ entry first; this file is the short version plus what lives outside git.
 - Modem and Wi-Fi firmware boot from the stock `modem_a` (patch 0143), and the phone **joins a
   WPA2 network** with upstream's station code plus `wifi_ssid=` / `wifi_pass=` boot args (0144).
   iOS itself has no network interface on it yet.
-- GPU (Adreno 610, patch 0145): the clock dump of stage 1 has run on the phone and matches
-  topaz-woa's measurements exactly. Powering it up (`gpu=2`) is the next thing to try.
+- GPU (Adreno 610, patch 0145): **powered and answering** (`gpu=2`): RBBM_STATUS 0x1, and the
+  always-on counter grows at 19.2 MHz. But three of the four boots that got that far killed the
+  phone about a second later, with every clock reading correct and nothing else in the log, so
+  the open question is why (`NOTES.md`, newest entries; `gpu_div` and `gpu_smmu_early` exist to
+  bisect it one variable per boot).
 
 ## The pieces outside this repository
 
@@ -69,11 +72,21 @@ tools/sapphire-boot.sh --gpu-fw ../gpu-fw xnu/out-cm6/kernel.development.sweet o
 
 ## The next step
 
-Boot `sapphire-gpu2d.img` (in this backup), attach the USB to WSL, and watch UDP 5140 for
-`SapphireGpu` lines: the power-up votes GPLL0, brings up the CX domain, the GPU CC branches, the
-GMU clock and the SMMU vote, then the GX domain and the core clock at 300 MHz, and finally reads
-`RBBM_STATUS` and the always-on counter, which should grow by about 192000 in 10 ms. `gpu_delay`
-is what puts that log in the live console instead of only in the ring at the end of `userdata`.
+Find out why a powered GPU kills the phone a second later. It needs a kernel built from the
+current `sapphire` (Codemagic, ~4 minutes) and then boots that change **one** thing at a time:
 
-If that works, `gpu=4` runs a command on the GPU with only the open microcode. `gpu=3` needs this
-phone's signed zap shader, which still has to be found in its vendor filesystem.
+```sh
+tools/sapphire-boot.sh --gpu-fw ../gpu-fw <kernel> out.img \
+    "sweetusb=2 gpu=2 gpu_delay=20 gpu_slow=1200"            # how often does it die at all?
+#   ... the same + gpu_smmu_early=1    identity SMMU bank before the GX domain
+#   ... the same + gpu_div=8           core at 75 MHz instead of 300
+```
+
+Attach the USB to WSL during the `gpu_delay` and watch UDP 5140; after a death, read the ring
+from recovery with `tools/sweet-log-pull.sh` (it survives, and it held the same lines as the live
+console last time). A death leaves the HFS+ journal dirty: repair it before the next boot, the
+way "Working on the phone without copying 16 GB" above says.
+
+Once a boot survives, `gpu=4` runs a command on the GPU with only the open microcode, and every
+step of it now reports before it runs. `gpu=3` needs this phone's signed zap shader, which still
+has to be found in its vendor filesystem.
