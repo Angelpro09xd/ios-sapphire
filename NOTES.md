@@ -58,6 +58,17 @@ over the adb tunnel; explicit OK before `fastboot flash userdata`.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
+**sapphire: what stage 3 does to the panel — the DSI command engine stops answering (2026-10-21, logs `logs/sapphire-gpu3-executes.txt`, `logs/sapphire-gpu4-hang2.txt`).** The colours the user saw are not a mis-set panel from the start: the panel worked up to the GPU run and **only after `*** the GPU executes commands ***` do the panel's DSI commands stop completing**. Counted across boots:
+
+| boot | `panel level 0x133` | `panel display on/off` |
+| --- | --- | --- |
+| `boot1` (no GPU) | done ×8 | done ×52 |
+| stage 2 (`gpu2i`) | done | done |
+| stage 4 (hangs after `CP_ME_INIT`) | done | done |
+| **stage 3 (the GPU executes)** | **NO DONE ×2** | **NO DONE ×2** |
+
+Stage 4 ran the same `hw_init_regs` (GBIF QoS, UCHE ranges) and started the same SQE with the display fine, so bus priority and the microcode alone are out. What only stage 3 adds is the zap shader through TrustZone (PAS 13), `CP_SET_SECURE_MODE 0`, the `CP_MEM_WRITE`, and **a CP left running** — and the CP also made one access to a garbage address after `CP_ME_INIT` (`CB0 FSR 00000400 FAR 00014810281091c0`). To bisect it in one kernel, 0145 now takes `gpu_stop=N` (1 after the zap, 2 SQE running, 3 after `CP_ME_INIT`, 4 after secure mode), logs the SMMU fault registers after `CP_ME_INIT` and after secure mode, and by default **parks the GPU at the end** (SQE halted, GX and CX collapsed, as Linux does when idle; `gpu_keep=1` leaves it up). Order of boots: `gpu=3` (parked: does the panel come back?), then `gpu_stop=1` (is the zap shader itself enough to break it?), then 3, then 4.
+
 **sapphire: THE GPU EXECUTES COMMANDS (2026-10-21, kernel out-cm10 / 5481aa7, boot `sweetusb=2 gpu=3 gpu_delay=60`, live log on the PC at `~/ios-build/logs/boot-20261021-144632.txt`, not yet copied here).** With the pool mapped write-combined, stage 3 ran end to end on the first try, in milliseconds, with no panic and the phone alive afterwards:
 
     zap shader (PAS 13): shutdown ret ffcfffb8 (nothing to shut down), init_image ret 0 res 0,

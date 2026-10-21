@@ -1,4 +1,4 @@
-From 8a5dfee5f1c805674cbd69142473ccfb403c82c2 Mon Sep 17 00:00:00 2001
+From b72eb73ef43063002b592a4cedca54904223d7cd Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 06:53:53 +0000
 Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
@@ -20,18 +20,18 @@ zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
 Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
 files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 1115 +++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireGpu.cpp      | 1161 +++++++++++++++++++++++++
  iokit/Kernel/arm/SweetFramebuffer.cpp |    2 +
  iokit/conf/files.arm64                |    1 +
- 3 files changed, 1118 insertions(+)
+ 3 files changed, 1164 insertions(+)
  create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 new file mode 100644
-index 0000000..787d3ab
+index 0000000..bff26b3
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -0,0 +1,1115 @@
+@@ -0,0 +1,1161 @@
 +/*
 + * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
 + *
@@ -255,6 +255,28 @@ index 0000000..787d3ab
 + * at all is the bootloader's business, so the state goes in the log either way.
 + */
 +static uint32_t gpu_irq;
++/*
++ * boot-arg gpu_stop=N ends stage 3 early: 1 after the zap shader, 2 once the SQE runs, 3 after
++ * CP_ME_INIT, 4 after CP_SET_SECURE_MODE; 0 (default) runs it all. boot-arg gpu_keep=1 leaves
++ * the GPU running afterwards; by default it is parked (SQE halted, GX and CX collapsed), as
++ * Linux does once a GPU goes idle. Both exist for the one stage-3 boot whose panel stopped
++ * taking DSI commands right after the GPU ran ("panel level: NO DONE", the screen filled with
++ * colours), when stage 2 and stage 4 did not: they say which step does it, and whether it
++ * lasts only while the GPU is up.
++ */
++static uint32_t stop_at, keep_running;
++static bool stopped_early;
++
++static bool
++stop_here(uint32_t step, const char *what)
++{
++	if (stop_at != step) {
++		return false;
++	}
++	LOG("gpu_stop=%u: stopping after %s", step, what);
++	stopped_early = true;
++	return true;
++}
 +static IOMemoryMap *gicd_map;
 +static volatile uint8_t *gicd;
 +static bool smmu_identity(void);
@@ -964,6 +986,9 @@ index 0000000..787d3ab
 +	LOG("  SQE started: RBBM_STATUS %08x CP_HW_FAULT %08x rptr %u", grd(REG_RBBM_STATUS), grd(REG_CP_HW_FAULT),
 +	    grd(REG_CP_RB_RPTR));
 +	step_done();
++	if (stop_here(2, "starting the SQE")) {
++		return false;
++	}
 +
 +	emit(pkt7(CP_ME_INIT, 8));
 +	emit(0x2f);
@@ -977,10 +1002,18 @@ index 0000000..787d3ab
 +	if (!submit("CP_ME_INIT", 100)) {
 +		return false;
 +	}
++	smmu_fault("after CP_ME_INIT");
++	if (stop_here(3, "CP_ME_INIT")) {
++		return false;
++	}
 +	if (have_zap) {
 +		emit(pkt7(CP_SET_SECURE_MODE, 1));
 +		emit(0);
 +		if (!submit("CP_SET_SECURE_MODE 0", 100)) {
++			return false;
++		}
++		smmu_fault("after CP_SET_SECURE_MODE");
++		if (stop_here(4, "CP_SET_SECURE_MODE 0")) {
 +			return false;
 +		}
 +	} else {
@@ -1023,6 +1056,8 @@ index 0000000..787d3ab
 +	}
 +	(void)PE_parse_boot_argn("gpu_smmu_early", &smmu_early, sizeof(smmu_early));
 +	(void)PE_parse_boot_argn("gpu_irq", &gpu_irq, sizeof(gpu_irq));
++	(void)PE_parse_boot_argn("gpu_stop", &stop_at, sizeof(stop_at));
++	(void)PE_parse_boot_argn("gpu_keep", &keep_running, sizeof(keep_running));
 +	if (PE_parse_boot_argn("gpu_delay", &delay_s, sizeof(delay_s)) && delay_s != 0) {
 +		LOG("starting in %u s", delay_s);
 +		IOSleep(delay_s * 1000);
@@ -1120,10 +1155,21 @@ index 0000000..787d3ab
 +		thread_terminate(current_thread());
 +		return;
 +	}
-+	if (cp_start(stage == 3)) {
++	if (stage == 3 && stop_here(1, "the zap shader")) {
++		;
++	} else if (cp_start(stage == 3)) {
 +		LOG("*** the GPU executes commands ***");
-+	} else {
++	} else if (!stopped_early) {
 +		LOG("the command processor did not come up");
++	}
++	if (keep_running) {
++		LOG("gpu_keep=1: the GPU stays up");
++	} else {
++		/* park it: halt the SQE, then collapse GX and CX */
++		gwr(REG_CP_SQE_CNTL, 0);
++		gmb();
++		LOG("parking the GPU: SQE halted, RBBM_STATUS %08x", grd(REG_RBBM_STATUS));
++		power_down();
 +	}
 +	thread_terminate(current_thread());
 +}
