@@ -153,11 +153,14 @@ staged by `gpu=N` and each stage is meant to be read in the kernel log before go
 | `gpu=1` | Maps GCC and the GPU CC and logs the clock tree. Never touches `0x5900000` | the bootloader leaves everything collapsed and off |
 | `gpu=2` | Powers up (GPLL0 vote, CX GDSC, cxo/ahb, GMU RCG, SMMU vote, GX GDSC, core clock at 300 MHz), then reads the GPU | `RBBM_STATUS`, and `CP_ALWAYS_ON_COUNTER` growing by ~192000 in 10 ms (19.2 MHz) |
 | `gpu=3` | Zap shader through TrustZone (PAS 13, region `0x55A15000` from the device tree), identity SMMU bank for the GPU's stream (SID 0 mask 1, as `gfx3d_user` in the device tree), SQE microcode, 32 KB ring, `CP_ME_INIT`, `CP_SET_SECURE_MODE 0`, `CP_MEM_WRITE` | `*** the GPU executes commands ***`, with `c0ffee00` read back from RAM |
+| `gpu=4` | The same without the zap shader: leaves secure mode by writing `RBBM_SECVID_TRUST_CNTL`, as Linux does for a device that has no zap firmware. A first test with only the open microcode, and a gamble Linux warns about: if the bootloader left the GPU secure, that write is refused | the same, or a permissions violation |
 
-`gpu=3` needs this phone's own GPU firmware (Qualcomm's `a630_sqe.fw` and the signed `a610_zap`
-shader, neither of them in this repository). The driver reads them where they already are, through
-the UFS driver: fill `gpu_fw[]` in `SapphireGpu.cpp` with `tools/fwtable-file.py`, pointing at the
-files in a mounted copy of the partition that holds them.
+Both `gpu=3` and `gpu=4` need the microcode `a630_sqe.fw` (it is in
+[linux-firmware](https://gitlab.com/kernel-firmware/linux-firmware) as `qcom/a630_sqe.fw`, and the
+phone has its own copy); `gpu=3` also needs this phone's signed `a610_zap` shader, which exists
+only on the device. Neither is in this repository: the driver reads them where they already are,
+through the UFS driver. Fill `gpu_fw[]` in `SapphireGpu.cpp` with `tools/fwtable-file.py`, pointing
+it at the files in a mounted copy of the partition that holds them.
 
 After that come the interrupt, a real draw from a freedreno command stream, and a user space
 driver (Mesa freedreno) behind CoreAnimation.

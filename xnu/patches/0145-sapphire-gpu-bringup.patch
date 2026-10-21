@@ -1,4 +1,4 @@
-From 4edc46493318ddaf69ea6129002e68cac815548a Mon Sep 17 00:00:00 2001
+From d4a993b492f0d0f6c562513564b8a61417f8453f Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 06:53:53 +0000
 Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
@@ -20,18 +20,18 @@ zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
 Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
 files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 857 ++++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireGpu.cpp      | 870 ++++++++++++++++++++++++++
  iokit/Kernel/arm/SweetFramebuffer.cpp |   2 +
  iokit/conf/files.arm64                |   1 +
- 3 files changed, 860 insertions(+)
+ 3 files changed, 873 insertions(+)
  create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 new file mode 100644
-index 0000000..24e161f
+index 0000000..6f334fc
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -0,0 +1,857 @@
+@@ -0,0 +1,870 @@
 +/*
 + * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
 + *
@@ -48,10 +48,17 @@ index 0000000..24e161f
 + *   gpu=2   + power up, then the first GPU reads (RBBM_STATUS, CP_ALWAYS_ON_COUNTER)
 + *   gpu=3   + zap shader through TrustZone, identity SMMU, SQE microcode, ring buffer,
 + *             CP_ME_INIT, CP_SET_SECURE_MODE and a CP_MEM_WRITE the CPU reads back
++ *   gpu=4   the same without the zap shader, leaving secure mode by writing
++ *             RBBM_SECVID_TRUST_CNTL as Linux does when a device has no zap firmware
 + *
-+ * gpu=3 needs the phone's own GPU firmware (Qualcomm's, not in this repository): gpu_fw[]
-+ * says where each file lies in a stock partition, read only through sweet_ufs_read_part.
-+ * tools/fwtable-vendor.py fills that table in from a dump of the partition.
++ * Both need the microcode (a630_sqe.fw, which is in linux-firmware); gpu=3 also needs this
++ * phone's signed zap shader. Neither is in this repository: gpu_fw[] says where each file
++ * lies in a stock partition, read only through sweet_ufs_read_part, and
++ * tools/fwtable-file.py fills that table in.
++ *
++ * gpu=4 is the shortcut for a first test with only the open microcode. It is a gamble Linux
++ * warns about: if the bootloader left the GPU in secure mode, writing that register is
++ * refused and a permissions violation follows, so prefer gpu=3 once the zap is in the table.
 + */
 +#include <pexpert/arm64/board_config.h>
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -118,6 +125,7 @@ index 0000000..24e161f
 +#define REG_CP_HW_FAULT         0x0821
 +#define REG_CP_SQE_INSTR_BASE   0x0830
 +#define REG_CP_ALWAYS_ON_COUNTER 0x0980
++#define REG_RBBM_SECVID_TRUST_CNTL 0xF400
 +
 +#define CP_ME_INIT              0x48
 +#define CP_MEM_WRITE            0x3d
@@ -704,13 +712,12 @@ index 0000000..24e161f
 +}
 +
 +/*
-+ * Start the command processor and prove it runs: its microcode (the vendor's a630_sqe.fw
-+ * without its first dword, as adreno_fw_create_bo copies it), a 32 KB ring, CP_ME_INIT,
-+ * CP_SET_SECURE_MODE 0 (this is what needs the zap shader), and a CP_MEM_WRITE the CPU
-+ * reads back from RAM.
++ * Start the command processor and prove it runs: its microcode (a630_sqe.fw without its
++ * first dword, as adreno_fw_create_bo copies it), a 32 KB ring, CP_ME_INIT, then leaving
++ * secure mode, and a CP_MEM_WRITE the CPU reads back from RAM.
 + */
 +static bool
-+cp_start(void)
++cp_start(bool have_zap)
 +{
 +	uint8_t *sqe = pool + OFF_SQE;
 +	int64_t fw_size;
@@ -757,10 +764,16 @@ index 0000000..24e161f
 +	if (!submit("CP_ME_INIT", 100)) {
 +		return false;
 +	}
-+	emit(pkt7(CP_SET_SECURE_MODE, 1));
-+	emit(0);
-+	if (!submit("CP_SET_SECURE_MODE 0", 100)) {
-+		return false;
++	if (have_zap) {
++		emit(pkt7(CP_SET_SECURE_MODE, 1));
++		emit(0);
++		if (!submit("CP_SET_SECURE_MODE 0", 100)) {
++			return false;
++		}
++	} else {
++		/* no zap shader: tell the hardware directly, and hope the bootloader left it open */
++		gwr(REG_RBBM_SECVID_TRUST_CNTL, 0);
++		LOG("  no zap shader: RBBM_SECVID_TRUST_CNTL = 0, RBBM_STATUS %08x", grd(REG_RBBM_STATUS));
 +	}
 +	emit(pkt7(CP_MEM_WRITE, 3));
 +	emit((uint32_t)(POOL_PA + OFF_TEST));
@@ -824,7 +837,7 @@ index 0000000..24e161f
 +	}
 +
 +	if (fw_count() == 0) {
-+		LOG("no firmware table (see tools/fwtable-vendor.py): stopping after the power-up");
++		LOG("no firmware table (see tools/fwtable-file.py): stopping after the power-up");
 +		thread_terminate(current_thread());
 +		return;
 +	}
@@ -857,12 +870,12 @@ index 0000000..24e161f
 +		IOSleep(500);
 +	}
 +
-+	if (!zap_load()) {
-+		LOG("the zap shader did not load: the GPU cannot leave secure mode");
++	if (stage == 3 && !zap_load()) {
++		LOG("the zap shader did not load; gpu=4 tries it without one");
 +		thread_terminate(current_thread());
 +		return;
 +	}
-+	if (cp_start()) {
++	if (cp_start(stage == 3)) {
 +		LOG("*** the GPU executes commands ***");
 +	} else {
 +		LOG("the command processor did not come up");
