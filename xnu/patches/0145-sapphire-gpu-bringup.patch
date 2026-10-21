@@ -1,4 +1,4 @@
-From d4a993b492f0d0f6c562513564b8a61417f8453f Mon Sep 17 00:00:00 2001
+From 01875367e83bad17915ce293e43f49d32ce8b9e5 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 06:53:53 +0000
 Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
@@ -20,18 +20,18 @@ zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
 Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
 files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 870 ++++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireGpu.cpp      | 922 ++++++++++++++++++++++++++
  iokit/Kernel/arm/SweetFramebuffer.cpp |   2 +
  iokit/conf/files.arm64                |   1 +
- 3 files changed, 873 insertions(+)
+ 3 files changed, 925 insertions(+)
  create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 new file mode 100644
-index 0000000..6f334fc
+index 0000000..f9d5f88
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -0,0 +1,870 @@
+@@ -0,0 +1,922 @@
 +/*
 + * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
 + *
@@ -52,9 +52,10 @@ index 0000000..6f334fc
 + *             RBBM_SECVID_TRUST_CNTL as Linux does when a device has no zap firmware
 + *
 + * Both need the microcode (a630_sqe.fw, which is in linux-firmware); gpu=3 also needs this
-+ * phone's signed zap shader. Neither is in this repository: gpu_fw[] says where each file
-+ * lies in a stock partition, read only through sweet_ufs_read_part, and
-+ * tools/fwtable-file.py fills that table in.
++ * phone's signed zap shader. Neither is in this repository. The driver takes them from the
++ * device tree when the boot image carries them (tools/mkadt.py --gpu-sqe / --gpu-zap-mdt /
++ * --gpu-zap-seg), and otherwise from a stock partition, read only through
++ * sweet_ufs_read_part, with gpu_fw[] below filled in by tools/fwtable-file.py.
 + *
 + * gpu=4 is the shortcut for a first test with only the open microcode. It is a gamble Linux
 + * warns about: if the bootloader left the GPU in secure mode, writing that register is
@@ -70,6 +71,7 @@ index 0000000..6f334fc
 +#include <libkern/crc.h>
 +#include <sys/param.h>
 +#include <sys/errno.h>
++#include <pexpert/device_tree.h>
 +
 +#define LOG(fmt, ...)       IOLog("SapphireGpu: " fmt "\n", ##__VA_ARGS__)
 +
@@ -165,6 +167,18 @@ index 0000000..6f334fc
 +	 */
 +	{ NULL, NULL, 0, 0, 0 },
 +};
++
++/* Does the boot image carry the microcode in its device tree? */
++static bool
++have_adt_firmware(void)
++{
++	DTEntry chosen;
++	void const *blob;
++	unsigned int size;
++
++	return SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++	       SecureDTGetProperty(chosen, "gpu-sqe-firmware", &blob, &size) == kSuccess && size > 4;
++}
 +
 +static unsigned
 +fw_count(void)
@@ -468,10 +482,48 @@ index 0000000..6f334fc
 +
 +/* ---------------------------------------------------------------- firmware */
 +
++/* The same firmware, carried in the device tree by the boot image. */
++static const struct { const char *file, *prop; } adt_fw_map[] = {
++	{ "a630_sqe.fw",  "gpu-sqe-firmware" },
++	{ "a610_zap.mdt", "gpu-zap-metadata" },
++	{ "a610_zap.b02", "gpu-zap-segment" },
++};
++
++static int64_t
++adt_fw_read(const char *name, void *dst, uint32_t max)
++{
++	DTEntry chosen;
++	void const *blob;
++	unsigned int size;
++
++	for (unsigned i = 0; i < sizeof(adt_fw_map) / sizeof(adt_fw_map[0]); i++) {
++		if (strcmp(adt_fw_map[i].file, name) != 0) {
++			continue;
++		}
++		if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++		    SecureDTGetProperty(chosen, adt_fw_map[i].prop, &blob, &size) != kSuccess) {
++			return -1;
++		}
++		if (size > max) {
++			LOG("  %s: %u bytes in the device tree, no room", name, size);
++			return -1;
++		}
++		memcpy(dst, blob, size);
++		LOG("  %s: %u bytes from the device tree", name, size);
++		return size;
++	}
++	return -1;
++}
++
 +/* Read a firmware file into dst. Returns its length, or -1. */
 +static int64_t
 +fw_read(const char *name, void *dst, uint32_t max)
 +{
++	int64_t n = adt_fw_read(name, dst, max);
++
++	if (n >= 0) {
++		return n;
++	}
 +	for (unsigned i = 0; i < fw_count(); i++) {
 +		if (strcmp(gpu_fw[i].name, name) != 0) {
 +			continue;
@@ -836,8 +888,8 @@ index 0000000..6f334fc
 +		return;
 +	}
 +
-+	if (fw_count() == 0) {
-+		LOG("no firmware table (see tools/fwtable-file.py): stopping after the power-up");
++	if (fw_count() == 0 && !have_adt_firmware()) {
++		LOG("no firmware, in the device tree or in a table: stopping after the power-up");
 +		thread_terminate(current_thread());
 +		return;
 +	}
@@ -855,8 +907,8 @@ index 0000000..6f334fc
 +	test_buf = (uint32_t *)(pool + OFF_TEST);
 +	bzero(pool, OFF_META + 0x4000);
 +
-+	/* the root device carries the firmware: sweet_ufs answers EAGAIN until it is up */
-+	for (int i = 0; i < 120; i++) {
++	/* a partition carries the firmware: sweet_ufs answers EAGAIN until the root device is up */
++	for (int i = 0; fw_count() != 0 && i < 120; i++) {
 +		uint8_t probe[16];
 +		int err = sweet_ufs_read_part(gpu_fw[0].part, gpu_fw[0].off, probe, sizeof(probe));
 +		if (err != EAGAIN) {

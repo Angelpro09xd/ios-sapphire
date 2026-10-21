@@ -77,7 +77,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
+def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, gpu_fw=()):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = ((MID_PHYS_BASE, MID_MEM_SIZE) if midmem else
                            (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
@@ -86,6 +86,11 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
 
+    # --gpu-sqe / --gpu-zap-mdt / --gpu-zap-seg: the Adreno firmware travels in the
+    # device tree instead of being looked for in a partition (SapphireGpu.cpp reads it
+    # from /chosen). Qualcomm's firmware stays out of this repository; this only carries
+    # it into a boot image built on a machine that has it.
+    gpu_props = list(gpu_fw)
     chosen = node('chosen', [
         ph(),
         ('dram-base', u64(phys_base)),
@@ -121,7 +126,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
-    ], [node('memory-map', [ph()]),
+    ] + gpu_props, [node('memory-map', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
         # debugger, dtrace, nvram), lp-sip1: unauthenticated (unsealed) root.
@@ -255,8 +260,17 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
 
 
 if __name__ == '__main__':
+    gpu_fw = []
+    for opt, prop in (('--gpu-sqe', 'gpu-sqe-firmware'), ('--gpu-zap-mdt', 'gpu-zap-metadata'),
+                      ('--gpu-zap-seg', 'gpu-zap-segment')):
+        if opt in sys.argv:
+            i = sys.argv.index(opt)
+            blob = open(sys.argv[i + 1], 'rb').read()
+            del sys.argv[i:i + 2]
+            gpu_fw.append((prop, blob))
+            print(f'{prop}: {len(blob)} bytes', file=sys.stderr)
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 native='--native' in sys.argv, midmem='--midmem' in sys.argv)
+                 native='--native' in sys.argv, midmem='--midmem' in sys.argv, gpu_fw=gpu_fw)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

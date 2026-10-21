@@ -158,9 +158,16 @@ staged by `gpu=N` and each stage is meant to be read in the kernel log before go
 Both `gpu=3` and `gpu=4` need the microcode `a630_sqe.fw` (it is in
 [linux-firmware](https://gitlab.com/kernel-firmware/linux-firmware) as `qcom/a630_sqe.fw`, and the
 phone has its own copy); `gpu=3` also needs this phone's signed `a610_zap` shader, which exists
-only on the device. Neither is in this repository: the driver reads them where they already are,
-through the UFS driver. Fill `gpu_fw[]` in `SapphireGpu.cpp` with `tools/fwtable-file.py`, pointing
-it at the files in a mounted copy of the partition that holds them.
+only on the device. Neither is in this repository. The simplest way to give them to the driver is
+to put them in the boot image's device tree:
+
+```sh
+tools/sapphire-boot.sh --gpu-fw ~/gpu-fw xnu/out/kernel.development.sweet sapphire-gpu.img "gpu=4"
+```
+
+where `~/gpu-fw` holds `a630_sqe.fw` (and `a610_zap.mdt` / `a610_zap.b02` for `gpu=3`). Otherwise
+the driver reads them from a stock partition: fill `gpu_fw[]` in `SapphireGpu.cpp` with
+`tools/fwtable-file.py`, pointing it at the files in a mounted copy of that partition.
 
 After that come the interrupt, a real draw from a freedreno command stream, and a user space
 driver (Mesa freedreno) behind CoreAnimation.
