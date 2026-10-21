@@ -23,7 +23,7 @@ The Redmi Note 12 4G (topaz) and the Redmi Note 13 4G share the SoC, the memory 
 ## What does not work (yet)
 
 - **Wi-Fi connection**: no association/WPA2, no data path, no network interface for iOS yet; the Wi-Fi switch in Settings does nothing.
-- **No GPU**: everything is drawn by the CPU, so it lags; wallpapers and Metal effects stay black.
+- **No GPU yet**: everything is drawn by the CPU, so it lags; wallpapers and Metal effects stay black. Patch 0145 starts the Adreno 610 bring-up (see below); the upstream project has the GPU drawing on topaz with patches it has not published.
 - **SSH**: a Procursus rootless bootstrap with sshd can be installed (`tools/sapphire-ssh-install.sh`), but iOS does not resolve `root` for it yet ("Invalid user root").
 - **No Bluetooth, cellular data, audio, camera, sensors, GPS, SEP**; no real-time clock (the date starts at 31 December).
 - **Only 4 of 8 cores** (the Silver cores have no 16K translation granule).
@@ -89,6 +89,7 @@ tools/sapphire-boot.sh xnu/out/kernel.development.sweet sapphire-wifi.img "sweet
 | `sweettouch_rx=8640 sweettouch_ry=9600` | sapphire's raw touch range (X 0..2159, Y 0..2399, 2 fraction bits) |
 | `sweetusb=1` / `sweetusb=2` | USB: report the controller state / start the CDC-ECM device |
 | `modem=1 wifi=1` | Boot the modem from `modem_a` and bring up the WLAN firmware (read-only on the phone's partitions) |
+| `gpu=1` / `2` / `3` | Adreno 610: log the clock tree / also power it up and read it / also run a command on it (see "GPU bring-up") |
 | `launchd_unsecure_cache=1`, `wdt=-1 wdt_test=no_user_checkin` | launchd without AMFI; no hardware watchdog |
 
 ### 4. Put the root on the phone and boot
@@ -128,11 +129,38 @@ nc -ukl 5140          # live kernel console
 | 0142 | sweet's DWC3/CDC-ECM USB device on the SM6225 addresses; opt-in with `sweetusb` |
 | 0143 | sapphire's modem_a tables (modem image for PAS, all files for the tftp server and WLAN board data), picked by the `modem.mdt` CRC so topaz keeps working |
 | 0144 | Join the network named by boot args `wifi_ssid=` / `wifi_pass=` through upstream's WLAN station (0129/0130), for testing |
+| 0145 | Adreno 610 bring-up staged by boot-arg `gpu=N`: clock tree, power-up, zap shader through TrustZone, identity SMMU bank, SQE microcode and a command the GPU executes (**not yet run on the phone**) |
 | `shim/` | DDR bank end from ABL's `/memory` node; RAM size clamped to it |
 | `tools/mkadt.py` | sapphire identity in the ADT |
 | `tools/sapphire-boot.sh`, `sapphire-root.sh` | Boot image and root image for sapphire |
 | `tools/fwtable-modem.py` | Generates the modem_a tables from a dump of the partition |
+| `tools/fwtable-file.py` | Where a file lies inside a partition, for a driver that reads it directly (the GPU firmware table) |
 | `tools/sapphire-touch-kpatch.sh`, `kpatch.py` | Binary fix of the touch scaling in a built kernel (used before a build was possible) |
+
+## GPU bring-up (patch 0145, in progress)
+
+The Adreno 610 v2 in this phone (`chip id 0x06010001`, registers at `0x5900000`) has no GMU, so
+the host powers it up itself, as Linux does through its "GMU wrapper". Patch 0145 follows what
+[topaz-woa](https://github.com/MakrSas/topaz-woa) `docs/P8_gpu.md` established on the same SoC
+under Windows, on this kernel and with the pieces `TopazModem` already brings: TrustZone calls,
+an identity SMMU bank and RAM below 4 GB that the kernel does not manage.
+
+Reading a GPU register while its power domain or its clocks are off hangs the bus, so the work is
+staged by `gpu=N` and each stage is meant to be read in the kernel log before going further:
+
+| Stage | What it does | What to look for |
+| --- | --- | --- |
+| `gpu=1` | Maps GCC and the GPU CC and logs the clock tree. Never touches `0x5900000` | the bootloader leaves everything collapsed and off |
+| `gpu=2` | Powers up (GPLL0 vote, CX GDSC, cxo/ahb, GMU RCG, SMMU vote, GX GDSC, core clock at 300 MHz), then reads the GPU | `RBBM_STATUS`, and `CP_ALWAYS_ON_COUNTER` growing by ~192000 in 10 ms (19.2 MHz) |
+| `gpu=3` | Zap shader through TrustZone (PAS 13, region `0x55A15000` from the device tree), identity SMMU bank for the GPU's stream (SID 0 mask 1, as `gfx3d_user` in the device tree), SQE microcode, 32 KB ring, `CP_ME_INIT`, `CP_SET_SECURE_MODE 0`, `CP_MEM_WRITE` | `*** the GPU executes commands ***`, with `c0ffee00` read back from RAM |
+
+`gpu=3` needs this phone's own GPU firmware (Qualcomm's `a630_sqe.fw` and the signed `a610_zap`
+shader, neither of them in this repository). The driver reads them where they already are, through
+the UFS driver: fill `gpu_fw[]` in `SapphireGpu.cpp` with `tools/fwtable-file.py`, pointing at the
+files in a mounted copy of the partition that holds them.
+
+After that come the interrupt, a real draw from a freedreno command stream, and a user space
+driver (Mesa freedreno) behind CoreAnimation.
 
 ## Repository layout
 
