@@ -13,8 +13,8 @@ render on the Adreno, three layers have to exist. This file is the plan; `NOTES.
 | Power-up, zap shader through TrustZone, SQE microcode, ring, CP commands | done (patch 0145) |
 | Park the GPU cleanly (GBIF drain before collapse) | done |
 | 2D blitter: fills and copies, an image on the panel | done |
-| **GPU virtual memory: stage-1 page tables in the GPU's SMMU context bank** | written, `gpu_mmu=1` |
-| Map any IOSurface / user memory into the GPU's address space | next |
+| GPU virtual memory: stage-1 page tables in the GPU's SMMU context bank | done (`gpu_mmu=1`): scattered memory above 4 GB filled right |
+| **Map any IOSurface / user memory into the GPU's address space** | next |
 | Interrupts (SPI 177) and fences instead of polling | |
 | A GPU service user space can open: buffer objects, command submission, waits | |
 | Per-process address spaces (TTBR switch from the ring, as msm does) | |

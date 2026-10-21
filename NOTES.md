@@ -58,6 +58,18 @@ over the adb tunnel; explicit OK before `fastboot flash userdata`.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
+**sapphire: THE GPU HAS ITS OWN VIRTUAL MEMORY (2026-10-21, kernel out-cm16 / 63250de, boot `gpu=3 gpu_delay=60 gpu_mmu=1`, `logs/sapphire-gpummu.txt`).**
+
+    SMMU page tables: L1 at e1080000, 3 tables used, identity for the pool and 5c000000-5c9e3400;
+      CB0 SCTLR 00000167 TCR 00802020 TCR2 00038061 TTBR0 00000000e1080000, TLB sync done
+    --- gpu_mmu: 256 KB of scattered memory at GPU address 10000000
+      64 pages in 16 physical runs, between 144760000 and 1a313bfff; 5 page tables in use
+      2D fill through the GPU MMU: done (rptr 183) after ~10 us
+      pixels: 65536 of 65536 as expected (ffffc020)
+    *** the GPU reached scattered memory through its own page tables ***
+
+First try. The pages came in 16 physical runs spread over 1.5 GB **above 4 GB** — memory the identity bank could never have reached, since the a610 only issues 32-bit addresses. With CB0 translating, everything that worked before still did (ring, SQE, `c0ffee00`, the orange fill through the identity blocks), no fault, clean park, panel fine. Read back: SCTLR `0x167`, i.e. `ASIDPNE` (bit 12) does not stick on this SMMU (RES0 or masked by the hypervisor; harmless with one ASID), and TCR2 `0x38061` has bits 5 and 6 set beyond what was written (`PASIZE` 1 kept). Layer 1's next steps (`GPU-ROADMAP.md`): map IOSurfaces into the GPU's address space, keep the GPU up as a service with one submission path, interrupts and fences.
+
 **sapphire: GPU virtual memory written (2026-10-21, patch 0145, `gpu_mmu=1`; plan in `GPU-ROADMAP.md`).** With `gpu_mmu=1`, `cp_start()` programs CB0 as a translating stage-1 context instead of the identity bank, with page tables in the pool. Everything is Linux's, from the 6.18 tree in `tools/wsl-kernel`: the PTE (`io-pgtable-arm.c`: AttrIndx 0 = MAIR NC, `AP_UNPRIV`, `SH_OS`, `AF`, `nG`; MAIR0 `0xf404ff44`), the TCR for a walker that is not coherent (non-cacheable walks, `SH_OS`, 4 KB granule, `EPD1`; T0SZ 32 because the a610 has `ADRENO_QUIRK_4GB_VA`, so the walk starts at level 1 with 4 entries) = `0x00802020`, TCR2 `0x38001` (SEP upstream, 36-bit PA), CBAR `0x1f300` (S1 translation, S2 bypass, WB, NSH), the register order of `arm_smmu_write_context_bank`, and SCTLR `0x1167` = Linux's `CFIE|CFRE|AFE|TRE|M|ASIDPNE` plus the `HUPCF` Qualcomm's Adreno `write_sctlr` adds — and **without `CFCFG`, which the identity bank had set (`0xE0`)**: with translation on, that would stall the GPU forever on its first fault instead of terminating the access. TLB invalidation is `TLBIASID` + `TLBSYNC` + `TLBSTATUS`. The pool and the boot framebuffer stay at VA = PA as 2 MB blocks, so everything that already worked keeps working; then `mmu_test()` maps 256 KB of ordinary kernel memory, allocated without contiguity, page by page at GPU address `0x10000000`, has the blitter fill it through that address and checks it from the CPU, logging how many physical runs the pages came in. Also from the same header: bits 10:9 of `CB_FSR` are `FORMAT`, so the `00000400` seen since the first stage-3 boot was never a fault.
 
 **sapphire: the numbers say the frame copy is not the lever, and the GPU needs its own MMU (2026-10-21, kernel out-cm15 / a1293fd, boot `gpu=3 gpu_delay=60 gpu_bench=1`, two minutes at the home screen, `logs/sapphire-gpubench.txt`).**
