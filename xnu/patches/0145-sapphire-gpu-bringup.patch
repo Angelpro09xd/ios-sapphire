@@ -1,4 +1,4 @@
-From 087e246093555c017f442d6d22c1dc4ed282a3de Mon Sep 17 00:00:00 2001
+From e84134fbb11cec660e37c5ce91a03668a78647fa Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 06:53:53 +0000
 Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
@@ -20,18 +20,18 @@ zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
 Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
 files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 1380 +++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireGpu.cpp      | 1466 +++++++++++++++++++++++++
  iokit/Kernel/arm/SweetFramebuffer.cpp |    2 +
  iokit/conf/files.arm64                |    1 +
- 3 files changed, 1383 insertions(+)
+ 3 files changed, 1469 insertions(+)
  create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 new file mode 100644
-index 0000000..cdb6e29
+index 0000000..04dde34
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -0,0 +1,1380 @@
+@@ -0,0 +1,1466 @@
 +/*
 + * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
 + *
@@ -1149,41 +1149,31 @@ index 0000000..cdb6e29
 +}
 +
 +/*
-+ * The first thing the GPU draws: a 256 x 256 RGBA8 solid fill with the 2D blitter, into a
-+ * buffer the CPU has filled with a pattern first, then read back pixel by pixel. Mesa's order:
-+ * clean + invalidate the CCU, render mode BLIT2DSCALE, CCU in bypass (sysmem) layout, the
-+ * a610 "magic" registers its batches start with, the clear colour, blit format and
-+ * destination, a label event, CP_BLIT(SCALE), then clean the CCU and the caches and wait for
-+ * idle so the pixels are in RAM before the fence.
++ * The 2D blitter, as Mesa's freedreno does a buffer clear: blit_begin() emits the a610's
++ * batch-start registers, cleans and invalidates the CCU, sets render mode BLIT2DSCALE, the CCU
++ * bypass (sysmem) layout, the clear colour and the blit format; blit_rect() emits one
++ * destination and one CP_BLIT(SCALE); blit_end() cleans the CCU and the caches, waits for idle
++ * and submits, so the pixels are in RAM when it returns.
 + */
-+static bool
-+blit_fill(uint32_t rgba)
++static void
++blit_begin(uint32_t rgba)
 +{
-+	uint32_t *pix = (uint32_t *)(pool + OFF_DRAW);
-+	uint64_t dst = POOL_PA + OFF_DRAW;
 +	uint32_t fmt = FMT6_8_8_8_8_UNORM;
 +	uint32_t blt = (0xFu << 20) | (fmt << 8) | (1u << 7);  /* MASK, COLOR_FORMAT, IFMT UNORM8, SOLID_COLOR */
-+	uint32_t good = 0, bad_at = 0xFFFFFFFF, bad_val = 0;
-+
-+	LOG("--- first draw: 2D blitter, %ux%u RGBA8 at %llx, colour %08x", DRAW_W, DRAW_H, dst, rgba);
-+	for (uint32_t i = 0; i < DRAW_W * DRAW_H; i++) {
-+		pix[i] = 0xDEADBEEF;
-+	}
-+	gmb();
 +
 +	/* the a610's batch-start registers (freedreno_devices.py magic_regs / raw_magic_regs) */
-+	reg1(0x9804, 0xf);                         /* PC_MODE_CNTL */
-+	reg1(0x9805, 0);                           /* PC_POWER_CNTL */
-+	reg1(0xa0f8, 0);                           /* VFD_POWER_CNTL */
-+	reg1(0xb600, 0);                           /* TPL1_DBG_ECO_CNTL */
-+	reg1(0x8600, 0);                           /* GRAS_DBG_ECO_CNTL */
-+	reg1(0xae03, 0);                           /* SP_CHICKEN_BITS */
-+	reg1(0xae00, 0);                           /* SP_DBG_ECO_CNTL */
-+	reg1(0xbe04, 0);                           /* HLSQ_DBG_ECO_CNTL */
-+	reg1(0x9600, 0);                           /* VPC_DBG_ECO_CNTL */
-+	reg1(0x0e12, 0x10000000);                  /* UCHE_UNKNOWN_0E12 */
++	reg1(0x9804, 0xf);                          /* PC_MODE_CNTL */
++	reg1(0x9805, 0);                            /* PC_POWER_CNTL */
++	reg1(0xa0f8, 0);                            /* VFD_POWER_CNTL */
++	reg1(0xb600, 0);                            /* TPL1_DBG_ECO_CNTL */
++	reg1(0x8600, 0);                            /* GRAS_DBG_ECO_CNTL */
++	reg1(0xae03, 0);                            /* SP_CHICKEN_BITS */
++	reg1(0xae00, 0);                            /* SP_DBG_ECO_CNTL */
++	reg1(0xbe04, 0);                            /* HLSQ_DBG_ECO_CNTL */
++	reg1(0x9600, 0);                            /* VPC_DBG_ECO_CNTL */
++	reg1(0x0e12, 0x10000000);                   /* UCHE_UNKNOWN_0E12 */
 +	reg1(REG_RB_RBP_CNTL, 1);
-+	reg1(REG_RB_DBG_ECO_CNTL, 0x04100000);     /* the same value for blits on a610: no toggling */
++	reg1(REG_RB_DBG_ECO_CNTL, 0x04100000);      /* the same value for blits on a610: no toggling */
 +
 +	/* emit_setup */
 +	event(EV_PC_CCU_FLUSH_COLOR_TS, true);
@@ -1196,38 +1186,65 @@ index 0000000..cdb6e29
 +	/* sysmem layout: depth cache at 0, colour at num_ccu (1) x 8 KB; fast clear off on gen1_low */
 +	reg1(REG_RB_CCU_CNTL, (1u << 0) | ((0x2000u >> 12) << 23));
 +
-+	/* emit_clear_color (R2D_UNORM8: one byte per dword) and emit_blit_setup */
++	/* emit_clear_color (R2D_UNORM8: one byte per dword, in the format's channel order) */
 +	emit(pkt4(REG_RB_A2D_CLEAR_COLOR_DW0, 4));
-+	emit((rgba >> 24) & 0xff);                 /* R */
-+	emit((rgba >> 16) & 0xff);                 /* G */
-+	emit((rgba >> 8) & 0xff);                  /* B */
-+	emit(rgba & 0xff);                         /* A */
++	emit((rgba >> 24) & 0xff);
++	emit((rgba >> 16) & 0xff);
++	emit((rgba >> 8) & 0xff);
++	emit(rgba & 0xff);
++	/* emit_blit_setup */
 +	reg1(REG_RB_A2D_BLT_CNTL, blt);
 +	reg1(REG_GRAS_A2D_BLT_CNTL, blt);
 +	reg1(REG_SP_A2D_OUTPUT_INFO, (fmt << 3) | (0xFu << 12));  /* IFMT_TYPE FLOAT, COLOR_FORMAT, MASK */
 +	reg1(REG_RB_A2D_PIXEL_CNTL, 0);
++}
 +
-+	/* destination: linear, WZYX, pitch in 64-byte units */
++/* One rectangle [x0, x1] x [y0, y1] of a linear surface: base 64-byte aligned, pitch a multiple of 64. */
++static void
++blit_rect(uint64_t base, uint32_t pitch, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
++{
 +	emit(pkt4(REG_RB_A2D_DEST_BUFFER_INFO, 4));
-+	emit(fmt);
-+	emit((uint32_t)dst);
-+	emit((uint32_t)(dst >> 32));
-+	emit(DRAW_PITCH >> 6);
++	emit(FMT6_8_8_8_8_UNORM);                   /* TILE6_LINEAR, WZYX */
++	emit((uint32_t)base);
++	emit((uint32_t)(base >> 32));
++	emit(pitch >> 6);
 +	emit(pkt4(REG_GRAS_A2D_DEST_TL, 2));
-+	emit(0);
-+	emit((DRAW_W - 1) | ((DRAW_H - 1) << 16));
-+
++	emit(x0 | (y0 << 16));
++	emit(x1 | (y1 << 16));
 +	/* emit_blit_fini */
 +	event(EV_DEBUG_LABEL, false);
 +	emit(pkt7(CP_BLIT, 1));
 +	emit(BLIT_OP_SCALE);
++}
 +
-+	/* make the pixels land */
++static bool
++blit_end(const char *what)
++{
 +	event(EV_PC_CCU_FLUSH_COLOR_TS, true);
 +	event(EV_PC_CCU_FLUSH_DEPTH_TS, true);
 +	event(EV_CACHE_FLUSH_TS, true);
 +	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
-+	if (!submit("2D fill", 200)) {
++	return submit(what, 200);
++}
++
++/*
++ * The first thing the GPU draws: a 256 x 256 RGBA8 solid fill into a buffer the CPU has filled
++ * with a pattern first, then read back pixel by pixel.
++ */
++static bool
++blit_fill(uint32_t rgba)
++{
++	uint32_t *pix = (uint32_t *)(pool + OFF_DRAW);
++	uint32_t good = 0, bad_at = 0xFFFFFFFF, bad_val = 0;
++
++	LOG("--- first draw: 2D blitter, %ux%u RGBA8 at %llx, colour %08x", DRAW_W, DRAW_H, POOL_PA + OFF_DRAW, rgba);
++	for (uint32_t i = 0; i < DRAW_W * DRAW_H; i++) {
++		pix[i] = 0xDEADBEEF;
++	}
++	gmb();
++	blit_begin(rgba);
++	blit_rect(POOL_PA + OFF_DRAW, DRAW_PITCH, 0, 0, DRAW_W - 1, DRAW_H - 1);
++	if (!blit_end("2D fill")) {
 +		return false;
 +	}
 +	IODelay(100);
@@ -1252,6 +1269,71 @@ index 0000000..cdb6e29
 +	return good == DRAW_W * DRAW_H;
 +}
 +
++/*
++ * boot-arg gpu_demo=1: the GPU paints three bars (red, green, blue) straight onto the boot
++ * framebuffer the panel scans out, over the Apple logo, where they stay until SpringBoard's first
++ * frame replaces them. The framebuffer is 1080 x 2400 BGRA with 4320 bytes a row, which the
++ * blitter cannot take as a pitch (it counts in 64-byte units and 4320 is 67.5 of them), but two
++ * rows are 8640 = 135 x 64: so the even rows are one surface with an 8640-byte pitch, and the odd
++ * rows another one starting 4320 bytes later, whose base is 32 bytes off alignment, so it is
++ * rounded down and x shifted right by 8 pixels, the trick fd6_clear_buffer uses for unaligned
++ * buffers. Two blits per bar.
++ */
++static uint32_t demo;
++
++static bool
++blit_bar(uint64_t fb, uint32_t stride, uint32_t w, uint32_t y0, uint32_t h, uint32_t r, uint32_t g, uint32_t b)
++{
++	/* the framebuffer is B,G,R,A in memory: channel order of the blit format is R,G,B,A */
++	uint32_t rgba = (b << 24) | (g << 16) | (r << 8) | 0xFF;
++	uint64_t even = fb + (uint64_t)y0 * stride;
++	uint64_t odd = even + stride;
++	uint32_t dx = (uint32_t)(odd & 63) / 4;
++
++	blit_begin(rgba);
++	blit_rect(even, 2 * stride, 0, 0, w - 1, h / 2 - 1);
++	blit_rect(odd & ~63ull, 2 * stride, dx, 0, dx + w - 1, h / 2 - 1);
++	return blit_end("bar");
++}
++
++static void
++demo_bars(void)
++{
++	PE_Video video;
++
++	PE_current_console(&video);
++	uint64_t fb = video.v_baseAddr;
++	uint32_t w = (uint32_t)video.v_width, h = (uint32_t)video.v_height, stride = (uint32_t)video.v_rowBytes;
++
++	LOG("--- gpu_demo: bars onto the framebuffer at %llx, %ux%u, %u bytes a row", fb, w, h, stride);
++	if (fb == 0 || (fb & 63) != 0 || ((2 * stride) & 63) != 0 || (stride & 3) != 0 || w > 0x3ff0 || h < 1400) {
++		LOG("  this framebuffer does not fit the two-surface trick; no demo");
++		return;
++	}
++	uint32_t bar = 200, top = h / 2 - 3 * bar / 2;
++	top &= ~1u;                                  /* even first row */
++	bool ok = blit_bar(fb, stride, w, top, bar, 0xFF, 0x20, 0x20) &&
++	    blit_bar(fb, stride, w, top + bar, bar, 0x20, 0xE0, 0x20) &&
++	    blit_bar(fb, stride, w, top + 2 * bar, bar, 0x20, 0x40, 0xFF);
++	LOG("  %s: rows %u-%u red, green, blue", ok ? "drawn" : "FAILED", top, top + 3 * bar - 1);
++
++	/* read a pixel of every bar on an even and an odd row back through the CPU */
++	IOMemoryMap *m = map_phys(fb, (uint64_t)stride * h, true);
++	if (m == NULL) {
++		return;
++	}
++	const uint8_t *v = (const uint8_t *)m->getVirtualAddress();
++	for (uint32_t i = 0; i < 3; i++) {
++		uint32_t ye = top + i * bar + 10, yo = ye + 1;
++		LOG("  bar %u: pixel (%u,%u) %08x, (%u,%u) %08x, (0,%u) %08x, (%u,%u) %08x", i, w / 2, ye,
++		    *(const volatile uint32_t *)(v + (uint64_t)ye * stride + (w / 2) * 4), w / 2, yo,
++		    *(const volatile uint32_t *)(v + (uint64_t)yo * stride + (w / 2) * 4), yo,
++		    *(const volatile uint32_t *)(v + (uint64_t)yo * stride), w - 1, yo,
++		    *(const volatile uint32_t *)(v + (uint64_t)yo * stride + (w - 1) * 4));
++	}
++	m->release();
++}
++
 +/* ---------------------------------------------------------------- bring-up thread */
 +
 +static void
@@ -1274,6 +1356,7 @@ index 0000000..cdb6e29
 +	(void)PE_parse_boot_argn("gpu_stop", &stop_at, sizeof(stop_at));
 +	(void)PE_parse_boot_argn("gpu_keep", &keep_running, sizeof(keep_running));
 +	(void)PE_parse_boot_argn("gpu_draw", &draw_first, sizeof(draw_first));
++	(void)PE_parse_boot_argn("gpu_demo", &demo, sizeof(demo));
 +	if (PE_parse_boot_argn("gpu_delay", &delay_s, sizeof(delay_s)) && delay_s != 0) {
 +		LOG("starting in %u s", delay_s);
 +		IOSleep(delay_s * 1000);
@@ -1377,6 +1460,9 @@ index 0000000..cdb6e29
 +		LOG("*** the GPU executes commands ***");
 +		if (draw_first && blit_fill(0xFF8000FF)) {
 +			LOG("*** the GPU drew: every pixel of the 2D fill is right ***");
++			if (demo) {
++				demo_bars();
++			}
 +		} else if (draw_first) {
 +			LOG("the 2D fill did not come out right");
 +		}

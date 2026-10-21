@@ -58,6 +58,8 @@ over the adb tunnel; explicit OK before `fastboot flash userdata`.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
+**sapphire: a demo you can see, written (2026-10-21, patch 0145, `gpu_demo=1`).** The blitter code is now `blit_begin(colour)` / `blit_rect(base, pitch, rect)` / `blit_end()`, and with `gpu_demo=1` stage 3 follows the fill test by painting three 1080×200 bars (red, green, blue) onto the boot framebuffer the panel scans out (`PE_current_console`: `0x5c000000`, 1080×2400 BGRA, 4320 bytes a row), then reads one pixel per bar back through the CPU on an even and an odd row. 4320 is not a pitch the blitter takes (its pitch is in 64-byte units: 67.5), but two rows are 8640 = 135 × 64: the even rows are one surface with an 8640-byte pitch from the row's start, the odd rows another one 4320 bytes later whose base is 32 bytes off alignment, so it is rounded down and x moved 8 pixels right — the same trick `fd6_clear_buffer` uses for buffers that are not 64-byte aligned. Two blits per bar. The framebuffer is B,G,R,A in memory, so the colour is given to the blit with R and B swapped. With `gpu_delay=10` the GPU runs during the Apple logo and the bars stay until SpringBoard's first swap replaces the panel contents.
+
 **sapphire: THE GPU DREW — 65536 of 65536 pixels right on the first try (2026-10-21, kernel out-cm13 / 3de45b5, boot `sweetusb=2 gpu=3 gpu_delay=60`, `logs/sapphire-gpu3-firstdraw.txt`).**
 
     --- first draw: 2D blitter, 256x256 RGBA8 at e1040000, colour ff8000ff
