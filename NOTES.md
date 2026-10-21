@@ -58,6 +58,17 @@ over the adb tunnel; explicit OK before `fastboot flash userdata`.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
+**sapphire: the yellow screen is fixed — stage 3 runs and parks cleanly (2026-10-21, kernel out-cm12 / c1e2bb9, boot `sweetusb=2 gpu=3 gpu_delay=60`, `logs/sapphire-gpu3-drained.txt`).** Same full stage 3 that turned the panel yellow three times out of three, now with the bus drained before the collapse:
+
+    *** the GPU executes commands ***
+    parking the GPU: RBBM_STATUS 00000001
+      bus drained: GX halted, clients halted, AXI halted (GBIF_HALT_ACK 00000003)
+    --- power down
+      gx gdscr 00222001, cx gdscr f8222001
+    panel display off / on / level 0x133: done, done, done
+
+Panel fine, phone at the home screen. Two smaller things in the same log: the CX GDSC keeps PWR_ON after its SW_COLLAPSE bit is set (`f8222001`), so something else still votes for CX (the GPU CC's hardware control or another master); harmless, worth knowing before relying on CX being off. And the SMMU "fault" seen since the first stage-3 boot is **not** a stray access: `CB0 FSR` reads `00000400` with the very same `FAR 00014810281091c0` after `CP_ME_INIT`, after secure mode and after the test, and bit 10 is none of the architected FSR fault bits (TF/AFF/PF/EF/TLBMCF/TLBLKF/ASF/UUT/SS/MULTI), so FAR carries no meaning; it is a constant, not a CP access, and not worth chasing. The user reported smoother animations in this boot; nothing in iOS uses the GPU yet (it is parked a second after running), so that is boot-to-boot variance, not this work.
+
 **sapphire: the yellow screen is a power collapse with the GPU's bus still busy (2026-10-21, kernel out-cm11 / ab733d3, all `gpu=3 gpu_delay=60`).** The bisect, one boot each, screen reported by the user (photo: the whole panel a flat pale yellow-green, a typical display underflow fill):
 
 | image | what it did | screen |
