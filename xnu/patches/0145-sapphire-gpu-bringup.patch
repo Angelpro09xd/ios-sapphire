@@ -1,4 +1,4 @@
-From 01875367e83bad17915ce293e43f49d32ce8b9e5 Mon Sep 17 00:00:00 2001
+From 51a27707e388800de9a89c7649a7c664c123354e Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 06:53:53 +0000
 Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
@@ -20,18 +20,18 @@ zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
 Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
 files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 922 ++++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireGpu.cpp      | 931 ++++++++++++++++++++++++++
  iokit/Kernel/arm/SweetFramebuffer.cpp |   2 +
  iokit/conf/files.arm64                |   1 +
- 3 files changed, 925 insertions(+)
+ 3 files changed, 934 insertions(+)
  create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 new file mode 100644
-index 0000000..f9d5f88
+index 0000000..3c98ccb
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -0,0 +1,922 @@
+@@ -0,0 +1,931 @@
 +/*
 + * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
 + *
@@ -846,9 +846,18 @@ index 0000000..f9d5f88
 +static void
 +gpu_thread(void *arg __unused, wait_result_t wr __unused)
 +{
-+	uint32_t stage = 0;
++	uint32_t stage = 0, delay_s = 0;
 +
 +	(void)PE_parse_boot_argn("gpu", &stage, sizeof(stage));
++	/*
++	 * gpu_delay=N waits N seconds before touching anything. The bring-up runs from
++	 * AppleCLCD::start, long before USB networking carries the console, so its log would
++	 * only be readable from recovery; with a delay it lands in the live log instead.
++	 */
++	if (PE_parse_boot_argn("gpu_delay", &delay_s, sizeof(delay_s)) && delay_s != 0) {
++		LOG("starting in %u s", delay_s);
++		IOSleep(delay_s * 1000);
++	}
 +	LOG("stage %u (Adreno 610 v2, regs %llx, GPU CC %llx)", stage, GPU_PA, GPUCC_PA);
 +
 +	gcc_map = map_phys(GCC_PA, GCC_SIZE);
