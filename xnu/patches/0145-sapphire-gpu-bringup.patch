@@ -1,4 +1,4 @@
-From 3f429d47c3a4f19f7a2d67de9b9db8243f565e12 Mon Sep 17 00:00:00 2001
+From 7b9141a29c0d40a0cc7abb7cb61b295248fd92c4 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 06:53:53 +0000
 Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
@@ -20,18 +20,18 @@ zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
 Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
 files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 964 ++++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireGpu.cpp      | 997 ++++++++++++++++++++++++++
  iokit/Kernel/arm/SweetFramebuffer.cpp |   2 +
  iokit/conf/files.arm64                |   1 +
- 3 files changed, 967 insertions(+)
+ 3 files changed, 1000 insertions(+)
  create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 new file mode 100644
-index 0000000..cfa60a4
+index 0000000..ab3f5ec
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -0,0 +1,964 @@
+@@ -0,0 +1,997 @@
 +/*
 + * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
 + *
@@ -44,8 +44,9 @@ index 0000000..cfa60a4
 + * Staged by boot-arg gpu=N, because reading a GPU register while its power domain or its
 + * clocks are off hangs the bus (the same trap as the WLAN copy engines before mission mode):
 + *
-+ * gpu_slow=N waits N ms after each step so the persistent log catches up with it, and
-+ * gpu_delay=N waits N seconds before starting so the live console over USB is already up.
++ * gpu_slow=N waits N ms after each step so the persistent log catches up with it,
++ * gpu_delay=N waits N seconds before starting so the live console over USB is already up,
++ * and gpu_div=N runs the core at GPLL0/N (2 = 300 MHz, 8 = 75 MHz) for a rail nothing votes.
 + *
 + *   gpu=1   clock tree only; never touches 0x5900000
 + *   gpu=2   + power up, then the first GPU reads (RBBM_STATUS, CP_ALWAYS_ON_COUNTER)
@@ -203,12 +204,23 @@ index 0000000..cfa60a4
 +static uint32_t ring_wptr;
 +static unsigned scm_resumes;
 +static uint32_t slow_ms;                        /* boot-arg gpu_slow: see step_done() */
++/*
++ * boot-arg gpu_div: the GPLL0 divider for the core clock, 2 = 300 MHz. Nothing here raises
++ * VDD_GFX (Linux does it through the OPP table and RPMh, and there is no GMU to do it for
++ * us), so the rail stays wherever the bootloader left it and 300 MHz may be above what it
++ * holds: a boot that dies with the clocks up and no bus error is the shape that has. gpu_div=8
++ * (75 MHz) is the slowest useful setting; the divider field holds 2 * div - 1.
++ */
++static uint32_t core_div = 2;
 +
 +/*
 + * The persistent log is written to userdata about once a second, so a step that hangs or
 + * panics the phone takes the lines around it with it: the last boot left nothing after
 + * "starting in N s". gpu_slow=N waits N ms after each step, which gives that writer time to
 + * put the step's line on disk before the next one runs. 1200 is a good value.
++ *
++ * Every step of the power-up, the zap shader and the CP ends in one of these, so a boot that
++ * stops dead says in the log which register or which TrustZone call it stopped on.
 + */
 +static void
 +step_done(void)
@@ -429,8 +441,8 @@ index 0000000..cfa60a4
 +	wr(gpucc, cmd + 4, (src << 8) | (2 * div - 1));
 +	rmw(gpucc, cmd, 0, RCG_UPDATE);
 +	ok = poll(gpucc, cmd, RCG_UPDATE, 0, 500);
-+	LOG("  %s src %u div %u: cmd %08x cfg %08x %s", name, src, div, rd(gpucc, cmd), rd(gpucc, cmd + 4),
-+	    ok ? "updated" : "UPDATE STUCK");
++	LOG("  %s src %u div %u (GPLL0/%u = %u MHz): cmd %08x cfg %08x %s", name, src, div, div, 600 / div,
++	    rd(gpucc, cmd), rd(gpucc, cmd + 4), ok ? "updated" : "UPDATE STUCK");
 +	step_done();
 +	return ok;
 +}
@@ -459,7 +471,7 @@ index 0000000..cfa60a4
 +	if (!ok) {
 +		return false;
 +	}
-+	rcg_set(0x1120, SRC_GPLL0, 3, "gmu_clk_src (200 MHz)");
++	rcg_set(0x1120, SRC_GPLL0, 3, "gmu_clk_src");
 +	rmw(gpucc, 0x1098, 0xFF0, 0xFF0);                   /* cx_gmu wakeup/sleep delays, as Linux probes */
 +	step_done();
 +	branch_on(gpucc, 0x1098, "gpucc_cx_gmu");
@@ -468,7 +480,7 @@ index 0000000..cfa60a4
 +	if (!gdsc_on(0x100c, 0x1008, 0x1508, 0x100c, "gpu_gx_gdsc")) {
 +		return false;
 +	}
-+	ok &= rcg_set(0x101c, SRC_GPLL0, 2, "gx_gfx3d_clk_src (300 MHz)");
++	ok &= rcg_set(0x101c, SRC_GPLL0, core_div, "gx_gfx3d_clk_src");
 +	rmw(gpucc, 0x1054, 0, (1u << 14) | (1u << 13));     /* force mem core / periph on */
 +	step_done();
 +	ok &= branch_on(gpucc, 0x1054, "gpucc_gx_gfx3d");
@@ -595,6 +607,7 @@ index 0000000..cfa60a4
 +	bool found = false;
 +
 +	LOG("--- zap shader (PAS %u)", GPU_PAS_ID);
++	step_done();
 +	mdt_size = fw_read("a610_zap.mdt", meta, POOL_SIZE - OFF_META);
 +	if (mdt_size < 52) {
 +		return false;
@@ -632,10 +645,13 @@ index 0000000..cfa60a4
 +	}
 +
 +	/* A half-finished PAS from an earlier try refuses everything: start clean */
++	step_done();
 +	st = scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, GPU_PAS_ID, 0, 0, &res);
 +	LOG("  shutdown: ret %llx res %llx", st, res);
++	step_done();
 +	st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), GPU_PAS_ID, meta_pa, 0, &res);
 +	LOG("  init_image: ret %llx res %llx (%lld bytes of metadata at %llx)", st, res, mdt_size, meta_pa);
++	step_done();
 +	if (st != 0 || res != 0) {
 +		/* already authenticated in this boot: ask TrustZone to resume it */
 +		st = scm(SCM_FN(SCM_SVC_BOOT, SCM_BOOT_SET_REMOTE_STATE), 2, 0, GPU_PAS_ID, 0, &res);
@@ -644,6 +660,7 @@ index 0000000..cfa60a4
 +	}
 +	st = scm(SCM_FN(SCM_SVC_PIL, PIL_MEM_SETUP), 3, GPU_PAS_ID, ZAP_PA, max_addr - min_addr, &res);
 +	LOG("  mem_setup %llx+%x: ret %llx res %llx", ZAP_PA, max_addr - min_addr, st, res);
++	step_done();
 +	if (st != 0 || res != 0) {
 +		return false;
 +	}
@@ -660,8 +677,11 @@ index 0000000..cfa60a4
 +		return false;
 +	}
 +	gmb();
++	LOG("  segment loaded at %llx, authenticating", ZAP_PA + (load_paddr - min_addr));
++	step_done();
 +	st = scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, GPU_PAS_ID, 0, 0, &res);
 +	LOG("  auth_and_reset: ret %llx res %llx resumes %u", st, res, scm_resumes);
++	step_done();
 +	return st == 0 && res == 0;
 +}
 +
@@ -782,6 +802,7 @@ index 0000000..cfa60a4
 +		if (rptr == wptr) {
 +			LOG("  %s: done (rptr %u) after ~%u us, RBBM_STATUS %08x", what, rptr, i * 10,
 +			    grd(REG_RBBM_STATUS));
++			step_done();
 +			return true;
 +		}
 +		IODelay(10);
@@ -789,6 +810,7 @@ index 0000000..cfa60a4
 +	LOG("  %s: TIMEOUT rptr %u wptr %u RBBM_STATUS %08x INT_0_STATUS %08x CP_HW_FAULT %08x", what, rptr, wptr,
 +	    grd(REG_RBBM_STATUS), grd(REG_RBBM_INT_0_STATUS), grd(REG_CP_HW_FAULT));
 +	smmu_fault(what);
++	step_done();
 +	return false;
 +}
 +
@@ -804,6 +826,7 @@ index 0000000..cfa60a4
 +	int64_t fw_size;
 +
 +	LOG("--- CP start");
++	step_done();
 +	/* adreno_fw_create_bo copies the firmware from its second dword on */
 +	fw_size = fw_read("a630_sqe.fw", sqe, OFF_RING - OFF_SQE);
 +	if (fw_size <= 4) {
@@ -818,11 +841,15 @@ index 0000000..cfa60a4
 +	gmb();
 +	LOG("  sqe %lld bytes at %llx, ring at %llx, test buffer at %llx", fw_size - 4, POOL_PA + OFF_SQE,
 +	    POOL_PA + OFF_RING, POOL_PA + OFF_TEST);
++	step_done();
 +
 +	if (!smmu_identity()) {
 +		return false;
 +	}
++	step_done();
 +	hw_init_regs();
++	LOG("  hw_init done: RBBM_STATUS %08x", grd(REG_RBBM_STATUS));
++	step_done();
 +	gwr64(REG_CP_SQE_INSTR_BASE, POOL_PA + OFF_SQE);
 +	gwr64(REG_CP_RB_BASE, POOL_PA + OFF_RING);
 +	/* 32 KB ring, 32-byte blocks, the CP does not write the read pointer back to memory */
@@ -832,6 +859,7 @@ index 0000000..cfa60a4
 +	gwr(REG_CP_SQE_CNTL, 1);
 +	LOG("  SQE started: RBBM_STATUS %08x CP_HW_FAULT %08x rptr %u", grd(REG_RBBM_STATUS), grd(REG_CP_HW_FAULT),
 +	    grd(REG_CP_RB_RPTR));
++	step_done();
 +
 +	emit(pkt7(CP_ME_INIT, 8));
 +	emit(0x2f);
@@ -855,6 +883,7 @@ index 0000000..cfa60a4
 +		/* no zap shader: tell the hardware directly, and hope the bootloader left it open */
 +		gwr(REG_RBBM_SECVID_TRUST_CNTL, 0);
 +		LOG("  no zap shader: RBBM_SECVID_TRUST_CNTL = 0, RBBM_STATUS %08x", grd(REG_RBBM_STATUS));
++		step_done();
 +	}
 +	emit(pkt7(CP_MEM_WRITE, 3));
 +	emit((uint32_t)(POOL_PA + OFF_TEST));
@@ -867,6 +896,7 @@ index 0000000..cfa60a4
 +	gmb();
 +	LOG("  test buffer: %08x (c0ffee00 = the GPU wrote it)", test_buf[0]);
 +	smmu_fault("after the test");
++	step_done();
 +	return test_buf[0] == 0xC0FFEE00;
 +}
 +
@@ -884,12 +914,15 @@ index 0000000..cfa60a4
 +	 * only be readable from recovery; with a delay it lands in the live log instead.
 +	 */
 +	(void)PE_parse_boot_argn("gpu_slow", &slow_ms, sizeof(slow_ms));
++	if (PE_parse_boot_argn("gpu_div", &core_div, sizeof(core_div)) && (core_div < 2 || core_div > 16)) {
++		core_div = 2;
++	}
 +	if (PE_parse_boot_argn("gpu_delay", &delay_s, sizeof(delay_s)) && delay_s != 0) {
 +		LOG("starting in %u s", delay_s);
 +		IOSleep(delay_s * 1000);
 +	}
-+	LOG("stage %u (Adreno 610 v2, regs %llx, GPU CC %llx), %u ms after each step", stage, GPU_PA, GPUCC_PA,
-+	    slow_ms);
++	LOG("stage %u (Adreno 610 v2, regs %llx, GPU CC %llx), core GPLL0/%u = %u MHz, %u ms after each step",
++	    stage, GPU_PA, GPUCC_PA, core_div, 600 / core_div, slow_ms);
 +
 +	gcc_map = map_phys(GCC_PA, GCC_SIZE);
 +	gpucc_map = map_phys(GPUCC_PA, GPUCC_SIZE);
@@ -1028,6 +1061,3 @@ index cc24c81..c7e119a 100644
  iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
  iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
  iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
--- 
-2.43.0
-
