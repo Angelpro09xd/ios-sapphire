@@ -167,10 +167,12 @@ after `gpu_delay` default to the behaviour that has already run, so a boot chang
 | `gpu_div=N` | run the core at GPLL0/N: 2 = 300 MHz (the default), 8 = 75 MHz |
 | `gpu_smmu_early=1` | program the identity SMMU bank as soon as its clock is voted, before the GX domain, so the GPU never sees the bus without a context bank |
 
-Both `gpu=3` and `gpu=4` need the microcode `a630_sqe.fw` (it is in
-[linux-firmware](https://gitlab.com/kernel-firmware/linux-firmware) as `qcom/a630_sqe.fw`, and the
-phone has its own copy); `gpu=3` also needs this phone's signed `a610_zap` shader, which exists
-only on the device. Neither is in this repository. The simplest way to give them to the driver is
+Both `gpu=3` and `gpu=4` need the microcode `a630_sqe.fw`, and `gpu=3` also needs this phone's
+signed `a610_zap` shader. Both come off the phone's own `/vendor/firmware`, which is an EROFS
+logical partition in `super`, in slot `_b` on this device (`HANDOFF.md` has the three commands);
+the microcode is also in [linux-firmware](https://gitlab.com/kernel-firmware/linux-firmware) as
+`qcom/a630_sqe.fw`, in a different build (34188 bytes against the vendor's 32504). Neither is in
+this repository, and neither should be put in it. The simplest way to give them to the driver is
 to put them in the boot image's device tree:
 
 ```sh
