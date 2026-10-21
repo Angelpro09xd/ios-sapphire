@@ -1,4 +1,4 @@
-From b72eb73ef43063002b592a4cedca54904223d7cd Mon Sep 17 00:00:00 2001
+From e02b98dbe761bde7a5fcbb4da9486900f70680cb Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 06:53:53 +0000
 Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
@@ -20,18 +20,18 @@ zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
 Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
 files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 1161 +++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireGpu.cpp      | 1204 +++++++++++++++++++++++++
  iokit/Kernel/arm/SweetFramebuffer.cpp |    2 +
  iokit/conf/files.arm64                |    1 +
- 3 files changed, 1164 insertions(+)
+ 3 files changed, 1207 insertions(+)
  create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 new file mode 100644
-index 0000000..bff26b3
+index 0000000..7bf88b3
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -0,0 +1,1161 @@
+@@ -0,0 +1,1204 @@
 +/*
 + * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
 + *
@@ -143,7 +143,13 @@ index 0000000..bff26b3
 +#define SRC_GPLL0           5                   /* GPLL0_OUT_MAIN in the GPU CC parent maps */
 +
 +/* A6xx registers, dword offsets (registers/adreno/a6xx.xml) */
++#define REG_RBBM_GBIF_HALT      0x0016
++#define REG_RBBM_GBIF_HALT_ACK  0x0017
 +#define REG_RBBM_INT_CLEAR_CMD  0x0037
++#define REG_GBIF_HALT           0x3c45
++#define REG_GBIF_HALT_ACK       0x3c46
++#define GBIF_CLIENT_HALT        (1u << 0)
++#define GBIF_ARB_HALT           (1u << 1)
 +#define REG_RBBM_INT_0_MASK     0x0038
 +#define REG_RBBM_INT_0_STATUS   0x0201
 +#define REG_RBBM_STATUS         0x0210
@@ -258,7 +264,7 @@ index 0000000..bff26b3
 +/*
 + * boot-arg gpu_stop=N ends stage 3 early: 1 after the zap shader, 2 once the SQE runs, 3 after
 + * CP_ME_INIT, 4 after CP_SET_SECURE_MODE; 0 (default) runs it all. boot-arg gpu_keep=1 leaves
-+ * the GPU running afterwards; by default it is parked (SQE halted, GX and CX collapsed), as
++ * the GPU running afterwards; by default it is parked (bus drained, GX and CX collapsed), as
 + * Linux does once a GPU goes idle. Both exist for the one stage-3 boot whose panel stopped
 + * taking DSI commands right after the GPU ran ("panel level: NO DONE", the screen filled with
 + * colours), when stage 2 and stage 4 did not: they say which step does it, and whether it
@@ -615,6 +621,45 @@ index 0000000..bff26b3
 +	rmw(gpucc, 0x5000, CBCR_EN, 0);
 +	rmw(gpucc, 0x106c, 0, GDSC_COLLAPSE);
 +	LOG("  gx gdscr %08x, cx gdscr %08x", rd(gpucc, 0x100c), rd(gpucc, 0x106c));
++}
++
++/*
++ * Linux a6xx_bus_clear_pending_transactions(gx_off = true), which a GPU without a GMU runs
++ * before every power collapse: halt the GX side of GBIF, then new client requests, then all
++ * AXI requests, waiting for each ack, and release the GBIF halt. Collapsing the domains with
++ * the CP's transactions still in flight leaves GBIF wedged mid-transfer, and the memory NoC
++ * the display fetches from with it: the panel underflows to a flat colour and its DSI
++ * commands stop completing. That is what every boot that parked the GPU after its CP had
++ * run did (gpu_stop=3, 4 and the full stage 3), and what neither the zap-only boot nor the
++ * one that left the GPU running did. RBBM_GBIF_HALT stays set; hw_init_regs clears it.
++ */
++static bool
++halt_ack(uint32_t reg, uint32_t mask)
++{
++	for (int i = 0; i < 1000; i++) {
++		if ((grd(reg) & mask) == mask) {
++			return true;
++		}
++		IODelay(1);
++	}
++	return false;
++}
++
++static void
++bus_drain(void)
++{
++	bool gx, client, arb;
++
++	gwr(REG_RBBM_GBIF_HALT, 1);
++	gx = halt_ack(REG_RBBM_GBIF_HALT_ACK, 1);
++	gwr(REG_GBIF_HALT, GBIF_CLIENT_HALT);
++	client = halt_ack(REG_GBIF_HALT_ACK, GBIF_CLIENT_HALT);
++	gwr(REG_GBIF_HALT, GBIF_ARB_HALT);
++	arb = halt_ack(REG_GBIF_HALT_ACK, GBIF_ARB_HALT);
++	gwr(REG_GBIF_HALT, 0);
++	gmb();
++	LOG("  bus drained: GX %s, clients %s, AXI %s (GBIF_HALT_ACK %08x)", gx ? "halted" : "NO ACK",
++	    client ? "halted" : "NO ACK", arb ? "halted" : "NO ACK", grd(REG_GBIF_HALT_ACK));
 +}
 +
 +/* The counter runs off the 19.2 MHz crystal: ~192000 ticks in 10 ms means the GPU is alive. */
@@ -1165,10 +1210,8 @@ index 0000000..bff26b3
 +	if (keep_running) {
 +		LOG("gpu_keep=1: the GPU stays up");
 +	} else {
-+		/* park it: halt the SQE, then collapse GX and CX */
-+		gwr(REG_CP_SQE_CNTL, 0);
-+		gmb();
-+		LOG("parking the GPU: SQE halted, RBBM_STATUS %08x", grd(REG_RBBM_STATUS));
++		LOG("parking the GPU: RBBM_STATUS %08x", grd(REG_RBBM_STATUS));
++		bus_drain();
 +		power_down();
 +	}
 +	thread_terminate(current_thread());

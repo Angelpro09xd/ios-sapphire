@@ -58,6 +58,20 @@ over the adb tunnel; explicit OK before `fastboot flash userdata`.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
+**sapphire: the yellow screen is a power collapse with the GPU's bus still busy (2026-10-21, kernel out-cm11 / ab733d3, all `gpu=3 gpu_delay=60`).** The bisect, one boot each, screen reported by the user (photo: the whole panel a flat pale yellow-green, a typical display underflow fill):
+
+| image | what it did | screen |
+| --- | --- | --- |
+| `gpu_stop=1` | zap shader only, then parked (the CP never started) | clean |
+| `gpu_stop=3` | up to `CP_ME_INIT`, then parked | **yellow** |
+| `gpu_stop=4` | up to `CP_SET_SECURE_MODE 0`, then parked | **yellow** |
+| full stage 3 | everything, then parked | **yellow** |
+| `gpu_keep=1` | everything, GPU left running | clean |
+
+So neither the zap shader nor any command breaks the display: **collapsing the GPU after its CP has run does**. The parking code halted the SQE and collapsed GX and CX straight away; Linux never does that on a GPU without a GMU — `a6xx_pm_suspend` first calls `a6xx_bus_clear_pending_transactions(gx_off = true)`: `RBBM_GBIF_HALT` = 1 and wait for `RBBM_GBIF_HALT_ACK`, then `GBIF_HALT` client bit and ack, then the arbiter bit and ack, then `GBIF_HALT` = 0. Collapsing with the CP's transactions in flight leaves GBIF stuck mid-transfer, and with it the memory NoC the display fetches from: the MDP underflows to a flat colour and its DSI command engine stops completing (`panel level 0x133: NO DONE`). With the CP never started there is nothing in flight, hence the clean `gpu_stop=1`. The one colour boot of the morning without parking (3L10, once of three) is the same thing without a power collapse to set it off for certain — most likely the CP's stray access after `CP_ME_INIT` (`FAR 00014810281091c0`) left a transaction hanging; that access is the next thing to fix.
+
+Fix in 0145: `bus_drain()` before `power_down()` when parking (and no SQE halt, which Linux does not do either), logging each ack. Next boot: the same full stage 3 with parking; clean means this is it.
+
 **sapphire: what stage 3 does to the panel — the DSI command engine stops answering (2026-10-21, logs `logs/sapphire-gpu3-executes.txt`, `logs/sapphire-gpu4-hang2.txt`).** The colours the user saw are not a mis-set panel from the start: the panel worked up to the GPU run and **only after `*** the GPU executes commands ***` do the panel's DSI commands stop completing**. Counted across boots:
 
 | boot | `panel level 0x133` | `panel display on/off` |
