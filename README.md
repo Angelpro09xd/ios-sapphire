@@ -169,6 +169,7 @@ after `gpu_delay` default to the behaviour that has already run, so a boot chang
 | `gpu_smmu_early=1` | program the identity SMMU bank as soon as its clock is voted, before the GX domain, so the GPU never sees the bus without a context bank |
 | `gpu_stop=N` | end stage 3 early: 1 after the zap shader, 2 once the SQE runs, 3 after `CP_ME_INIT`, 4 after `CP_SET_SECURE_MODE` |
 | `gpu_keep=1` | leave the GPU running at the end; by default it is parked (GBIF bus drained, GX and CX collapsed) |
+| `gpu_draw=0` | skip the first draw (a 256×256 solid fill with the 2D blitter, read back by the CPU) that stage 3 now does after its test |
 | `gpu_irq=1` | leave the GPU's interrupt (SPI 177, INTID 209) alone. By default it is masked in the GIC distributor before anything is powered, and at the GPU once its registers answer: it is level triggered and nothing here handles it, which is what the deaths above look like |
 
 Both `gpu=3` and `gpu=4` need the microcode `a630_sqe.fw`, and `gpu=3` also needs this phone's

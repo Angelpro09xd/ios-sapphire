@@ -1,4 +1,4 @@
-From e02b98dbe761bde7a5fcbb4da9486900f70680cb Mon Sep 17 00:00:00 2001
+From 087e246093555c017f442d6d22c1dc4ed282a3de Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 06:53:53 +0000
 Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
@@ -20,18 +20,18 @@ zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
 Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
 files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 1204 +++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireGpu.cpp      | 1380 +++++++++++++++++++++++++
  iokit/Kernel/arm/SweetFramebuffer.cpp |    2 +
  iokit/conf/files.arm64                |    1 +
- 3 files changed, 1207 insertions(+)
+ 3 files changed, 1383 insertions(+)
  create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 new file mode 100644
-index 0000000..7bf88b3
+index 0000000..cdb6e29
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -0,0 +1,1204 @@
+@@ -0,0 +1,1380 @@
 +/*
 + * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
 + *
@@ -131,6 +131,11 @@ index 0000000..7bf88b3
 +#define OFF_RING            0x10000u            /* 32 KB, 64 KB aligned */
 +#define OFF_TEST            0x18000u            /* what CP_MEM_WRITE writes */
 +#define OFF_META            0x19000u            /* zap metadata, read by TrustZone */
++#define OFF_FENCE           0x18100u            /* where the CCU/cache flush events write their seqno */
++#define OFF_DRAW            0x40000u            /* what the 2D blitter fills: 256 x 256 RGBA8, 256 KB */
++#define DRAW_W              256u
++#define DRAW_H              256u
++#define DRAW_PITCH          (DRAW_W * 4u)       /* bytes; the blitter wants a multiple of 64 */
 +#define RING_BYTES          0x8000u
 +#define RING_DWORDS         (RING_BYTES / 4)
 +
@@ -166,6 +171,35 @@ index 0000000..7bf88b3
 +#define CP_ME_INIT              0x48
 +#define CP_MEM_WRITE            0x3d
 +#define CP_SET_SECURE_MODE      0x66
++#define CP_WAIT_FOR_IDLE        0x26
++#define CP_EVENT_WRITE          0x46
++#define CP_SET_MARKER           0x65
++#define CP_BLIT                 0x2c
++
++/*
++ * The 2D blitter, as Mesa's freedreno does a buffer clear on a6xx gen1 (fd6_blitter.cc
++ * fd6_clear_buffer, emit_setup / emit_blit_setup / emit_blit_fini; offsets and fields from the
++ * same tree's registers/adreno/a6xx.xml, a610's values from common/freedreno_devices.py).
++ */
++#define REG_RB_A2D_BLT_CNTL         0x8c00
++#define REG_RB_A2D_PIXEL_CNTL       0x8c01
++#define REG_RB_A2D_DEST_BUFFER_INFO 0x8c17      /* + BASE (64-bit) at 0x8c18, PITCH at 0x8c1a */
++#define REG_RB_A2D_CLEAR_COLOR_DW0  0x8c2c      /* DW0..DW3 */
++#define REG_GRAS_A2D_BLT_CNTL       0x8400
++#define REG_GRAS_A2D_DEST_TL        0x8405      /* + BR at 0x8406 */
++#define REG_SP_A2D_OUTPUT_INFO      0xacc0
++#define REG_RB_CCU_CNTL             0x8e07
++#define REG_RB_DBG_ECO_CNTL         0x8e04
++#define REG_RB_RBP_CNTL             0x8e01
++#define FMT6_8_8_8_8_UNORM          0x30
++#define RM6_BLIT2DSCALE             12
++#define BLIT_OP_SCALE               3
++#define EV_PC_CCU_FLUSH_COLOR_TS    0x1d
++#define EV_PC_CCU_FLUSH_DEPTH_TS    0x1c
++#define EV_PC_CCU_INVALIDATE_COLOR  0x19
++#define EV_PC_CCU_INVALIDATE_DEPTH  0x18
++#define EV_CACHE_FLUSH_TS           0x04
++#define EV_DEBUG_LABEL              0x3f
 +
 +/* TrustZone (same calls as TopazModem's PAS boot, with the GPU's PAS id) */
 +#define SCM_FN(svc, cmd)    (0x42000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
@@ -271,6 +305,7 @@ index 0000000..7bf88b3
 + * lasts only while the GPU is up.
 + */
 +static uint32_t stop_at, keep_running;
++static uint32_t draw_first = 1;                 /* boot-arg gpu_draw=0 skips the 2D fill */
 +static bool stopped_early;
 +
 +static bool
@@ -953,6 +988,13 @@ index 0000000..7bf88b3
 +	return 0x70000000u | cnt | (par(cnt) << 15) | ((op & 0x7F) << 16) | (par(op) << 23);
 +}
 +
++/* Type-4 packet header: write cnt registers from reg on, with the same odd-parity bits. */
++static uint32_t
++pkt4(uint32_t reg, uint32_t cnt)
++{
++	return 0x40000000u | cnt | (par(cnt) << 7) | ((reg & 0x3FFFF) << 8) | (par(reg) << 27);
++}
++
 +static void
 +emit(uint32_t v)
 +{
@@ -1082,6 +1124,134 @@ index 0000000..7bf88b3
 +	return test_buf[0] == 0xC0FFEE00;
 +}
 +
++static void
++reg1(uint32_t reg, uint32_t v)
++{
++	emit(pkt4(reg, 1));
++	emit(v);
++}
++
++static void
++event(uint32_t ev, bool ts)
++{
++	static uint32_t seqno;
++
++	if (!ts) {
++		emit(pkt7(CP_EVENT_WRITE, 1));
++		emit(ev);
++		return;
++	}
++	emit(pkt7(CP_EVENT_WRITE, 4));
++	emit(ev | (1u << 30));                     /* TIMESTAMP: write the seqno below */
++	emit((uint32_t)(POOL_PA + OFF_FENCE));
++	emit((uint32_t)((POOL_PA + OFF_FENCE) >> 32));
++	emit(++seqno);
++}
++
++/*
++ * The first thing the GPU draws: a 256 x 256 RGBA8 solid fill with the 2D blitter, into a
++ * buffer the CPU has filled with a pattern first, then read back pixel by pixel. Mesa's order:
++ * clean + invalidate the CCU, render mode BLIT2DSCALE, CCU in bypass (sysmem) layout, the
++ * a610 "magic" registers its batches start with, the clear colour, blit format and
++ * destination, a label event, CP_BLIT(SCALE), then clean the CCU and the caches and wait for
++ * idle so the pixels are in RAM before the fence.
++ */
++static bool
++blit_fill(uint32_t rgba)
++{
++	uint32_t *pix = (uint32_t *)(pool + OFF_DRAW);
++	uint64_t dst = POOL_PA + OFF_DRAW;
++	uint32_t fmt = FMT6_8_8_8_8_UNORM;
++	uint32_t blt = (0xFu << 20) | (fmt << 8) | (1u << 7);  /* MASK, COLOR_FORMAT, IFMT UNORM8, SOLID_COLOR */
++	uint32_t good = 0, bad_at = 0xFFFFFFFF, bad_val = 0;
++
++	LOG("--- first draw: 2D blitter, %ux%u RGBA8 at %llx, colour %08x", DRAW_W, DRAW_H, dst, rgba);
++	for (uint32_t i = 0; i < DRAW_W * DRAW_H; i++) {
++		pix[i] = 0xDEADBEEF;
++	}
++	gmb();
++
++	/* the a610's batch-start registers (freedreno_devices.py magic_regs / raw_magic_regs) */
++	reg1(0x9804, 0xf);                         /* PC_MODE_CNTL */
++	reg1(0x9805, 0);                           /* PC_POWER_CNTL */
++	reg1(0xa0f8, 0);                           /* VFD_POWER_CNTL */
++	reg1(0xb600, 0);                           /* TPL1_DBG_ECO_CNTL */
++	reg1(0x8600, 0);                           /* GRAS_DBG_ECO_CNTL */
++	reg1(0xae03, 0);                           /* SP_CHICKEN_BITS */
++	reg1(0xae00, 0);                           /* SP_DBG_ECO_CNTL */
++	reg1(0xbe04, 0);                           /* HLSQ_DBG_ECO_CNTL */
++	reg1(0x9600, 0);                           /* VPC_DBG_ECO_CNTL */
++	reg1(0x0e12, 0x10000000);                  /* UCHE_UNKNOWN_0E12 */
++	reg1(REG_RB_RBP_CNTL, 1);
++	reg1(REG_RB_DBG_ECO_CNTL, 0x04100000);     /* the same value for blits on a610: no toggling */
++
++	/* emit_setup */
++	event(EV_PC_CCU_FLUSH_COLOR_TS, true);
++	event(EV_PC_CCU_FLUSH_DEPTH_TS, true);
++	event(EV_PC_CCU_INVALIDATE_COLOR, false);
++	event(EV_PC_CCU_INVALIDATE_DEPTH, false);
++	emit(pkt7(CP_SET_MARKER, 1));
++	emit(RM6_BLIT2DSCALE);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	/* sysmem layout: depth cache at 0, colour at num_ccu (1) x 8 KB; fast clear off on gen1_low */
++	reg1(REG_RB_CCU_CNTL, (1u << 0) | ((0x2000u >> 12) << 23));
++
++	/* emit_clear_color (R2D_UNORM8: one byte per dword) and emit_blit_setup */
++	emit(pkt4(REG_RB_A2D_CLEAR_COLOR_DW0, 4));
++	emit((rgba >> 24) & 0xff);                 /* R */
++	emit((rgba >> 16) & 0xff);                 /* G */
++	emit((rgba >> 8) & 0xff);                  /* B */
++	emit(rgba & 0xff);                         /* A */
++	reg1(REG_RB_A2D_BLT_CNTL, blt);
++	reg1(REG_GRAS_A2D_BLT_CNTL, blt);
++	reg1(REG_SP_A2D_OUTPUT_INFO, (fmt << 3) | (0xFu << 12));  /* IFMT_TYPE FLOAT, COLOR_FORMAT, MASK */
++	reg1(REG_RB_A2D_PIXEL_CNTL, 0);
++
++	/* destination: linear, WZYX, pitch in 64-byte units */
++	emit(pkt4(REG_RB_A2D_DEST_BUFFER_INFO, 4));
++	emit(fmt);
++	emit((uint32_t)dst);
++	emit((uint32_t)(dst >> 32));
++	emit(DRAW_PITCH >> 6);
++	emit(pkt4(REG_GRAS_A2D_DEST_TL, 2));
++	emit(0);
++	emit((DRAW_W - 1) | ((DRAW_H - 1) << 16));
++
++	/* emit_blit_fini */
++	event(EV_DEBUG_LABEL, false);
++	emit(pkt7(CP_BLIT, 1));
++	emit(BLIT_OP_SCALE);
++
++	/* make the pixels land */
++	event(EV_PC_CCU_FLUSH_COLOR_TS, true);
++	event(EV_PC_CCU_FLUSH_DEPTH_TS, true);
++	event(EV_CACHE_FLUSH_TS, true);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	if (!submit("2D fill", 200)) {
++		return false;
++	}
++	IODelay(100);
++	gmb();
++
++	for (uint32_t i = 0; i < DRAW_W * DRAW_H; i++) {
++		if (pix[i] == __builtin_bswap32(rgba)) {
++			good++;
++		} else if (bad_at == 0xFFFFFFFF) {
++			bad_at = i;
++			bad_val = pix[i];
++		}
++	}
++	LOG("  pixels: first %08x, centre %08x, last %08x; %u of %u as expected (%08x in memory)", pix[0],
++	    pix[(DRAW_H / 2) * DRAW_W + DRAW_W / 2], pix[DRAW_W * DRAW_H - 1], good, DRAW_W * DRAW_H,
++	    __builtin_bswap32(rgba));
++	if (bad_at != 0xFFFFFFFF) {
++		LOG("  first wrong pixel: #%u (x %u, y %u) = %08x", bad_at, bad_at % DRAW_W, bad_at / DRAW_W, bad_val);
++	}
++	LOG("  RBBM_STATUS %08x CP_HW_FAULT %08x RBBM_INT_0_STATUS %08x", grd(REG_RBBM_STATUS), grd(REG_CP_HW_FAULT),
++	    grd(REG_RBBM_INT_0_STATUS));
++	return good == DRAW_W * DRAW_H;
++}
++
 +/* ---------------------------------------------------------------- bring-up thread */
 +
 +static void
@@ -1103,6 +1273,7 @@ index 0000000..7bf88b3
 +	(void)PE_parse_boot_argn("gpu_irq", &gpu_irq, sizeof(gpu_irq));
 +	(void)PE_parse_boot_argn("gpu_stop", &stop_at, sizeof(stop_at));
 +	(void)PE_parse_boot_argn("gpu_keep", &keep_running, sizeof(keep_running));
++	(void)PE_parse_boot_argn("gpu_draw", &draw_first, sizeof(draw_first));
 +	if (PE_parse_boot_argn("gpu_delay", &delay_s, sizeof(delay_s)) && delay_s != 0) {
 +		LOG("starting in %u s", delay_s);
 +		IOSleep(delay_s * 1000);
@@ -1204,6 +1375,11 @@ index 0000000..7bf88b3
 +		;
 +	} else if (cp_start(stage == 3)) {
 +		LOG("*** the GPU executes commands ***");
++		if (draw_first && blit_fill(0xFF8000FF)) {
++			LOG("*** the GPU drew: every pixel of the 2D fill is right ***");
++		} else if (draw_first) {
++			LOG("the 2D fill did not come out right");
++		}
 +	} else if (!stopped_early) {
 +		LOG("the command processor did not come up");
 +	}
