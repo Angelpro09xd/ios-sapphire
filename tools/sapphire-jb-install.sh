@@ -31,7 +31,7 @@ for app in "$mnt"/private/var/jb/Applications/*.app; do
 	[ -d "$app" ] || continue
 	n=$(basename "$app")
 	rm -rf "$mnt/Applications/$n"
-	cp -a "$app" "$mnt/Applications/$n"
+	(cd "$(dirname "$app")" && tar -cf - "$n") | (cd "$mnt/Applications" && tar -xpf - --same-owner)   # (cp copies ACLs: this hfsplus has none)
 	apps="$apps /Applications/$n"
 done
 for c in chmod cp mkdir mv rm; do
