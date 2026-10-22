@@ -4,7 +4,7 @@
 
 A port of [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz) (itself a port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)) to the Xiaomi **Redmi Note 13 4G** (`sapphire` / `sapphiren`, Qualcomm **SM6225 "khaje"** / Snapdragon 685). Apple's open-source XNU kernel (xnu-8796) boots from RAM through a small boot shim, and on top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd and SpringBoard.
 
-The Redmi Note 12 4G (topaz) and the Redmi Note 13 4G share the SoC, the memory carve-outs and most of the board, so this fork follows the topaz branch and adds what differs on sapphire (patches 0140–0150, the shim's DDR handling and the tools below).
+The Redmi Note 12 4G (topaz) and the Redmi Note 13 4G share the SoC, the memory carve-outs and most of the board, so this fork follows the topaz branch and adds what differs on sapphire (patches 0140–0151, the shim's DDR handling and the tools below).
 
 > Experimental bring-up, not a usable phone OS. Many things are missing or stubbed, and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**. The kernel is started from RAM with `fastboot boot`; boot partitions do not need to be flashed.
 
@@ -135,6 +135,7 @@ nc -ukl 5140          # live kernel console
 | 0148 | the GPU for user space: `IOServiceOpen` type `'SGPU'` on IOAcceleratorES gives buffers (mapped write-combined, at GPU addresses 0x01000000–0x10000000), IOSurface import, cache sync and submit with a fence; needs `gpu_service` up. Used by `metal/SapphireMetal/sgpu.c`; a development interface, no register protection yet |
 | 0149 | SapphireGPU: the Adreno for Mesa's freedreno through Linux's msm DRM interface, with HackiOS's ABI (request number = selector, client memory = buffer handle, 0x7e = IOSurface as a buffer). Kernel-chosen GPU addresses 0x60000000–0xE0000000, cacheable buffers cleaned before submits, page tables grown into a second low-bank region. Needs `gpu_service` up |
 | 0150 | Wi-Fi for iOS, from HackiOS: `en0` (interface KPI), the station thread, Apple80211 answered in the kernel for wifid and Settings, and the registry entries configd and wifid look for; fed by upstream's WCN3988 station (`bsd/dev/sapphire_wlan.c`). Boot arg `wifi=1` |
+| 0151 | The GPU for 60 fps: asynchronous msm submissions with fences, buffers given back while in use freed at their fence, up to 256 command buffers per submission; Mesa's buffers from the unused DDR at 0x1_0000_0000 (1 GB) mapped write-combined (no cache maintenance; `gpu_pool=0` turns it off); the display skips cleaning surfaces the GPU drew; no per-submission log lines |
 | `shim/` | DDR bank end from ABL's `/memory` node; RAM size clamped to it |
 | `tools/mkadt.py` | sapphire identity in the ADT |
 | `tools/sapphire-boot.sh`, `sapphire-root.sh` | Boot image and root image for sapphire |

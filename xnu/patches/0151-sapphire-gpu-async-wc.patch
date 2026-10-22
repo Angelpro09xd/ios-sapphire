@@ -1,0 +1,604 @@
+From 6de6d41bd9d1dc2a078a2b6eed1f7709bd9da738 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 22 Oct 2026 11:38:37 +0000
+Subject: [PATCH] sapphire-0151: the GPU for 60 fps: asynchronous submits,
+ write-combined GPU memory
+
+Measured with CoreAnimation on Mesa (0149): ~15 fps, frames spent
+waiting -- every submission ran to completion inside its call, every
+mapped buffer was cleaned out of the CPU caches first (~3.5 ms), the
+display cleaned each 1125x2436 frame (4.4 ms) the GPU had drawn, a
+submission of 68 command buffers was refused (limit 64), and every
+submission and frame copy printed a line.
+
+- submissions return at once with their fence (ring space checked);
+  WAIT_FENCE and GEM_CPU_PREP wait for it (2 s means the GPU hung and
+  the service stops); a buffer given back while still in use is freed
+  when its fence passes; up to 256 command buffers per submission.
+- Mesa's buffers come from the unused DDR at 0x1_0000_0000 (1 GB, below
+  xnu's 0x1_4000_0000), mapped write-combined: no cache maintenance.
+  gpu_pool=0 goes back to 0149's cacheable buffers. GET_PARAM 0x1000
+  tells libdrm which.
+- the display skips the clean of a surface the GPU drew since its seed.
+- no per-submission log lines once the service is up.
+---
+ iokit/Kernel/arm/SapphireGpu.cpp      | 346 ++++++++++++++++++++++++--
+ iokit/Kernel/arm/SweetFramebuffer.cpp |   9 +-
+ iokit/Kernel/arm/SweetSurface.h       |   4 +-
+ 3 files changed, 330 insertions(+), 29 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index 2271633..7700592 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -286,6 +286,7 @@ static uint32_t stop_at, keep_running;
+ static uint32_t draw_first = 1;                 /* boot-arg gpu_draw=0 skips the 2D fill */
+ static bool stopped_early;
+ static bool service_ok;                         /* stage 3 and the draw tests passed */
++static volatile bool service_ready;              /* gpu_service: the GPU takes work from the rest of the kernel */
+ 
+ static bool
+ stop_here(uint32_t step, const char *what)
+@@ -1186,8 +1187,10 @@ submit(const char *what, uint32_t ms)
+ 	for (uint32_t i = 0; i < ms * 100; i++) {
+ 		rptr = grd(REG_CP_RB_RPTR);
+ 		if (rptr == wptr) {
+-			LOG("  %s: done (rptr %u) after ~%u us, RBBM_STATUS %08x", what, rptr, i * 10,
+-			    grd(REG_RBBM_STATUS));
++			if (!service_ready) {           /* (the tests' lines; frame after frame they cost time) */
++				LOG("  %s: done (rptr %u) after ~%u us, RBBM_STATUS %08x", what, rptr, i * 10,
++				    grd(REG_RBBM_STATUS));
++			}
+ 			step_done();
+ 			return true;
+ 		}
+@@ -1200,6 +1203,28 @@ submit(const char *what, uint32_t ms)
+ 	return false;
+ }
+ 
++/* Room for `need` more dwords in the ring (the CP reads behind us): wait up to ms. */
++static bool
++ring_room(uint32_t need, uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms * 100; i++) {
++		uint32_t rptr = grd(REG_CP_RB_RPTR), w = ring_wptr % RING_DWORDS;
++		if ((rptr + RING_DWORDS - w - 1) % RING_DWORDS >= need) {
++			return true;
++		}
++		IODelay(10);
++	}
++	return false;
++}
++
++/* Hand what was emitted to the CP and return at once (the msm client's submissions). */
++static void
++kick(void)
++{
++	gmb();
++	gwr(REG_CP_RB_WPTR, ring_wptr % RING_DWORDS);
++}
++
+ /*
+  * Start the command processor and prove it runs: its microcode (a630_sqe.fw without its
+  * first dword, as adreno_fw_create_bo copies it), a 32 KB ring, CP_ME_INIT, then leaving
+@@ -1843,7 +1868,7 @@ replay_3d(void)
+ #define WIN_COUNT           4u
+ 
+ static uint32_t service;
+-static volatile bool service_ready;
++/* service_ready: defined at the top (submit() reads it) */
+ static IOLock *service_lock;
+ static struct {
+ 	IOMemoryDescriptor *md;
+@@ -1959,6 +1984,11 @@ sapphire_gpu_copy(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src_pitch,
+ 	if (service_ready) {
+ 		uint64_t va = map_window(src);
+ 		bool dst_ok = map_identity(dst_base, dst_size);
++		if (!ring_room(1024, 200)) {
++			LOG("service: the ring stays full (the GPU stopped?): copy refused");
++			IOLockUnlock(service_lock);
++			return false;
++		}
+ 		if (va != 0 && dst_ok && src_off + (uint64_t)(h - 1) * src_pitch + w * 4u <= src->getLength()) {
+ 			ok = blit_copy(va + src_off, src_pitch, dst_pa, dst_pitch, w, h);
+ 			if (!ok) {
+@@ -2698,6 +2728,9 @@ SapphireGpuClient::run(uint64_t va, uint64_t dwords, uint64_t ms, uint64_t *out)
+ 		return kIOReturnBadArgument;
+ 	}
+ 	ms = ms == 0 ? 100 : (ms > 2000 ? 2000 : ms);
++	if (!ring_room(64, 2000)) {
++		return kIOReturnTimeout;
++	}
+ 	flushAll();                                 /* what the CPU wrote, out to RAM */
+ 	emit(pkt7(CP_INDIRECT_BUFFER, 3));
+ 	emit((uint32_t)va);
+@@ -2842,7 +2875,7 @@ sapphire_gpu_new_client(IOService *provider, task_t task, void *security, UInt32
+ #define MSM_PAGES           ((MSM_VA_END - MSM_VA_START) >> 12)
+ #define MSM_BUFFERS         4096u
+ #define MSM_BUFFER_MAX      (256ull << 20)
+-#define MSM_SUBMIT_CMDS     64u
++#define MSM_SUBMIT_CMDS     256u                /* Mesa sends 68 and more (a frame of CoreAnimation) */
+ #define MSM_SUBMIT_BOS      4096u
+ 
+ enum {
+@@ -2949,6 +2982,121 @@ msm_fence_done(uint32_t f)
+ 	return (int32_t)(*(volatile uint32_t *)(pool + OFF_FENCE) - f) >= 0;
+ }
+ 
++/*
++ * GPU memory (0151): the gigabyte from 0x1_0000_0000 to 0x1_4000_0000 is DDR that nobody uses
++ * here -- xnu runs from 0x1_4000_0000 (the shim clamps it there), the fixed firmware carve-outs
++ * end at 0x65b00000, the shim's payload is below 4 GB -- so Mesa's buffers come from it, mapped
++ * write-combined into the program (as the panel's own framebuffer surface is; the memory is not
++ * the kernel's, so no cache mode of its pages changes) and seen by the GPU without any cache
++ * maintenance: no buffer is cleaned before a submission any more. Contiguous runs of 4 KB pages,
++ * next fit. boot-arg gpu_pool=0: the cacheable kernel buffers of 0149 instead. GET_PARAM 0x1000
++ * tells the program which (its libdrm then asks for write-combined mappings).
++ */
++#define GPOOL_PA            0x100000000ull
++#define GPOOL_SIZE          0x40000000ull
++#define GPOOL_PAGES         (GPOOL_SIZE >> 12)
++static uint64_t gpool_bits[GPOOL_PAGES / 64];
++static uint64_t gpool_next;
++static int gpool_on = -1;
++
++static bool
++gpool_enabled(void)
++{
++	if (gpool_on < 0) {
++		uint32_t v = 1;
++		(void)PE_parse_boot_argn("gpu_pool", &v, sizeof(v));
++		gpool_on = v != 0;
++		LOG("msm: buffers %s", gpool_on ? "from the GPU pool 0x100000000-0x140000000, write-combined" :
++		    "cacheable kernel memory (gpu_pool=0)");
++	}
++	return gpool_on;
++}
++
++static void
++bits_mark(uint64_t *bits, uint64_t p0, uint64_t n, bool used)
++{
++	for (uint64_t p = p0; p < p0 + n; p++) {
++		if (used) {
++			bits[p >> 6] |= 1ull << (p & 63);
++		} else {
++			bits[p >> 6] &= ~(1ull << (p & 63));
++		}
++	}
++}
++
++/* n contiguous pages of the pool: their physical address, or 0. service_lock held. */
++static uint64_t
++gpool_alloc(uint64_t n)
++{
++	for (int pass = 0; pass < 2; pass++) {
++		uint64_t start = pass == 0 ? gpool_next : 0, end = pass == 0 ? GPOOL_PAGES : gpool_next, run = 0;
++		for (uint64_t p = start; p < end; p++) {
++			if ((p & 63) == 0 && run == 0 && gpool_bits[p >> 6] == ~0ull) {
++				p += 63;
++				continue;
++			}
++			run = ((gpool_bits[p >> 6] >> (p & 63)) & 1) ? 0 : run + 1;
++			if (run == n) {
++				bits_mark(gpool_bits, p + 1 - n, n, true);
++				gpool_next = p + 1;
++				return GPOOL_PA + ((p + 1 - n) << 12);
++			}
++		}
++	}
++	return 0;
++}
++
++/* Wait for fence f, without the service lock, up to ms; false if it never came. */
++static bool
++msm_wait(uint32_t f, uint64_t ms)
++{
++	uint64_t deadline, now;
++
++	if (msm_fence_done(f)) {
++		return true;
++	}
++	if (ms == 0) {
++		return false;
++	}
++	clock_interval_to_deadline((uint32_t)ms, kMillisecondScale, &deadline);
++	while (!msm_fence_done(f)) {
++		now = mach_absolute_time();
++		if (now >= deadline) {
++			return false;
++		}
++		delay_for_interval(50, NSEC_PER_USEC);
++	}
++	return true;
++}
++
++/* How long from now a time of msm's is (CLOCK_MONOTONIC = mach_continuous_time here), in ms; at most 2 s. */
++static uint64_t
++msm_ms_until(const struct msm_timespec *when)
++{
++	uint64_t now;
++	int64_t left;
++
++	absolutetime_to_nanoseconds(mach_continuous_time(), &now);
++	left = when->seconds * (int64_t)NSEC_PER_SEC + when->nanoseconds - (int64_t)now;
++	if (left <= 0) {
++		return 0;
++	}
++	return (uint64_t)left / NSEC_PER_MSEC > 2000 ? 2000 : (uint64_t)left / NSEC_PER_MSEC;
++}
++
++/* A submission that never finishes: the service stops (no more work is given to a GPU that may still write). */
++static void
++msm_hung(const char *who, uint32_t fence)
++{
++	if (service_ready) {
++		service_ready = false;
++		LOG("msm: %s: submission %u did not finish in 2 s (done: %u): the GPU service stops; RBBM_STATUS %08x CP_HW_FAULT %08x rptr %u wptr %u",
++		    who, fence, *(volatile uint32_t *)(pool + OFF_FENCE), grd(REG_RBBM_STATUS), grd(REG_CP_HW_FAULT),
++		    grd(REG_CP_RB_RPTR), ring_wptr % RING_DWORDS);
++		smmu_fault("msm");
++	}
++}
++
+ struct msm_bo {
+ 	IOMemoryDescriptor *md;                 /* NULL: free handle */
+ 	SweetSurface       *surf;
+@@ -2957,7 +3105,11 @@ struct msm_bo {
+ 	uint32_t            flags, seed;
+ 	uint64_t            cleaned;            /* surfaces: when they were last cleaned */
+ 	bool                mapped;             /* the program has mapped it: it may have written it */
++	bool                pooled;             /* GPU pool memory at pa (write-combined, never cleaned) */
++	uint64_t            pa;
++	uint32_t            fence;              /* the last submission that named it */
+ };
++#define MSM_LEFT            256u                /* buffers given back while the GPU still had them */
+ 
+ class SapphireGPU : public IOService {
+ 	OSDeclareDefaultStructors(SapphireGPU);
+@@ -2971,6 +3123,7 @@ class SapphireGPUClient : public IOUserClient {
+ public:
+ 	char            fName[32];
+ 	struct msm_bo  *fBo;                    /* handle n is fBo[n - 1] */
++	struct msm_bo  *fLeft;                  /* MSM_LEFT of them: kept until their fence */
+ 	uint32_t        fCount, fSubmits, fQueue;
+ 	uint64_t        fBytes;
+ 
+@@ -2984,6 +3137,8 @@ public:
+ 	struct msm_bo *slot(uint32_t *handle);
+ 	bool place(struct msm_bo *b);
+ 	void drop(struct msm_bo *b);
++	void freeBo(struct msm_bo *b);
++	void reap(void);
+ 	IOReturn gemNew(struct msm_gem_new *r);
+ 	IOReturn gemInfo(struct msm_gem_info *r);
+ 	IOReturn surface(struct msm_surface *r);
+@@ -3000,10 +3155,20 @@ SapphireGPUClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
+ 	}
+ 	proc_selfname(fName, sizeof(fName));
+ 	fBo = IONew(struct msm_bo, MSM_BUFFERS);
+-	if (fBo == NULL) {
++	fLeft = IONew(struct msm_bo, MSM_LEFT);
++	if (fBo == NULL || fLeft == NULL) {
++		if (fBo != NULL) {
++			IODelete(fBo, struct msm_bo, MSM_BUFFERS);
++			fBo = NULL;
++		}
++		if (fLeft != NULL) {
++			IODelete(fLeft, struct msm_bo, MSM_LEFT);
++			fLeft = NULL;
++		}
+ 		return false;
+ 	}
+ 	bzero(fBo, sizeof(struct msm_bo) * MSM_BUFFERS);
++	bzero(fLeft, sizeof(struct msm_bo) * MSM_LEFT);
+ 	fCount = fSubmits = fQueue = 0;
+ 	fBytes = 0;
+ 	LOG("msm: %s opened the GPU", fName);
+@@ -3059,9 +3224,9 @@ SapphireGPUClient::place(struct msm_bo *b)
+ 	return tlb_flush();
+ }
+ 
+-/* service_lock held; the GPU is idle (every submission finished before its call returned) */
++/* Free a buffer the GPU is done with. service_lock held. */
+ void
+-SapphireGPUClient::drop(struct msm_bo *b)
++SapphireGPUClient::freeBo(struct msm_bo *b)
+ {
+ 	uint64_t n = b->size >> 12;
+ 
+@@ -3074,19 +3239,73 @@ SapphireGPUClient::drop(struct msm_bo *b)
+ 		b->md->complete();
+ 		b->surf->release();
+ 	}
++	if (b->pooled) {
++		bits_mark(gpool_bits, (b->pa - GPOOL_PA) >> 12, n, false);
++	}
+ 	b->md->release();
+ 	fCount--;
+ 	fBytes -= b->size;
+ 	bzero(b, sizeof(*b));
+ }
+ 
++/* Buffers given back earlier whose submissions are done now: freed. service_lock held. */
++void
++SapphireGPUClient::reap(void)
++{
++	for (uint32_t i = 0; fLeft != NULL && i < MSM_LEFT; i++) {
++		if (fLeft[i].md != NULL && msm_fence_done(fLeft[i].fence)) {
++			fCount++;                       /* (counted out when it was left: release counts it again) */
++			fBytes += fLeft[i].size;
++			freeBo(&fLeft[i]);
++		}
++	}
++}
++
++/*
++ * GEM_CLOSE: the handle is free at once; the memory and the GPU addresses stay until the last
++ * submission that named the buffer is done. service_lock held.
++ */
++void
++SapphireGPUClient::drop(struct msm_bo *b)
++{
++	if (b->fence == 0 || msm_fence_done(b->fence) || !service_ready) {
++		freeBo(b);
++		return;
++	}
++	for (uint32_t i = 0; i < MSM_LEFT; i++) {
++		if (fLeft[i].md == NULL) {
++			fLeft[i] = *b;
++			fCount--;
++			fBytes -= b->size;
++			bzero(b, sizeof(*b));
++			return;
++		}
++	}
++	IOLockUnlock(service_lock);                 /* no room to leave it: wait for it */
++	if (!msm_wait(b->fence, 2000)) {
++		msm_hung(fName, b->fence);
++	}
++	IOLockLock(service_lock);
++	freeBo(b);
++}
++
+ IOReturn
+ SapphireGPUClient::clientClose(void)
+ {
++	if (service_ready && !msm_wait(fence_seq, 2000)) {     /* nothing of ours may still be at work */
++		msm_hung(fName, fence_seq);
++	}
+ 	IOLockLock(service_lock);
+ 	for (uint32_t i = 0; fBo != NULL && i < MSM_BUFFERS; i++) {
+ 		if (fBo[i].md != NULL) {
+-			drop(&fBo[i]);
++			freeBo(&fBo[i]);
++		}
++	}
++	for (uint32_t i = 0; fLeft != NULL && i < MSM_LEFT; i++) {
++		if (fLeft[i].md != NULL) {
++			fCount++;
++			fBytes += fLeft[i].size;
++			freeBo(&fLeft[i]);
+ 		}
+ 	}
+ 	IOLockUnlock(service_lock);
+@@ -3095,6 +3314,10 @@ SapphireGPUClient::clientClose(void)
+ 		IODelete(fBo, struct msm_bo, MSM_BUFFERS);
+ 		fBo = NULL;
+ 	}
++	if (fLeft != NULL) {
++		IODelete(fLeft, struct msm_bo, MSM_LEFT);
++		fLeft = NULL;
++	}
+ 	terminate();
+ 	return kIOReturnSuccess;
+ }
+@@ -3110,7 +3333,8 @@ SapphireGPUClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMem
+ 		b->md->retain();
+ 		b->mapped = true;
+ 		*memory = b->md;
+-		*options = kIOMapDefaultCache;          /* never write-combined (see above) */
++		/* pool memory write-combined; kernel memory never (see above). libdrm asks for the same. */
++		*options = b->pooled ? kIOMapWriteCombineCache : kIOMapDefaultCache;
+ 		r = kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(service_lock);
+@@ -3126,6 +3350,49 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 	if (size == 0 || size > MSM_BUFFER_MAX) {
+ 		return kIOReturnBadArgument;
+ 	}
++	if (gpool_enabled()) {
++		IOLockLock(service_lock);
++		uint64_t pa = gpool_alloc(size >> 12);
++		IOLockUnlock(service_lock);
++		if (pa == 0) {
++			LOG("msm: %s: the GPU pool has no %llu KB in one piece (%u buffers, %llu MB)", fName, size >> 10, fCount,
++			    fBytes >> 20);
++			return kIOReturnNoMemory;
++		}
++		IOMemoryDescriptor *pm = IOMemoryDescriptor::withPhysicalAddress(pa, size, kIODirectionInOut);
++		IOMemoryMap *km = pm != NULL ? pm->map(kIOMapWriteCombineCache) : NULL;
++		if (km != NULL) {
++			bzero((void *)km->getVirtualAddress(), size);
++			km->release();
++		}
++		IOLockLock(service_lock);
++		struct msm_bo *b = km != NULL ? slot(&h) : NULL;
++		if (b != NULL) {
++			b->md = pm;
++			b->kva = NULL;                  /* never cleaned: write-combined everywhere */
++			b->size = size;
++			b->flags = r->flags;
++			b->pooled = true;
++			b->pa = pa;
++			if (!place(b)) {
++				bzero(b, sizeof(*b));
++				b = NULL;
++			}
++		}
++		if (b != NULL) {
++			fCount++;
++			fBytes += size;
++			r->handle = h;
++		} else {
++			bits_mark(gpool_bits, (pa - GPOOL_PA) >> 12, size >> 12, false);
++		}
++		IOLockUnlock(service_lock);
++		if (b == NULL) {
++			OSSafeReleaseNULL(pm);
++			return kIOReturnNoMemory;
++		}
++		return kIOReturnSuccess;
++	}
+ 	IOBufferMemoryDescriptor *m = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryKernelUserShared, size, 4096);
+ 	if (m == NULL) {
+@@ -3271,6 +3538,13 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 		ret = kIOReturnNotReady;
+ 		goto out;
+ 	}
++	reap();
++	if (!ring_room(4 * r->nr_cmds + 16, 2000)) {
++		msm_hung(fName, fence_seq);
++		IOLockUnlock(service_lock);
++		ret = kIOReturnTimeout;
++		goto out;
++	}
+ 	{
+ 		uint64_t now = mach_absolute_time(), again;
+ 		nanoseconds_to_absolutetime(4 * NSEC_PER_MSEC, &again);
+@@ -3281,6 +3555,9 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 			}
+ 			if (b->surf != NULL && b->surf->state != NULL) {
+ 				uint32_t seed = *(volatile uint32_t *)((uint8_t *)b->surf->state->getBytesNoCopy() + 0xc);
++				/* the GPU has drawn it since that seed: the display need not clean it (SweetFramebuffer) */
++				b->surf->gpuSeed = seed;
++				b->surf->gpuDrawn = true;
+ 				if (seed == b->seed && !b->mapped && now - b->cleaned < again) {
+ 					continue;
+ 				}
+@@ -3313,27 +3590,22 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 		}
+ 		emit(pkt7(CP_WAIT_FOR_IDLE, 0));
+ 		event(EV_CACHE_FLUSH_TS, true);
+-		emit(pkt7(CP_WAIT_FOR_IDLE, 0));
+ 		r->fence = fence_seq;
+-		uint64_t t0 = mach_absolute_time(), ns;
+-		bool ok = submit("msm", 2000);
+-		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		kick();                                 /* and back to the program: msm_wait() is how it waits */
++		for (uint32_t i = 0; i < r->nr_bos; i++) {
++			struct msm_bo *b = bo(bos[i].handle);
++			if (b != NULL) {
++				b->fence = r->fence;
++			}
++		}
+ 		if (r->flags & MSM_SUBMIT_FENCE_FD_OUT) {
+ 			r->fence_fd = -1;
+ 		}
+ 		if (fSubmits++ < 4) {
+-			LOG("msm: %s: submission %u, %u command buffers in %u buffers, %llu us", fName, r->fence, n, r->nr_bos,
+-			    ns / 1000);
+-		}
+-		if (!ok) {
+-			service_ready = false;
+-			LOG("msm: %s: submission %u did not finish in 2 s: the GPU service stops; RBBM_STATUS %08x CP_HW_FAULT %08x",
+-			    fName, r->fence, grd(REG_RBBM_STATUS), grd(REG_CP_HW_FAULT));
+-			smmu_fault("msm submit");
+-			ret = kIOReturnTimeout;
+-		} else {
+-			ret = kIOReturnSuccess;
++			LOG("msm: %s: submission %u, %u command buffers in %u buffers (asynchronous)", fName, r->fence, n,
++			    r->nr_bos);
+ 		}
++		ret = kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(service_lock);
+ out:
+@@ -3360,6 +3632,7 @@ msm_param(uint32_t which, uint64_t *value)
+ 	case 0x07: *value = 1; return true;                     /* PRIORITIES */
+ 	case 0x08: case 0x09: case 0x0a: case 0x11: *value = 0; return true;  /* PP_PGTABLE FAULTS SUSPENDS RAYTRACING */
+ 	case 0x10: *value = 14; return true;                    /* HIGHEST_BANK_BIT */
++	case 0x1000: *value = gpool_enabled(); return true;     /* sapphire: buffers are write-combined (libdrm) */
+ 	default: return false;                                  /* VA_START/VA_SIZE among them */
+ 	}
+ }
+@@ -3409,9 +3682,21 @@ SapphireGPUClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 		ret = gemInfo(&r.gemInfo);
+ 		break;
+ 	case kMsmGemCpuPrep: {
+-		/* every submission is done already; the CPU is about to read: drop what it holds */
++		/* the CPU is about to use the buffer: the GPU done with it, and (kernel memory) nothing stale cached */
+ 		IOLockLock(service_lock);
+ 		struct msm_bo *b = bo(r.cpuPrep.handle);
++		uint32_t f = b != NULL ? b->fence : 0;
++		IOLockUnlock(service_lock);
++		if (b == NULL) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		if (f != 0 && !msm_wait(f, (r.cpuPrep.op & 0x04) ? 0 : msm_ms_until(&r.cpuPrep.timeout))) {
++			ret = kIOReturnBusy;            /* MSM_PREP_NOSYNC, or not done in time */
++			break;
++		}
++		IOLockLock(service_lock);
++		b = bo(r.cpuPrep.handle);
+ 		if (b != NULL && b->kva != NULL) {
+ 			sweet_dcache_flush((vm_offset_t)b->kva, (unsigned)b->size);
+ 		}
+@@ -3421,9 +3706,16 @@ SapphireGPUClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 	case kMsmGemSubmit:
+ 		ret = submitIt(&r.submit);
+ 		break;
+-	case kMsmWaitFence:
+-		ret = msm_fence_done(r.waitFence.fence) ? kIOReturnSuccess : kIOReturnTimeout;
++	case kMsmWaitFence: {
++		uint64_t ms = msm_ms_until(&r.waitFence.timeout);
++		if (!msm_wait(r.waitFence.fence, ms)) {
++			ret = kIOReturnTimeout;
++			if (ms >= 2000) {
++				msm_hung(fName, r.waitFence.fence);
++			}
++		}
+ 		break;
++	}
+ 	case kMsmGemMadvise:
+ 		r.madvise.retained = 1;
+ 		break;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 5473053..602cfd5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1166,7 +1166,14 @@ AppleCLCD::present(const uint8_t *rec)
+ 			uint64_t soff = s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
+ 			uint64_t dbase = fFlip[0] != NULL ? fFlipPhys[fFlipIdx ^ 1] : fPhys;
+ 			uint64_t t0 = mach_absolute_time();
+-			sweet_dcache_clean((vm_offset_t)(src + soff), (unsigned)((uint64_t)(h - 1) * s->bytesPerRow + (uint64_t)w * 4));
++			/*
++			 * sapphire 0151: a surface the GPU drew (msm client) and nobody locked since -- its seed
++			 * is the one of that submission -- has nothing of the CPU's in the caches to push out.
++			 */
++			uint32_t seed_now = s->state != NULL ? *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
++			if (!(s->gpuDrawn && seed_now == s->gpuSeed)) {
++				sweet_dcache_clean((vm_offset_t)(src + soff), (unsigned)((uint64_t)(h - 1) * s->bytesPerRow + (uint64_t)w * 4));
++			}
+ 			uint64_t t1 = mach_absolute_time();
+ 			if (sapphire_gpu_copy(s->memory, soff, s->bytesPerRow,
+ 			    dbase + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4, fRowBytes, (uint32_t)w, (uint32_t)h,
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index a2f7201..626953d 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -43,10 +43,12 @@ public:
+ 	int                       scanoutSlot;  /* pool slot, -1 when not from the pool */
+ 	OSDictionary             *values;       /* IOSurfaceSetValue & co. */
+ 	uint32_t                  purgeable;    /* IOSurfaceSetPurgeable state */
++	volatile uint32_t         gpuSeed;      /* sapphire 0151: the seed when the GPU last drew into it ... */
++	volatile bool             gpuDrawn;     /* ... (msm client): the display needs no cache clean then */
+ 	uint32_t                  wrapDelta;    /* wrapped client memory: where it starts in its first page */
+ 	bool                      wrapped;      /* memory is a prepared range of a task (IOSurfaceWrapClient*) */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { gpuSeed = 0; gpuDrawn = false; scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */

@@ -49,6 +49,46 @@ drmOpenWithType(const char *name, const char *busid, int type)
 	return dup(connection_fd);
 }
 
+/*
+ * sapphire (xnu 0151): the kernel's buffers come from GPU memory that is not the kernel's and
+ * are to be mapped write-combined (GET_PARAM 0x1000 says so); an IOSurface's memory is the
+ * kernel's and must stay cached (a write-combined mapping of it panics that kernel). So the
+ * handles that are surfaces are remembered here.
+ */
+#define SAPPHIRE_HANDLES        8192
+static uint8_t surface_handle[SAPPHIRE_HANDLES / 8];
+static int wc_buffers = -1;
+
+static void
+mark_surface(uint32_t handle, int on)
+{
+	if (handle < SAPPHIRE_HANDLES) {
+		if (on) {
+			surface_handle[handle >> 3] |= (uint8_t)(1u << (handle & 7));
+		} else {
+			surface_handle[handle >> 3] &= (uint8_t)~(1u << (handle & 7));
+		}
+	}
+}
+
+static int
+is_surface(uint32_t handle)
+{
+	return handle < SAPPHIRE_HANDLES && (surface_handle[handle >> 3] >> (handle & 7)) & 1;
+}
+
+static int call(unsigned number, void *data, size_t size);
+
+static int
+buffers_write_combined(void)
+{
+	if (wc_buffers < 0) {
+		struct { uint32_t pipe, param; uint64_t value; uint32_t len, pad; } p = { 0x10, 0x1000, 0, 0, 0 };
+		wc_buffers = call(0x40, &p, sizeof(p)) == 0 && p.value != 0;
+	}
+	return wc_buffers;
+}
+
 static int
 call(unsigned number, void *data, size_t size)
 {
@@ -84,6 +124,9 @@ drmIoctl(int fd, unsigned long request, void *arg)
 	if (error != 0) {
 		errno = error;
 		return -1;
+	}
+	if ((request & 0xff) == 0x09) {         /* GEM_CLOSE: the handle may come back as an ordinary buffer */
+		mark_surface(*(const uint32_t *)arg, 0);
 	}
 	return 0;
 }
@@ -157,7 +200,8 @@ redwood_drm_map(int fd, uint32_t handle, uint64_t size)
 	 * the program and the memory the GPU sees. So does the kernel's driver here: the memory is
 	 * made that way, and this mapping is as the memory is.
 	 */
-	if (IOConnectMapMemory64(connection, handle, mach_task_self(), &address, &mapped, kIOMapAnywhere) != 0) {
+	if (IOConnectMapMemory64(connection, handle, mach_task_self(), &address, &mapped,
+	    kIOMapAnywhere | (buffers_write_combined() && !is_surface(handle) ? kIOMapWriteCombineCache : 0)) != 0) {
 		return (void *)-1;              /* mmap()'s MAP_FAILED */
 	}
 	return (void *)(uintptr_t)address;
@@ -197,6 +241,7 @@ drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
 		return -1;
 	}
 	*handle = request.handle;
+	mark_surface(request.handle, 1);
 	return 0;
 }
 
