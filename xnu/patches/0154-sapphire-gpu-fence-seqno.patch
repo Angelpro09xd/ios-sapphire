@@ -1,0 +1,48 @@
+From 78a7b1cbe044da274578662f3664a677cb5d17fa Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 22 Oct 2026 12:47:18 +0000
+Subject: [PATCH] sapphire-0154: fences write the seqno, not the GPU's clock
+
+CP_EVENT_WRITE's bit 30 is TIMESTAMP: the CP writes its 64-bit always-on
+counter instead of the value in the packet (turnip sets it for trace
+timestamps). event() has set it since 0145, so every fence was that
+counter: "done" for any seqno while it was below 2^31 (the first ~112 s
+of a boot at 19.2 MHz) and never done after. Hidden while submissions
+were waited for; with 0151's asynchronous ones it made the false hang of
+0152 (the "pixel" 0x801d229c was the counter) and, with 0153's idle
+check, a 2 s wait for every frame after ~2 minutes of uptime.
+
+The events are now sent as Linux's a6xx_submit sends them: event only,
+the seqno written when it completes.
+---
+ iokit/Kernel/arm/SapphireGpu.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index 4f7e2f8..f6e5d58 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -1343,7 +1343,13 @@ event(uint32_t ev, bool ts)
+ 		return;
+ 	}
+ 	emit(pkt7(CP_EVENT_WRITE, 4));
+-	emit(ev | (1u << 30));                     /* TIMESTAMP: write the seqno below */
++	/*
++	 * 0154: the event alone, so the CP writes the seqno below when the event is done. Bit 30 of
++	 * this dword is TIMESTAMP, which writes the GPU's always-on counter (64 bits) instead -- what
++	 * turnip asks for in its trace timestamps -- and every fence of 0145-0153 was that counter:
++	 * "done" while it was under 2^31 (the first ~112 s of a boot at 19.2 MHz), never after.
++	 */
++	emit(ev);
+ 	emit((uint32_t)(POOL_PA + OFF_FENCE));
+ 	emit((uint32_t)((POOL_PA + OFF_FENCE) >> 32));
+ 	emit(++fence_seq);
+@@ -3646,7 +3652,7 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 		}
+ 		emit(pkt7(CP_WAIT_FOR_IDLE, 0));
+ 		emit(pkt7(CP_EVENT_WRITE, 4));          /* CACHE_FLUSH_TS into the msm slot (event() writes the shared one) */
+-		emit(EV_CACHE_FLUSH_TS | (1u << 30));
++		emit(EV_CACHE_FLUSH_TS);                /* (not TIMESTAMP: see event()) */
+ 		emit((uint32_t)(POOL_PA + OFF_MSM_FENCE));
+ 		emit((uint32_t)((POOL_PA + OFF_MSM_FENCE) >> 32));
+ 		emit(++msm_seq);

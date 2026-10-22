@@ -4,7 +4,7 @@
 
 A port of [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz) (itself a port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)) to the Xiaomi **Redmi Note 13 4G** (`sapphire` / `sapphiren`, Qualcomm **SM6225 "khaje"** / Snapdragon 685). Apple's open-source XNU kernel (xnu-8796) boots from RAM through a small boot shim, and on top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd and SpringBoard.
 
-The Redmi Note 12 4G (topaz) and the Redmi Note 13 4G share the SoC, the memory carve-outs and most of the board, so this fork follows the topaz branch and adds what differs on sapphire (patches 0140–0153, the shim's DDR handling and the tools below).
+The Redmi Note 12 4G (topaz) and the Redmi Note 13 4G share the SoC, the memory carve-outs and most of the board, so this fork follows the topaz branch and adds what differs on sapphire (patches 0140–0154, the shim's DDR handling and the tools below).
 
 > Experimental bring-up, not a usable phone OS. Many things are missing or stubbed, and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**. The kernel is started from RAM with `fastboot boot`; boot partitions do not need to be flashed.
 
@@ -138,6 +138,7 @@ nc -ukl 5140          # live kernel console
 | 0151 | The GPU for 60 fps: asynchronous msm submissions with fences, buffers given back while in use freed at their fence, up to 256 command buffers per submission; Mesa's buffers from the unused DDR at 0x1_0000_0000 (1 GB) mapped write-combined (no cache maintenance; `gpu_pool=0` turns it off); the display skips cleaning surfaces the GPU drew; no per-submission log lines |
 | 0152 | Display frame copies handed to the GPU without waiting (`gpu_copy_async=0` waits); `gpu_div=1` runs the GPU at 600 MHz for a test |
 | 0153 | msm fences in a slot of their own; an idle GPU with its ring read is never taken for hung (that false alarm stopped the service and crashed backboardd); frame-copy windows not remapped under a queued copy |
+| 0154 | GPU fences write their sequence number: the TIMESTAMP bit made every fence the GPU's clock (done for the first ~112 s of a boot, never after) |
 | `shim/` | DDR bank end from ABL's `/memory` node; RAM size clamped to it |
 | `tools/mkadt.py` | sapphire identity in the ADT |
 | `tools/sapphire-boot.sh`, `sapphire-root.sh` | Boot image and root image for sapphire |
