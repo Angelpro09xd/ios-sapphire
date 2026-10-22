@@ -172,6 +172,13 @@ int main(int argc, char **argv) {
     float pcv[8] = { -0.5f, -0.5f, 0.5f, 0.5f, 1, 1, 1, 1 };
     vkCmdPushConstants(c, pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, pcv);
     vkCmdDraw(c, 4, 1, 0, 0);
+    /* CAP_DRAWS=n: more quads, each a different rect and tint, to see what one more layer costs */
+    int draws = getenv("CAP_DRAWS") ? atoi(getenv("CAP_DRAWS")) : 1;
+    for (int i = 1; i < draws; i++) {
+        float p2[8] = { -0.9f + 0.1f * i, -0.9f, -0.6f + 0.1f * i, -0.6f, 0.5f, 0.5f, 0.5f, 0.5f };
+        vkCmdPushConstants(c, pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, p2);
+        vkCmdDraw(c, 4, 1, 0, 0);
+    }
     vkCmdEndRendering(c);
     barrier(c, rt, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     barrier(c, ds, VK_IMAGE_LAYOUT_PREINITIALIZED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
