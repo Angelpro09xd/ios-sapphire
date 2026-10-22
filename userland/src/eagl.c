@@ -108,6 +108,7 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 #define GL_TRIANGLE_STRIP               0x0005
 #define GL_TRIANGLE_FAN                 0x0006
 #define GL_UNPACK_ROW_LENGTH            0x0cf2
+#define GL_ALPHA                        0x1906
 #define GL_UNPACK_ALIGNMENT             0x0cf5
 #define GL_PACK_ROW_LENGTH              0x0d02
 #define GL_PACK_ALIGNMENT               0x0d05
@@ -570,6 +571,151 @@ image_forget(struct eagl *e, GLuint texture)
 	}
 }
 
+/*
+ * sapphire: alpha-only textures (GL_ALPHA: CoreAnimation's text masks, 'A008' IOSurfaces) are
+ * made RGBA (0, 0, 0, a) here, which a shader samples exactly as it samples GL_ALPHA. On the
+ * Adreno 610 the alpha-only kind (Mesa's A8_UNORM) showed every glyph as a solid box of the
+ * text's colour: its alpha read 1. boot-arg glalpha=0 leaves GL_ALPHA alone.
+ */
+#define ALPHA_TEXTURES  65536
+static uint8_t alpha_converted[ALPHA_TEXTURES / 8];     /* texture names made RGBA here */
+static int alpha_expand = -1;
+
+static bool
+alpha_expand_on(void)
+{
+	if (alpha_expand < 0) {
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+		alpha_expand = !(sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "glalpha=0") != NULL);
+	}
+	return alpha_expand;
+}
+
+static GLuint
+bound_texture_2d(GLenum target)
+{
+	GLint name = 0;
+	if (target == GL_TEXTURE_2D) {
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &name);
+	}
+	return (GLuint)name;
+}
+
+static bool
+alpha_marked(GLuint name)
+{
+	return name != 0 && name < ALPHA_TEXTURES && (alpha_converted[name >> 3] >> (name & 7)) & 1;
+}
+
+static void
+alpha_mark(GLuint name, bool on)
+{
+	if (name != 0 && name < ALPHA_TEXTURES) {
+		if (on) {
+			alpha_converted[name >> 3] |= (uint8_t)(1u << (name & 7));
+		} else {
+			alpha_converted[name >> 3] &= (uint8_t)~(1u << (name & 7));
+		}
+	}
+}
+
+/* w x h alpha bytes, as the unpack state says they lie, as RGBA (0, 0, 0, a); NULL if not possible */
+static uint8_t *
+alpha_as_rgba(const void *pixels, GLsizei w, GLsizei h)
+{
+	GLint row_length = 0, alignment = 4, skip_rows = 0, skip_pixels = 0, pbo = 0;
+	uint8_t *out;
+
+	glGetIntegerv(0x88EF /* GL_PIXEL_UNPACK_BUFFER_BINDING */, &pbo);
+	if (pixels == NULL || pbo != 0 || w <= 0 || h <= 0) {
+		return NULL;
+	}
+	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
+	glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+	glGetIntegerv(0x0CF3 /* GL_UNPACK_SKIP_ROWS */, &skip_rows);
+	glGetIntegerv(0x0CF4 /* GL_UNPACK_SKIP_PIXELS */, &skip_pixels);
+	size_t row = (size_t)(row_length > 0 ? row_length : w);
+	if (alignment > 1) {
+		row = (row + (size_t)alignment - 1) / (size_t)alignment * (size_t)alignment;
+	}
+	const uint8_t *in = (const uint8_t *)pixels + (size_t)skip_rows * row + (size_t)skip_pixels;
+	if ((out = calloc((size_t)w * (size_t)h, 4)) == NULL) {
+		return NULL;
+	}
+	for (GLsizei y = 0; y < h; y++) {
+		for (GLsizei x = 0; x < w; x++) {
+			out[((size_t)y * (size_t)w + (size_t)x) * 4 + 3] = in[(size_t)y * row + (size_t)x];
+		}
+	}
+	return out;
+}
+
+/* glTexImage2D, with an alpha-only texture made RGBA */
+static void
+tex_image(GLenum target, GLint level, GLint internal, GLsizei w, GLsizei h, GLint border, GLenum format, GLenum type,
+    const void *pixels)
+{
+	GLuint name = bound_texture_2d(target);
+
+	if (alpha_expand_on() && target == GL_TEXTURE_2D && internal == GL_ALPHA && format == GL_ALPHA &&
+	    type == GL_UNSIGNED_BYTE) {
+		uint8_t *rgba = alpha_as_rgba(pixels, w, h);
+		if (rgba != NULL || pixels == NULL) {
+			GLint row_length = 0, alignment = 4, skip_rows = 0, skip_pixels = 0;
+			glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
+			glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+			glGetIntegerv(0x0CF3, &skip_rows);
+			glGetIntegerv(0x0CF4, &skip_pixels);
+			glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+			glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+			glPixelStorei(0x0CF3, 0);
+			glPixelStorei(0x0CF4, 0);
+			glTexImage2D(target, level, GL_RGBA, w, h, border, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+			glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
+			glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+			glPixelStorei(0x0CF3, skip_rows);
+			glPixelStorei(0x0CF4, skip_pixels);
+			free(rgba);
+			alpha_mark(name, true);
+			return;
+		}
+	}
+	if (level == 0) {
+		alpha_mark(name, false);
+	}
+	glTexImage2D(target, level, internal, w, h, border, format, type, pixels);
+}
+
+/* glTexSubImage2D, into a texture tex_image() made RGBA */
+static void
+tex_sub_image(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type,
+    const void *pixels)
+{
+	if (format == GL_ALPHA && type == GL_UNSIGNED_BYTE && alpha_marked(bound_texture_2d(target))) {
+		uint8_t *rgba = alpha_as_rgba(pixels, w, h);
+		if (rgba != NULL) {
+			GLint row_length = 0, alignment = 4, skip_rows = 0, skip_pixels = 0;
+			glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
+			glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+			glGetIntegerv(0x0CF3, &skip_rows);
+			glGetIntegerv(0x0CF4, &skip_pixels);
+			glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+			glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+			glPixelStorei(0x0CF3, 0);
+			glPixelStorei(0x0CF4, 0);
+			glTexSubImage2D(target, level, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+			glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
+			glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+			glPixelStorei(0x0CF3, skip_rows);
+			glPixelStorei(0x0CF4, skip_pixels);
+			free(rgba);
+			return;
+		}
+	}
+	glTexSubImage2D(target, level, x, y, w, h, format, type, pixels);
+}
+
 /* Apple's OpenGL ES takes blue-first pixels into a texture called GL_RGBA; everybody else's calls the texture so too. */
 static GLenum
 internal_format(GLenum internal, GLenum format)
@@ -725,7 +871,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 	glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(row / pixel));
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-	glTexImage2D(image->to, 0, (GLint)internal_format(image->internal, image->format), image->width, image->height, 0,
+	tex_image(image->to, 0, (GLint)internal_format(image->internal, image->format), image->width, image->height, 0,
 	    image->format, image->type, base);
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
@@ -3334,7 +3480,7 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 		group_forget(e, e->bound[e->unit]);
 	}
 	uint64_t began = slow_calls_us != 0 ? now_us() : 0;
-	glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type, pixels);
+	tex_image(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type, pixels);
 	if (began != 0 && now_us() - began >= slow_calls_us) {
 		/* (with glslow=US: which pictures take long to hand over) */
 		say("tl: slow-tex %dx%d level %d format %#x type %#x%s %llu at %llu\n", width, height, level, format, type,
@@ -3360,7 +3506,7 @@ my_glTexSubImage2D(void *context, GLenum target, GLint level, GLint x, GLint y, 
 		group_read(e, e->bound[e->unit]);
 		group_forget(e, e->bound[e->unit]);
 	}
-	glTexSubImage2D(target, level, x, y, width, height, format, type, pixels);
+	tex_sub_image(target, level, x, y, width, height, format, type, pixels);
 	EAGL_LEAVE(e, 0x9a0);
 }
 
