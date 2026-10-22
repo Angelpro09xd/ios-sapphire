@@ -5,5 +5,5 @@ install-name:    '/usr/lib/libSystem.B.dylib'
 current-version: 1319
 exports:
   - targets:     [ arm64-ios ]
-    symbols:     [ _fprintf, ___stderrp, _getpid, _calloc, _free, _strcmp, _strncmp, _strstr, _snprintf, ___stack_chk_fail, ___stack_chk_guard, dyld_stub_binder ]
+    symbols:     [ _fprintf, ___stderrp, _getpid, _calloc, _free, _strcmp, _strncmp, _strstr, _snprintf, _memcpy, ___stack_chk_fail, ___stack_chk_guard, dyld_stub_binder ]
 ...

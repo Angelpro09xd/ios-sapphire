@@ -169,6 +169,41 @@ static const struct {
 };
 
 static void stub_forward(id self, SEL _cmd, id inv);
+void *memcpy(void *, const void *, size_t);
+
+/*
+ * Buffers are real: on this GPU a Metal buffer is memory the CPU and the GPU share, and callers
+ * write into [buffer contents] (CoreAnimation's gamma LUT is bigger than any shared scratch).
+ * Each MTLBuffer stub gets its own allocation of the length asked for, or the caller's memory
+ * for newBufferWithBytesNoCopy:, and answers contents and length from it.
+ */
+#define NBUF 8192
+static struct {
+	id obj;
+	void *mem;
+	unsigned long len;
+} bufs[NBUF];
+static unsigned int nbufs;
+
+static void
+buffer_made(id obj, void *mem, unsigned long len)
+{
+	bufs[nbufs % NBUF].obj = obj;
+	bufs[nbufs % NBUF].mem = mem;
+	bufs[nbufs % NBUF].len = len;
+	nbufs++;
+}
+
+static int
+buffer_find(id obj)
+{
+	for (unsigned int i = 0; i < NBUF && i < nbufs; i++) {
+		if (bufs[i].obj == obj) {
+			return (int)i;
+		}
+	}
+	return -1;
+}
 static id stub_signature(id self, SEL _cmd, SEL sel);
 static id stub_unrecognized(id self, SEL _cmd, SEL sel);
 
@@ -252,7 +287,31 @@ forward_common(id self, id inv, Class super_cls)
 		((void (*)(id, SEL, void *))objc_msgSend)(inv, sel_registerName("setReturnValue:"), zero);
 		free(zero);
 	}
-	if (stub != (id)0) {
+	const char *sn = sel_getName(sel);
+	if (stub != (id)0 && strncmp(sn, "newBuffer", 9) == 0) {
+		unsigned long len = 0;
+		void *bytes = NULL;
+		if (strncmp(sn, "newBufferWithLength:", 20) == 0) {
+			((void (*)(id, SEL, void *, long))objc_msgSend)(inv, sel_registerName("getArgument:atIndex:"), &len, 2);
+		} else {
+			((void (*)(id, SEL, void *, long))objc_msgSend)(inv, sel_registerName("getArgument:atIndex:"), &bytes, 2);
+			((void (*)(id, SEL, void *, long))objc_msgSend)(inv, sel_registerName("getArgument:atIndex:"), &len, 3);
+		}
+		void *mem = strncmp(sn, "newBufferWithBytesNoCopy:", 25) == 0 ? bytes : calloc(1, len ? len : 16);
+		if (mem != bytes && bytes != NULL && len != 0) {
+			memcpy(mem, bytes, len);
+		}
+		buffer_made(stub, mem, len);
+		SLOG("  buffer %p: %lu bytes at %p", (void *)stub, len, mem);
+	}
+	int bi = strncmp(who, "SapphireStub_MTLBuffer", 22) == 0 ? buffer_find(self) : -1;
+	if (bi >= 0 && strcmp(sn, "contents") == 0) {
+		void *c = bufs[bi].mem;
+		((void (*)(id, SEL, void *))objc_msgSend)(inv, sel_registerName("setReturnValue:"), &c);
+	} else if (bi >= 0 && strcmp(sn, "length") == 0) {
+		unsigned long l = bufs[bi].len;
+		((void (*)(id, SEL, void *))objc_msgSend)(inv, sel_registerName("setReturnValue:"), &l);
+	} else if (stub != (id)0) {
 		((void (*)(id, SEL, void *))objc_msgSend)(inv, sel_registerName("setReturnValue:"), &stub);
 	} else if (ptr) {
 		void *z = zeros;
