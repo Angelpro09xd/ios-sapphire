@@ -36,7 +36,9 @@ for app in "$mnt"/private/var/jb/Applications/*.app; do
 done
 for c in chmod cp mkdir mv rm; do
 	[ -e "$mnt/bin/$c" ] && [ ! -L "$mnt/bin/$c" ] && continue          # (iOS's own, if it has one)
-	ln -sfn "/var/jb/usr/bin/$c" "$mnt/bin/$c"
+	rm -f "$mnt/bin/$c"
+	cp -p "$mnt/private/var/jb/usr/bin/$c" "$mnt/bin/$c"       # (a copy: a link made by Linux's hfsplus is not followed by dyld/XNU here)
+	apps="$apps /bin/$c"
 done
 rm -f "$mnt"/private/var/mobile/Containers/Data/InternalDaemon/*/Library/Caches/*com.apple.LaunchServices-*.csstore
 ls -l "$mnt"/private/var/jb/Applications/Sileo.app/giveMeRoot "$mnt/bin/mv"

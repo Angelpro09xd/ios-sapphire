@@ -9,7 +9,9 @@ img=$1 dir=$2 out=$3 n=${4:-12}
 A="/mnt/c/adb/adb.exe -s fcd8b95d"
 mkdir -p "$out"
 runs=$out/runs.txt
-echo "${SUDO_PASS:?SUDO_PASS (the WSL sudo password) in the environment}" | sudo -S python3 -I - "$img" "$dir" "$n" > "$runs" <<'PY'
+py=$(mktemp /tmp/pullfiles.XXXXXX.py)
+trap 'rm -f "$py"' EXIT
+cat > "$py" <<'PY'
 import fcntl, os, struct, subprocess, sys
 img, d, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
 m = '/mnt/ios-ro'
@@ -32,6 +34,7 @@ try:
 finally:
     subprocess.call(['umount', m])
 PY
+echo "${SUDO_PASS:?SUDO_PASS (the WSL sudo password) in the environment}" | sudo -S python3 -I "$py" "$img" "$dir" "$n" > "$runs"
 while IFS=$'\t' read -r size path blocks; do
 	name=$(echo "$path" | tr '/' '_')
 	: > "$out/$name"

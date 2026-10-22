@@ -239,3 +239,12 @@ rm -f "$OUT/root/var/jb/prep_bootstrap.sh"
 
 echo "mk-jb.sh: $OUT/root/var/jb ($(du -sh "$OUT/root/var/jb" | cut -f1), $(find "$OUT/root/var/jb" | wc -l) entries)"
 echo "          Sileo $(grep -m1 '^Version:' "$TMP/control/control" | cut -d' ' -f2), $(grep -c '^Package:' "$OUT/root/var/jb/Library/dpkg/status") packages in dpkg's database"
+
+# sapphire: the libraries' version links (libzstd.1.dylib -> libzstd.1.5.5.dylib, 18 of them) as copies:
+# put on the phone's HFS+ by Linux's driver, such a link was "no such file" to dyld (Sileo:
+# "Library not loaded: @rpath/libzstd.1.dylib") while the regular files beside it loaded.
+find "$OUT/root/var/jb" -type l -name '*.dylib' | while read -r l; do
+	t=$(readlink -f "$l")
+	[ -f "$t" ] && { rm "$l"; cp -p "$t" "$l"; }
+done
+echo "mk-jb.sh: library links dereferenced"
