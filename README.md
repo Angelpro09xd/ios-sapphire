@@ -4,7 +4,7 @@
 
 A port of [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz) (itself a port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)) to the Xiaomi **Redmi Note 13 4G** (`sapphire` / `sapphiren`, Qualcomm **SM6225 "khaje"** / Snapdragon 685). Apple's open-source XNU kernel (xnu-8796) boots from RAM through a small boot shim, and on top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd and SpringBoard.
 
-The Redmi Note 12 4G (topaz) and the Redmi Note 13 4G share the SoC, the memory carve-outs and most of the board, so this fork follows the topaz branch and adds what differs on sapphire (patches 0140–0147, the shim's DDR handling and the tools below).
+The Redmi Note 12 4G (topaz) and the Redmi Note 13 4G share the SoC, the memory carve-outs and most of the board, so this fork follows the topaz branch and adds what differs on sapphire (patches 0140–0148, the shim's DDR handling and the tools below).
 
 > Experimental bring-up, not a usable phone OS. Many things are missing or stubbed, and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**. The kernel is started from RAM with `fastboot boot`; boot partitions do not need to be flashed.
 
@@ -132,6 +132,7 @@ nc -ukl 5140          # live kernel console
 | 0145 | Adreno 610 bring-up staged by boot-arg `gpu=N`: clock tree, power-up, zap shader through TrustZone, identity SMMU bank, SQE microcode and a command the GPU executes (powered and answering on the phone; the command stages are blocked by the panic below) |
 | 0146 | Black box: a kernel panic writes the console ring (with the panic text) to the end of `userdata` before the panic path spins, since this board has no iBoot panic region. `tools/sweet-log.py` reports it as a PANIC flush |
 | 0147 | AppleCLCD frame timing (every 5 s: direct, CPU-composed and GPU-composed frames with the average time of each part; `sweetfb_stats=0` turns it off), and with `sweetfb_gpucopy=1` the GPU copy of single-layer frames |
+| 0148 | the GPU for user space: `IOServiceOpen` type `'SGPU'` on IOAcceleratorES gives buffers (mapped write-combined, at GPU addresses 0x01000000–0x10000000), IOSurface import, cache sync and submit with a fence; needs `gpu_service` up. Used by `metal/SapphireMetal/sgpu.c`; a development interface, no register protection yet |
 | `shim/` | DDR bank end from ABL's `/memory` node; RAM size clamped to it |
 | `tools/mkadt.py` | sapphire identity in the ADT |
 | `tools/sapphire-boot.sh`, `sapphire-root.sh` | Boot image and root image for sapphire |

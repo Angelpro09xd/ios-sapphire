@@ -21,6 +21,7 @@
  */
 /* Darwin's libc, declared here (Linux's headers do not describe it) */
 typedef unsigned long size_t;
+int sgpu_selftest(unsigned int service);   /* sgpu_selftest.c */
 typedef struct __sFILE FILE;
 extern FILE *__stderrp;
 #define stderr __stderrp
@@ -459,6 +460,11 @@ stub_unrecognized(id self, SEL _cmd, SEL sel)
 	sapphire_port = port;
 	sapphire_device = self;
 	SLOG("initWithAcceleratorPort: %u -> %p", port, (void *)self);
+	static int tested;
+	if (!tested) {
+		tested = 1;
+		(void)sgpu_selftest(port);              /* once per process; logs its own result */
+	}
 	return self;
 }
 

@@ -1,0 +1,553 @@
+From c0d1f79a0a07a8bbbf863d5a738cca64dee44445 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 22 Oct 2026 08:32:34 +0000
+Subject: [PATCH] sapphire-0148: the GPU for user space (IOAcceleratorES 'SGPU'
+ user client)
+
+What a Metal driver needs from the kernel: IOServiceOpen of type 'SGPU' on
+IOAcceleratorES gives a SapphireGpuClient (any other type is refused as
+before). Selectors: 0 info, 1 create a buffer (wired, zeroed, mapped into
+the task write-combined, at a GPU address from 0x01000000 to 0x10000000,
+optionally fixed), 2 release, 3 import an IOSurface by id, 4 sync the CPU
+caches over a buffer or surface, 5 submit an indirect buffer and wait for
+its timestamped cache flush. It shares the gpu_service lock, ring and page
+tables with the frame copies, and works only once the service is up. A
+submit that does not finish stops the service.
+
+Also: replay_3d() now unmaps its pages before freeing them.
+
+This is a development interface: no register protection yet.
+---
+ iokit/Kernel/arm/SapphireGpu.cpp      | 460 ++++++++++++++++++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp |  23 ++
+ 2 files changed, 483 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index 838e1f2..1da1a47 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -42,6 +42,7 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOUserClient.h>
+ #include <kern/thread.h>
+ #include <kern/clock.h>
+ #include <pexpert/pexpert.h>
+@@ -959,6 +960,23 @@ map_page_4k(uint64_t va, uint64_t pa)
+ 	return true;
+ }
+ 
++/* Clear one 4 KB entry, if its tables exist; the caller flushes the TLB. */
++static void
++unmap_page_4k(uint64_t va)
++{
++	uint64_t e1 = pt_l1[(va >> 30) & 3];
++	if ((e1 & 3) != PTE_TYPE_TABLE) {
++		return;
++	}
++	uint64_t *l2 = (uint64_t *)(pool + ((e1 & PTE_ADDR_MASK) - POOL_PA));
++	uint64_t e2 = l2[(va >> 21) & 511];
++	if ((e2 & 3) != PTE_TYPE_TABLE) {
++		return;
++	}
++	uint64_t *l3 = (uint64_t *)(pool + ((e2 & PTE_ADDR_MASK) - POOL_PA));
++	l3[(va >> 12) & 511] = 0;
++}
++
+ /* TLBIASID 0, then TLBSYNC and wait for TLBSTATUS.SACTIVE to clear. */
+ static bool
+ tlb_flush(void)
+@@ -1757,6 +1775,10 @@ replay_3d(void)
+ 			IOSleep(500);
+ 		}
+ 	}
++	for (uint32_t off = 0; off < span; off += 4096) {
++		unmap_page_4k(rp3d_VA_START + off);     /* no GPU address may outlive its page */
++	}
++	(void)tlb_flush();
+ 	m->release();
+ 	return ok && good_rt == RP_W * RP_W && good_ds == RP_W * RP_W;
+ }
+@@ -2292,6 +2314,444 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+ 	thread_terminate(current_thread());
+ }
+ 
++/* ---------------------------------------------------------------- user client */
++
++/*
++ * The GPU for user space: what a Metal driver needs from the kernel. IOAcceleratorES (in
++ * SweetFramebuffer.cpp) hands IOServiceOpen of type 'SGPU' to sapphire_gpu_new_client(); any
++ * other type is refused as before, so Metal's own probes see nothing new. Works only once
++ * gpu_service is up (gpu=3 gpu_mmu=1 gpu_service=1 and every test passed), and shares the
++ * service lock with the frame copies: one ring, one set of page tables.
++ *
++ *   sel 0  info            out: gpu id, chip id, user VA base, user VA end, page tables free
++ *   sel 1  buffer create   in: size, fixed GPU address (0 = any)    out: handle, GPU address
++ *   sel 2  release         in: handle
++ *   sel 3  surface import  in: IOSurface id                  out: handle, GPU address, size
++ *   sel 4  sync            in: handle   (clean + invalidate the CPU caches over it)
++ *   sel 5  submit          in: GPU address, dwords, timeout ms   out: fence seqno, us taken
++ *
++ * Buffers are wired kernel memory, zeroed and cleaned; map one into the task with
++ * IOConnectMapMemory64(conn, handle, ..., kIOMapAnywhere | kIOMapWriteCombineCache) so CPU
++ * and GPU agree without cache maintenance. A surface is the task's own IOSurface (by id):
++ * its pixels get a GPU address and sel 4 cleans what the CPU wrote, or drops what it holds
++ * before reading what the GPU wrote. The GPU sees its buffers through 4 KB pages from
++ * 0x01000000 to 0x10000000, below RAM: nothing there aliases the identity blocks.
++ *
++ * A submit runs one indirect buffer, which must lie inside a buffer of this client, then a
++ * wait for idle and a timestamped cache flush, and waits for it (no queue yet). If the GPU
++ * does not finish in time, the service stops: every later call and frame copy is refused.
++ *
++ * This is a development interface: the command processor runs what it is given with the
++ * whole GPU address space reachable, and no register protection is set up yet.
++ */
++#include "SweetSurface.h"
++
++extern "C" void proc_selfname(char *buf, int size);
++
++#define UVA_BASE            0x01000000ull
++#define UVA_END             0x10000000ull
++#define UVA_PAGES           ((UVA_END - UVA_BASE) >> 12)
++#define UC_BOS              256u
++
++static uint8_t uva_bits[UVA_PAGES / 8];
++
++static bool
++uva_used(uint64_t p)
++{
++	return (uva_bits[p >> 3] >> (p & 7)) & 1;
++}
++
++static void
++uva_mark(uint64_t p0, uint64_t n, bool used)
++{
++	for (uint64_t p = p0; p < p0 + n; p++) {
++		if (used) {
++			uva_bits[p >> 3] |= (uint8_t)(1u << (p & 7));
++		} else {
++			uva_bits[p >> 3] &= (uint8_t)~(1u << (p & 7));
++		}
++	}
++}
++
++/* n pages of GPU addresses, at fixed if non-zero; 0 if there is no room. */
++static uint64_t
++uva_alloc(uint64_t n, uint64_t fixed)
++{
++	if (n == 0 || n > UVA_PAGES) {
++		return 0;
++	}
++	if (fixed != 0) {
++		if ((fixed & 0xFFF) != 0 || fixed < UVA_BASE || fixed + (n << 12) > UVA_END) {
++			return 0;
++		}
++		uint64_t p0 = (fixed - UVA_BASE) >> 12;
++		for (uint64_t i = 0; i < n; i++) {
++			if (uva_used(p0 + i)) {
++				return 0;
++			}
++		}
++		uva_mark(p0, n, true);
++		return fixed;
++	}
++	for (uint64_t p = 0, run = 0; p < UVA_PAGES; p++) {
++		run = uva_used(p) ? 0 : run + 1;
++		if (run == n) {
++			uva_mark(p + 1 - n, n, true);
++			return UVA_BASE + ((p + 1 - n) << 12);
++		}
++	}
++	return 0;
++}
++
++struct uc_bo {
++	IOMemoryDescriptor *md;                 /* retained; NULL = free slot */
++	SweetSurface       *surf;               /* retained when imported */
++	uint64_t            va;                 /* GPU address of the first page */
++	uint64_t            pages;
++	uint64_t            len;                /* bytes from va + delta */
++	uint32_t            delta;              /* where byte 0 sits in the first page */
++	uintptr_t           kva;                /* kernel address of byte 0, for cache maintenance */
++};
++
++/*
++ * Map len bytes of md from offset 0 at fresh GPU addresses (fixed if non-zero), page by page,
++ * following the physical segments. Fills va, pages and delta. service_lock held.
++ */
++static bool
++uc_map(struct uc_bo *b, uint64_t fixed)
++{
++	uint64_t seg = 0, pa0 = b->md->getPhysicalSegment(0, &seg, kIOMemoryMapperNone);
++
++	if (pa0 == 0) {
++		return false;
++	}
++	b->delta = (uint32_t)(pa0 & 0xFFF);
++	b->pages = (b->delta + b->len + 4095) >> 12;
++	b->va = uva_alloc(b->pages, fixed);
++	if (b->va == 0) {
++		return false;
++	}
++	bool ok = true;
++	for (uint64_t o = 0; ok && o < b->len;) {
++		uint64_t pa = b->md->getPhysicalSegment(o, &seg, kIOMemoryMapperNone);
++		uint64_t at = b->delta + o;             /* byte offset from the first page */
++		ok = pa != 0 && map_page_4k(b->va + (at & ~0xFFFull), pa & ~0xFFFull);
++		o += 4096 - (pa & 0xFFF);
++	}
++	if (!ok) {
++		for (uint64_t p = 0; p < b->pages; p++) {
++			unmap_page_4k(b->va + (p << 12));
++		}
++		uva_mark((b->va - UVA_BASE) >> 12, b->pages, false);
++	}
++	return tlb_flush() && ok;
++}
++
++static void
++uc_unmap(struct uc_bo *b)
++{
++	for (uint64_t p = 0; p < b->pages; p++) {
++		unmap_page_4k(b->va + (p << 12));
++	}
++	(void)tlb_flush();
++	uva_mark((b->va - UVA_BASE) >> 12, b->pages, false);
++}
++
++class SapphireGpuClient : public IOUserClient {
++	OSDeclareDefaultStructors(SapphireGpuClient);
++
++public:
++	task_t        fTask;
++	uint32_t      fCalls;
++	char          fName[32];
++	struct uc_bo  fBo[UC_BOS];
++
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
++	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++
++	int  freeSlot(void);
++	void drop(uint32_t h);
++	IOReturn create(uint64_t size, uint64_t fixed, uint64_t *out);
++	IOReturn import(uint32_t id, uint64_t *out);
++	IOReturn run(uint64_t va, uint64_t dwords, uint64_t ms, uint64_t *out);
++};
++
++OSDefineMetaClassAndStructors(SapphireGpuClient, IOUserClient);
++
++bool
++SapphireGpuClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fTask = owningTask;
++	fCalls = 0;
++	proc_selfname(fName, sizeof(fName));          /* IOServiceOpen runs in the caller */
++	bzero(fBo, sizeof(fBo));
++	return true;
++}
++
++int
++SapphireGpuClient::freeSlot(void)
++{
++	for (uint32_t i = 1; i < UC_BOS; i++) {         /* handle 0 is never used */
++		if (fBo[i].md == NULL) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++/* service_lock held */
++void
++SapphireGpuClient::drop(uint32_t h)
++{
++	struct uc_bo *b = &fBo[h];
++
++	if (h == 0 || h >= UC_BOS || b->md == NULL) {
++		return;
++	}
++	uc_unmap(b);
++	if (b->surf != NULL) {
++		b->md->complete();
++	}
++	OSSafeReleaseNULL(b->md);
++	OSSafeReleaseNULL(b->surf);
++	bzero(b, sizeof(*b));
++}
++
++IOReturn
++SapphireGpuClient::clientClose(void)
++{
++	if (service_lock != NULL) {
++		IOLockLock(service_lock);
++		for (uint32_t i = 1; i < UC_BOS; i++) {
++			drop(i);
++		}
++		IOLockUnlock(service_lock);
++	}
++	LOG("client: %s closed after %u calls", fName, fCalls);
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SapphireGpuClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
++{
++	IOReturn r = kIOReturnBadArgument;
++
++	IOLockLock(service_lock);
++	if (type > 0 && type < UC_BOS && fBo[type].md != NULL && fBo[type].surf == NULL) {
++		*memory = fBo[type].md;
++		fBo[type].md->retain();
++		*options = kIOMapWriteCombineCache;
++		r = kIOReturnSuccess;
++	}
++	IOLockUnlock(service_lock);
++	return r;
++}
++
++/* service_lock held */
++IOReturn
++SapphireGpuClient::create(uint64_t size, uint64_t fixed, uint64_t *out)
++{
++	int h = freeSlot();
++
++	if (h < 0) {
++		return kIOReturnNoResources;
++	}
++	if (size == 0 || size > (UVA_END - UVA_BASE)) {
++		return kIOReturnBadArgument;
++	}
++	size = (size + 4095) & ~4095ull;
++	IOBufferMemoryDescriptor *m = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, size, 4096);
++	if (m == NULL) {
++		return kIOReturnNoMemory;
++	}
++	bzero(m->getBytesNoCopy(), size);
++	sweet_dcache_flush((vm_offset_t)m->getBytesNoCopy(), (unsigned)size);
++	struct uc_bo *b = &fBo[h];
++	b->md = m;
++	b->len = size;
++	b->kva = (uintptr_t)m->getBytesNoCopy();
++	if (!uc_map(b, fixed)) {
++		m->release();
++		bzero(b, sizeof(*b));
++		return fixed ? kIOReturnExclusiveAccess : kIOReturnNoSpace;
++	}
++	out[0] = (uint64_t)h;
++	out[1] = b->va + b->delta;
++	return kIOReturnSuccess;
++}
++
++/* service_lock held */
++IOReturn
++SapphireGpuClient::import(uint32_t id, uint64_t *out)
++{
++	int h = freeSlot();
++
++	if (h < 0) {
++		return kIOReturnNoResources;
++	}
++	SweetSurface *s = sweet_surface_copy(id);
++	if (s == NULL || s->memory == NULL) {
++		OSSafeReleaseNULL(s);
++		return kIOReturnNotFound;
++	}
++	if (s->memory->prepare() != kIOReturnSuccess) {
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	struct uc_bo *b = &fBo[h];
++	b->md = s->memory;
++	b->md->retain();
++	b->surf = s;
++	b->len = s->memory->getLength();
++	b->kva = s->kernelAddress();
++	if (!uc_map(b, 0)) {
++		b->md->complete();
++		OSSafeReleaseNULL(b->md);
++		OSSafeReleaseNULL(b->surf);
++		bzero(b, sizeof(*b));
++		return kIOReturnNoSpace;
++	}
++	out[0] = (uint64_t)h;
++	out[1] = b->va + b->delta + s->wrapDelta;     /* byte 0 of the surface, as IOSurfaceGetBaseAddress */
++	out[2] = b->len - s->wrapDelta;
++	return kIOReturnSuccess;
++}
++
++/* service_lock held */
++IOReturn
++SapphireGpuClient::run(uint64_t va, uint64_t dwords, uint64_t ms, uint64_t *out)
++{
++	bool inside = false;
++
++	for (uint32_t i = 1; i < UC_BOS && !inside; i++) {
++		struct uc_bo *b = &fBo[i];
++		inside = b->md != NULL && va >= b->va + b->delta && va + dwords * 4 <= b->va + b->delta + b->len;
++	}
++	if (!inside || dwords == 0 || dwords > 0xFFFFF || (va & 3) != 0) {
++		return kIOReturnBadArgument;
++	}
++	ms = ms == 0 ? 100 : (ms > 2000 ? 2000 : ms);
++	emit(pkt7(CP_INDIRECT_BUFFER, 3));
++	emit((uint32_t)va);
++	emit((uint32_t)(va >> 32));
++	emit((uint32_t)dwords);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	event(EV_CACHE_FLUSH_TS, true);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	uint64_t t0 = mach_absolute_time(), ns;
++	bool ok = submit("user", (uint32_t)ms);
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	out[0] = *(volatile uint32_t *)(pool + OFF_FENCE);
++	out[1] = ns / 1000;
++	if (!ok) {
++		service_ready = false;
++		LOG("client: %s's submit of %llu dwords at %llx did not finish in %llu ms: the GPU service stops; RBBM_STATUS %08x CP_HW_FAULT %08x",
++		    fName, dwords, va, ms, grd(REG_RBBM_STATUS), grd(REG_CP_HW_FAULT));
++		smmu_fault("user submit");
++		return kIOReturnTimeout;
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SapphireGpuClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a, IOExternalMethodDispatch *,
++    OSObject *, void *)
++{
++	static const uint8_t ins[] = { 0, 2, 1, 1, 1, 3 }, outs[] = { 5, 2, 0, 3, 0, 2 };
++	uint64_t out[5] = { 0 };
++	IOReturn r = kIOReturnSuccess;
++
++	if (selector >= sizeof(ins) || a->scalarInputCount != ins[selector] || a->scalarOutputCount < outs[selector]) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(service_lock);
++	if (!service_ready) {
++		IOLockUnlock(service_lock);
++		return kIOReturnNotReady;
++	}
++	const uint64_t *in = a->scalarInput;
++	switch (selector) {
++	case 0:
++		out[0] = 610;
++		out[1] = 0x06010001;
++		out[2] = UVA_BASE;
++		out[3] = UVA_END;
++		out[4] = PT_PAGES - pt_used;
++		break;
++	case 1:
++		r = create(in[0], in[1], out);
++		break;
++	case 2:
++		if (in[0] == 0 || in[0] >= UC_BOS || fBo[in[0]].md == NULL) {
++			r = kIOReturnBadArgument;
++		} else {
++			drop((uint32_t)in[0]);
++		}
++		break;
++	case 3:
++		r = import((uint32_t)in[0], out);
++		break;
++	case 4:
++		if (in[0] == 0 || in[0] >= UC_BOS || fBo[in[0]].md == NULL || fBo[in[0]].kva == 0) {
++			r = kIOReturnBadArgument;
++		} else {
++			sweet_dcache_flush((vm_offset_t)fBo[in[0]].kva, (unsigned)fBo[in[0]].len);
++		}
++		break;
++	case 5:
++		r = run(in[0], in[1], in[2], out);
++		break;
++	}
++	IOLockUnlock(service_lock);
++	if (fCalls++ < 32 || r != kIOReturnSuccess) {
++		LOG("client: %s sel %u (%llx %llx) -> %x, out %llx %llx", fName, selector,
++		    ins[selector] > 0 ? in[0] : 0, ins[selector] > 1 ? in[1] : 0, r, out[0], out[1]);
++	}
++	a->scalarOutputCount = outs[selector];
++	for (uint32_t i = 0; i < outs[selector]; i++) {
++		a->scalarOutput[i] = out[i];
++	}
++	return r;
++}
++
++IOReturn sapphire_gpu_new_client(IOService *provider, task_t task, void *security, UInt32 type, IOUserClient **handler);
++
++IOReturn
++sapphire_gpu_new_client(IOService *provider, task_t task, void *security, UInt32 type, IOUserClient **handler)
++{
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	if (!service_ready || service_lock == NULL) {
++		LOG("client: %s asked for the GPU, but the service is not up", name);
++		return kIOReturnNotReady;
++	}
++	SapphireGpuClient *c = OSTypeAlloc(SapphireGpuClient);
++	if (c == NULL || !c->initWithTask(task, security, type)) {
++		OSSafeReleaseNULL(c);
++		return kIOReturnNoMemory;
++	}
++	if (!c->attach(provider)) {
++		c->release();
++		return kIOReturnError;
++	}
++	if (!c->start(provider)) {
++		c->detach(provider);
++		c->release();
++		return kIOReturnError;
++	}
++	LOG("client: %s opened the GPU", name);
++	*handler = c;
++	return kIOReturnSuccess;
++}
++
+ void
+ sapphire_gpu_init(void)
+ {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index edcd849..5473053 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -233,9 +233,32 @@ OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+  */
+ class IOAcceleratorES : public IOService {
+ 	OSDeclareDefaultStructors(IOAcceleratorES);
++
++public:
++	using IOService::newUserClient;
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
++	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++/*
++ * IOServiceOpen type 'SGPU': the Adreno for our Metal driver (SapphireGpu.cpp, user client).
++ * Every other type goes where it went before, which for this service is nowhere.
++ */
++#define SAPPHIRE_GPU_CLIENT_TYPE 0x53475055u
++extern IOReturn sapphire_gpu_new_client(IOService *provider, task_t task, void *security, UInt32 type,
++    IOUserClient **handler);
++
++IOReturn
++IOAcceleratorES::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
++    IOUserClient **handler)
++{
++	if (type == SAPPHIRE_GPU_CLIENT_TYPE) {
++		return sapphire_gpu_new_client(this, owningTask, securityID, type, handler);
++	}
++	return IOService::newUserClient(owningTask, securityID, type, properties, handler);
++}
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
