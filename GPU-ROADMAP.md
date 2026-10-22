@@ -77,6 +77,14 @@ and either rewritten for the Adreno with the same interface, or translated mecha
 (LLVM IR → NIR → Mesa's ir3, which is in `infinity/external/mesa3d`): the shaders are small, and the
 `air.*` intrinsics (sampling, interpolation) map onto NIR's.
 
+**The a610's 3D state comes from turnip itself, not from guessing.** Mesa's drm-shim lets turnip
+run on the server as this a610 (`metal/capture/`), and `FD_RD_DUMP=full` records every register,
+packet and buffer of a submit. The first capture (clear, one textured quad blended source-over, a
+blit) replays in the kernel unchanged (`gpu_3d=1`, `metal/tools/rd2replay.py`). Every piece the
+real driver needs can be learned the same way, one Vulkan call at a time: what a texture
+descriptor, a sampler, a blend state, a scissor or a draw costs in commands, on exactly this GPU,
+written by a driver that already works on it.
+
 ## Scale
 
 Layer 1 is weeks of work; layers 2 and 3 are the size of a large open-source GPU project. Each

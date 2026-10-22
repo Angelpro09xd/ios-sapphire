@@ -1,0 +1,30 @@
+--- a/src/freedreno/drm-shim/freedreno_noop.c	2026-10-19 08:24:39.540761012 +0000
++++ b/src/freedreno/drm-shim/freedreno_noop.c	2026-10-22 08:02:31.706007431 +0000
+@@ -123,9 +123,12 @@
+       gp->value = 0;
+       return 0;
+    case MSM_PARAM_VA_START:
+-   case MSM_PARAM_VA_SIZE:
+-      gp->value = 0x100000000ULL;
++   case MSM_PARAM_VA_SIZE: {
++      /* FD_VA_START / FD_VA_SIZE: put the GPU addresses where a replay target has room */
++      const char *e = os_get_option(gp->param == MSM_PARAM_VA_START ? "FD_VA_START" : "FD_VA_SIZE");
++      gp->value = e ? strtoull(e, NULL, 0) : 0x100000000ULL;
+       return 0;
++   }
+    case MSM_PARAM_RAYTRACING:
+       gp->value = 1;
+       return 0;
+@@ -247,6 +250,12 @@
+       .gmem_size = 1024 * 1024,
+    },
+    {
++      /* sapphire's Adreno 610 v2, as the kernel reads it off the GPU */
++      .gpu_id = 610,
++      .chip_id = 0x06010001,
++      .gmem_size = 128 * 1024,
++   },
++   {
+       .gpu_id = 618,
+       .chip_id = CHIPID(6, 1, 8, 0xff),
+       .gmem_size = 512 * 1024,
