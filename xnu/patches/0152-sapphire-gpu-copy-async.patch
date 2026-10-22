@@ -1,0 +1,61 @@
+From 02b4c9a661f99dfad90fb6ff6e167af2ca9b9f60 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 22 Oct 2026 12:13:13 +0000
+Subject: [PATCH] sapphire-0152: display copies not waited for; gpu_div=1 (600
+ MHz) allowed
+
+With 0151 the display's frame copy was the CPU's cost: it waited for the
+CP to reach it -- behind the frame's own drawing -- polling (1.8 s of CPU
+in 5 s, 15 ms a copy). Once the service is up a copy is now handed to the
+CP and not waited for (the CP keeps the ring's order, so the next frame's
+drawing cannot overtake it); gpu_copy_async=0 waits as before.
+
+gpu_div=1 runs the core from GPLL0 undivided, 600 MHz instead of 300, for
+a test: VDD_CX stays where the bootloader left it.
+---
+ iokit/Kernel/arm/SapphireGpu.cpp | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index 7700592..46ce420 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -1424,6 +1424,14 @@ blit_rect(uint64_t base, uint32_t pitch, uint32_t x0, uint32_t y0, uint32_t x1,
+ 	emit(BLIT_OP_SCALE);
+ }
+ 
++/*
++ * boot-arg gpu_copy_async (default 1, 0152): once the service is up, a copy is handed to the CP and
++ * not waited for. The CP runs the ring in order, so nothing queued after it (the next frame's
++ * drawing into the same surface) overtakes it; waiting only cost the CPU (1.8 s in 5 s, measured)
++ * and held the frame up behind the drawing queued before it.
++ */
++static uint32_t copy_async = 1;
++
+ static bool
+ blit_end(const char *what)
+ {
+@@ -1431,6 +1439,10 @@ blit_end(const char *what)
+ 	event(EV_PC_CCU_FLUSH_DEPTH_TS, true);
+ 	event(EV_CACHE_FLUSH_TS, true);
+ 	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	if (copy_async && service_ready) {
++		kick();
++		return true;
++	}
+ 	return submit(what, 200);
+ }
+ 
+@@ -2226,9 +2238,11 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+ 	 * only be readable from recovery; with a delay it lands in the live log instead.
+ 	 */
+ 	(void)PE_parse_boot_argn("gpu_slow", &slow_ms, sizeof(slow_ms));
+-	if (PE_parse_boot_argn("gpu_div", &core_div, sizeof(core_div)) && (core_div < 2 || core_div > 16)) {
++	/* 0152: gpu_div=1 is GPLL0 undivided, 600 MHz -- the rail is the bootloader's, so try it, do not assume it */
++	if (PE_parse_boot_argn("gpu_div", &core_div, sizeof(core_div)) && (core_div < 1 || core_div > 16)) {
+ 		core_div = 2;
+ 	}
++	(void)PE_parse_boot_argn("gpu_copy_async", &copy_async, sizeof(copy_async));
+ 	(void)PE_parse_boot_argn("gpu_smmu_early", &smmu_early, sizeof(smmu_early));
+ 	(void)PE_parse_boot_argn("gpu_irq", &gpu_irq, sizeof(gpu_irq));
+ 	(void)PE_parse_boot_argn("gpu_stop", &stop_at, sizeof(stop_at));
