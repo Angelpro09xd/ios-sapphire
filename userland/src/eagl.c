@@ -1,9 +1,11 @@
 /*
  * From HackiOS (OOSEX GANG, github.com/oosexgang/hackios-xnu-userland, MIT; userland/hackios/).
- * sapphire: iOS 16.7's OpenGLES (20H392) reads the context at table + 0x20 and every entry 0x20
- * past where 16.5's did (all 457 functions of eagl_slots.txt checked in the dyld cache): its
- * table begins with four pointers more. So the table handed out starts four slots before ours
- * (struct eagl's head16_7), and nothing else changes.
+ * sapphire, iOS 16.7 (20H392): the table of -getMacroContextPrivate is 16.5's, unchanged --
+ * QuartzCore calls through it directly, context at table[0], glGetString at 0x3b0 (CA::OGL::
+ * GLESContext::GLESContext). What moved is the thread's pointer OpenGLES's own gl* functions
+ * load (tpidrro_el0[0xf0]): they read the context at +0x20 and every entry 0x20 past its slot
+ * (all 457 checked), so that pointer is 0x20 before the table. struct eagl keeps four pointers
+ * in front of the table (head16_7) so that address is ours too.
  */
 /*
  * libredwood-gl.dylib: an OpenGL ES implementation behind iOS's EAGLContext, inside the window
@@ -247,7 +249,7 @@ struct image {
 };
 
 struct eagl {
-	void *head16_7[4];              /* sapphire: the four leading pointers of iOS 16.7 (zero) */
+	void *head16_7[4];              /* sapphire: what OpenGLES 16.7's thread pointer finds before the table */
 	void *table[SLOTS];             /* [0] is the context itself: what every entry gets as its first argument */
 	id object;                      /* the EAGLContext */
 	struct redwood_gl *gl;
@@ -3897,7 +3899,7 @@ my_getMacroContextPrivate(id self, SEL selector)
 	struct eagl *e = context_of(self);
 
 	(void)selector;
-	return e ? (void *)e->head16_7 : NULL;  /* sapphire: 16.7 calls entry(head[4] = table[0], ...) at +0x20 */
+	return e ? e->table : NULL;     /* (16.5's layout: QuartzCore reads table[0] and the slots as they were) */
 }
 
 /* (the types are the method's own: the last three arrive on the stack, where sizes matter) */
