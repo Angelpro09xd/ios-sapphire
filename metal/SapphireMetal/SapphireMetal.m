@@ -22,6 +22,11 @@
 /* Darwin's libc, declared here (Linux's headers do not describe it) */
 typedef unsigned long size_t;
 int sgpu_selftest(unsigned int service);   /* sgpu_selftest.c */
+void *dlopen(const char *, int);
+char *dlerror(void);
+const char *getprogname(void);
+int sysctlbyname(const char *, void *, size_t *, void *, size_t);
+char *strstr(const char *, const char *);
 typedef struct __sFILE FILE;
 extern FILE *__stderrp;
 #define stderr __stderrp
@@ -454,8 +459,40 @@ stub_unrecognized(id self, SEL _cmd, SEL sel)
 	SLOG("loaded, MTLDeviceSPI %s, MTLDevice %s", spi ? "found" : "MISSING", pub ? "found" : "MISSING");
 }
 
+/*
+ * Boot-arg sweetgl=1: CoreAnimation draws with OpenGL ES (Mesa's freedreno on the Adreno, xnu
+ * 0149) instead of Metal. In backboardd this bundle -- which Metal loads there because
+ * IOAcceleratorES names it -- loads the EAGL bridge (/redwood/lib/libredwood-gl.dylib, HackiOS's
+ * eagl.c, userland/), whose constructor takes over EAGLContext; and in every process it makes
+ * no Metal device, so CoreAnimation's render server falls back to OpenGL ES (EAGLServer).
+ */
+#define SAPPHIRE_GL "/redwood/lib/libredwood-gl.dylib"
+
+static int
+gl_mode(void)
+{
+	static int mode = -1;
+	if (mode < 0) {
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+		mode = sysctlbyname("kern.bootargs", args, &size, 0, 0) == 0 && strstr(args, "sweetgl=1") != 0;
+	}
+	return mode;
+}
+
 - (id)initWithAcceleratorPort:(unsigned int)port
 {
+	if (gl_mode()) {
+		static int loaded;
+		const char *name = getprogname();
+		if (!loaded && name != 0 && strcmp(name, "backboardd") == 0) {
+			loaded = 1;
+			void *gl = dlopen(SAPPHIRE_GL, 2 /* RTLD_NOW */);
+			SLOG("sweetgl=1: %s %s", SAPPHIRE_GL, gl != 0 ? "loaded: CoreAnimation is to draw with OpenGL ES" : dlerror());
+		}
+		SLOG("sweetgl=1: no Metal device (port %u): OpenGL ES instead", port);
+		return (id)0;
+	}
 	self = [super init];
 	sapphire_port = port;
 	sapphire_device = self;

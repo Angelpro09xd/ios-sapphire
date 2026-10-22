@@ -14,3 +14,5 @@ metal/out/
 metal/ir3/sapphire-ir3as
 metal/ir3/*.o
 metal/capture/out/
+userland/obj/
+userland/stage/
