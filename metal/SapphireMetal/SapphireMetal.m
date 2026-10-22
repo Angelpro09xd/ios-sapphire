@@ -158,6 +158,13 @@ static const struct {
 	{ "newHeap", "MTLHeap" },
 	{ "newIndirectCommandBuffer", "MTLIndirectCommandBuffer" },
 	{ "newArgumentEncoder", "MTLArgumentEncoder" },
+	{ "newPipelineLibrary", "MTLPipelineLibrary" },
+	{ "newBinaryArchive", "MTLBinaryArchive" },
+	{ "newDynamicLibrary", "MTLDynamicLibrary" },
+	{ "newRasterizationRateMap", "MTLRasterizationRateMap" },
+	{ "newCounterSampleBuffer", "MTLCounterSampleBuffer" },
+	{ "newAccelerationStructure", "MTLAccelerationStructure" },
+	{ "newResidencySet", "MTLResidencySet" },
 	{ NULL, NULL }
 };
 
@@ -228,11 +235,17 @@ forward_common(id self, id inv, Class super_cls)
 	const char *rtype = ((const char *(*)(id, SEL))objc_msgSend)(sig, sel_registerName("methodReturnType"));
 	Method m = super_cls != (Class)0 ? class_getInstanceMethod(super_cls, sel) : (Method)0;
 	id stub = (rtype != NULL && rtype[0] == '@') ? stub_for(sel) : (id)0;
+	/*
+	 * A raw pointer (targetDeviceInfo, ...) gets zeroed memory rather than NULL, so a caller
+	 * that reads a field of it carries on and the trace goes further.
+	 */
+	static char zeros[65536];
+	int ptr = rtype != NULL && (rtype[0] == '^' || rtype[0] == '*') && rlen == sizeof(void *);
 	const char *who = class_getName(object_getClass(self));
 
 	if (sapphire_logged++ < 6000) {
 		SLOG("%s %s%s", strncmp(who, "SapphireStub_", 13) == 0 ? who + 13 : "device", sel_getName(sel),
-		    stub != (id)0 ? "  -> stub" : (m != NULL ? "  (to _MTLDevice)" : ""));
+		    stub != (id)0 ? "  -> stub" : (ptr ? "  -> zeroed memory" : (m != NULL ? "  (to _MTLDevice)" : "")));
 	}
 	if (rlen > 0) {
 		void *zero = calloc(1, rlen < 64 ? 64 : rlen);
@@ -241,6 +254,9 @@ forward_common(id self, id inv, Class super_cls)
 	}
 	if (stub != (id)0) {
 		((void (*)(id, SEL, void *))objc_msgSend)(inv, sel_registerName("setReturnValue:"), &stub);
+	} else if (ptr) {
+		void *z = zeros;
+		((void (*)(id, SEL, void *))objc_msgSend)(inv, sel_registerName("setReturnValue:"), &z);
 	} else if (m != NULL) {
 		((void (*)(id, SEL, IMP_t))objc_msgSend)(inv, sel_registerName("invokeUsingIMP:"), method_getImplementation(m));
 	}
