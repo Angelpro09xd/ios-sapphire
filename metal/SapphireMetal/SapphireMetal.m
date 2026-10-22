@@ -27,6 +27,10 @@ char *dlerror(void);
 const char *getprogname(void);
 int sysctlbyname(const char *, void *, size_t *, void *, size_t);
 char *strstr(const char *, const char *);
+unsigned int IOServiceGetMatchingService(unsigned int, void *);
+void *IOServiceMatching(const char *);
+int IOObjectRelease(unsigned int);
+int usleep(unsigned int);
 typedef struct __sFILE FILE;
 extern FILE *__stderrp;
 #define stderr __stderrp
@@ -487,6 +491,22 @@ gl_mode(void)
 		const char *name = getprogname();
 		if (!loaded && name != 0 && strcmp(name, "backboardd") == 0) {
 			loaded = 1;
+			/*
+			 * Mesa takes the GPU only if SapphireGPU (xnu 0149) is there when the first
+			 * context is made, and stays on the CPU (softpipe) for good otherwise; the service
+			 * comes up when the kernel's GPU tests end (gpu_delay). So wait for it, 90 s at most.
+			 */
+			int waited = 0;
+			for (; waited < 180; waited++) {
+				unsigned int gpu = IOServiceGetMatchingService(0, IOServiceMatching("SapphireGPU"));
+				if (gpu != 0) {
+					IOObjectRelease(gpu);
+					break;
+				}
+				usleep(500000);
+			}
+			SLOG("sweetgl=1: SapphireGPU %s after %d.%d s", waited < 180 ? "found" : "NOT found (Mesa draws on the CPU)",
+			    waited / 2, (waited % 2) * 5);
 			void *gl = dlopen(SAPPHIRE_GL, 2 /* RTLD_NOW */);
 			SLOG("sweetgl=1: %s %s", SAPPHIRE_GL, gl != 0 ? "loaded: CoreAnimation is to draw with OpenGL ES" : dlerror());
 		}
