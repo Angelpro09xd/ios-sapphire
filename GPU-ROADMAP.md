@@ -41,7 +41,7 @@ What the iOS 16.7.16 binaries say (dyld shared cache, `ipsw` 3.1.739):
 
 | Step | State |
 | --- | --- |
-| A device that loads and logs every message iOS sends it (`metal/`, built on Linux with clang + ld64.lld, no SDK) | built, symbols checked against the device's libraries |
+| A device that loads and logs every message iOS sends it (`metal/`, built on Linux with clang + ld64.lld, no SDK) | done: backboardd's compositor runs its frame loop on it; the full list of what it uses is in NOTES (2026-10-22) |
 | From that list: queues, command buffers, buffers, textures, blits on layer 1's GPU service | |
 | Render encoders and pipelines for what CoreAnimation draws | |
 

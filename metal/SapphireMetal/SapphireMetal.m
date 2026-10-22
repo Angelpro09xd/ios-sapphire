@@ -320,6 +320,38 @@ stub_unrecognized(id self, SEL _cmd, SEL sel)
 	return self;
 }
 
+/*
+ * MetalPerformanceShaders (SpringBoard's blurs) identifies the GPU before anything else
+ * (MPSDevice::GetMPSDevice: supportsFamily: per family, name compared with isEqualToString:,
+ * gpuCoreCount), and asserts when it knows none of them. For the trace to go on, the device
+ * answers as this phone's iOS expects its GPU to: an A11, GPU family Apple4 and below, the
+ * common families, three cores. The real driver has to draw those blurs itself anyway.
+ */
+- (id)name
+{
+	static id n;
+	if (n == (id)0) {
+		n = ((id (*)(Class, SEL, const char *))objc_msgSend)(objc_getClass("NSString"),
+		    sel_registerName("stringWithUTF8String:"), "Apple A11 GPU");
+		n = msg0(n, "retain");
+	}
+	SLOG("device name -> Apple A11 GPU");
+	return n;
+}
+
+- (signed char)supportsFamily:(long)family
+{
+	signed char yes = (family >= 1001 && family <= 1004) || (family >= 3001 && family <= 3003);
+	SLOG("device supportsFamily: %ld -> %s", family, yes ? "YES" : "NO");
+	return yes;
+}
+
+- (unsigned long)gpuCoreCount
+{
+	SLOG("device gpuCoreCount -> 3");
+	return 3;
+}
+
 /* Everything routed to _objc_msgForward ends up here, as an NSInvocation. */
 - (void)forwardInvocation:(id)inv
 {
