@@ -14,6 +14,12 @@ int fprintf(FILE *, const char *, ...) __attribute__((format(printf, 2, 3)));
 int getpid(void);
 void *memcpy(void *, const void *, sgpu_size_t);
 void *memset(void *, int, sgpu_size_t);
+unsigned int sleep(unsigned int);
+typedef struct _opaque_pthread_t *pthread_t;
+int pthread_create(pthread_t *, const void *, void *(*)(void *), void *);
+int pthread_detach(pthread_t);
+int IOObjectRetain(uint32_t);
+int IOObjectRelease(uint32_t);
 
 #include "SapphireReplayUser.h"
 
@@ -50,8 +56,8 @@ check(const volatile uint32_t *img, uint32_t *bad_x, uint32_t *bad_y, uint32_t *
 	return good;
 }
 
-int
-sgpu_selftest(uint32_t service)
+static int
+selftest_once(uint32_t service)
 {
 	sgpu_t g = { 0 };
 	sgpu_bo_t bo = { 0 };
@@ -60,7 +66,6 @@ sgpu_selftest(uint32_t service)
 
 	int r = sgpu_open(&g, service);
 	if (r != 0) {
-		TLOG("selftest: cannot open the GPU (0x%x): kernel without 0148, or gpu_service not up", r);
 		return r;
 	}
 	TLOG("selftest: Adreno %u (chip %08x), GPU addresses %llx-%llx, %u page tables free", g.gpu_id, g.chip_id,
@@ -90,9 +95,14 @@ sgpu_selftest(uint32_t service)
 		rt[i] = 0xDEADBEEFu;
 		ds[i] = 0xDEADBEEFu;
 	}
-	__asm__ volatile("dsb sy" ::: "memory");        /* write-combined stores out before the submit */
+	__asm__ volatile("dsb sy" ::: "memory");        /* stores done before the submit (the kernel cleans the caches) */
+	/* explicit syncs too, so this also runs on an 0148 kernel that does not flush around submits */
+	r = sgpu_sync(&g, &bo);
 	for (uint32_t i = 0; r == 0 && i < sizeof(urp_cmds) / sizeof(urp_cmds[0]); i++) {
 		r = sgpu_submit(&g, urp_cmds[i].va, urp_cmds[i].dwords, 500, &seq, &us);
+	}
+	if (r == 0) {
+		r = sgpu_sync(&g, &bo);
 	}
 	TLOG("selftest: submit 0x%x, fence %u, %u us; rt (0,0) %08x (128,128) %08x (255,255) %08x", r, seq, us, rt[0],
 	    rt[128 * W + 128], rt[W * W - 1]);
@@ -110,4 +120,45 @@ sgpu_selftest(uint32_t service)
 	(void)sgpu_release(&g, &bo);
 	sgpu_close(&g);
 	return ok ? 0 : -1;
+}
+
+/*
+ * The GPU service comes up when the kernel's tests finish (gpu_delay seconds into the boot),
+ * often after backboardd made its Metal device: so the test waits on its own thread, trying
+ * every two seconds for two minutes, and never holds up the caller.
+ */
+static void *
+selftest_thread(void *arg)
+{
+	uint32_t service = (uint32_t)(sgpu_size_t)arg;
+	int r = -1;
+
+	for (int i = 0; i < 60; i++) {
+		r = selftest_once(service);
+		if (r != (int)0xe00002d8) {             /* kIOReturnNotReady: the service is not up yet */
+			break;
+		}
+		sleep(2);
+	}
+	if (r == (int)0xe00002d8) {
+		TLOG("selftest: the GPU service never came up (kernel without 0148, or gpu_service=1 missing)");
+	} else if (r != 0 && r != -1) {
+		TLOG("selftest: failed, 0x%x", r);
+	}
+	IOObjectRelease(service);
+	return 0;
+}
+
+int
+sgpu_selftest(uint32_t service)
+{
+	pthread_t t;
+	IOObjectRetain(service);                    /* Metal releases its port after the device is made */
+	int r = pthread_create(&t, 0, selftest_thread, (void *)(sgpu_size_t)service);
+	if (r == 0) {
+		pthread_detach(t);
+	} else {
+		IOObjectRelease(service);
+	}
+	return r;
 }

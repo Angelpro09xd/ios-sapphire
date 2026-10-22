@@ -13,7 +13,6 @@ kern_return_t IOConnectUnmapMemory64(uint32_t conn, uint32_t type, uint32_t task
 
 #define SGPU_TYPE               0x53475055u     /* 'SGPU' */
 #define kIOMapAnywhere          0x00000001u
-#define kIOMapWriteCombineCache 0x00000400u     /* kIOWriteCombineCache (4) << kIOMapCacheShift (8) */
 
 static int
 call(sgpu_t *g, uint32_t sel, const uint64_t *in, uint32_t nin, uint64_t *out, uint32_t nout)
@@ -64,8 +63,8 @@ sgpu_buffer(sgpu_t *g, uint64_t size, uint64_t fixed_gpu, sgpu_bo_t *bo)
 	bo->handle = (uint32_t)out[0];
 	bo->gpu = out[1];
 	bo->size = (size + 4095) & ~4095ull;
-	r = IOConnectMapMemory64(g->conn, bo->handle, mach_task_self_, &addr, &len,
-	    kIOMapAnywhere | kIOMapWriteCombineCache);
+	/* cacheable, never write-combined (that panics the kernel); it flushes around submits */
+	r = IOConnectMapMemory64(g->conn, bo->handle, mach_task_self_, &addr, &len, kIOMapAnywhere);
 	if (r != 0) {
 		uint64_t h = bo->handle;
 		(void)call(g, 2, &h, 1, 0, 0);

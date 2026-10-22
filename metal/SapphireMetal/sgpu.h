@@ -21,7 +21,7 @@ typedef struct sgpu_bo {
 	uint32_t handle;
 	uint64_t gpu;                   /* GPU address of byte 0 */
 	uint64_t size;
-	void    *cpu;                   /* write-combined mapping (buffers), NULL for surfaces */
+	void    *cpu;                   /* cacheable mapping (buffers; the kernel flushes them around submits), NULL for surfaces */
 } sgpu_bo_t;
 
 /* All return 0 or the kern_return_t / IOReturn of the failing call. */

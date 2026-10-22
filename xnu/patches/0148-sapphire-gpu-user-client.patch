@@ -1,4 +1,4 @@
-From c0d1f79a0a07a8bbbf863d5a738cca64dee44445 Mon Sep 17 00:00:00 2001
+From 9a9387c0913a956e13a62870142c2079b3751196 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Thu, 22 Oct 2026 08:32:34 +0000
 Subject: [PATCH] sapphire-0148: the GPU for user space (IOAcceleratorES 'SGPU'
@@ -7,7 +7,7 @@ Subject: [PATCH] sapphire-0148: the GPU for user space (IOAcceleratorES 'SGPU'
 What a Metal driver needs from the kernel: IOServiceOpen of type 'SGPU' on
 IOAcceleratorES gives a SapphireGpuClient (any other type is refused as
 before). Selectors: 0 info, 1 create a buffer (wired, zeroed, mapped into
-the task write-combined, at a GPU address from 0x01000000 to 0x10000000,
+the task cacheable and cleaned around every submit, at a GPU address from 0x01000000 to 0x10000000,
 optionally fixed), 2 release, 3 import an IOSurface by id, 4 sync the CPU
 caches over a buffer or surface, 5 submit an indirect buffer and wait for
 its timestamped cache flush. It shares the gpu_service lock, ring and page
@@ -18,12 +18,12 @@ Also: replay_3d() now unmaps its pages before freeing them.
 
 This is a development interface: no register protection yet.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 460 ++++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireGpu.cpp      | 477 ++++++++++++++++++++++++++
  iokit/Kernel/arm/SweetFramebuffer.cpp |  23 ++
- 2 files changed, 483 insertions(+)
+ 2 files changed, 500 insertions(+)
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
-index 838e1f2..1da1a47 100644
+index 838e1f2..a20dfc2 100644
 --- a/iokit/Kernel/arm/SapphireGpu.cpp
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
 @@ -42,6 +42,7 @@
@@ -69,7 +69,7 @@ index 838e1f2..1da1a47 100644
  	m->release();
  	return ok && good_rt == RP_W * RP_W && good_ds == RP_W * RP_W;
  }
-@@ -2292,6 +2314,444 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -2292,6 +2314,461 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
  	thread_terminate(current_thread());
  }
  
@@ -90,10 +90,13 @@ index 838e1f2..1da1a47 100644
 + *   sel 5  submit          in: GPU address, dwords, timeout ms   out: fence seqno, us taken
 + *
 + * Buffers are wired kernel memory, zeroed and cleaned; map one into the task with
-+ * IOConnectMapMemory64(conn, handle, ..., kIOMapAnywhere | kIOMapWriteCombineCache) so CPU
-+ * and GPU agree without cache maintenance. A surface is the task's own IOSurface (by id):
-+ * its pixels get a GPU address and sel 4 cleans what the CPU wrote, or drops what it holds
-+ * before reading what the GPU wrote. The GPU sees its buffers through 4 KB pages from
++ * IOConnectMapMemory64(conn, handle, ..., kIOMapAnywhere), cacheable, as the IOSurface buffers
++ * are: never write-combined, because changing the cache mode of kernel pages for a user
++ * mapping panics this kernel (phystokv_range: illegal PA, first try of this interface).
++ * Every submit cleans and invalidates all of the client's buffers before it starts and after
++ * it ends, so CPU writes reach the GPU and GPU writes reach the CPU. A surface is the task's
++ * own IOSurface (by id): its pixels get a GPU address and sel 4 cleans what the CPU wrote, or
++ * drops what it holds before reading what the GPU wrote. The GPU sees its buffers through 4 KB pages from
 + * 0x01000000 to 0x10000000, below RAM: nothing there aliases the identity blocks.
 + *
 + * A submit runs one indirect buffer, which must lie inside a buffer of this client, then a
@@ -232,6 +235,7 @@ index 838e1f2..1da1a47 100644
 +	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
 +
 +	int  freeSlot(void);
++	void flushAll(void);
 +	void drop(uint32_t h);
 +	IOReturn create(uint64_t size, uint64_t fixed, uint64_t *out);
 +	IOReturn import(uint32_t id, uint64_t *out);
@@ -262,6 +266,17 @@ index 838e1f2..1da1a47 100644
 +		}
 +	}
 +	return -1;
++}
++
++/* Clean and invalidate every buffer of this client (not surfaces: sel 4 does those). */
++void
++SapphireGpuClient::flushAll(void)
++{
++	for (uint32_t i = 1; i < UC_BOS; i++) {
++		if (fBo[i].md != NULL && fBo[i].surf == NULL && fBo[i].kva != 0) {
++			sweet_dcache_flush((vm_offset_t)fBo[i].kva, (unsigned)fBo[i].len);
++		}
++	}
 +}
 +
 +/* service_lock held */
@@ -306,7 +321,7 @@ index 838e1f2..1da1a47 100644
 +	if (type > 0 && type < UC_BOS && fBo[type].md != NULL && fBo[type].surf == NULL) {
 +		*memory = fBo[type].md;
 +		fBo[type].md->retain();
-+		*options = kIOMapWriteCombineCache;
++		*options = kIOMapDefaultCache;          /* see above: never write-combined */
 +		r = kIOReturnSuccess;
 +	}
 +	IOLockUnlock(service_lock);
@@ -398,6 +413,7 @@ index 838e1f2..1da1a47 100644
 +		return kIOReturnBadArgument;
 +	}
 +	ms = ms == 0 ? 100 : (ms > 2000 ? 2000 : ms);
++	flushAll();                                 /* what the CPU wrote, out to RAM */
 +	emit(pkt7(CP_INDIRECT_BUFFER, 3));
 +	emit((uint32_t)va);
 +	emit((uint32_t)(va >> 32));
@@ -408,6 +424,7 @@ index 838e1f2..1da1a47 100644
 +	uint64_t t0 = mach_absolute_time(), ns;
 +	bool ok = submit("user", (uint32_t)ms);
 +	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	flushAll();                                 /* and no stale line over what the GPU wrote */
 +	out[0] = *(volatile uint32_t *)(pool + OFF_FENCE);
 +	out[1] = ns / 1000;
 +	if (!ok) {
