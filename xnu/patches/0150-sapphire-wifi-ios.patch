@@ -1,4 +1,4 @@
-From 5eb55f37c5393ce4d947cd22916869272f67a2c9 Mon Sep 17 00:00:00 2001
+From 7e0391d333ded9e7ce1582cee90f961bd6600d5c Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Thu, 22 Oct 2026 09:25:35 +0000
 Subject: [PATCH] sapphire-0150: Wi-Fi for iOS: en0, the station, Apple80211
