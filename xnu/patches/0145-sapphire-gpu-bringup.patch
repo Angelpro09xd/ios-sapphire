@@ -1,4 +1,4 @@
-From b046f507c148fffb46f9696be8e1ab68af87d929 Mon Sep 17 00:00:00 2001
+From 680d5c9788476dee6698121c871090cc7c182e37 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 21 Oct 2026 06:53:53 +0000
 Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
@@ -20,18 +20,18 @@ zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
 Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
 files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp      | 2009 +++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireGpu.cpp      | 2159 +++++++++++++++++++++++++
  iokit/Kernel/arm/SweetFramebuffer.cpp |    2 +
  iokit/conf/files.arm64                |    1 +
- 3 files changed, 2012 insertions(+)
+ 3 files changed, 2162 insertions(+)
  create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 new file mode 100644
-index 0000000..264e308
+index 0000000..ae15720
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -0,0 +1,2009 @@
+@@ -0,0 +1,2159 @@
 +/*
 + * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
 + *
@@ -136,6 +136,8 @@ index 0000000..264e308
 +#define OFF_FENCE           0x18100u            /* where the CCU/cache flush events write their seqno */
 +#define OFF_DRAW            0x40000u            /* what the 2D blitter fills: 256 x 256 RGBA8, 256 KB */
 +#define OFF_PT              0x80000u            /* GPU page tables: 128 pages of 4 KB */
++#define OFF_CS              0x30000u            /* compute shader binary */
++#define OFF_CSOUT           0x31000u            /* what it writes */
 +#define PT_PAGES            128u
 +#define DRAW_W              256u
 +#define DRAW_H              256u
@@ -1795,6 +1797,148 @@ index 0000000..264e308
 +}
 +
 +/*
++ * boot-arg gpu_cs=1: the first shader on the Adreno — a compute kernel of 64 invocations, each
++ * storing 0xc0de0000 + its local invocation id at buf[id], the buffer's GPU address in c0.xy.
++ * Source metal/ir3/shaders/first.asm, assembled for the a610 by metal/ir3/sapphire-ir3as (Mesa's
++ * own ir3 assembler and encoder): 128 bytes, max_reg 2 (3 full registers), no half registers,
++ * constlen 4 vec4, mergedregs, double_threadsize (THREAD128), branchstack 0, local id in r0.x.
++ * The launch is Mesa's computerator a6xx.cc (cs_restore_emit, cs_program_emit_regs,
++ * cs_program_emit, emit_const, a6xx_emit_grid) for a GPU without LPAC; offsets and fields from
++ * a6xx.xml (metal/tools/a6xx-reg.py).
++ */
++static const uint32_t first_cs[32] = {
++	0x00000000, 0x202cc004, 0x00000001, 0x202cc005, 0xc0de0000, 0x204cc008, 0x00000000, 0x00000500,
++	0x00000008, 0x42100008, 0x00000000, 0x00000500, 0x01800010, 0xc0d60900, 0x00000000, 0x03000000,
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++};
++static uint32_t cs_test;
++
++#define REG_SP_PERFCTR_SHADER_MASK  0xae0f
++#define REG_SP_NC_MODE_CNTL_2       0xae04
++#define REG_SP_MODE_CNTL            0xab00
++#define REG_SP_UPDATE_CNTL          0xbb08
++#define REG_SP_CS_CONST_CONFIG      0xb987
++#define REG_SP_CS_CONFIG            0xa9bb
++#define REG_SP_CS_INSTR_SIZE        0xa9bc
++#define REG_SP_CS_CNTL_0            0xa9b0
++#define REG_SP_CS_CNTL_1            0xa9b1
++#define REG_SP_CS_CONST_CONFIG_0    0xb997
++#define REG_SP_CS_WGE_CNTL          0xb998
++#define REG_SP_CS_BASE              0xa9b4
++#define REG_SP_CS_NDRANGE_0         0xb990      /* NDRANGE_0..6 consecutive */
++#define REG_SP_CS_KERNEL_GROUP_X    0xb999      /* X, Y, Z consecutive */
++#define CP_LOAD_STATE6_FRAG         0x34
++#define CP_EXEC_CS                  0x33
++#define RM6_COMPUTE                 8
++#define INVALID_REG                 0xfcu
++
++static bool
++cs_first(void)
++{
++	uint64_t code = POOL_PA + OFF_CS, out = POOL_PA + OFF_CSOUT;
++	volatile uint32_t *res = (volatile uint32_t *)(pool + OFF_CSOUT);
++	uint32_t good = 0, bad_at = 0xFFFFFFFF, bad_val = 0;
++
++	LOG("--- gpu_cs: the first shader, 64 invocations writing to %llx", out);
++	memcpy(pool + OFF_CS, first_cs, sizeof(first_cs));
++	for (int i = 0; i < 64; i++) {
++		res[i] = 0xDEADBEEF;
++	}
++	gmb();
++
++	/* cs_restore_emit: shader mask, NC mode, the a610's magic registers */
++	reg1(REG_SP_PERFCTR_SHADER_MASK, 1u << 5);
++	reg1(REG_SP_NC_MODE_CNTL_2, 0);
++	reg1(0x9804, 0xf);                          /* PC_MODE_CNTL */
++	reg1(0x9805, 0);                            /* PC_POWER_CNTL */
++	reg1(0xa0f8, 0);                            /* VFD_POWER_CNTL */
++	reg1(0xb600, 0);                            /* TPL1_DBG_ECO_CNTL */
++	reg1(0x8600, 0);                            /* GRAS_DBG_ECO_CNTL */
++	reg1(0xae03, 0);                            /* SP_CHICKEN_BITS */
++	reg1(0xae00, 0);                            /* SP_DBG_ECO_CNTL */
++	reg1(0xbe04, 0);                            /* HLSQ_DBG_ECO_CNTL */
++	reg1(0x9600, 0);                            /* VPC_DBG_ECO_CNTL */
++	reg1(0x0e12, 0x10000000);                   /* UCHE_UNKNOWN_0E12 */
++
++	/* cs_program_emit_regs */
++	reg1(REG_SP_MODE_CNTL, 1u | (2u << 1));     /* constant demotion, ISAMMODE_GL */
++	reg1(REG_SP_UPDATE_CNTL, 0x3Fu | (1u << 7)); /* every stage's state, GFX_UAV */
++	reg1(REG_SP_CS_CONST_CONFIG, (4u >> 2) | (1u << 8));  /* constlen 4 vec4 (field shr 2), enabled */
++	reg1(REG_SP_CS_CONFIG, 1u << 8);            /* enabled, no textures, samplers or UAVs */
++	reg1(REG_SP_CS_INSTR_SIZE, 1);              /* instrlen */
++	reg1(REG_SP_CS_CNTL_0, (0u << 1) | (3u << 7) | (0u << 13) | (1u << 20) | (1u << 31));
++	                                            /* half 0, full 3, branchstack 0, THREAD128, mergedregs */
++	reg1(REG_SP_CS_CNTL_1, 1u);                 /* shared_size 1, CONSTLEN_128 */
++	reg1(REG_SP_CS_CONST_CONFIG_0, INVALID_REG | (INVALID_REG << 8) | (INVALID_REG << 16) | (0u << 24));
++	                                            /* no wg id / size / offset consts, local id in r0.x */
++	reg1(REG_SP_CS_WGE_CNTL, INVALID_REG | (1u << 9));  /* no linear local id, THREAD128 */
++	emit(pkt4(REG_SP_CS_BASE, 2));
++	emit((uint32_t)code);
++	emit((uint32_t)(code >> 32));
++	reg1(REG_SP_CS_INSTR_SIZE, 1);
++
++	/* cs_program_emit: preload the code (instrlen 1, within the 64-entry cache) */
++	emit(pkt7(CP_LOAD_STATE6_FRAG, 3));
++	emit(0u | (0u << 14) | (2u << 16) | (0xDu << 18) | (1u << 22));  /* ST6_SHADER, SS6_INDIRECT, SB6_CS_SHADER, 1 unit */
++	emit((uint32_t)code);
++	emit((uint32_t)(code >> 32));
++
++	/* emit_const: c0 = the buffer's address */
++	emit(pkt7(CP_LOAD_STATE6_FRAG, 3 + 4));
++	emit(0u | (1u << 14) | (0u << 16) | (0xDu << 18) | (1u << 22));  /* ST6_CONSTANTS, SS6_DIRECT, SB6_CS_SHADER, 1 vec4 */
++	emit(0);
++	emit(0);
++	emit((uint32_t)out);
++	emit((uint32_t)(out >> 32));
++	emit(0);
++	emit(0);
++
++	/* a6xx_emit_grid: one group of 64 */
++	emit(pkt7(CP_SET_MARKER, 1));
++	emit(RM6_COMPUTE);
++	emit(pkt4(REG_SP_CS_NDRANGE_0, 7));
++	emit(1u | (63u << 2) | (0u << 12) | (0u << 22));  /* kerneldim 1, local size 64 x 1 x 1 */
++	emit(64);                                   /* global size x */
++	emit(0);
++	emit(1);                                    /* global size y */
++	emit(0);
++	emit(1);                                    /* global size z */
++	emit(0);
++	emit(pkt4(REG_SP_CS_KERNEL_GROUP_X, 3));
++	emit(1);
++	emit(1);
++	emit(1);
++	emit(pkt7(CP_EXEC_CS, 4));
++	emit(0);
++	emit(1);
++	emit(1);
++	emit(1);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	event(EV_CACHE_FLUSH_TS, true);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	if (!submit("compute", 200)) {
++		return false;
++	}
++	IODelay(100);
++	gmb();
++	for (uint32_t i = 0; i < 64; i++) {
++		if (res[i] == 0xC0DE0000u + i) {
++			good++;
++		} else if (bad_at == 0xFFFFFFFF) {
++			bad_at = i;
++			bad_val = res[i];
++		}
++	}
++	LOG("  results: [0] %08x [1] %08x [63] %08x; %u of 64 right", res[0], res[1], res[63], good);
++	if (bad_at != 0xFFFFFFFF) {
++		LOG("  first wrong: [%u] = %08x", bad_at, bad_val);
++	}
++	LOG("  RBBM_STATUS %08x CP_HW_FAULT %08x RBBM_INT_0_STATUS %08x", grd(REG_RBBM_STATUS), grd(REG_CP_HW_FAULT),
++	    grd(REG_RBBM_INT_0_STATUS));
++	return good == 64;
++}
++
++/*
 + * boot-arg gpu_demo=1: the GPU paints three bars (red, green, blue) straight onto the boot
 + * framebuffer the panel scans out, over the Apple logo, where they stay until SpringBoard's first
 + * frame replaces them. The framebuffer is 1080 x 2400 BGRA with 4320 bytes a row, which the
@@ -1883,6 +2027,7 @@ index 0000000..264e308
 +	(void)PE_parse_boot_argn("gpu_draw", &draw_first, sizeof(draw_first));
 +	(void)PE_parse_boot_argn("gpu_demo", &demo, sizeof(demo));
 +	(void)PE_parse_boot_argn("gpu_bench", &bench, sizeof(bench));
++	(void)PE_parse_boot_argn("gpu_cs", &cs_test, sizeof(cs_test));
 +	(void)PE_parse_boot_argn("gpu_mmu", &mmu, sizeof(mmu));
 +	(void)PE_parse_boot_argn("gpu_service", &service, sizeof(service));
 +	service_lock = IOLockAlloc();
@@ -1995,6 +2140,11 @@ index 0000000..264e308
 +			}
 +			if (bench) {
 +				bench_copy();
++			}
++			if (cs_test && cs_first()) {
++				LOG("*** the first shader ran on the Adreno: 64 of 64 invocations wrote their value ***");
++			} else if (cs_test) {
++				LOG("the compute shader did not come out right");
 +			}
 +			if (mmu && mmu_test()) {
 +				LOG("*** the GPU reached scattered memory through its own page tables ***");

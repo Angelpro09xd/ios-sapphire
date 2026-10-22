@@ -11,3 +11,5 @@ __pycache__/
 # boot logs: SSIDs nearby, device identifiers
 logs/
 metal/out/
+metal/ir3/sapphire-ir3as
+metal/ir3/*.o
