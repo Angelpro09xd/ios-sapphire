@@ -255,7 +255,8 @@ struct eagl {
 	id object;                      /* the EAGLContext */
 	struct redwood_gl *gl;
 	unsigned long api;
-	struct image images[256];
+	struct image *images;           /* sapphire: IMAGES_MAX of them (256 ran out: text came out as boxes) */
+	uint32_t *image_index;          /* ... and texture name -> 1 + its place there, for names below IMAGE_NAMES */
 	unsigned image_count;
 	GLuint framebuffer;             /* the one bound */
 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
@@ -523,9 +524,23 @@ summary(struct eagl *e)
 
 /* ---- IOSurfaces ----------------------------------------------------------------------------------- */
 
+/*
+ * sapphire: room for 8192 textures made of IOSurfaces, and a direct index by texture name. With
+ * 256, Settings and the keyboard ran out ("more textures with IOSurfaces than there is room for",
+ * hundreds of times a session), every texImageIOSurface after that was "not done", and the
+ * textures kept what they held before: text came out as solid boxes. A linear search through
+ * thousands on every glBindTexture would cost a frame its time, hence the index.
+ */
+#define IMAGES_MAX      8192
+#define IMAGE_NAMES     65536
+
 static struct image *
 image_of(struct eagl *e, GLuint texture)
 {
+	if (texture < IMAGE_NAMES && e->image_index != NULL) {
+		uint32_t at = e->image_index[texture];
+		return at != 0 ? &e->images[at - 1] : NULL;
+	}
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].texture == texture) {
 			return &e->images[i];
@@ -540,11 +555,14 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 	struct image *image = image_of(e, texture);
 
 	if (image == NULL) {
-		if (e->image_count == sizeof(e->images) / sizeof(e->images[0])) {
+		if (e->images == NULL || e->image_count == IMAGES_MAX) {
 			say("redwood-gl: more textures with IOSurfaces than there is room for\n");
 			return NULL;
 		}
 		image = &e->images[e->image_count++];
+		if (texture < IMAGE_NAMES && e->image_index != NULL) {
+			e->image_index[texture] = e->image_count;
+		}
 	} else {
 		if (image->mirror != 0) {
 			glDeleteTextures(1, &image->mirror);
@@ -567,15 +585,21 @@ image_forget(struct eagl *e, GLuint texture)
 			glDeleteTextures(1, &image->mirror);
 		}
 		CFRelease(image->surface);
+		if (texture < IMAGE_NAMES && e->image_index != NULL) {
+			e->image_index[texture] = 0;
+		}
 		*image = e->images[--e->image_count];
+		if (image != &e->images[e->image_count] && image->texture < IMAGE_NAMES && e->image_index != NULL) {
+			e->image_index[image->texture] = (uint32_t)(image - e->images) + 1;     /* (the last one moved here) */
+		}
 	}
 }
 
 /*
- * sapphire: alpha-only textures (GL_ALPHA: CoreAnimation's text masks, 'A008' IOSurfaces) are
- * made RGBA (0, 0, 0, a) here, which a shader samples exactly as it samples GL_ALPHA. On the
- * Adreno 610 the alpha-only kind (Mesa's A8_UNORM) showed every glyph as a solid box of the
- * text's colour: its alpha read 1. boot-arg glalpha=0 leaves GL_ALPHA alone.
+ * sapphire, boot-arg glalpha=1: alpha-only textures (GL_ALPHA: CoreAnimation's text masks, 'A008'
+ * IOSurfaces) made RGBA (0, 0, 0, a), which a shader samples exactly as it samples GL_ALPHA. Tried
+ * against text drawn as solid boxes, which turned out to be the image table running out (above);
+ * kept as a switch, off by default.
  */
 #define ALPHA_TEXTURES  65536
 static uint8_t alpha_converted[ALPHA_TEXTURES / 8];     /* texture names made RGBA here */
@@ -587,7 +611,7 @@ alpha_expand_on(void)
 	if (alpha_expand < 0) {
 		char args[1024] = "";
 		size_t size = sizeof(args) - 1;
-		alpha_expand = !(sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "glalpha=0") != NULL);
+		alpha_expand = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "glalpha=1") != NULL;
 	}
 	return alpha_expand;
 }
@@ -3986,6 +4010,8 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 		free(e);
 		return nil;
 	}
+	e->images = calloc(IMAGES_MAX, sizeof(struct image));
+	e->image_index = calloc(IMAGE_NAMES, sizeof(uint32_t));
 	current = e;
 	e->object = self;
 	e->api = api;
@@ -4182,6 +4208,8 @@ my_dealloc(id self, SEL selector)
 			current = NULL;
 		}
 		redwood_gl_destroy(e->gl);
+		free(e->images);
+		free(e->image_index);
 		free(e);
 	}
 	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&super, selector);
