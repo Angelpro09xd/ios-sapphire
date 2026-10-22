@@ -1,0 +1,166 @@
+From 4ac22f1fa51d558e147799b9f6f3852040212f93 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 22 Oct 2026 12:30:01 +0000
+Subject: [PATCH] sapphire-0153: msm fences of their own; an idle GPU is not a
+ hung one
+
+On 0152 the shared fence slot once held 0x801d229c (a pixel, not a
+seqno; the GPU's SMMU had a translation fault at 0x64658000 at about the
+same time). A GPU that was idle with the ring read to its end was taken
+for hung, the service stopped, Mesa's next call failed and backboardd
+crashed; after its restart Mesa fell back to the CPU (7-9 s a frame).
+
+- msm submissions write their own fence (OFF_MSM_FENCE, own counter).
+- a fence that looks unfinished after the wait while the CP is idle and
+  has read the whole ring counts as done, and that is logged.
+- a frame copy's source window is not remapped while a copy queued
+  earlier (0152 no longer waits for them) may still be reading it.
+---
+ iokit/Kernel/arm/SapphireGpu.cpp | 60 ++++++++++++++++++++++++++++----
+ 1 file changed, 53 insertions(+), 7 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index 46ce420..4f7e2f8 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -104,6 +104,7 @@ extern "C" int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, ui
+ #define OFF_TEST            0x18000u            /* what CP_MEM_WRITE writes */
+ #define OFF_META            0x19000u            /* zap metadata, read by TrustZone */
+ #define OFF_FENCE           0x18100u            /* where the CCU/cache flush events write their seqno */
++#define OFF_MSM_FENCE       0x18200u            /* 0153: the msm client's own fence, written by nothing else */
+ #define OFF_DRAW            0x40000u            /* what the 2D blitter fills: 256 x 256 RGBA8, 256 KB */
+ #define OFF_PT              0x80000u            /* GPU page tables: 128 pages of 4 KB */
+ #define OFF_CS              0x30000u            /* compute shader binary */
+@@ -1330,6 +1331,7 @@ reg1(uint32_t reg, uint32_t v)
+ }
+ 
+ static uint32_t fence_seq;                      /* the last timestamp handed to the GPU */
++static uint32_t msm_seq;                        /* 0153: the last msm submission's (OFF_MSM_FENCE) */
+ 
+ static void
+ event(uint32_t ev, bool ts)
+@@ -1885,7 +1887,15 @@ static IOLock *service_lock;
+ static struct {
+ 	IOMemoryDescriptor *md;
+ 	uint64_t len, first, last;
++	uint32_t fence;                         /* 0153: the shared seqno of the last copy that read it */
+ } win[WIN_COUNT];
++
++/* the shared slot's seqno has reached f (the copies' own events) */
++static bool
++fence_done(uint32_t f)
++{
++	return (int32_t)(*(volatile uint32_t *)(pool + OFF_FENCE) - f) >= 0;
++}
+ static uint32_t win_next;
+ static struct {
+ 	uint64_t base, size;
+@@ -1939,6 +1949,13 @@ map_window(IOMemoryDescriptor *md)
+ 	}
+ 	uint32_t i = win_next++ % WIN_COUNT;
+ 	uint64_t va = WIN_BASE + i * WIN_SIZE;
++	/* 0153: copies are not waited for (0152): a window still being read is not remapped under it */
++	for (uint32_t t = 0; win[i].fence != 0 && !fence_done(win[i].fence) && t < 20000; t++) {
++		if (grd(REG_CP_RB_RPTR) == ring_wptr % RING_DWORDS) {
++			break;                          /* (the CP is past it: the slot was overwritten, as above) */
++		}
++		IODelay(10);
++	}
+ 	for (uint64_t off = 0; off < WIN_SIZE; off += 4096) {
+ 		uint64_t pa = off < len ? md->getPhysicalSegment(off, &seg, kIOMemoryMapperNone) : 0;
+ 		if (off < len && pa == 0) {
+@@ -2003,6 +2020,10 @@ sapphire_gpu_copy(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src_pitch,
+ 		}
+ 		if (va != 0 && dst_ok && src_off + (uint64_t)(h - 1) * src_pitch + w * 4u <= src->getLength()) {
+ 			ok = blit_copy(va + src_off, src_pitch, dst_pa, dst_pitch, w, h);
++			uint32_t wi = (uint32_t)((va - WIN_BASE) / WIN_SIZE);
++			if (wi < WIN_COUNT) {
++				win[wi].fence = fence_seq;      /* blit_end's last event */
++			}
+ 			if (!ok) {
+ 				service_ready = false;
+ 				LOG("service: a copy failed, the GPU path is off; RBBM_STATUS %08x", grd(REG_RBBM_STATUS));
+@@ -2990,10 +3011,23 @@ msm_va_alloc(uint64_t n)
+ 	return 0;
+ }
+ 
++/*
++ * 0153: the msm fences have a slot and a counter of their own. On 0152 the shared slot once held
++ * 0x801d229c -- a pixel, not a seqno (the GPU's SMMU had a translation fault at about the same
++ * time) -- and a GPU that was idle with the ring read to its end was taken for hung, the service
++ * stopped and backboardd crashed (Mesa on the CPU after its restart). Now a fence that looks
++ * unfinished while the CP is idle and has read everything counts as done, and that is said.
++ */
+ static bool
+ msm_fence_done(uint32_t f)
+ {
+-	return (int32_t)(*(volatile uint32_t *)(pool + OFF_FENCE) - f) >= 0;
++	return (int32_t)(*(volatile uint32_t *)(pool + OFF_MSM_FENCE) - f) >= 0;
++}
++
++static bool
++msm_gpu_idle(void)
++{
++	return grd(REG_CP_RB_RPTR) == ring_wptr % RING_DWORDS && (grd(REG_RBBM_STATUS) & ~1u) == 0;
+ }
+ 
+ /*
+@@ -3076,6 +3110,14 @@ msm_wait(uint32_t f, uint64_t ms)
+ 	while (!msm_fence_done(f)) {
+ 		now = mach_absolute_time();
+ 		if (now >= deadline) {
++			if (msm_gpu_idle()) {
++				static uint32_t said;
++				if (said++ < 8) {
++					LOG("msm: fence %u not written (slot %08x) but the GPU is idle with the ring read: done", f,
++					    *(volatile uint32_t *)(pool + OFF_MSM_FENCE));
++				}
++				return true;
++			}
+ 			return false;
+ 		}
+ 		delay_for_interval(50, NSEC_PER_USEC);
+@@ -3105,7 +3147,7 @@ msm_hung(const char *who, uint32_t fence)
+ 	if (service_ready) {
+ 		service_ready = false;
+ 		LOG("msm: %s: submission %u did not finish in 2 s (done: %u): the GPU service stops; RBBM_STATUS %08x CP_HW_FAULT %08x rptr %u wptr %u",
+-		    who, fence, *(volatile uint32_t *)(pool + OFF_FENCE), grd(REG_RBBM_STATUS), grd(REG_CP_HW_FAULT),
++		    who, fence, *(volatile uint32_t *)(pool + OFF_MSM_FENCE), grd(REG_RBBM_STATUS), grd(REG_CP_HW_FAULT),
+ 		    grd(REG_CP_RB_RPTR), ring_wptr % RING_DWORDS);
+ 		smmu_fault("msm");
+ 	}
+@@ -3306,8 +3348,8 @@ SapphireGPUClient::drop(struct msm_bo *b)
+ IOReturn
+ SapphireGPUClient::clientClose(void)
+ {
+-	if (service_ready && !msm_wait(fence_seq, 2000)) {     /* nothing of ours may still be at work */
+-		msm_hung(fName, fence_seq);
++	if (service_ready && !msm_wait(msm_seq, 2000)) {       /* nothing of ours may still be at work */
++		msm_hung(fName, msm_seq);
+ 	}
+ 	IOLockLock(service_lock);
+ 	for (uint32_t i = 0; fBo != NULL && i < MSM_BUFFERS; i++) {
+@@ -3554,7 +3596,7 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 	}
+ 	reap();
+ 	if (!ring_room(4 * r->nr_cmds + 16, 2000)) {
+-		msm_hung(fName, fence_seq);
++		msm_hung(fName, msm_seq);
+ 		IOLockUnlock(service_lock);
+ 		ret = kIOReturnTimeout;
+ 		goto out;
+@@ -3603,8 +3645,12 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 			n++;
+ 		}
+ 		emit(pkt7(CP_WAIT_FOR_IDLE, 0));
+-		event(EV_CACHE_FLUSH_TS, true);
+-		r->fence = fence_seq;
++		emit(pkt7(CP_EVENT_WRITE, 4));          /* CACHE_FLUSH_TS into the msm slot (event() writes the shared one) */
++		emit(EV_CACHE_FLUSH_TS | (1u << 30));
++		emit((uint32_t)(POOL_PA + OFF_MSM_FENCE));
++		emit((uint32_t)((POOL_PA + OFF_MSM_FENCE) >> 32));
++		emit(++msm_seq);
++		r->fence = msm_seq;
+ 		kick();                                 /* and back to the program: msm_wait() is how it waits */
+ 		for (uint32_t i = 0; i < r->nr_bos; i++) {
+ 			struct msm_bo *b = bo(bos[i].handle);
