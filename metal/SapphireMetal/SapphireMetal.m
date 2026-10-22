@@ -32,6 +32,7 @@ void *calloc(size_t, size_t);
 void free(void *);
 int strcmp(const char *, const char *);
 int strncmp(const char *, const char *, size_t);
+char *strstr(const char *, const char *);
 
 typedef struct objc_method *Method;
 typedef struct objc_protocol_def Protocol_t;
@@ -55,6 +56,11 @@ extern void **protocol_copyProtocolList(void *p, unsigned int *count);
 extern const char *protocol_getName(void *p);
 extern int class_addMethod(Class cls, SEL name, IMP_t imp, const char *types);
 extern int class_addProtocol(Class cls, void *protocol);
+extern Class objc_allocateClassPair(Class superclass, const char *name, size_t extra);
+extern void objc_registerClassPair(Class cls);
+extern const char *class_getName(Class cls);
+extern Class object_getClass(id obj);
+int snprintf(char *, size_t, const char *, ...);
 extern Method class_getInstanceMethod(Class cls, SEL name);
 extern IMP_t method_getImplementation(Method m);
 extern Class class_getSuperclass(Class cls);
@@ -74,6 +80,7 @@ __attribute__((objc_root_class))
 @end
 
 static unsigned int sapphire_port;
+static id sapphire_device;
 static int sapphire_logged;
 
 /* one fprintf per line: the console splits a line written in several pieces */
@@ -119,6 +126,154 @@ route_protocol(Class cls, void *proto, int depth)
 	}
 }
 
+/*
+ * Step 0b: objects of the right kind. When a routed method returns an object, the selector tells
+ * what CoreAnimation expects back (newCommandQueue -> an MTLCommandQueue, commandBuffer -> an
+ * MTLCommandBuffer, newTexture... -> an MTLTexture, ...), and it gets a stub of that kind: a
+ * class made at run time per protocol, declaring the protocol (and its SPI twin) and routing all
+ * of its methods through the same logging forwardInvocation. Nothing is drawn; the point is to
+ * see the whole of what is asked, not only up to the first nil.
+ */
+static const struct {
+	const char *needle, *proto;
+} stub_kinds[] = {
+	{ "parallelRenderCommandEncoder", "MTLParallelRenderCommandEncoder" },
+	{ "renderCommandEncoder", "MTLRenderCommandEncoder" },
+	{ "blitCommandEncoder", "MTLBlitCommandEncoder" },
+	{ "computeCommandEncoder", "MTLComputeCommandEncoder" },
+	{ "newCommandQueue", "MTLCommandQueue" },
+	{ "commandBuffer", "MTLCommandBuffer" },
+	{ "newRenderPipelineState", "MTLRenderPipelineState" },
+	{ "newComputePipelineState", "MTLComputePipelineState" },
+	{ "newDepthStencilState", "MTLDepthStencilState" },
+	{ "newSamplerState", "MTLSamplerState" },
+	{ "newTexture", "MTLTexture" },
+	{ "newBuffer", "MTLBuffer" },
+	{ "newDefaultLibrary", "MTLLibrary" },
+	{ "newLibrary", "MTLLibrary" },
+	{ "newFunction", "MTLFunction" },
+	{ "newSharedEvent", "MTLSharedEvent" },
+	{ "newEvent", "MTLEvent" },
+	{ "newFence", "MTLFence" },
+	{ "newHeap", "MTLHeap" },
+	{ "newIndirectCommandBuffer", "MTLIndirectCommandBuffer" },
+	{ "newArgumentEncoder", "MTLArgumentEncoder" },
+	{ NULL, NULL }
+};
+
+static void stub_forward(id self, SEL _cmd, id inv);
+static id stub_signature(id self, SEL _cmd, SEL sel);
+static id stub_unrecognized(id self, SEL _cmd, SEL sel);
+
+static int
+contains(const char *hay, const char *needle)
+{
+	return strstr(hay, needle) != NULL;
+}
+
+static Class
+stub_class(const char *proto_name)
+{
+	char name[160], spi_name[160];
+	snprintf(name, sizeof(name), "SapphireStub_%s", proto_name);
+	Class cls = objc_getClass(name);
+	if (cls != (Class)0) {
+		return cls;
+	}
+	cls = objc_allocateClassPair(objc_getClass("NSObject"), name, 0);
+	if (cls == (Class)0) {
+		return objc_getClass(name);
+	}
+	snprintf(spi_name, sizeof(spi_name), "%sSPI", proto_name);
+	void *spi = objc_getProtocol(spi_name), *pub = objc_getProtocol(proto_name);
+	if (spi != NULL) {
+		(void)class_addProtocol(cls, spi);
+		route_protocol(cls, spi, 0);
+	}
+	if (pub != NULL) {
+		(void)class_addProtocol(cls, pub);
+		route_protocol(cls, pub, 0);
+	}
+	(void)class_addMethod(cls, sel_registerName("forwardInvocation:"), (IMP_t)stub_forward, "v@:@");
+	(void)class_addMethod(cls, sel_registerName("methodSignatureForSelector:"), (IMP_t)stub_signature, "@@::");
+	(void)class_addMethod(cls, sel_registerName("doesNotRecognizeSelector:"), (IMP_t)stub_unrecognized, "@@::");
+	objc_registerClassPair(cls);
+	SLOG("made %s (%s%s)", name, pub ? proto_name : "no protocol", spi ? " + SPI" : "");
+	return cls;
+}
+
+static id
+stub_for(SEL sel)
+{
+	const char *n = sel_getName(sel);
+	if (strcmp(n, "device") == 0) {
+		return sapphire_device;
+	}
+	for (int i = 0; stub_kinds[i].needle != NULL; i++) {
+		if (contains(n, stub_kinds[i].needle)) {
+			id obj = msg0((id)stub_class(stub_kinds[i].proto), "alloc");
+			return msg0(obj, "init");
+		}
+	}
+	return (id)0;
+}
+
+/* The routed call: log, then answer with a stub, _MTLDevice's implementation, or zero. */
+static void
+forward_common(id self, id inv, Class super_cls)
+{
+	SEL sel = ((SEL (*)(id, SEL))objc_msgSend)(inv, sel_registerName("selector"));
+	id sig = msg0(inv, "methodSignature");
+	unsigned long rlen = ((unsigned long (*)(id, SEL))objc_msgSend)(sig, sel_registerName("methodReturnLength"));
+	const char *rtype = ((const char *(*)(id, SEL))objc_msgSend)(sig, sel_registerName("methodReturnType"));
+	Method m = super_cls != (Class)0 ? class_getInstanceMethod(super_cls, sel) : (Method)0;
+	id stub = (rtype != NULL && rtype[0] == '@') ? stub_for(sel) : (id)0;
+	const char *who = class_getName(object_getClass(self));
+
+	if (sapphire_logged++ < 6000) {
+		SLOG("%s %s%s", strncmp(who, "SapphireStub_", 13) == 0 ? who + 13 : "device", sel_getName(sel),
+		    stub != (id)0 ? "  -> stub" : (m != NULL ? "  (to _MTLDevice)" : ""));
+	}
+	if (rlen > 0) {
+		void *zero = calloc(1, rlen < 64 ? 64 : rlen);
+		((void (*)(id, SEL, void *))objc_msgSend)(inv, sel_registerName("setReturnValue:"), zero);
+		free(zero);
+	}
+	if (stub != (id)0) {
+		((void (*)(id, SEL, void *))objc_msgSend)(inv, sel_registerName("setReturnValue:"), &stub);
+	} else if (m != NULL) {
+		((void (*)(id, SEL, IMP_t))objc_msgSend)(inv, sel_registerName("invokeUsingIMP:"), method_getImplementation(m));
+	}
+}
+
+static void
+stub_forward(id self, SEL _cmd, id inv)
+{
+	forward_common(self, inv, (Class)0);
+}
+
+static id
+stub_signature(id self, SEL _cmd, SEL sel)
+{
+	struct objc_super sup = { self, objc_getClass("NSObject") };
+	id sig = ((id (*)(struct objc_super *, SEL, SEL))objc_msgSendSuper)(&sup,
+	    sel_registerName("methodSignatureForSelector:"), sel);
+	if (sig == (id)0) {
+		sig = ((id (*)(Class, SEL, const char *))objc_msgSend)(objc_getClass("NSMethodSignature"),
+		    sel_registerName("signatureWithObjCTypes:"), "@@:");
+	}
+	return sig;
+}
+
+static id
+stub_unrecognized(id self, SEL _cmd, SEL sel)
+{
+	if (sapphire_logged++ < 6000) {
+		SLOG("%s %s: not implemented, answering 0", class_getName(object_getClass(self)), sel_getName(sel));
+	}
+	return (id)0;
+}
+
 @implementation SapphireMTLDevice
 
 + (void)load
@@ -144,6 +299,7 @@ route_protocol(Class cls, void *proto, int depth)
 {
 	self = [super init];
 	sapphire_port = port;
+	sapphire_device = self;
 	SLOG("initWithAcceleratorPort: %u -> %p", port, (void *)self);
 	return self;
 }
@@ -151,23 +307,7 @@ route_protocol(Class cls, void *proto, int depth)
 /* Everything routed to _objc_msgForward ends up here, as an NSInvocation. */
 - (void)forwardInvocation:(id)inv
 {
-	SEL sel = ((SEL (*)(id, SEL))objc_msgSend)(inv, sel_registerName("selector"));
-	id sig = msg0(inv, "methodSignature");
-	unsigned long rlen = ((unsigned long (*)(id, SEL))objc_msgSend)(sig, sel_registerName("methodReturnLength"));
-	Class super_cls = class_getSuperclass(objc_getClass("SapphireMTLDevice"));
-	Method m = class_getInstanceMethod(super_cls, sel);
-
-	if (sapphire_logged++ < 4000) {
-		SLOG("%s%s", sel_getName(sel), m != NULL ? "  (to _MTLDevice)" : "");
-	}
-	if (rlen > 0) {
-		void *zero = calloc(1, rlen < 64 ? 64 : rlen);
-		((void (*)(id, SEL, void *))objc_msgSend)(inv, sel_registerName("setReturnValue:"), zero);
-		free(zero);
-	}
-	if (m != NULL) {
-		((void (*)(id, SEL, IMP_t))objc_msgSend)(inv, sel_registerName("invokeUsingIMP:"), method_getImplementation(m));
-	}
+	forward_common(self, inv, class_getSuperclass(objc_getClass("SapphireMTLDevice")));
 }
 
 /*
