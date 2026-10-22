@@ -9,8 +9,8 @@
 #include "quad.vert.h"
 #include "quad.frag.h"
 
-#define W 256
-#define H 256
+/* CAP_W/CAP_H: render target size, CAP_TW/CAP_TH: texture size (default 256 each) */
+static uint32_t W = 256, H = 256, TW = 256, TH = 256;
 #define CK(x) do { VkResult r_ = (x); if (r_) { fprintf(stderr, "%s = %d\n", #x, r_); exit(1); } } while (0)
 
 static PFN_vkGetInstanceProcAddr gipa;
@@ -28,11 +28,11 @@ static uint32_t memtype(uint32_t bits) {
     fprintf(stderr, "no host-visible memory type\n"); exit(1);
 }
 
-static VkImage image(VkFormat f, VkImageUsageFlags u, void **map, VkSubresourceLayout *lay) {
+static VkImage image(VkFormat f, uint32_t w, uint32_t h, VkImageUsageFlags u, void **map, VkSubresourceLayout *lay) {
     I(vkCreateImage); I(vkGetImageMemoryRequirements); I(vkAllocateMemory);
     I(vkBindImageMemory); I(vkMapMemory); I(vkGetImageSubresourceLayout);
     VkImageCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
-        .format = f, .extent = { W, H, 1 }, .mipLevels = 1, .arrayLayers = 1,
+        .format = f, .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR, .usage = u,
         .initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED };
     VkImage im; CK(vkCreateImage(dev, &ci, NULL, &im));
@@ -68,6 +68,10 @@ static void barrier(VkCommandBuffer cb, VkImage im, VkImageLayout from, VkImageL
 
 int main(int argc, char **argv) {
     const char *icd = argc > 1 ? argv[1] : "libvulkan_freedreno.so";
+    if (getenv("CAP_W")) W = atoi(getenv("CAP_W"));
+    if (getenv("CAP_H")) H = atoi(getenv("CAP_H"));
+    TW = getenv("CAP_TW") ? atoi(getenv("CAP_TW")) : W;
+    TH = getenv("CAP_TH") ? atoi(getenv("CAP_TH")) : H;
     void *h = dlopen(icd, RTLD_NOW); if (!h) { fprintf(stderr, "%s\n", dlerror()); return 1; }
     gipa = (PFN_vkGetInstanceProcAddr)dlsym(h, "vk_icdGetInstanceProcAddr");
     uint32_t ver = 5; PFN_vkVoidFunction neg = (PFN_vkVoidFunction)dlsym(h, "vk_icdNegotiateLoaderICDInterfaceVersion");
@@ -92,10 +96,10 @@ int main(int argc, char **argv) {
     /* the framebuffer format of the phone (BGRA8 linear) and an RGBA8 "IOSurface" */
     const VkFormat RT = VK_FORMAT_B8G8R8A8_UNORM, TX = VK_FORMAT_R8G8B8A8_UNORM;
     void *rtmap, *txmap, *dsmap; VkSubresourceLayout rtl, txl, dsl;
-    VkImage rt = image(RT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, &rtmap, &rtl);
-    VkImage tx = image(TX, VK_IMAGE_USAGE_SAMPLED_BIT, &txmap, &txl);
-    VkImage ds = image(RT, VK_IMAGE_USAGE_TRANSFER_DST_BIT, &dsmap, &dsl);
-    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++)
+    VkImage rt = image(RT, W, H, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, &rtmap, &rtl);
+    VkImage tx = image(TX, TW, TH, VK_IMAGE_USAGE_SAMPLED_BIT, &txmap, &txl);
+    VkImage ds = image(RT, W, H, VK_IMAGE_USAGE_TRANSFER_DST_BIT, &dsmap, &dsl);
+    for (uint32_t y = 0; y < TH; y++) for (uint32_t x = 0; x < TW; x++)
         ((uint32_t *)((char *)txmap + y * txl.rowPitch))[x] = 0xff000000u | (uint32_t)y << 8 | (uint32_t)x;
     printf("pitches rt %llu tx %llu\n", (unsigned long long)rtl.rowPitch, (unsigned long long)txl.rowPitch);
     VkImageView rtv = view(rt, RT), txv = view(tx, TX);
@@ -145,7 +149,10 @@ int main(int argc, char **argv) {
         .colorWriteMask = 0xf };
     VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &cba };
     VkPipelineRenderingCreateInfo prci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1, .pColorAttachmentFormats = &RT };
-    VkGraphicsPipelineCreateInfo gpci = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &prci,
+    /* viewport and scissor are dynamic: one pipeline for every render target size */
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dsci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn };
+    VkGraphicsPipelineCreateInfo gpci = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &prci, .pDynamicState = &dsci,
         .stageCount = 2, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vps,
         .pRasterizationState = &rs, .pMultisampleState = &ms, .pColorBlendState = &cb, .layout = pl };
     VkPipeline pipe; CK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, NULL, &pipe));
@@ -168,6 +175,9 @@ int main(int argc, char **argv) {
         .colorAttachmentCount = 1, .pColorAttachments = &att };
     vkCmdBeginRendering(c, &ri);
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    I(vkCmdSetViewport); I(vkCmdSetScissor);
+    vkCmdSetViewport(c, 0, 1, &vp);
+    vkCmdSetScissor(c, 0, 1, &sc);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &set, 0, NULL);
     float pcv[8] = { -0.5f, -0.5f, 0.5f, 0.5f, 1, 1, 1, 1 };
     vkCmdPushConstants(c, pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, pcv);
@@ -182,8 +192,8 @@ int main(int argc, char **argv) {
     vkCmdEndRendering(c);
     barrier(c, rt, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     barrier(c, ds, VK_IMAGE_LAYOUT_PREINITIALIZED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkImageBlit bl = { { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { { 0, 0, 0 }, { W, H, 1 } },
-                       { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { { 0, 0, 0 }, { W, H, 1 } } };
+    VkImageBlit bl = { { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { { 0, 0, 0 }, { (int)W, (int)H, 1 } },
+                       { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { { 0, 0, 0 }, { (int)W, (int)H, 1 } } };
     vkCmdBlitImage(c, rt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ds, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_NEAREST);
     CK(vkEndCommandBuffer(c));
     VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
@@ -191,6 +201,6 @@ int main(int argc, char **argv) {
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &c };
     CK(vkQueueSubmit(q, 1, &si, fe));
     CK(vkWaitForFences(dev, 1, &fe, 1, 2000000000ull));
-    printf("submitted; rt[32,32] = %08x (zero under drm-shim)\n", ((uint32_t *)((char *)rtmap + 32 * rtl.rowPitch))[32]);
+    printf("submitted; rt[0] = %08x (zero under drm-shim)\n", ((uint32_t *)rtmap)[0]);
     return 0;
 }

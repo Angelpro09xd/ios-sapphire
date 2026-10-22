@@ -1,0 +1,868 @@
+From cea4c295bb203b0890044dc6dc6b36ab6ea093f4 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 22 Oct 2026 09:15:32 +0000
+Subject: [PATCH] sapphire-0149: SapphireGPU, the Adreno for Mesa (msm DRM
+ interface)
+
+Mesa's freedreno speaks Linux's msm DRM interface. SapphireGPU (published
+once gpu_service is up) answers it the way HackiOS's RedwoodGPU does
+(github.com/oosexgang): the request number is the user client selector,
+the structure goes in and comes back, client memory type = buffer handle,
+request 0x7e makes an IOSurface a buffer. So HackiOS's libdrm stand-in
+and stock freedreno run on it.
+
+GET_PARAM (a610: GPU_ID 610, chip 0x06010001, 128 KB GMEM at 0x100000),
+GEM_NEW / GEM_INFO (kernel-chosen addresses from 0x60000000 to
+0xE0000000, which identity mappings may not use), GEM_CPU_PREP,
+GEM_SUBMIT (indirect buffers, then a timestamped cache flush; run to
+completion), WAIT_FENCE, MADVISE, submit queues, GEM_CLOSE.
+
+Buffers are cacheable: mapped buffers and changed IOSurfaces are cleaned
+before a submission, CPU_PREP invalidates. Page tables grow into a second
+4 MB of the low-bank hole after the pool (0xE1100000, 1024 tables).
+---
+ iokit/Kernel/arm/SapphireGpu.cpp | 742 ++++++++++++++++++++++++++++++-
+ 1 file changed, 731 insertions(+), 11 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index a20dfc2..aad3b30 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -43,12 +43,14 @@
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
+ #include <kern/thread.h>
+ #include <kern/clock.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/crc.h>
+ #include <sys/param.h>
+ #include <sys/errno.h>
++#include <sys/systm.h>                         /* copyin, copyout (the msm client) */
+ #include <pexpert/device_tree.h>
+ 
+ #define LOG(fmt, ...)       IOLog("SapphireGpu: " fmt "\n", ##__VA_ARGS__)
+@@ -297,6 +299,7 @@ stop_here(uint32_t step, const char *what)
+ static IOMemoryMap *gicd_map;
+ static volatile uint8_t *gicd;
+ static bool smmu_identity(void);
++static void msm_publish(void);
+ 
+ /*
+  * The persistent log is written to userdata about once a second, so a step that hangs or
+@@ -907,16 +910,52 @@ static uint32_t pt_used;
+ static uint64_t *pt_l1;
+ static uint64_t pt_l1_pa;
+ 
++/*
++ * More page tables, for the msm client's buffers (up to 2 GB of 4 KB pages need 1024 tables):
++ * the 4 MB of the same unmanaged low-bank hole right after the pool (modem pool 0xE0000000 + 16
++ * MB, our pool + 1 MB, these + 4 MB, all below 0xF0000000), mapped write-combined like the
++ * pool, so the SMMU's non-cached walks see every entry after a dsb. Mapped on first use.
++ */
++#define PT2_PA              0xE1100000ull
++#define PT2_SIZE            0x00400000u
++#define PT2_PAGES           (PT2_SIZE / 4096u)
++static IOMemoryMap *pt2_map;
++static uint8_t *pt2;
++static uint32_t pt2_used;
++
++static uint64_t *
++pt_va(uint64_t pa)
++{
++	if (pa >= POOL_PA && pa < POOL_PA + POOL_SIZE) {
++		return (uint64_t *)(pool + (pa - POOL_PA));
++	}
++	return (uint64_t *)(pt2 + (pa - PT2_PA));
++}
++
+ static uint64_t
+ pt_alloc(uint64_t **va)
+ {
+-	if (pt_used >= PT_PAGES) {
++	if (pt_used < PT_PAGES) {
++		uint32_t off = OFF_PT + pt_used++ * 4096u;
++		*va = (uint64_t *)(pool + off);
++		bzero(*va, 4096);
++		return POOL_PA + off;
++	}
++	if (pt2 == NULL) {
++		pt2_map = map_phys(PT2_PA, PT2_SIZE, true);
++		if (pt2_map == NULL) {
++			return 0;
++		}
++		pt2 = (uint8_t *)pt2_map->getVirtualAddress();
++		LOG("  page tables: the pool's %u are used up, %u more at %llx", PT_PAGES, PT2_PAGES, PT2_PA);
++	}
++	if (pt2_used >= PT2_PAGES) {
+ 		return 0;
+ 	}
+-	uint32_t off = OFF_PT + pt_used++ * 4096u;
+-	*va = (uint64_t *)(pool + off);
++	uint32_t off = pt2_used++ * 4096u;
++	*va = (uint64_t *)(pt2 + off);
+ 	bzero(*va, 4096);
+-	return POOL_PA + off;
++	return PT2_PA + off;
+ }
+ 
+ static uint64_t *
+@@ -934,7 +973,7 @@ pt_next(uint64_t *e)
+ 	if ((*e & 3) != PTE_TYPE_TABLE) {
+ 		return NULL;                            /* a block is already there */
+ 	}
+-	return (uint64_t *)(pool + ((*e & PTE_ADDR_MASK) - POOL_PA));
++	return pt_va(*e & PTE_ADDR_MASK);
+ }
+ 
+ static bool
+@@ -968,12 +1007,12 @@ unmap_page_4k(uint64_t va)
+ 	if ((e1 & 3) != PTE_TYPE_TABLE) {
+ 		return;
+ 	}
+-	uint64_t *l2 = (uint64_t *)(pool + ((e1 & PTE_ADDR_MASK) - POOL_PA));
++	uint64_t *l2 = pt_va(e1 & PTE_ADDR_MASK);
+ 	uint64_t e2 = l2[(va >> 21) & 511];
+ 	if ((e2 & 3) != PTE_TYPE_TABLE) {
+ 		return;
+ 	}
+-	uint64_t *l3 = (uint64_t *)(pool + ((e2 & PTE_ADDR_MASK) - POOL_PA));
++	uint64_t *l3 = pt_va(e2 & PTE_ADDR_MASK);
+ 	l3[(va >> 12) & 511] = 0;
+ }
+ 
+@@ -1264,10 +1303,11 @@ reg1(uint32_t reg, uint32_t v)
+ 	emit(v);
+ }
+ 
++static uint32_t fence_seq;                      /* the last timestamp handed to the GPU */
++
+ static void
+ event(uint32_t ev, bool ts)
+ {
+-	static uint32_t seqno;
+ 
+ 	if (!ts) {
+ 		emit(pkt7(CP_EVENT_WRITE, 1));
+@@ -1278,7 +1318,7 @@ event(uint32_t ev, bool ts)
+ 	emit(ev | (1u << 30));                     /* TIMESTAMP: write the seqno below */
+ 	emit((uint32_t)(POOL_PA + OFF_FENCE));
+ 	emit((uint32_t)((POOL_PA + OFF_FENCE) >> 32));
+-	emit(++seqno);
++	emit(++fence_seq);
+ }
+ 
+ /*
+@@ -1796,6 +1836,8 @@ replay_3d(void)
+  * buffers) and are mapped at their own physical address, once.
+  */
+ #define WIN_BASE            0x20000000ull
++#define MSM_VA_START        0x60000000ull       /* the msm client's buffers (below): 2 GB, nothing else there */
++#define MSM_VA_END          0xE0000000ull
+ #define WIN_SIZE            0x01000000ull       /* 16 MB: a 1125 x 2436 surface is 10.9 MB */
+ #define WIN_COUNT           4u
+ 
+@@ -1820,8 +1862,8 @@ map_identity(uint64_t base, uint64_t size)
+ 			return true;
+ 		}
+ 	}
+-	if (ident_used == 4 || base + size > (1ull << 32)) {
+-		return false;
++	if (ident_used == 4 || base + size > (1ull << 32) || (base < MSM_VA_END && base + size > MSM_VA_START)) {
++		return false;                           /* (the msm client's addresses are never identity) */
+ 	}
+ 	for (uint64_t a = base & ~0xFFFull; a < base + size; a += 4096) {
+ 		uint64_t *l2 = pt_next(&pt_l1[(a >> 30) & 3]);
+@@ -2303,6 +2345,7 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+ 	if (service && mmu && service_lock != NULL && service_ok) {
+ 		service_ready = true;
+ 		LOG("*** gpu_service: the GPU stays up and takes copies (%u page tables in use) ***", pt_used);
++		msm_publish();
+ 	} else if (keep_running || service) {
+ 		LOG("%s: the GPU stays up%s", service ? "gpu_service" : "gpu_keep=1",
+ 		    service ? " but takes no work (needs gpu_mmu=1 and every test passed)" : "");
+@@ -2769,6 +2812,683 @@ sapphire_gpu_new_client(IOService *provider, task_t task, void *security, UInt32
+ 	return kIOReturnSuccess;
+ }
+ 
++/* ---------------------------------------------------------------- msm client (Mesa) */
++
++/*
++ * SapphireGPU: the Adreno for Mesa's freedreno, which speaks Linux's msm DRM interface. The
++ * interface is HackiOS's (github.com/oosexgang, iokit/Kernel/RedwoodGPU.cpp, whose design
++ * this follows; their user-space libdrm stand-in, tools/mesa/redwood-drm, MIT, is what talks
++ * to it): every msm request is a call of this user client whose selector is the request's
++ * number (the low byte of the ioctl code) and whose structure goes in and comes back as it is;
++ * mmap of a buffer is the client memory of the type that is its handle. Request 0x7e, not
++ * Linux's, makes an IOSurface's memory a buffer (by surface id).
++ *
++ * Built on what gpu_service already runs: the same ring, lock and page tables. Buffers get GPU
++ * addresses from 0x60000000 to 0xE0000000 (2 GB, no identity mapping may land there) in 4 KB
++ * pages, and the kernel chooses them (MSM_INFO_GET_IOVA; VA_START/VA_SIZE refused, as Linux
++ * does for a client without its own page tables).
++ *
++ * Memory is cacheable (never write-combined: changing the cache mode of these pages panics this
++ * kernel, see the SGPU client). So: before a submission every buffer it names that the program
++ * has mapped is cleaned out of the CPU caches, and every IOSurface whose seed moved (or that was
++ * last cleaned more than 4 ms ago: not everyone who writes one says so); GEM_CPU_PREP (the CPU
++ * is about to read what the GPU wrote) cleans and invalidates the buffer.
++ *
++ * Submissions run to completion before the call returns (no queue yet), so every fence is done
++ * by the time anyone waits for it; a submission that does not finish in 2 s stops the service.
++ * Development quality: one address space for all clients, no register protection.
++ */
++#define MSM_PAGES           ((MSM_VA_END - MSM_VA_START) >> 12)
++#define MSM_BUFFERS         4096u
++#define MSM_BUFFER_MAX      (256ull << 20)
++#define MSM_SUBMIT_CMDS     64u
++#define MSM_SUBMIT_BOS      4096u
++
++enum {
++	kDrmGemClose        = 0x09,
++	kMsmGetParam        = 0x40,
++	kMsmSetParam        = 0x41,
++	kMsmGemNew          = 0x42,
++	kMsmGemInfo         = 0x43,
++	kMsmGemCpuPrep      = 0x44,
++	kMsmGemCpuFini      = 0x45,
++	kMsmGemSubmit       = 0x46,
++	kMsmWaitFence       = 0x47,
++	kMsmGemMadvise      = 0x48,
++	kMsmSubmitQueueNew  = 0x4a,
++	kMsmSubmitQueueClose = 0x4b,
++	kMsmSubmitQueueQuery = 0x4c,
++	kMsmSurface         = 0x7e,             /* HackiOS's: an IOSurface's memory as a buffer */
++};
++
++struct msm_timespec { int64_t seconds, nanoseconds; };
++struct msm_param { uint32_t pipe, param; uint64_t value; uint32_t len, pad; };
++struct msm_gem_new { uint64_t size; uint32_t flags, handle; };
++struct msm_gem_info { uint32_t handle, info; uint64_t value; uint32_t len, pad; };
++struct msm_gem_cpu_prep { uint32_t handle, op; struct msm_timespec timeout; };
++struct msm_gem_submit_cmd { uint32_t type, submit_idx, submit_offset, size, pad, nr_relocs; uint64_t relocs; };
++struct msm_gem_submit_bo { uint32_t flags, handle; uint64_t presumed; };
++struct msm_gem_submit {
++	uint32_t flags, fence, nr_bos, nr_cmds;
++	uint64_t bos, cmds;
++	int32_t fence_fd;
++	uint32_t queueid;
++	uint64_t in_syncobjs, out_syncobjs;
++	uint32_t nr_in_syncobjs, nr_out_syncobjs, syncobj_stride, pad;
++};
++struct msm_wait_fence { uint32_t fence, flags; struct msm_timespec timeout; uint32_t queueid; };
++struct msm_gem_madvise { uint32_t handle, madv, retained; };
++struct msm_submitqueue { uint32_t flags, prio, id; };
++struct msm_submitqueue_query { uint64_t data; uint32_t id, param, len, pad; };
++struct drm_gem_close { uint32_t handle, pad; };
++struct msm_surface {                            /* HackiOS's struct redwood_surface */
++	uint32_t surface;                       /* the IOSurface id */
++	uint32_t handle;                        /* 0xffffffff: only describe it; back: the buffer */
++	uint64_t size;
++	uint32_t offset, rowBytes;              /* where the pixels start in the buffer, a row's length */
++	uint32_t width, height, pixelFormat, planes;
++};
++
++#define MSM_INFO_GET_OFFSET 0
++#define MSM_INFO_GET_IOVA   1
++#define MSM_INFO_SET_NAME   2
++#define MSM_INFO_SET_IOVA   4
++#define MSM_INFO_GET_FLAGS  5
++#define MSM_SUBMIT_CMD_BUF  1
++#define MSM_SUBMIT_CMD_CTX_RESTORE_BUF 3
++#define MSM_SUBMIT_FENCE_FD_OUT 0x20000000
++#define MSM_DESCRIBE        0xffffffffu
++
++static uint64_t msm_bits[MSM_PAGES / 64];
++static uint64_t msm_next;                       /* where the next search starts (next fit) */
++
++static bool
++msm_used(uint64_t p)
++{
++	return (msm_bits[p >> 6] >> (p & 63)) & 1;
++}
++
++static void
++msm_mark(uint64_t p0, uint64_t n, bool used)
++{
++	for (uint64_t p = p0; p < p0 + n; p++) {
++		if (used) {
++			msm_bits[p >> 6] |= 1ull << (p & 63);
++		} else {
++			msm_bits[p >> 6] &= ~(1ull << (p & 63));
++		}
++	}
++}
++
++/* n pages of addresses, next fit, wrapping once; 0 if none */
++static uint64_t
++msm_va_alloc(uint64_t n)
++{
++	for (int pass = 0; pass < 2; pass++) {
++		uint64_t start = pass == 0 ? msm_next : 0, end = pass == 0 ? MSM_PAGES : msm_next, run = 0;
++		for (uint64_t p = start; p < end; p++) {
++			if ((p & 63) == 0 && run == 0 && msm_bits[p >> 6] == ~0ull) {
++				p += 63;                /* a full word: skip it */
++				continue;
++			}
++			run = msm_used(p) ? 0 : run + 1;
++			if (run == n) {
++				msm_mark(p + 1 - n, n, true);
++				msm_next = p + 1;
++				return MSM_VA_START + ((p + 1 - n) << 12);
++			}
++		}
++	}
++	return 0;
++}
++
++static bool
++msm_fence_done(uint32_t f)
++{
++	return (int32_t)(*(volatile uint32_t *)(pool + OFF_FENCE) - f) >= 0;
++}
++
++struct msm_bo {
++	IOMemoryDescriptor *md;                 /* NULL: free handle */
++	SweetSurface       *surf;
++	uint8_t            *kva;                /* kernel address of byte 0 (cache maintenance) */
++	uint64_t            va, size;
++	uint32_t            flags, seed;
++	uint64_t            cleaned;            /* surfaces: when they were last cleaned */
++	bool                mapped;             /* the program has mapped it: it may have written it */
++};
++
++class SapphireGPU : public IOService {
++	OSDeclareDefaultStructors(SapphireGPU);
++};
++
++OSDefineMetaClassAndStructors(SapphireGPU, IOService);
++
++class SapphireGPUClient : public IOUserClient {
++	OSDeclareDefaultStructors(SapphireGPUClient);
++
++public:
++	char            fName[32];
++	struct msm_bo  *fBo;                    /* handle n is fBo[n - 1] */
++	uint32_t        fCount, fSubmits, fQueue;
++	uint64_t        fBytes;
++
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
++	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++
++	struct msm_bo *bo(uint32_t handle);
++	struct msm_bo *slot(uint32_t *handle);
++	bool place(struct msm_bo *b);
++	void drop(struct msm_bo *b);
++	IOReturn gemNew(struct msm_gem_new *r);
++	IOReturn gemInfo(struct msm_gem_info *r);
++	IOReturn surface(struct msm_surface *r);
++	IOReturn submitIt(struct msm_gem_submit *r);
++};
++
++OSDefineMetaClassAndStructors(SapphireGPUClient, IOUserClient);
++
++bool
++SapphireGPUClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	proc_selfname(fName, sizeof(fName));
++	fBo = IONew(struct msm_bo, MSM_BUFFERS);
++	if (fBo == NULL) {
++		return false;
++	}
++	bzero(fBo, sizeof(struct msm_bo) * MSM_BUFFERS);
++	fCount = fSubmits = fQueue = 0;
++	fBytes = 0;
++	LOG("msm: %s opened the GPU", fName);
++	return true;
++}
++
++/* service_lock held */
++struct msm_bo *
++SapphireGPUClient::bo(uint32_t handle)
++{
++	if (handle == 0 || handle > MSM_BUFFERS || fBo[handle - 1].md == NULL) {
++		return NULL;
++	}
++	return &fBo[handle - 1];
++}
++
++struct msm_bo *
++SapphireGPUClient::slot(uint32_t *handle)
++{
++	for (uint32_t i = 0; i < MSM_BUFFERS; i++) {
++		if (fBo[i].md == NULL) {
++			*handle = i + 1;
++			return &fBo[i];
++		}
++	}
++	return NULL;
++}
++
++/* Give b->md [0, b->size) GPU addresses, page by page. service_lock held. */
++bool
++SapphireGPUClient::place(struct msm_bo *b)
++{
++	uint64_t n = b->size >> 12, seg;
++
++	b->va = msm_va_alloc(n);
++	if (b->va == 0) {
++		LOG("msm: %s: no %llu MB of GPU addresses left", fName, b->size >> 20);
++		return false;
++	}
++	for (uint64_t p = 0; p < n; p++) {
++		uint64_t pa = b->md->getPhysicalSegment(p << 12, &seg, kIOMemoryMapperNone);
++		if (pa == 0 || !map_page_4k(b->va + (p << 12), pa & ~0xFFFull)) {
++			LOG("msm: %s: cannot map page %llu of %llu (pa %llx; %u + %u page tables used)", fName, p, n, pa, pt_used,
++			    pt2_used);
++			for (uint64_t q = 0; q < p; q++) {
++				unmap_page_4k(b->va + (q << 12));
++			}
++			(void)tlb_flush();
++			msm_mark((b->va - MSM_VA_START) >> 12, n, false);
++			return false;
++		}
++	}
++	return tlb_flush();
++}
++
++/* service_lock held; the GPU is idle (every submission finished before its call returned) */
++void
++SapphireGPUClient::drop(struct msm_bo *b)
++{
++	uint64_t n = b->size >> 12;
++
++	for (uint64_t p = 0; p < n; p++) {
++		unmap_page_4k(b->va + (p << 12));
++	}
++	(void)tlb_flush();
++	msm_mark((b->va - MSM_VA_START) >> 12, n, false);
++	if (b->surf != NULL) {
++		b->md->complete();
++		b->surf->release();
++	}
++	b->md->release();
++	fCount--;
++	fBytes -= b->size;
++	bzero(b, sizeof(*b));
++}
++
++IOReturn
++SapphireGPUClient::clientClose(void)
++{
++	IOLockLock(service_lock);
++	for (uint32_t i = 0; fBo != NULL && i < MSM_BUFFERS; i++) {
++		if (fBo[i].md != NULL) {
++			drop(&fBo[i]);
++		}
++	}
++	IOLockUnlock(service_lock);
++	LOG("msm: %s closed (%u submissions)", fName, fSubmits);
++	if (fBo != NULL) {
++		IODelete(fBo, struct msm_bo, MSM_BUFFERS);
++		fBo = NULL;
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SapphireGPUClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
++{
++	IOReturn r = kIOReturnBadArgument;
++
++	IOLockLock(service_lock);
++	struct msm_bo *b = fBo != NULL ? bo(type) : NULL;
++	if (b != NULL) {
++		b->md->retain();
++		b->mapped = true;
++		*memory = b->md;
++		*options = kIOMapDefaultCache;          /* never write-combined (see above) */
++		r = kIOReturnSuccess;
++	}
++	IOLockUnlock(service_lock);
++	return r;
++}
++
++IOReturn
++SapphireGPUClient::gemNew(struct msm_gem_new *r)
++{
++	uint64_t size = (r->size + 4095) & ~4095ull;
++	uint32_t h;
++
++	if (size == 0 || size > MSM_BUFFER_MAX) {
++		return kIOReturnBadArgument;
++	}
++	IOBufferMemoryDescriptor *m = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, size, 4096);
++	if (m == NULL) {
++		LOG("msm: %s: no memory for %llu KB (%u buffers, %llu MB)", fName, size >> 10, fCount, fBytes >> 20);
++		return kIOReturnNoMemory;
++	}
++	bzero(m->getBytesNoCopy(), size);
++	sweet_dcache_flush((vm_offset_t)m->getBytesNoCopy(), (unsigned)size);
++	IOLockLock(service_lock);
++	struct msm_bo *b = slot(&h);
++	if (b != NULL) {
++		b->md = m;
++		b->kva = (uint8_t *)m->getBytesNoCopy();
++		b->size = size;
++		b->flags = r->flags;
++		if (!place(b)) {
++			bzero(b, sizeof(*b));
++			b = NULL;
++		}
++	}
++	if (b != NULL) {
++		fCount++;
++		fBytes += size;
++		r->handle = h;
++	}
++	IOLockUnlock(service_lock);
++	if (b == NULL) {
++		m->release();
++		return kIOReturnNoMemory;
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SapphireGPUClient::gemInfo(struct msm_gem_info *r)
++{
++	IOReturn ret = kIOReturnSuccess;
++
++	IOLockLock(service_lock);
++	struct msm_bo *b = bo(r->handle);
++	if (b == NULL) {
++		ret = kIOReturnBadArgument;
++	} else if (r->info == MSM_INFO_GET_OFFSET) {
++		r->value = (uint64_t)r->handle << 32;   /* nobody maps by it here */
++	} else if (r->info == MSM_INFO_GET_IOVA) {
++		r->value = b->va;
++	} else if (r->info == MSM_INFO_GET_FLAGS) {
++		r->value = b->flags;
++	} else if (r->info != MSM_INFO_SET_NAME) {
++		ret = kIOReturnUnsupported;             /* SET_IOVA among them: addresses are the kernel's */
++	}
++	IOLockUnlock(service_lock);
++	return ret;
++}
++
++/* An IOSurface's memory as a buffer (HackiOS request 0x7e). */
++IOReturn
++SapphireGPUClient::surface(struct msm_surface *r)
++{
++	SweetSurface *s = sweet_surface_copy(r->surface);
++	uint32_t h;
++
++	if (s == NULL || s->memory == NULL) {
++		OSSafeReleaseNULL(s);
++		return kIOReturnNotFound;
++	}
++	if (s->wrapped) {
++		s->release();                           /* a program's own memory: rows the GPU seldom takes */
++		return kIOReturnUnsupported;
++	}
++	uint64_t size = (s->memory->getLength() + 4095) & ~4095ull;
++	r->size = size;
++	r->offset = s->offset;
++	r->rowBytes = s->bytesPerRow;
++	r->width = s->width;
++	r->height = s->height;
++	r->pixelFormat = s->pixelFormat;
++	r->planes = s->planeCount;
++	if (r->handle == MSM_DESCRIBE) {
++		r->handle = 0;
++		s->release();
++		return kIOReturnSuccess;
++	}
++	IOLockLock(service_lock);
++	for (uint32_t i = 0; i < MSM_BUFFERS; i++) {
++		if (fBo[i].md != NULL && fBo[i].surf == s) {
++			r->handle = i + 1;              /* the same surface is the same buffer, as Linux's handles */
++			IOLockUnlock(service_lock);
++			s->release();
++			return kIOReturnSuccess;
++		}
++	}
++	struct msm_bo *b = slot(&h);
++	IOReturn ret = kIOReturnNoMemory;
++	if (b != NULL && s->memory->prepare() == kIOReturnSuccess) {
++		b->md = s->memory;
++		b->md->retain();
++		b->surf = s;
++		b->size = size;
++		b->kva = (uint8_t *)s->kernelAddress();
++		if (place(b)) {
++			fCount++;
++			fBytes += size;
++			r->handle = h;
++			s = NULL;                       /* the buffer keeps the reference */
++			ret = kIOReturnSuccess;
++		} else {
++			b->md->complete();
++			b->md->release();
++			bzero(b, sizeof(*b));
++		}
++	}
++	IOLockUnlock(service_lock);
++	OSSafeReleaseNULL(s);
++	return ret;
++}
++
++IOReturn
++SapphireGPUClient::submitIt(struct msm_gem_submit *r)
++{
++	struct msm_gem_submit_bo *bos = NULL;
++	struct msm_gem_submit_cmd *cmds = NULL;
++	IOReturn ret = kIOReturnBadArgument;
++
++	if (r->nr_cmds == 0 || r->nr_cmds > MSM_SUBMIT_CMDS || r->nr_bos == 0 || r->nr_bos > MSM_SUBMIT_BOS) {
++		LOG("msm: %s: a submission of %u commands in %u buffers: not taken", fName, r->nr_cmds, r->nr_bos);
++		return kIOReturnBadArgument;
++	}
++	bos = IONew(struct msm_gem_submit_bo, r->nr_bos);
++	cmds = IONew(struct msm_gem_submit_cmd, r->nr_cmds);
++	if (bos == NULL || cmds == NULL) {
++		ret = kIOReturnNoMemory;
++		goto out;
++	}
++	if (copyin((user_addr_t)r->bos, bos, r->nr_bos * sizeof(*bos)) != 0 ||
++	    copyin((user_addr_t)r->cmds, cmds, r->nr_cmds * sizeof(*cmds)) != 0) {
++		ret = kIOReturnVMError;
++		goto out;
++	}
++	IOLockLock(service_lock);
++	if (!service_ready) {
++		IOLockUnlock(service_lock);
++		ret = kIOReturnNotReady;
++		goto out;
++	}
++	{
++		uint64_t now = mach_absolute_time(), again;
++		nanoseconds_to_absolutetime(4 * NSEC_PER_MSEC, &again);
++		for (uint32_t i = 0; i < r->nr_bos; i++) {
++			struct msm_bo *b = bo(bos[i].handle);
++			if (b == NULL || b->kva == NULL) {
++				continue;
++			}
++			if (b->surf != NULL && b->surf->state != NULL) {
++				uint32_t seed = *(volatile uint32_t *)((uint8_t *)b->surf->state->getBytesNoCopy() + 0xc);
++				if (seed == b->seed && !b->mapped && now - b->cleaned < again) {
++					continue;
++				}
++				b->seed = seed;
++				b->cleaned = now;
++			} else if (!b->mapped) {
++				continue;                       /* never written by the CPU since it was cleaned */
++			}
++			sweet_dcache_flush((vm_offset_t)b->kva, (unsigned)b->size);
++		}
++		uint32_t n = 0;
++		for (uint32_t i = 0; i < r->nr_cmds; i++) {
++			struct msm_bo *b = cmds[i].submit_idx < r->nr_bos ? bo(bos[cmds[i].submit_idx].handle) : NULL;
++			if (cmds[i].type != MSM_SUBMIT_CMD_BUF && cmds[i].type != MSM_SUBMIT_CMD_CTX_RESTORE_BUF) {
++				continue;                       /* IB_TARGET_BUF: only reached from another */
++			}
++			if (b == NULL || cmds[i].nr_relocs != 0 || (cmds[i].size & 3) || (cmds[i].submit_offset & 3) ||
++			    (uint64_t)cmds[i].submit_offset + cmds[i].size > b->size) {
++				LOG("msm: %s: command %u (buffer %u, +%u, %u bytes, %u relocs): not taken", fName, i,
++				    cmds[i].submit_idx, cmds[i].submit_offset, cmds[i].size, cmds[i].nr_relocs);
++				IOLockUnlock(service_lock);
++				goto out;
++			}
++			uint64_t va = b->va + cmds[i].submit_offset;
++			emit(pkt7(CP_INDIRECT_BUFFER, 3));
++			emit((uint32_t)va);
++			emit((uint32_t)(va >> 32));
++			emit(cmds[i].size / 4);
++			n++;
++		}
++		emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++		event(EV_CACHE_FLUSH_TS, true);
++		emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++		r->fence = fence_seq;
++		uint64_t t0 = mach_absolute_time(), ns;
++		bool ok = submit("msm", 2000);
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		if (r->flags & MSM_SUBMIT_FENCE_FD_OUT) {
++			r->fence_fd = -1;
++		}
++		if (fSubmits++ < 4) {
++			LOG("msm: %s: submission %u, %u command buffers in %u buffers, %llu us", fName, r->fence, n, r->nr_bos,
++			    ns / 1000);
++		}
++		if (!ok) {
++			service_ready = false;
++			LOG("msm: %s: submission %u did not finish in 2 s: the GPU service stops; RBBM_STATUS %08x CP_HW_FAULT %08x",
++			    fName, r->fence, grd(REG_RBBM_STATUS), grd(REG_CP_HW_FAULT));
++			smmu_fault("msm submit");
++			ret = kIOReturnTimeout;
++		} else {
++			ret = kIOReturnSuccess;
++		}
++	}
++	IOLockUnlock(service_lock);
++out:
++	if (bos != NULL) {
++		IODelete(bos, struct msm_gem_submit_bo, r->nr_bos);
++	}
++	if (cmds != NULL) {
++		IODelete(cmds, struct msm_gem_submit_cmd, r->nr_cmds);
++	}
++	return ret;
++}
++
++/* msm GET_PARAM for this GPU (Linux adreno_get_param; numbers from msm_drm.h) */
++static bool
++msm_param(uint32_t which, uint64_t *value)
++{
++	switch (which) {
++	case 0x01: *value = 610; return true;                   /* GPU_ID */
++	case 0x02: *value = 128 * 1024; return true;            /* GMEM_SIZE */
++	case 0x03: *value = 0x06010001; return true;            /* CHIP_ID (a610 v2, read off the GPU) */
++	case 0x04: *value = 600000000; return true;             /* MAX_FREQ (nominal) */
++	case 0x05: *value = mach_absolute_time(); return true;  /* TIMESTAMP */
++	case 0x06: *value = 0x100000; return true;              /* GMEM_BASE: UCHE_GMEM_RANGE_MIN of hw_init */
++	case 0x07: *value = 1; return true;                     /* PRIORITIES */
++	case 0x08: case 0x09: case 0x0a: case 0x11: *value = 0; return true;  /* PP_PGTABLE FAULTS SUSPENDS RAYTRACING */
++	case 0x10: *value = 14; return true;                    /* HIGHEST_BANK_BIT */
++	default: return false;                                  /* VA_START/VA_SIZE among them */
++	}
++}
++
++IOReturn
++SapphireGPUClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *,
++    OSObject *, void *)
++{
++	union {
++		struct msm_param param;
++		struct msm_gem_new gemNew;
++		struct msm_gem_info gemInfo;
++		struct msm_gem_cpu_prep cpuPrep;
++		struct msm_gem_submit submit;
++		struct msm_wait_fence waitFence;
++		struct msm_gem_madvise madvise;
++		struct msm_submitqueue queue;
++		struct msm_submitqueue_query query;
++		struct drm_gem_close close;
++		struct msm_surface surface;
++	} r;
++	size_t size = args->structureInputSize;
++	IOReturn ret = kIOReturnSuccess;
++	uint64_t zero = 0;
++	static uint32_t unknown;
++
++	if (args->structureInput == NULL || size > sizeof(r) || fBo == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (!service_ready) {
++		return kIOReturnNotReady;
++	}
++	bzero(&r, sizeof(r));
++	memcpy(&r, args->structureInput, size);
++	switch (selector) {
++	case kMsmGetParam:
++		ret = msm_param(r.param.param, &r.param.value) ? kIOReturnSuccess : kIOReturnBadArgument;
++		break;
++	case kMsmSetParam:
++	case kMsmGemCpuFini:
++	case kMsmSubmitQueueClose:
++		break;
++	case kMsmGemNew:
++		ret = gemNew(&r.gemNew);
++		break;
++	case kMsmGemInfo:
++		ret = gemInfo(&r.gemInfo);
++		break;
++	case kMsmGemCpuPrep: {
++		/* every submission is done already; the CPU is about to read: drop what it holds */
++		IOLockLock(service_lock);
++		struct msm_bo *b = bo(r.cpuPrep.handle);
++		if (b != NULL && b->kva != NULL) {
++			sweet_dcache_flush((vm_offset_t)b->kva, (unsigned)b->size);
++		}
++		IOLockUnlock(service_lock);
++		break;
++	}
++	case kMsmGemSubmit:
++		ret = submitIt(&r.submit);
++		break;
++	case kMsmWaitFence:
++		ret = msm_fence_done(r.waitFence.fence) ? kIOReturnSuccess : kIOReturnTimeout;
++		break;
++	case kMsmGemMadvise:
++		r.madvise.retained = 1;
++		break;
++	case kMsmSubmitQueueNew:
++		r.queue.id = ++fQueue;
++		break;
++	case kMsmSubmitQueueQuery:
++		if (r.query.data != 0 && r.query.len >= sizeof(zero)) {
++			(void)copyout(&zero, (user_addr_t)r.query.data, sizeof(zero));
++		}
++		break;
++	case kDrmGemClose: {
++		IOLockLock(service_lock);
++		struct msm_bo *b = bo(r.close.handle);
++		if (b == NULL) {
++			ret = kIOReturnBadArgument;
++		} else {
++			drop(b);
++		}
++		IOLockUnlock(service_lock);
++		break;
++	}
++	case kMsmSurface:
++		ret = surface(&r.surface);
++		break;
++	default:
++		if (unknown++ < 16) {
++			LOG("msm: %s: request %#x (%zu bytes) is not known here", fName, selector, size);
++		}
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	if (ret == kIOReturnSuccess && args->structureOutput != NULL) {
++		if (args->structureOutputSize > size) {
++			args->structureOutputSize = (uint32_t)size;
++		}
++		memcpy(args->structureOutput, &r, args->structureOutputSize);
++	}
++	return ret;
++}
++
++/* Called once gpu_service is up: publish the service Mesa's libdrm looks for. */
++static void
++msm_publish(void)
++{
++	IOService *provider = IOService::getPlatform();
++	SapphireGPU *gpu = OSTypeAlloc(SapphireGPU);
++
++	if (gpu == NULL || provider == NULL || !gpu->init()) {
++		OSSafeReleaseNULL(gpu);
++		LOG("msm: cannot make the SapphireGPU service");
++		return;
++	}
++	gpu->setProperty(kIOUserClientClassKey, "SapphireGPUClient");
++	gpu->setName("SapphireGPU");
++	if (gpu->attach(provider)) {
++		if (gpu->start(provider)) {
++			gpu->registerService();
++			LOG("*** msm: SapphireGPU published: Mesa can open the GPU ***");
++		} else {
++			gpu->detach(provider);
++		}
++	}
++	gpu->release();
++}
++
+ void
+ sapphire_gpu_init(void)
+ {
