@@ -185,6 +185,56 @@ static struct {
 } bufs[NBUF];
 static unsigned int nbufs;
 
+#define NNAME 4096
+static struct {
+	id obj;
+	char name[120];
+} names[NNAME];
+static unsigned int nnames;
+
+static void
+name_set(id obj, const char *n)
+{
+	names[nnames % NNAME].obj = obj;
+	snprintf(names[nnames % NNAME].name, sizeof(names[0].name), "%s", n);
+	nnames++;
+}
+
+static const char *
+name_of(id obj)
+{
+	for (unsigned int i = 0; i < NNAME && i < nnames; i++) {
+		if (names[i].obj == obj) {
+			return names[i].name;
+		}
+	}
+	return NULL;
+}
+
+/* A stub describes itself by kind and, when known, name: pipeline descriptors print it. */
+static id
+stub_description(id self, SEL _cmd)
+{
+	char d[200];
+	const char *n = name_of(self);
+	snprintf(d, sizeof(d), "<%s%s%s>", class_getName(object_getClass(self)) + 13, n ? " " : "", n ? n : "");
+	return ((id (*)(Class, SEL, const char *))objc_msgSend)(objc_getClass("NSString"),
+	    sel_registerName("stringWithUTF8String:"), d);
+}
+
+static const char *
+utf8_of(id obj, char *buf, size_t len)
+{
+	id d = msg0(obj, "description");
+	const char *u = d != (id)0 ? ((const char *(*)(id, SEL))objc_msgSend)(d, sel_registerName("UTF8String")) : NULL;
+	size_t i = 0;
+	for (; u != NULL && u[i] != 0 && i + 1 < len; i++) {
+		buf[i] = (u[i] == '\n' || u[i] == '\t') ? ' ' : u[i];
+	}
+	buf[i] = 0;
+	return buf;
+}
+
 static void
 buffer_made(id obj, void *mem, unsigned long len)
 {
@@ -239,6 +289,7 @@ stub_class(const char *proto_name)
 	(void)class_addMethod(cls, sel_registerName("forwardInvocation:"), (IMP_t)stub_forward, "v@:@");
 	(void)class_addMethod(cls, sel_registerName("methodSignatureForSelector:"), (IMP_t)stub_signature, "@@::");
 	(void)class_addMethod(cls, sel_registerName("doesNotRecognizeSelector:"), (IMP_t)stub_unrecognized, "@@::");
+	(void)class_addMethod(cls, sel_registerName("description"), (IMP_t)stub_description, "@@:");
 	objc_registerClassPair(cls);
 	SLOG("made %s (%s%s)", name, pub ? proto_name : "no protocol", spi ? " + SPI" : "");
 	return cls;
@@ -288,6 +339,36 @@ forward_common(id self, id inv, Class super_cls)
 		free(zero);
 	}
 	const char *sn = sel_getName(sel);
+	/* creation calls: log every object argument's description (names, paths, descriptors) */
+	if (strncmp(sn, "new", 3) == 0 && sapphire_logged < 6000) {
+		unsigned long nargs = ((unsigned long (*)(id, SEL))objc_msgSend)(sig, sel_registerName("numberOfArguments"));
+		for (unsigned long a = 2; a < nargs; a++) {
+			const char *at = ((const char *(*)(id, SEL, unsigned long))objc_msgSend)(sig,
+			    sel_registerName("getArgumentTypeAtIndex:"), a);
+			if (at == NULL || at[0] != '@') {
+				continue;
+			}
+			id arg = (id)0;
+			((void (*)(id, SEL, void *, long))objc_msgSend)(inv, sel_registerName("getArgument:atIndex:"), &arg, (long)a);
+			if (arg == (id)0) {
+				continue;
+			}
+			char b[600];
+			SLOG("  arg %lu: %s", a - 2, utf8_of(arg, b, sizeof(b)));
+			if (stub != (id)0 && a == 2 && (strncmp(sn, "newFunctionWithName", 19) == 0 ||
+			    strncmp(sn, "newRenderPipelineStateWithName", 30) == 0 ||
+			    strncmp(sn, "newComputePipelineStateWithName", 31) == 0)) {
+				name_set(stub, b);
+			}
+			if (stub != (id)0 && a == 2 && strncmp(sn, "newFunctionWithDescriptor", 25) == 0) {
+				id fn = msg0(arg, "name");
+				char nb[120];
+				if (fn != (id)0) {
+					name_set(stub, utf8_of(fn, nb, sizeof(nb)));
+				}
+			}
+		}
+	}
 	if (stub != (id)0 && strncmp(sn, "newBuffer", 9) == 0) {
 		unsigned long len = 0;
 		void *bytes = NULL;
