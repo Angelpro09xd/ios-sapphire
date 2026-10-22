@@ -240,11 +240,14 @@ rm -f "$OUT/root/var/jb/prep_bootstrap.sh"
 echo "mk-jb.sh: $OUT/root/var/jb ($(du -sh "$OUT/root/var/jb" | cut -f1), $(find "$OUT/root/var/jb" | wc -l) entries)"
 echo "          Sileo $(grep -m1 '^Version:' "$TMP/control/control" | cut -d' ' -f2), $(grep -c '^Package:' "$OUT/root/var/jb/Library/dpkg/status") packages in dpkg's database"
 
-# sapphire: the libraries' version links (libzstd.1.dylib -> libzstd.1.5.5.dylib, 18 of them) as copies:
-# put on the phone's HFS+ by Linux's driver, such a link was "no such file" to dyld (Sileo:
-# "Library not loaded: @rpath/libzstd.1.dylib") while the regular files beside it loaded.
-find "$OUT/root/var/jb" -type l -name '*.dylib' | while read -r l; do
+# sapphire: every link to a file of the prefix as a copy of it (about 1060 of them, a few MB): put on
+# the phone's HFS+ by Linux's driver, a symbolic link is "no such file" there -- dyld's
+# libzstd.1.dylib (Sileo would not start), apt's methods/https -> http ("The method driver ... https
+# could not be found"), /var/jb/bin/* -> ../usr/bin/*. Links to directories stay (84).
+J=$OUT/root/var/jb
+find "$J" -type l | while read -r l; do
 	t=$(readlink -f "$l")
+	case "$(readlink "$l")" in /var/jb/*) t=$J$(readlink "$l" | sed 's|^/var/jb||') ;; esac
 	[ -f "$t" ] && { rm "$l"; cp -p "$t" "$l"; }
 done
-echo "mk-jb.sh: library links dereferenced"
+echo "mk-jb.sh: file links made copies ($(find "$J" -type l | wc -l) links left, to directories)"
