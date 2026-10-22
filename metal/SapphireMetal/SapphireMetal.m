@@ -54,6 +54,7 @@ extern struct objc_method_description *protocol_copyMethodDescriptionList(void *
 extern void **protocol_copyProtocolList(void *p, unsigned int *count);
 extern const char *protocol_getName(void *p);
 extern int class_addMethod(Class cls, SEL name, IMP_t imp, const char *types);
+extern int class_addProtocol(Class cls, void *protocol);
 extern Method class_getInstanceMethod(Class cls, SEL name);
 extern IMP_t method_getImplementation(Method m);
 extern Class class_getSuperclass(Class cls);
@@ -75,8 +76,8 @@ __attribute__((objc_root_class))
 static unsigned int sapphire_port;
 static int sapphire_logged;
 
-#define SLOG(...) do { fprintf(stderr, "SAPPHIRE MTL[%d]: ", getpid()); fprintf(stderr, __VA_ARGS__); \
-	fputc('\n', stderr); } while (0)
+/* one fprintf per line: the console splits a line written in several pieces */
+#define SLOG(fmt, ...) fprintf(stderr, "SAPPHIRE MTL[%d]: " fmt "\n", getpid(), ##__VA_ARGS__)
 
 static id
 msg0(id obj, const char *sel)
@@ -124,10 +125,16 @@ route_protocol(Class cls, void *proto, int depth)
 {
 	void *spi = objc_getProtocol("MTLDeviceSPI"), *pub = objc_getProtocol("MTLDevice");
 	Class cls = objc_getClass("SapphireMTLDevice");
+	/*
+	 * MTLAddDevice asserts [newDevice conformsToProtocol:@protocol(MTLDevice)], and Apple's
+	 * device classes declare <MTLDeviceSPI> (which takes in MTLDevice): declare both.
+	 */
 	if (spi != NULL) {
+		(void)class_addProtocol(cls, spi);
 		route_protocol(cls, spi, 0);
 	}
 	if (pub != NULL) {
+		(void)class_addProtocol(cls, pub);
 		route_protocol(cls, pub, 0);
 	}
 	SLOG("loaded, MTLDeviceSPI %s, MTLDevice %s", spi ? "found" : "MISSING", pub ? "found" : "MISSING");
