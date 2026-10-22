@@ -58,8 +58,24 @@ a limited subset: textured quads, blending, blits, a few filters (blur), YUV.
 
 ## 3. Shaders
 
-Metal's shaders arrive as AIR (Apple's LLVM IR) in metallibs. The plausible road to the Adreno
-ISA reuses Mesa's compiler: AIR → SPIR-V → NIR → ir3, with Apple's intrinsics lowered on the way.
+Metal's shaders arrive as AIR (Apple's LLVM IR) in metallibs. CoreAnimation's are in
+`QuartzCore.framework/default.metallib`: **141 functions** (39 vertex, 95 fragment, 7 kernel; list
+in `metal/quartzcore-functions.txt`, made with `metal/tools/metallib-list.py`), each in an `_lpf`
+and an `_lph` (half) variant: `std_vert0/1` (textured and coloured quads: most of the UI), paths
+(`path_rect`, `path_stroke_line/curve/round_join/miter_join`), blurs (`variable_blur`,
+`single_pass_blur_3`, `downsample`/`upsample`), gradients (`radial_shading`,
+`radial_complex_shading`), `read_surf`, the panel's APL/dimming kernels, and `tile_downsample_*`
+(A11 tile shaders, used only if the GPU claims family Apple4). Precompiled pipelines for Apple's
+GPUs are in `default.pipelinelib` (one file per GPU generation, 94 MB; nothing there runs on an
+Adreno, but it names the pipelines).
+
+**Ubuntu's LLVM 18 `llvm-dis` reads AIR**, wrapper and all: `std_vert0` disassembles to plain LLVM
+IR (`position = MVP × position`, the 4×4 matrix in buffer 2, colour and texcoord passed through),
+with metadata naming every input and output (`air.vertex_input` locations 0/1/3, `air.buffer`
+indices 2/3, `air.vertex_output` names). So every shader CoreAnimation uses can be read exactly,
+and either rewritten for the Adreno with the same interface, or translated mechanically
+(LLVM IR → NIR → Mesa's ir3, which is in `infinity/external/mesa3d`): the shaders are small, and the
+`air.*` intrinsics (sampling, interpolation) map onto NIR's.
 
 ## Scale
 

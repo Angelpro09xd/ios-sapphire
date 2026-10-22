@@ -290,6 +290,8 @@ stub_class(const char *proto_name)
 	(void)class_addMethod(cls, sel_registerName("methodSignatureForSelector:"), (IMP_t)stub_signature, "@@::");
 	(void)class_addMethod(cls, sel_registerName("doesNotRecognizeSelector:"), (IMP_t)stub_unrecognized, "@@::");
 	(void)class_addMethod(cls, sel_registerName("description"), (IMP_t)stub_description, "@@:");
+	/* Metal's own descriptors describe what they point at with this private one */
+	(void)class_addMethod(cls, sel_registerName("formattedDescription:"), (IMP_t)stub_description, "@@:Q");
 	objc_registerClassPair(cls);
 	SLOG("made %s (%s%s)", name, pub ? proto_name : "no protocol", spi ? " + SPI" : "");
 	return cls;
