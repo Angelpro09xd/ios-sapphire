@@ -1,0 +1,132 @@
+From 1c1a5e493102221ca6b0146395f6b3adfa6977fe Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 23 Oct 2026 22:03:01 +0000
+Subject: [PATCH] sapphire-0170: the audio test watches the ADSP, in band
+ first, more log
+
+0169 on the phone rebooted the phone after the codec register read (the
+USB log stops there; the persistent one earlier). Now: a_wait() looks at
+the ADSP's SMP2P fatal bit and logs its crash reason (SMEM 423); every
+step pauses 300 ms so its lines reach the USB log; every GLINK command
+during the graph open is logged, and packets over 128 bytes with the
+buffer they go into; the graph is opened in band first and out of band
+only if that is not answered.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 40 ++++++++++++++++++++++++++++++---
+ 1 file changed, 37 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 9508f54..a7309a5 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -8015,6 +8015,10 @@ a_try_send(struct a_chan *c, const void *data, uint32_t len)
+ 		return false;
+ 	}
+ 	struct glink_data_hdr h = { { CMD_TX_DATA, c->lcid, c->ri[i].id }, len, 0 };
++	if (len > 128 || a_verbose) {
++		LOG("adsp: t=%u ms: \"%s\": %u bytes into the ADSP's buffer %u (%u bytes)", a_ms, c->name, len, c->ri[i].id,
++		    c->ri[i].size);
++	}
+ 	c->ri[i].used = true;
+ 	return a_tx_write(&h, sizeof(h), data, len);
+ }
+@@ -8077,6 +8081,9 @@ a_rx_one(void)
+ 	}
+ 	a_rx_peek(0, &m, sizeof(m));
+ 	a_rx_msgs++;
++	if (a_verbose && m.cmd != CMD_TX_DATA) {
++		LOG("adsp: t=%u ms: glink rx cmd %u %x %x", a_ms, m.cmd, m.p1, m.p2);
++	}
+ 	switch (m.cmd) {
+ 	case CMD_VERSION:
+ 		a_rx_advance(8);
+@@ -8331,6 +8338,8 @@ a_qrtr_rx(const uint8_t *p, uint32_t len)
+ 
+ static unsigned a_gpr_rx_count;
+ static bool a_spf_ready;
++static volatile uint32_t *a_sk;                 /* the ADSP's SMP2P slave-kernel entry (bit 0: fatal) */
++static bool a_verbose;                          /* audio_test(): every GLINK command logged */
+ static struct {
+ 	bool full;
+ 	uint32_t opcode, token, n, p[8];
+@@ -8500,6 +8509,17 @@ a_wait(uint32_t cmd, uint32_t rsp, unsigned ms)
+ {
+ 	for (unsigned t = 0; t < ms; t++) {
+ 		a_service();
++		if (a_sk != NULL && (*a_sk & 1)) {
++			uint32_t sz = 0;
++			const char *why = (const char *)smem_get(smem_partition(SMEM_GLOBAL_HOST, SMEM_GLOBAL_HOST), 423, &sz);
++			char reason[160] = {};
++			if (why != NULL) {
++				memcpy(reason, why, MIN(sz, (uint32_t)sizeof(reason) - 1));
++			}
++			LOG("adsp: *** the ADSP crashed waiting for %08x: %s ***", cmd, why != NULL ? reason : "(no reason)");
++			IOSleep(500);
++			return -3;
++		}
+ 		if (a_box.full) {
+ 			a_box.full = false;
+ 			if (rsp != 0 && a_box.opcode == rsp) {
+@@ -8525,6 +8545,7 @@ a_wait(uint32_t cmd, uint32_t rsp, unsigned ms)
+  * parameters goes once the command area is mapped (a_cmd_area, after the tone's buffers).
+  */
+ static uint8_t *a_cmd_area;
++static bool a_oob;                              /* 0170: in band first; out of band if that is not answered */
+ static uint64_t a_cmd_pa;
+ 
+ static int64_t
+@@ -8534,7 +8555,7 @@ a_cmd_sync(uint32_t src, uint32_t dst, uint32_t opcode, const void *payload, uin
+ 	uint8_t *b;
+ 	int64_t r;
+ 
+-	if (len > 64 && a_cmd_area != NULL && a_mem_handle != 0 && len <= 4096) {
++	if (a_oob && len > 64 && a_cmd_area != NULL && a_mem_handle != 0 && len <= 4096) {
+ 		uint32_t h[4] = { (uint32_t)a_cmd_pa, (uint32_t)(a_cmd_pa >> 32), a_mem_handle, len };
+ 		memcpy(a_cmd_area, payload, len);
+ 		mb();
+@@ -8816,7 +8837,9 @@ audio_test(void)
+ 	} else {
+ 		LOG("adsp: the codec's registers are not read without its clocks");
+ 	}
++	IOSleep(300);
+ 	a_amp_probe();
++	IOSleep(300);
+ 
+ 	const uint32_t tone = (A_NBUF * bytes + 0xfff) & ~0xfffu;
+ 	buf = (int16_t *)pool_alloc(tone + 0x1000, &buf_pa);
+@@ -8849,12 +8872,22 @@ audio_test(void)
+ 			return;
+ 		}
+ 	}
+-	r = a_graph_open(2, 3);                                 /* CD, EP */
+-	if (r != 0) {
++	a_verbose = true;
++	IOSleep(300);                                           /* (the USB log goes out every 100 ms) */
++	r = a_graph_open(2, 3);                                 /* CD, EP, in band */
++	if (r == -1) {
++		LOG("adsp: graph open in band not answered; out of band, in the shared memory");
++		IOSleep(300);
++		a_oob = true;
++		r = a_graph_open(2, 3);
++	}
++	if (r != 0 && r != -3) {
+ 		LOG("adsp: graph open (capabilities) -> %lld; again with generic containers", r);
++		IOSleep(300);
+ 		(void)a_graph_mgmt(APM_CMD_GRAPH_CLOSE);
+ 		r = a_graph_open(0x0B001001, 0x0B001001);
+ 	}
++	a_verbose = false;
+ 	LOG("adsp: graph open -> %lld", r);
+ 	if (r != 0) {
+ 		return;
+@@ -8928,6 +8961,7 @@ adsp_thread(void *arg __unused, wait_result_t wr __unused)
+ 		}
+ 		if (in != NULL && sk == NULL) {
+ 			sk = smp2p_find(in, "slave-kernel");
++			a_sk = sk;
+ 		}
+ 		if (sk != NULL && *sk != sk_last) {
+ 			sk_last = *sk;
+-- 
+2.43.0
+
