@@ -1,0 +1,140 @@
+From 833380e11a9c9a396aefe167471951719e399a2e Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 23 Oct 2026 15:05:01 +0000
+Subject: [PATCH] sapphire-0164: IOSurface memory pageable and purgeable, as on
+ a phone
+
+SWEET MEM (0163) named the leak: buffer surfaces grew from 416 MB at the
+home screen to 1.3 GB a few minutes into animations, wired pages with
+them (101,000), while the GPU's own buffers stayed flat. CoreAnimation
+and SpringBoard make the surfaces they can draw again volatile
+(IOSurfaceSetPurgeable) and count on the VM to reclaim them under
+pressure; here the state was only remembered and the memory stayed
+wired until the phone crawled.
+
+Buffer surfaces are now pageable and purgeable IOBufferMemoryDescriptors
+and SetPurgeable goes to setPurgeable() (IOSurface states mapped onto
+IOKit's), reporting "empty" when the VM took the pages. Whoever needs
+the physical pages wires them while it uses them: the msm imports did
+already; the GPU's display windows now retain and prepare their surface
+until the slot is reused. The buffer cap goes to 3 GB, since it is no
+longer all wired.
+---
+ iokit/Kernel/arm/SapphireGpu.cpp  | 28 ++++++++++++++++++--------
+ iokit/Kernel/arm/SweetSurface.cpp | 33 ++++++++++++++++++++++++++-----
+ 2 files changed, 48 insertions(+), 13 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index 6665a63..f9aa76c 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -2023,10 +2023,12 @@ map_window(IOMemoryDescriptor *md)
+ 	if (len == 0 || len > WIN_SIZE) {
+ 		return 0;
+ 	}
+-	first = md->getPhysicalSegment(0, &seg, kIOMemoryMapperNone);
+-	last = md->getPhysicalSegment((len - 1) & ~0xFFFull, &seg, kIOMemoryMapperNone);
++	/*
++	 * 0164: a window holds its memory: retained and prepared (surfaces are pageable now, and the
++	 * VM must not move or take the pages the GPU reads) until another surface takes the slot.
++	 */
+ 	for (uint32_t i = 0; i < WIN_COUNT; i++) {
+-		if (win[i].md == md && win[i].len == len && win[i].first == first && win[i].last == last) {
++		if (win[i].md == md && win[i].len == len) {
+ 			return WIN_BASE + i * WIN_SIZE;
+ 		}
+ 	}
+@@ -2039,13 +2041,23 @@ map_window(IOMemoryDescriptor *md)
+ 		}
+ 		IODelay(10);
+ 	}
++	if (win[i].md != NULL) {
++		win[i].md->complete();
++		win[i].md->release();
++		win[i].md = NULL;
++	}
++	if (md->prepare() != kIOReturnSuccess) {
++		return 0;
++	}
++	md->retain();
++	win[i].md = md;
++	first = md->getPhysicalSegment(0, &seg, kIOMemoryMapperNone);
++	last = md->getPhysicalSegment((len - 1) & ~0xFFFull, &seg, kIOMemoryMapperNone);
+ 	for (uint64_t off = 0; off < WIN_SIZE; off += 4096) {
+ 		uint64_t pa = off < len ? md->getPhysicalSegment(off, &seg, kIOMemoryMapperNone) : 0;
+-		if (off < len && pa == 0) {
+-			win[i].md = NULL;
+-			return 0;
+-		}
+-		if (pa != 0 && !map_page_4k(va + off, pa)) {
++		if ((off < len && pa == 0) || (pa != 0 && !map_page_4k(va + off, pa))) {
++			md->complete();
++			md->release();
+ 			win[i].md = NULL;
+ 			return 0;
+ 		}
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 5920bab..390ea48 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -108,7 +108,7 @@ sweet_surface_census(uint32_t *objects, uint64_t *wired)
+ 	*objects = (uint32_t)sweet_surface_objects;
+ 	*wired = sweet_surface_wired;
+ }
+-#define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
++#define SWEET_SURFACE_WIRED_MAX         (3072ull << 20)   /* (0164: pageable now, so not all of it wired) */
+ 
+ /* topaz scanout: at most 6 contiguous 16 MiB surfaces */
+ #define SWEET_SCANOUT_SLOT      (16u << 20)
+@@ -879,8 +879,17 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
++			/*
++			 * 0164: pageable and purgeable, as an IOSurface's memory is on a phone. CoreAnimation
++			 * and SpringBoard make the surfaces they can draw again volatile (app snapshots, image
++			 * caches) and count on the VM to reclaim them under pressure; wired, they never went
++			 * and the phone ran out of memory a few minutes into any animation (1.3 GB of
++			 * surfaces, frames 6-7 s apart). Who needs the physical pages wires them while it
++			 * does: the GPU's imports and display windows prepare() them.
++			 */
+ 			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPageable | kIOMemoryPurgeable,
++			    s->allocSize, page_size);
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+@@ -1272,12 +1281,26 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		}
+ 		IOLockLock(sweet_surface_lock);
+ 		if (selector == kSweetSurfaceSetPurgeable) {
++			/*
++			 * IOSurface's states (0 non-volatile, 1 volatile, 2 empty, 3 keep: only ask) onto
++			 * the VM's (IOKit: 2, 3, 4, 1). A pageable buffer surface really is made volatile, and
++			 * reports "empty" when the VM took its pages meanwhile: the client draws it again.
++			 */
++			static const IOOptionBits to_io[4] = { kIOMemoryPurgeableNonVolatile, kIOMemoryPurgeableVolatile,
++				                               kIOMemoryPurgeableEmpty, kIOMemoryPurgeableKeepCurrent };
++			uint32_t asked = (uint32_t)args->scalarInput[1], old = s->purgeable;
++			IOBufferMemoryDescriptor *buf = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
++			IOOptionBits io_old = 0;
++			if (buf != NULL && !s->wrapped && s->scanoutPhys == 0 && asked < 4 &&
++			    buf->setPurgeable(to_io[asked], &io_old) == kIOReturnSuccess) {
++				old = io_old == kIOMemoryPurgeableVolatile ? 1 : io_old == kIOMemoryPurgeableEmpty ? 2 : 0;
++			}
+ 			if (args->scalarOutputCount >= 1) {
+-				args->scalarOutput[0] = s->purgeable;
++				args->scalarOutput[0] = old;
+ 				args->scalarOutputCount = 1;
+ 			}
+-			if (args->scalarInput[1] != 3) {        /* 3: only ask */
+-				s->purgeable = (uint32_t)args->scalarInput[1];
++			if (asked != 3) {                       /* 3: only ask */
++				s->purgeable = asked == 2 ? 1 : asked;
+ 			}
+ 		} else if (selector == kSweetSurfaceBindAccel && args->scalarInputCount >= 3) {
+ 			uint16_t accel[2] = { (uint16_t)args->scalarInput[1], (uint16_t)args->scalarInput[2] };
+-- 
+2.43.0
+
