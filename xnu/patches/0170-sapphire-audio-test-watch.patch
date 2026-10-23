@@ -1,4 +1,4 @@
-From 1c1a5e493102221ca6b0146395f6b3adfa6977fe Mon Sep 17 00:00:00 2001
+From bcafb5ca3cba325b4a75033d6ade81902904ab51 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Fri, 23 Oct 2026 22:03:01 +0000
 Subject: [PATCH] sapphire-0170: the audio test watches the ADSP, in band
@@ -16,10 +16,18 @@ only if that is not answered.
  1 file changed, 37 insertions(+), 3 deletions(-)
 
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
-index 9508f54..a7309a5 100644
+index 9508f54..9093b6c 100644
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
-@@ -8015,6 +8015,10 @@ a_try_send(struct a_chan *c, const void *data, uint32_t len)
+@@ -7710,6 +7710,7 @@ out:
+ 
+ static unsigned audio_on, modem_on;
+ static unsigned a_ms;
++static bool a_verbose;                          /* audio_test(): every GLINK command logged */
+ 
+ static void
+ adsp_kick(unsigned bit)
+@@ -8015,6 +8016,10 @@ a_try_send(struct a_chan *c, const void *data, uint32_t len)
  		return false;
  	}
  	struct glink_data_hdr h = { { CMD_TX_DATA, c->lcid, c->ri[i].id }, len, 0 };
@@ -30,7 +38,7 @@ index 9508f54..a7309a5 100644
  	c->ri[i].used = true;
  	return a_tx_write(&h, sizeof(h), data, len);
  }
-@@ -8077,6 +8081,9 @@ a_rx_one(void)
+@@ -8077,6 +8082,9 @@ a_rx_one(void)
  	}
  	a_rx_peek(0, &m, sizeof(m));
  	a_rx_msgs++;
@@ -40,12 +48,11 @@ index 9508f54..a7309a5 100644
  	switch (m.cmd) {
  	case CMD_VERSION:
  		a_rx_advance(8);
-@@ -8331,6 +8338,8 @@ a_qrtr_rx(const uint8_t *p, uint32_t len)
+@@ -8331,6 +8339,7 @@ a_qrtr_rx(const uint8_t *p, uint32_t len)
  
  static unsigned a_gpr_rx_count;
  static bool a_spf_ready;
 +static volatile uint32_t *a_sk;                 /* the ADSP's SMP2P slave-kernel entry (bit 0: fatal) */
-+static bool a_verbose;                          /* audio_test(): every GLINK command logged */
  static struct {
  	bool full;
  	uint32_t opcode, token, n, p[8];
