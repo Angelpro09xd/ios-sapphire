@@ -151,6 +151,12 @@ static int frame_lines;                 /* boot-arg glframes=1: a line for every
 static int latency_lines;               /* boot-arg touch_lat=1: when every frame began and ended (see frame_end()) */
 static uint64_t slow_calls_us;          /* boot-arg glslow=US: a line for every call that takes longer (eagl_leave()) */
 static uint64_t call_began_us;          /* (when the call in progress began) */
+/*
+ * boot-arg glprofile=1: the time spent in each entry (mach_absolute_time ticks, summed), and in all of
+ * them, so that the CPU time of a frame can be put on the functions it went to (profile_report()).
+ */
+static int profile_calls;
+static uint64_t profile_began;
 static uint64_t now_us(void);
 static void eagl_trace(const char *format, ...) __attribute__((format(printf, 1, 2)));
 static void eagl_trace_floats(const float *values, int count);
@@ -346,6 +352,7 @@ static struct group_texture *group_of(struct eagl *e, GLuint texture);
 static __thread struct eagl *current;
 static struct eagl *contexts[8];
 static uint32_t slot_calls[SLOTS];
+static uint64_t slot_ticks[SLOTS];      /* glprofile=1 */
 static int check_errors = 1;            /* ask the library for an error after every call (the first frames) */
 static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
 /*
@@ -405,6 +412,9 @@ eagl_enter(struct eagl *e, unsigned offset)
 	if (slow_calls_us != 0) {
 		call_began_us = now_us();
 	}
+	if (profile_calls) {
+		profile_began = mach_absolute_time();
+	}
 }
 
 static void
@@ -416,6 +426,10 @@ eagl_leave(struct eagl *e, unsigned offset)
 		if (e->errors++ < 60) {
 			say("redwood-gl: %s: error %#x\n", eagl_slot_name(offset), error);
 		}
+	}
+	if (profile_calls && profile_began != 0) {
+		slot_ticks[offset / 8] += mach_absolute_time() - profile_began;
+		profile_began = 0;
 	}
 	if (slow_calls_us != 0) {
 		uint64_t now = now_us();
@@ -520,6 +534,59 @@ summary(struct eagl *e)
 			say("redwood-gl:   %-28s %u\n", eagl_slot_name(offset), slot_calls[offset / 8]);
 		}
 	}
+}
+
+/*
+ * glprofile=1, every 200 frames: the 15 entries that took the most time since the last report, with
+ * their calls and the average, and the share of the frames' time spent inside entries at all. Then
+ * the counters start again.
+ */
+static void
+profile_report(struct eagl *e)
+{
+	static uint32_t last_calls[SLOTS];
+	static uint64_t last_frame_us;
+	static unsigned last_frames;
+	mach_timebase_info_data_t tb;
+	uint64_t total = 0, frames_us = e->frame_us - last_frame_us;
+	unsigned frames = e->frames - last_frames;
+	unsigned order[16], n = 0;
+
+	mach_timebase_info(&tb);
+	for (unsigned i = 1; i < SLOTS; i++) {
+		total += slot_ticks[i];
+	}
+	for (unsigned k = 0; k < 15; k++) {
+		unsigned best = 0;
+		for (unsigned i = 1; i < SLOTS; i++) {
+			bool taken = false;
+			for (unsigned j = 0; j < n; j++) {
+				taken |= order[j] == i;
+			}
+			if (!taken && slot_ticks[i] > slot_ticks[best]) {
+				best = i;
+			}
+		}
+		if (best == 0 || slot_ticks[best] == 0) {
+			break;
+		}
+		order[n++] = best;
+	}
+	say("redwood-gl: profile of %u frames: %llu us a frame inside GL entries, of %llu us a frame\n", frames,
+	    frames ? total * tb.numer / tb.denom / 1000 / frames : 0, frames ? frames_us / frames : 0);
+	for (unsigned j = 0; j < n; j++) {
+		unsigned i = order[j];
+		uint32_t calls = slot_calls[i] - last_calls[i];
+		uint64_t us = slot_ticks[i] * tb.numer / tb.denom / 1000;
+		say("redwood-gl:   %-28s %6llu us a frame, %5u calls a frame, %4llu ns a call\n", eagl_slot_name(i * 8),
+		    frames ? us / frames : 0, frames ? calls / frames : 0, calls ? us * 1000 / calls : 0);
+	}
+	for (unsigned i = 0; i < SLOTS; i++) {
+		last_calls[i] = slot_calls[i];
+		slot_ticks[i] = 0;
+	}
+	last_frame_us = e->frame_us;
+	last_frames = e->frames;
 }
 
 /* ---- IOSurfaces ----------------------------------------------------------------------------------- */
@@ -1305,6 +1372,9 @@ frame_end(struct eagl *e, bool finished)
 	}
 	if (e->frames == 30 || e->frames % 200 == 0) {
 		summary(e);
+	}
+	if (profile_calls && e->frames % 200 == 0) {
+		profile_report(e);
 	}
 	census_report();
 	if (e->frames == 600 && e->errors == 0) {
@@ -4300,6 +4370,8 @@ install(void)
 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
 		census_on = strstr(arguments, "glcensus=1") != NULL;
 		frame_lines = strstr(arguments, "glframes=1") != NULL;
+		/* (or the file /redwood/glprofile: no reboot, a restart of backboardd is enough) */
+		profile_calls = strstr(arguments, "glprofile=1") != NULL || access("/redwood/glprofile", F_OK) == 0;
 		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
 		if ((argument = strstr(arguments, "glslow=")) != NULL) {
 			slow_calls_us = strtoull(argument + 7, NULL, 10);

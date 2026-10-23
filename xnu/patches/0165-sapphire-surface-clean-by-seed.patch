@@ -1,0 +1,49 @@
+From 97cf826c3b2f35c2be78307610e14f28b27513f4 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 23 Oct 2026 16:37:08 +0000
+Subject: [PATCH] sapphire-0165: imported surfaces cleaned only when the CPU
+ may have written them
+
+eagl's profile (glprofile=1): glFlush took 9 ms of a 17.6 ms frame. The
+msm submit cleaned every imported surface from the CPU caches unless its
+seed was unchanged, it was not mapped as a buffer *and* it had been
+cleaned in the last 4 ms: frames are longer than that, so the 11 MB
+display surface, which the GPU alone writes, was cleaned on every frame.
+A surface is now cleaned when its seed moved (IOSurfaceLock for writing)
+or it is mapped as a buffer, as the seed already tells.
+---
+ iokit/Kernel/arm/SapphireGpu.cpp | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index f9aa76c..9552236 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -3729,8 +3729,7 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 		goto out;
+ 	}
+ 	{
+-		uint64_t now = mach_absolute_time(), again;
+-		nanoseconds_to_absolutetime(4 * NSEC_PER_MSEC, &again);
++		uint64_t now = mach_absolute_time();
+ 		for (uint32_t i = 0; i < r->nr_bos; i++) {
+ 			struct msm_bo *b = bo(bos[i].handle);
+ 			if (b == NULL || b->kva == NULL) {
+@@ -3741,7 +3740,13 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 				/* the GPU has drawn it since that seed: the display need not clean it (SweetFramebuffer) */
+ 				b->surf->gpuSeed = seed;
+ 				b->surf->gpuDrawn = true;
+-				if (seed == b->seed && !b->mapped && now - b->cleaned < again) {
++				/*
++				 * 0165: a surface is cleaned only when the CPU may have written it since: its seed
++				 * moved (IOSurfaceLock for writing) or it is mapped as a buffer. The 4 ms window that
++				 * also cleaned an unchanged surface again cleaned the 11 MB display surface on every
++				 * frame (glFlush took 9 ms a frame, most of the CPU's time); the GPU alone writes it.
++				 */
++				if (seed == b->seed && !b->mapped) {
+ 					continue;
+ 				}
+ 				b->seed = seed;
+-- 
+2.43.0
+
