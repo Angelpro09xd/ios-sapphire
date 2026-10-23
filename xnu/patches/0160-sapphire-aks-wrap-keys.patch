@@ -1,0 +1,149 @@
+From 147300ca50a30ba0631f4679ef85727ebd8191ec Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 23 Oct 2026 10:57:23 +0000
+Subject: [PATCH] sapphire-0160: AppleKeyStore wraps and unwraps keys (the
+ keychain can write)
+
+securityd wraps every keychain item's key with aks_wrap_key (selector
+10) and reads it back with aks_unwrap_key (11). Both were unsupported:
+every keychain write failed (ks_crypt e00002c7 "failed to 'oe' item"),
+Wi-Fi passwords were never kept, and wifid waited on its keychain
+work for minutes before Settings' Wi-Fi page could open.
+
+There is no Secure Enclave and no passcode here, so this protects
+nothing: the wrapped key is a tag and the key mixed with a fixed pad,
+the same at every boot so that saved items can be read back; 8 bytes
+longer than the key, as AES key wrap's are (the size libaks expects).
+A wrapped key without the tag is refused.
+---
+ iokit/Kernel/arm/SweetKeyStore.cpp | 107 +++++++++++++++++++++++++++++
+ 1 file changed, 107 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index d11fe26..66de894 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -170,6 +170,107 @@ sweet_aks_struct_out_size(IOExternalMethodArguments *args)
+ 	       (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize;
+ }
+ 
++/*
++ * Key wrapping (aks_wrap_key / aks_unwrap_key): securityd wraps every keychain item's key with
++ * its class key, and without these every keychain write failed (ks_crypt e00002c7 "failed to
++ * 'oe' item"), so Wi-Fi passwords and the rest were never kept, and wifid waited minutes on
++ * them before Settings' Wi-Fi page could open. There is no Secure Enclave here and the device
++ * has no passcode, so this protects nothing: the wrapped form is a tag and the key mixed with a
++ * fixed pad, the same at every boot so that saved items can be read back. Wrapped keys are 8
++ * bytes longer than their key, as AES key wrap's (RFC 3394) are, the size libaks expects.
++ */
++#define SWEET_AKS_WRAP_TAG      "SWEETAK1"
++#define SWEET_AKS_WRAP_TAG_LEN  8
++#define SWEET_AKS_KEY_MAX       64
++
++static const uint8_t sweet_aks_pad[32] = {
++	0x5a, 0x21, 0x9c, 0x47, 0xe3, 0x0b, 0x76, 0xd8, 0x3f, 0xa1, 0x64, 0x12, 0xc9, 0x8e, 0x2d, 0xf0,
++	0x07, 0xb5, 0x4a, 0x93, 0x6e, 0xdc, 0x18, 0x81, 0xf4, 0x3b, 0xa7, 0x55, 0x0e, 0xc2, 0x69, 0x9d,
++};
++
++static IOReturn
++sweet_aks_read_in(IOExternalMethodArguments *args, uint8_t *buf, uint32_t *len)
++{
++	uint32_t n;
++
++	if (args->structureInputDescriptor != NULL) {
++		n = (uint32_t)args->structureInputDescriptor->getLength();
++		if (n > *len || args->structureInputDescriptor->readBytes(0, buf, n) != n) {
++			return kIOReturnBadArgument;
++		}
++	} else {
++		n = args->structureInputSize;
++		if (n > *len || (n > 0 && args->structureInput == NULL)) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(buf, args->structureInput, n);
++	}
++	*len = n;
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++sweet_aks_write_out(IOExternalMethodArguments *args, const uint8_t *buf, uint32_t len)
++{
++	if (args->structureOutputDescriptor != NULL) {
++		if (args->structureOutputDescriptor->getLength() < len ||
++		    args->structureOutputDescriptor->writeBytes(0, buf, len) != len) {
++			return kIOReturnNoSpace;
++		}
++		args->structureOutputDescriptorSize = len;
++		return kIOReturnSuccess;
++	}
++	if (args->structureOutput == NULL || args->structureOutputSize < len) {
++		return kIOReturnNoSpace;
++	}
++	memcpy(args->structureOutput, buf, len);
++	args->structureOutputSize = len;
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++sweet_aks_wrap(IOExternalMethodArguments *args, bool wrap)
++{
++	uint8_t in[SWEET_AKS_KEY_MAX + SWEET_AKS_WRAP_TAG_LEN], out[sizeof(in)];
++	uint32_t len = sizeof(in), n;
++	IOReturn ret = sweet_aks_read_in(args, in, &len);
++
++	if (ret != kIOReturnSuccess) {
++		return ret;
++	}
++	if (wrap) {
++		if (len == 0 || len > SWEET_AKS_KEY_MAX) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(out, SWEET_AKS_WRAP_TAG, SWEET_AKS_WRAP_TAG_LEN);
++		for (uint32_t i = 0; i < len; i++) {
++			out[SWEET_AKS_WRAP_TAG_LEN + i] = in[i] ^ sweet_aks_pad[i % sizeof(sweet_aks_pad)];
++		}
++		n = len + SWEET_AKS_WRAP_TAG_LEN;
++	} else {
++		if (len <= SWEET_AKS_WRAP_TAG_LEN || memcmp(in, SWEET_AKS_WRAP_TAG, SWEET_AKS_WRAP_TAG_LEN) != 0) {
++			return kIOReturnNotPermitted;   /* not ours: a key wrapped elsewhere cannot be read */
++		}
++		n = len - SWEET_AKS_WRAP_TAG_LEN;
++		for (uint32_t i = 0; i < n; i++) {
++			out[i] = in[SWEET_AKS_WRAP_TAG_LEN + i] ^ sweet_aks_pad[i % sizeof(sweet_aks_pad)];
++		}
++	}
++	ret = sweet_aks_write_out(args, out, n);
++	bzero(in, sizeof(in));
++	bzero(out, sizeof(out));
++	if (ret == kIOReturnSuccess) {
++		/* wrap: the key's class back (the one asked for); unwrap: nothing */
++		if (wrap && args->scalarOutputCount >= 1) {
++			args->scalarOutput[0] = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
++			args->scalarOutputCount = 1;
++		} else {
++			args->scalarOutputCount = 0;
++		}
++	}
++	return ret;
++}
++
+ IOReturn
+ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -227,6 +328,12 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		args->scalarOutputCount = 0;
+ 		ret = sweet_aks_device_state(args);
+ 		break;
++	case kAKSWrapKey:
++		ret = sweet_aks_wrap(args, true);
++		break;
++	case kAKSUnwrapKey:
++		ret = sweet_aks_wrap(args, false);
++		break;
+ 	default:
+ 		ret = kIOReturnUnsupported;
+ 		break;
+-- 
+2.43.0
+
