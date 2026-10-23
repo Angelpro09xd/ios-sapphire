@@ -1,0 +1,102 @@
+diff --git a/BootShim/BootShim.S b/BootShim/BootShim.S
+index 4d208553..2353062e 100644
+--- a/BootShim/BootShim.S
++++ b/BootShim/BootShim.S
+@@ -28,6 +28,27 @@ _CopyLoop:
+   stp   x2, x3, [x5], #16
+   subs  x6, x6, #16
+   b.ne  _CopyLoop
++
++#ifdef PAYLOAD_BASE
++  /* (HackiOS) x4 now points just past the FD: an optional "XNUP" payload may follow */
++  ldr   w2, [x4]
++  movz  w3, #0x4E58
++  movk  w3, #0x5055, lsl #16
++  cmp   w2, w3
++  b.ne  _NoPayload
++  ldr   w6, [x4, #4]    /* Payload Size */
++  add   x6, x6, #23     /* Header + Round Up to 16 */
++  and   x6, x6, #~15
++  movz  x5, #(PAYLOAD_BASE >> 16), lsl #16
++
++_PayloadLoop:
++  ldp   x2, x3, [x4], #16
++  stp   x2, x3, [x5], #16
++  subs  x6, x6, #16
++  b.ne  _PayloadLoop
++
++_NoPayload:
++#endif
+   ldr   x5, =FD_BASE
+ 
+ _Entry:
+diff --git a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c
+index 9b18ddb1..4c1bb5f6 100644
+--- a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c
++++ b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c
+@@ -34,6 +34,8 @@ STATIC UINTN YPos = 0;
+ //
+ STATIC CONST CHAR8 *ComboMessage = "[Volume Up] Boot Manager";
+ 
++VOID EFIAPI SapphireXnuBoot (VOID);    /* SapphireXnuBoot.c */
++
+ VOID
+ EFIAPI
+ PlatformBootManagerBeforeConsole ()
+@@ -203,6 +205,9 @@ PlatformBootManagerUnableToBoot ()
+ {
+   EFI_STATUS Status;
+ 
++  // sapphire: an "XNUP" container from BootShim means our XNU shim (does not return then)
++  SapphireXnuBoot ();
++
+   // Execute Secondary Unable To Boot
+   DeviceBootManagerUnableToBoot ();
+ 
+@@ -238,4 +243,7 @@ PlatformBootManagerBdsEntry ()
+ 
+   // Execute Secondary BDS Entry
+   DeviceBootManagerBdsEntry ();
++
++  // sapphire: with an "XNUP" container, boot XNU now: no boot menu, no "no OS" screen
++  SapphireXnuBoot ();
+ }
+diff --git a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf
+index 2310dc61..45ba252f 100644
+--- a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf
++++ b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf
+@@ -15,9 +15,11 @@
+ [Sources]
+   BootManager.c
+   KeyCallback.c
++  SapphireXnuBoot.c
+ 
+ [Packages]
+   MdePkg/MdePkg.dec
++
+   PcBdsPkg/PcBdsPkg.dec
+   MsCorePkg/MsCorePkg.dec
+   MsGraphicsPkg/MsGraphicsPkg.dec
+@@ -27,6 +29,7 @@
+ [LibraryClasses]
+   PcdLib
+   DebugLib
++  ArmLib
+   AcpiTableUpdateLib
+   DeviceBootManagerLib
+   UefiRuntimeServicesTableLib
+diff --git a/build_uefi.py b/build_uefi.py
+index e20a2ecb..699aaa89 100755
+--- a/build_uefi.py
++++ b/build_uefi.py
+@@ -196,6 +196,10 @@ def compile_boot_shim (boot_shim_config: dict, fd_config: dict) -> bool:
+         f"FD_SIZE={fd_size}"
+     ]
+ 
++    # Optional "XNUP" Payload Copied Behind the FD (sapphire)
++    if boot_shim_config.get ("payload_base"):
++        cmd.append (f"CFLAGS=--target=aarch64-linux-gnu -DPAYLOAD_BASE={hex (boot_shim_config.get ('payload_base'))}")
++
+     # Compile Boot Shim
+     return subprocess.run (cmd, cwd=BOOT_SHIM_PATH).returncode == 0
+ 
