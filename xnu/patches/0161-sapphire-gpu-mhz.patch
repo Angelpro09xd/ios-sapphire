@@ -1,0 +1,132 @@
+From a7809db840151528e3c8760c375d67d819f0200f Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 23 Oct 2026 10:58:40 +0000
+Subject: [PATCH] sapphire-0161: gpu_mhz= runs the GPU at a stock OPP above 600
+ MHz
+
+Frames wait about 24 ms for the GPU at 600 MHz (GPLL0 undivided, the
+fastest gpu_div): 20-25 a second. gpu_mhz=785/820/980/1025/1100/1260
+starts gpu_cc_pll0 (Zonda) at the stock khaje OPP and feeds
+gx_gfx3d from it (ios-topaz 0922, after topaz-woa TopazGpuW v0.43 and
+gpucc-khaje.c). Opt-in, since VDD_GFX is still not raised: a rate above
+what the bootloader's corner holds may hang the GPU. A rate not in the
+table, or a PLL that does not lock, falls back to gpu_div.
+---
+ iokit/Kernel/arm/SapphireGpu.cpp | 80 +++++++++++++++++++++++++++++++-
+ 1 file changed, 79 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index f6e5d58..51e16f2 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -254,6 +254,13 @@ static uint32_t slow_ms;                        /* boot-arg gpu_slow: see step_d
+  * (75 MHz) is the slowest useful setting; the divider field holds 2 * div - 1.
+  */
+ static uint32_t core_div = 2;
++/*
++ * boot-arg gpu_mhz: a stock OPP above 600 MHz (785 820 980 1025 1100 1260) from gpu_cc_pll0
++ * instead of GPLL0 (ios-topaz 0922, sequence from topaz-woa TopazGpuW v0.43 and the stock
++ * gpucc-khaje.c). The same caveat as gpu_div: VDD_GFX is not raised, so a rate above what the
++ * bootloader's corner holds may hang the GPU. 0 = off (gpu_div decides).
++ */
++static uint32_t core_mhz;
+ /*
+  * boot-arg gpu_smmu_early: program the identity context bank as soon as its clock is voted,
+  * before the GX domain comes up, instead of in cp_start(). The GPU's SMMU comes out of the
+@@ -564,6 +571,72 @@ gdsc_on(uint32_t gdscr, uint32_t bcr, uint32_t clamp, uint32_t status, const cha
+ }
+ 
+ /* Root clock generator: pick a parent and a divider (the register holds 2 * div - 1). */
++/* ---- gpu_cc_pll0: Zonda PLL at GPU CC + 0, f = 19.2 MHz * (L + alpha / 2^16) ---- */
++#define ZP_MODE         0x00
++#define ZP_L            0x04
++#define ZP_ALPHA        0x08
++#define ZP_USER         0x0c
++#define ZP_CFG          0x10
++#define ZP_CFG_U        0x14
++#define ZP_CFG_U1       0x18
++#define ZP_OPMODE       0x28
++#define ZP_OUTCTRL      (1u << 0)
++#define ZP_BYPASSNL     (1u << 1)
++#define ZP_RESET_N      (1u << 2)
++#define ZP_LOCK         (1u << 31)
++#define SRC_GPU_PLL0    1                   /* GPU_CC_PLL0_OUT_MAIN in gx_gfx3d's parent map */
++
++static bool
++zonda_la(uint32_t mhz, uint32_t *l, uint32_t *a)
++{
++	static const uint32_t t[][3] = {
++		{ 785, 41, 0xE2AA }, { 820, 43, 0xB555 }, { 980, 51, 0x0AAB },
++		{ 1025, 53, 0x62AA }, { 1100, 57, 0x4AAB }, { 1260, 66, 0xA000 },
++	};
++	for (unsigned i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
++		if (t[i][0] == mhz) {
++			*l = t[i][1];
++			*a = t[i][2];
++			return true;
++		}
++	}
++	return false;
++}
++
++static bool
++gpu_pll_start(uint32_t mhz)
++{
++	uint32_t l, a;
++
++	if (!zonda_la(mhz, &l, &a)) {
++		LOG("gpu_mhz=%u is not a stock OPP above 600 (785 820 980 1025 1100 1260): GPLL0", mhz);
++		return false;
++	}
++	rmw(gpucc, ZP_MODE, ZP_OUTCTRL, 0);
++	wr(gpucc, ZP_OPMODE, 0);
++	wr(gpucc, ZP_L, l);
++	wr(gpucc, ZP_ALPHA, a);
++	wr(gpucc, ZP_CFG, 0x08200800);
++	wr(gpucc, ZP_CFG_U, 0x05022001);
++	wr(gpucc, ZP_CFG_U1, 0x00000010);
++	wr(gpucc, ZP_USER, 0x01000101);
++	rmw(gpucc, ZP_MODE, ZP_BYPASSNL, 0);
++	rmw(gpucc, ZP_MODE, 0, ZP_RESET_N);
++	rmw(gpucc, ZP_MODE, 0, ZP_BYPASSNL);
++	IODelay(1);
++	rmw(gpucc, ZP_MODE, 0, ZP_RESET_N);
++	wr(gpucc, ZP_OPMODE, 1);
++	if (!poll(gpucc, ZP_MODE, ZP_LOCK, ZP_LOCK, 1000)) {
++		LOG("gpu_cc_pll0: no lock at %u MHz (mode %08x): GPLL0", mhz, rd(gpucc, ZP_MODE));
++		return false;
++	}
++	rmw(gpucc, ZP_USER, 0, 0xF);
++	rmw(gpucc, ZP_MODE, 0, ZP_OUTCTRL);
++	IODelay(100);
++	LOG("gpu_cc_pll0 locked at %u MHz (l %u alpha %04x)", mhz, l, a);
++	return true;
++}
++
+ static bool
+ rcg_set(uint32_t cmd, uint32_t src, uint32_t div, const char *name)
+ {
+@@ -616,7 +689,11 @@ power_up(void)
+ 	if (!gdsc_on(0x100c, 0x1008, 0x1508, 0x100c, "gpu_gx_gdsc")) {
+ 		return false;
+ 	}
+-	ok &= rcg_set(0x101c, SRC_GPLL0, core_div, "gx_gfx3d_clk_src");
++	if (core_mhz != 0 && gpu_pll_start(core_mhz)) {
++		ok &= rcg_set(0x101c, SRC_GPU_PLL0, 1, "gx_gfx3d_clk_src");
++	} else {
++		ok &= rcg_set(0x101c, SRC_GPLL0, core_div, "gx_gfx3d_clk_src");
++	}
+ 	rmw(gpucc, 0x1054, 0, (1u << 14) | (1u << 13));     /* force mem core / periph on */
+ 	step_done();
+ 	ok &= branch_on(gpucc, 0x1054, "gpucc_gx_gfx3d");
+@@ -2266,6 +2343,7 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+ 	 */
+ 	(void)PE_parse_boot_argn("gpu_slow", &slow_ms, sizeof(slow_ms));
+ 	/* 0152: gpu_div=1 is GPLL0 undivided, 600 MHz -- the rail is the bootloader's, so try it, do not assume it */
++	(void)PE_parse_boot_argn("gpu_mhz", &core_mhz, sizeof(core_mhz));
+ 	if (PE_parse_boot_argn("gpu_div", &core_div, sizeof(core_div)) && (core_div < 1 || core_div > 16)) {
+ 		core_div = 2;
+ 	}
+-- 
+2.43.0
+
