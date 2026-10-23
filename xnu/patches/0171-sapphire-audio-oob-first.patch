@@ -1,0 +1,76 @@
+From 1964e11d3580c164c7d114db5b0f62631935bc19 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 23 Oct 2026 22:20:23 +0000
+Subject: [PATCH] sapphire-0171: AudioReach commands over 128 bytes out of band
+ from the start
+
+0170 on the phone: the ADSP grants a bigger receive buffer on adsp_apps
+(RX_INTENT_REQ_ACK 1) but never advertises it, so the 392-byte graph
+open waited in the queue for ever, and the out-of-band try queued behind
+it was never sent either. Payloads whose packet would exceed the ADSP's
+128-byte buffers now go in the shared command page from the first try,
+and a command not answered drops what is stuck in the queue.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 24 +++++++++++++++---------
+ 1 file changed, 15 insertions(+), 9 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 9093b6c..3b0dd60 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -8533,6 +8533,12 @@ a_wait(uint32_t cmd, uint32_t rsp, unsigned ms)
+ 		IOSleep(1);
+ 		a_ms++;
+ 	}
++	while (a_ch[1].qh != a_ch[1].qt) {                      /* what never went out stays out */
++		LOG("adsp: dropping a %u-byte packet that found no receive buffer", a_ch[1].q[a_ch[1].qh % 32].len);
++		IOFree(a_ch[1].q[a_ch[1].qh % 32].p, a_ch[1].q[a_ch[1].qh % 32].len);
++		a_ch[1].qh++;
++	}
++	a_ch[1].intent_req_sent = false;
+ 	return -1;
+ }
+ 
+@@ -8545,7 +8551,12 @@ a_wait(uint32_t cmd, uint32_t rsp, unsigned ms)
+  * parameters goes once the command area is mapped (a_cmd_area, after the tone's buffers).
+  */
+ static uint8_t *a_cmd_area;
+-static bool a_oob;                              /* 0170: in band first; out of band if that is not answered */
++/*
++ * 0170: a bigger receive buffer asked for on adsp_apps is granted (RX_INTENT_REQ_ACK) but never
++ * advertised, so a packet over 128 bytes waits for ever (and everything queued behind it):
++ * payloads that would not fit go out of band.
++ */
++static bool a_oob;
+ static uint64_t a_cmd_pa;
+ 
+ static int64_t
+@@ -8555,7 +8566,7 @@ a_cmd_sync(uint32_t src, uint32_t dst, uint32_t opcode, const void *payload, uin
+ 	uint8_t *b;
+ 	int64_t r;
+ 
+-	if (a_oob && len > 64 && a_cmd_area != NULL && a_mem_handle != 0 && len <= 4096) {
++	if (a_oob && 24 + 16 + len > 128 && a_cmd_area != NULL && a_mem_handle != 0 && len <= 4096) {
+ 		uint32_t h[4] = { (uint32_t)a_cmd_pa, (uint32_t)(a_cmd_pa >> 32), a_mem_handle, len };
+ 		memcpy(a_cmd_area, payload, len);
+ 		mb();
+@@ -8873,14 +8884,9 @@ audio_test(void)
+ 		}
+ 	}
+ 	a_verbose = true;
++	a_oob = true;
+ 	IOSleep(300);                                           /* (the USB log goes out every 100 ms) */
+-	r = a_graph_open(2, 3);                                 /* CD, EP, in band */
+-	if (r == -1) {
+-		LOG("adsp: graph open in band not answered; out of band, in the shared memory");
+-		IOSleep(300);
+-		a_oob = true;
+-		r = a_graph_open(2, 3);
+-	}
++	r = a_graph_open(2, 3);                                 /* CD, EP, out of band */
+ 	if (r != 0 && r != -3) {
+ 		LOG("adsp: graph open (capabilities) -> %lld; again with generic containers", r);
+ 		IOSleep(300);
+-- 
+2.43.0
+
