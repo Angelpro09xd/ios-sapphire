@@ -1,0 +1,82 @@
+From 5a6c6d83cb07f306c0490d3ec02dcf8815157411 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 23 Oct 2026 21:41:42 +0000
+Subject: [PATCH] sapphire-0169: big AudioReach commands out of band, in the
+ mapped shared memory
+
+0168 on the phone: PRM votes and the RX clocks granted, the SoundWire
+master reads 01060000 (the codec is clocked), fs16xx amplifiers answer
+at 0x34/0x35 (no aw87xxx), the shared memory maps (handle b0add858); but
+the ADSP's receive buffers on adsp_apps are 128 bytes and the 392-byte
+graph open was not answered, even with a bigger buffer granted. Payloads
+over 64 bytes now go in a command page after the tone's buffers, named
+by apm_cmd_header (address, map handle, size).
+---
+ iokit/Kernel/arm/TopazModem.cpp | 28 ++++++++++++++++++++++++----
+ 1 file changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 29a42af..9508f54 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -8517,14 +8517,31 @@ a_wait(uint32_t cmd, uint32_t rsp, unsigned ms)
+ }
+ 
+ /* an in-band APM-style command: GPR header, apm_cmd_header (payload size), payload */
++/*
++ * An APM-style command: GPR header, apm_cmd_header, payload. On adsp_apps the ADSP's receive
++ * buffers are 128 bytes (0168: 32 of them), and a 392-byte graph open was never answered even
++ * with a bigger buffer granted; the header can instead name the payload in shared memory
++ * (payload address, the map's handle, size), which is how anything bigger than a few
++ * parameters goes once the command area is mapped (a_cmd_area, after the tone's buffers).
++ */
++static uint8_t *a_cmd_area;
++static uint64_t a_cmd_pa;
++
+ static int64_t
+ a_cmd_sync(uint32_t src, uint32_t dst, uint32_t opcode, const void *payload, uint32_t len, uint32_t rsp)
+ {
+ 	uint32_t n = 16 + len;
+-	uint8_t *b = (uint8_t *)IOMalloc(n);
++	uint8_t *b;
+ 	int64_t r;
+ 
+-	if (b == NULL) {
++	if (len > 64 && a_cmd_area != NULL && a_mem_handle != 0 && len <= 4096) {
++		uint32_t h[4] = { (uint32_t)a_cmd_pa, (uint32_t)(a_cmd_pa >> 32), a_mem_handle, len };
++		memcpy(a_cmd_area, payload, len);
++		mb();
++		a_gpr_pkt(src, dst, opcode, 0, h, sizeof(h));
++		return a_wait(opcode, rsp, 2000);
++	}
++	if ((b = (uint8_t *)IOMalloc(n)) == NULL) {
+ 		return -1;
+ 	}
+ 	bzero(b, 16);
+@@ -8801,7 +8818,8 @@ audio_test(void)
+ 	}
+ 	a_amp_probe();
+ 
+-	buf = (int16_t *)pool_alloc(A_NBUF * bytes, &buf_pa);
++	const uint32_t tone = (A_NBUF * bytes + 0xfff) & ~0xfffu;
++	buf = (int16_t *)pool_alloc(tone + 0x1000, &buf_pa);
+ 	if (buf == NULL) {
+ 		LOG("adsp: no buffer");
+ 		return;
+@@ -8820,10 +8838,12 @@ audio_test(void)
+ 		a_put16(&p, 1);
+ 		a_put32(&p, 0);                                       /* physical addresses */
+ 		a_put32(&p, (uint32_t)buf_pa); a_put32(&p, (uint32_t)(buf_pa >> 32));
+-		a_put32(&p, (A_NBUF * bytes + 0xfff) & ~0xfffu);
++		a_put32(&p, tone + 0x1000);
+ 		a_gpr_pkt(GPR_PORT_APM_CLIENT, APM_PORT, APM_CMD_SHARED_MEM_MAP_REGIONS, 1, m, sizeof(m));
+ 		r = a_wait(APM_CMD_SHARED_MEM_MAP_REGIONS, APM_CMD_RSP_SHARED_MEM_MAP_REGIONS, 2000);
+ 		a_mem_handle = r == 0 ? a_box.p[0] : 0;
++		a_cmd_area = (uint8_t *)buf + tone;
++		a_cmd_pa = buf_pa + tone;
+ 		LOG("adsp: shared memory %llx (%u bytes): map %lld, handle %x", buf_pa, A_NBUF * bytes, r, a_mem_handle);
+ 		if (r != 0) {
+ 			return;
+-- 
+2.43.0
+
