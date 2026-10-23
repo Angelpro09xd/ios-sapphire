@@ -1,0 +1,46 @@
+From acf7e97bec31f6c48bae2302804c1b1f7e13a84a Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 23 Oct 2026 09:29:57 +0000
+Subject: [PATCH] sapphire-0158: local-mac-address on the wlan device
+
+MobileGestalt reads the Wi-Fi address as the property local-mac-address
+of the "wlan" device (libMobileGestalt 0x19c57c070, as a phone's device
+tree has it) and only without it waits, up to 5 s, for an
+IONetworkController (0x19c57c084): 0157's controller did not end the
+waits. The radio's address is set on the device when en0 is attached.
+---
+ iokit/Kernel/arm/SapphireWLAN.cpp | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SapphireWLAN.cpp b/iokit/Kernel/arm/SapphireWLAN.cpp
+index b4655dc..f86a956 100644
+--- a/iokit/Kernel/arm/SapphireWLAN.cpp
++++ b/iokit/Kernel/arm/SapphireWLAN.cpp
+@@ -23,10 +23,10 @@
+  *     service can be the one the system routes through -- which wifid waits for after a join
+  *     ("failed to become routable interface") before Settings ticks the network.
+  *
+- *   - MobileGestalt (the Wi-Fi address and the like, asked by lsd for every bundle it registers)
+- *     finds the "wlan" device and then waits, 5 s at a time, for a service of the class
+- *     IONetworkController: with IO80211Controller made directly from IOService none ever came,
+- *     and rebuilding the LaunchServices database took more than an hour.
++ *   - MobileGestalt (the Wi-Fi address, asked by lsd for every bundle it registers) reads the
++ *     property local-mac-address of the "wlan" device, as a device tree has it on a phone;
++ *     without it, it waits up to 5 s for an IONetworkController to its liking, every time:
++ *     rebuilding the LaunchServices database took more than an hour.
+  *
+  * So: a controller of the class IO80211Controller (an IOEthernetController, an
+  * IONetworkController, as in IO80211Family) under the "wlan" device, and below it one object
+@@ -134,6 +134,9 @@ SapphireWLANStart(const char * interface, const uint8_t * address)
+ 	}
+ 	if ((mac = OSData::withBytes(address, 6)) != NULL) {
+ 		controller->setProperty("IOMACAddress", mac);
++		if (device != NULL) {
++			device->setProperty("local-mac-address", mac);
++		}
+ 		mac->release();
+ 	}
+ 	controller->setProperty("IOBuiltin", true);
+-- 
+2.43.0
+
