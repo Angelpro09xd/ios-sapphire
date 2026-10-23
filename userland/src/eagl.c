@@ -238,6 +238,9 @@ static int group_vibrant_on = 1;        /* boot-arg glgroup=0 */
 static unsigned group_covered, group_laid, group_flattened;    /* (glframes=1) this frame's */
 
 /* A texture that stands for an IOSurface. */
+#define SUM_STRIDE      520             /* see surface_changed() */
+#define SUM_SLICES      16
+
 struct image {
 	GLuint texture;
 	IOSurfaceRef surface;
@@ -248,8 +251,11 @@ struct image {
 	bool wrapped;                   /* the surface is memory of somebody's with a surface made around it */
 	bool alpha_first;               /* its pixels are opacity, blue, green, red in memory: see my_attachImage() */
 	bool painted;                   /* something has been drawn into it (it is a target in fact, not only in name) */
+	bool damaged;                   /* drawn into this frame inside damage[] (x0, y0, x1, y1): what the mirror needs */
+	GLint damage[4];
 	unsigned looked;                /* ... the frame in which that memory was last looked at, */
-	uint64_t sum;                   /* ... and what it added up to */
+	uint64_t sum;                   /* ... what a word in every SUM_STRIDE bytes of it added up to, */
+	uint64_t slice_sum[SUM_SLICES]; /* ... and what each slice of it added up to, word by word */
 	GLenum to, internal, format, type;
 	uint32_t plane, seed;
 	GLsizei width, height;
@@ -326,6 +332,7 @@ struct eagl {
 	/* everything so far */
 	unsigned frames, shaders, programs, errors, shared, refused;
 	uint64_t all_calls, all_draws, all_triangles, readback_us, wait_us, attach_us, flush_us, frame_us;
+	uint64_t mirror_us, sync_us, mirrored_pixels;            /* of wait_us: the GPU's copies into the display's surfaces, and the fence that sends all out */
 	unsigned most_calls, most_triangles;
 	const char *sources[256];       /* the text of the shaders being made, by name (modulo this) */
 	bool fragment[256];             /* ... and which of the two kinds each is */
@@ -367,6 +374,14 @@ static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
  */
 static int blit_targets = 1;
 /*
+ * The GPU's copy into a display surface does not move its seed: a seed that moved is, to the
+ * kernel's GPU submission (0165), a surface the CPU may have written, and the next submission
+ * cleaned all 11 MB of it out of the caches -- 3.7 ms of every frame, a quiet one 4.7 ms instead
+ * of 1.8. The display takes the surface by its swap, not by the seed. File /redwood/glseed: as before.
+ */
+static int mirror_unseeded = 1;
+static int full_mirror;                 /* boot-arg glmirror=full (a test): all of the surface every frame, not what was drawn (damage()) */
+/*
  * A frame that is handed to the display must have been drawn. The display's driver waits for
  * the GPU itself before it puts a surface on the panel, on a thread of its own, and says so in
  * the registry ("RedwoodWaitsForGPU"); the window server is then at its next frame meanwhile.
@@ -391,6 +406,7 @@ static int sync_frames = 1;             /* boot-arg glsync=0 (a test): a frame's
 static int fetch_offered = 1;
 
 #define GL_SCISSOR_TEST                 0x0c11
+#define GL_VIEWPORT                     0x0ba2
 #define GL_SCISSOR_BOX                  0x0c10
 #define GL_COLOR_CLEAR_VALUE            0x0c22
 
@@ -520,10 +536,10 @@ summary(struct eagl *e)
 
 	say("redwood-gl: after %u frames: %llu calls, %llu draws and %llu triangles a frame on average; the most in one: "
 	    "%u calls, %u triangles; %llu us a frame, of which %llu handing the commands on, %llu waiting for the picture "
-	    "to be drawn and %llu copying it out, and before each %llu making textures of IOSurfaces; %u IOSurfaces were "
+	    "to be drawn (%llu the copies into the display's surfaces, %llu KB of them, %llu the fence) and %llu copying it out, and before each %llu making textures of IOSurfaces; %u IOSurfaces were "
 	    "the textures' memory, %u had to be copied; %u shaders, %u programs; biggest texture %u x %u; %u errors\n",
 	    e->frames, e->all_calls / frames, e->all_draws / frames, e->all_triangles / frames, e->most_calls,
-	    e->most_triangles, e->frame_us / frames, e->flush_us / frames, e->wait_us / frames, e->readback_us / frames,
+	    e->most_triangles, e->frame_us / frames, e->flush_us / frames, e->wait_us / frames, e->mirror_us / frames, e->mirrored_pixels * 4 / 1024 / frames, e->sync_us / frames, e->readback_us / frames,
 	    e->attach_us / frames, e->shared, e->refused, e->shaders, e->programs, widest_texture, tallest_texture, e->errors);
 	for (unsigned i = 0; i < sizeof(formats) / sizeof(formats[0]) && formats[i].count; i++) {
 		say("redwood-gl:   textures: %s %#x/%#x/%#x: %u times, up to %u x %u\n", formats[i].how, formats[i].internal,
@@ -892,30 +908,64 @@ surface_shared(struct eagl *e, struct image *image)
  * made again. A GPU that has the memory itself shows what is there. A copy has to notice: once
  * a frame, when the texture is about to be drawn with, the memory is added up, and copied again
  * if the sum has changed.
+ *
+ * Adding all of it up every frame cost more than the drawing (a whole screen is 10 MB: a few
+ * milliseconds a frame, for every such surface). So each frame adds up one word in every
+ * SUM_STRIDE bytes -- the stride is not a multiple of a row, so the words fall in other columns
+ * row after row, and what is drawn over more than a few pixels is seen at once -- and one slice
+ * of the memory in full, a different one each frame: a change smaller than that is seen within
+ * SUM_SLICES frames. Everything is added up when the texture is made (all, below).
  */
+static uint64_t
+add_up(const uint8_t *base, size_t from, size_t to, size_t stride, uint64_t sum)
+{
+	uint64_t word;
+
+	for (size_t at = from; at + 8 <= to; at += stride) {
+		memcpy(&word, base + at, 8);
+		sum = (sum ^ word) * 0x9e3779b97f4a7c15ull;
+		sum ^= sum >> 29;
+	}
+	return sum;
+}
+
 static bool
-surface_changed(struct eagl *e, struct image *image)
+surface_changed_all(struct eagl *e, struct image *image, bool all)
 {
 	IOSurfaceRef surface = image->surface;
 	size_t size = IOSurfaceGetBytesPerRow(surface) * (size_t)(image->height - 1) +
 	    (size_t)image->width * bytes_a_pixel(image->format, image->type);
+	size_t slice = (size / SUM_SLICES + 7) & ~(size_t)7;
 	const uint8_t *base = IOSurfaceGetBaseAddress(surface);
-	uint64_t sum = size, word;
+	bool changed = false;
+	uint64_t sum;
 
 	if (image->looked == e->frames + 1 || base == NULL || IOSurfaceGetPlaneCount(surface) > 0) {
 		return false;
 	}
 	image->looked = e->frames + 1;
-	for (size_t at = 0; at + 8 <= size; at += 8) {
-		memcpy(&word, base + at, 8);
-		sum = (sum ^ word) * 0x9e3779b97f4a7c15ull;
-		sum ^= sum >> 29;
+	sum = add_up(base, 0, size, SUM_STRIDE, size);
+	if (sum != image->sum) {
+		image->sum = sum;
+		changed = true;
 	}
-	if (sum == image->sum) {
-		return false;
+	for (unsigned n = 0; n < SUM_SLICES; n++) {
+		if (!all && n != (e->frames + (unsigned)(uintptr_t)image / 64) % SUM_SLICES) {
+			continue;
+		}
+		sum = add_up(base, n * slice, (n + 1) * slice < size ? (n + 1) * slice : size, 8, n);
+		if (sum != image->slice_sum[n]) {
+			image->slice_sum[n] = sum;
+			changed = true;
+		}
 	}
-	image->sum = sum;
-	return true;
+	return changed;
+}
+
+static bool
+surface_changed(struct eagl *e, struct image *image)
+{
+	return surface_changed_all(e, image, false);
 }
 
 /* Fill a texture, which is bound, from its IOSurface, unless it is the surface. */
@@ -1023,11 +1073,19 @@ target_to_surface(struct eagl *e, struct image *image)
 		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
 		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->mirror, 0);
-		glBlitFramebuffer(0, 0, image->width, image->height, 0, image->invert ? image->height : 0, image->width,
-		    image->invert ? 0 : image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		/* only what was drawn this frame: the rest of the surface is what the texture holds already */
+		GLint x0 = 0, y0 = 0, x1 = image->width, y1 = image->height;
+
+		if (image->damaged && !full_mirror) {
+			x0 = image->damage[0], y0 = image->damage[1], x1 = image->damage[2], y1 = image->damage[3];
+		}
+		image->damaged = false;
+		glBlitFramebuffer(x0, y0, x1, y1, x0, image->invert ? image->height - y0 : y0, x1,
+		    image->invert ? image->height - y1 : y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		e->mirrored_pixels += (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0);
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
-		if (IOSurfaceLock(surface, 0, NULL) == 0) {
+		if (!mirror_unseeded && IOSurfaceLock(surface, 0, NULL) == 0) {
 			IOSurfaceUnlock(surface, 0, NULL);
 		}
 		return;
@@ -1274,7 +1332,7 @@ static void
 frame_end(struct eagl *e, bool finished)
 {
 	static unsigned unfollowed;
-	uint64_t before, waited, after;
+	uint64_t before, mirrored, waited, after;
 	unsigned copied = 0, in_place = 0;
 
 	clear_now(e);
@@ -1289,6 +1347,7 @@ frame_end(struct eagl *e, bool finished)
 			in_place++;
 		}
 	}
+	mirrored = now_us();
 	if (in_place != 0 && !finished && wait_for_frames) {
 		glFinish();             /* the display's driver reads the surface as soon as it is told of it */
 	} else if (in_place != 0 && !finished && sync_frames) {
@@ -1353,6 +1412,8 @@ frame_end(struct eagl *e, bool finished)
 	e->all_draws += e->draws;
 	e->all_triangles += e->triangles;
 	e->wait_us += waited - before;
+	e->mirror_us += mirrored - before;
+	e->sync_us += waited - mirrored;
 	e->readback_us += after - waited;
 	e->attach_us += e->attaching;
 	e->flush_us += e->flushing;
@@ -1412,6 +1473,49 @@ count_spans(struct eagl *e, GLenum mode, GLsizei count)
 	}
 }
 
+/*
+ * Where a frame draws into a surface: the viewport, within the scissor box if there is one.
+ * CoreAnimation draws only what has changed, so the GPU's copy into the surface's memory
+ * (target_to_surface(), mirror) need take only that much -- all of a 1125 x 2436 picture every
+ * frame was 4-5 ms of the frame's end. `all`: something drew into it the whole way.
+ */
+static void
+damage(struct image *image, bool all)
+{
+	GLint view[4] = { 0, 0, image->width, image->height }, box[4], r[4];
+
+	if (!all) {
+		glGetIntegerv(GL_VIEWPORT, view);
+		if (glIsEnabled(GL_SCISSOR_TEST)) {
+			glGetIntegerv(GL_SCISSOR_BOX, box);
+			r[0] = box[0] > view[0] ? box[0] : view[0];
+			r[1] = box[1] > view[1] ? box[1] : view[1];
+			r[2] = box[0] + box[2] < view[0] + view[2] ? box[0] + box[2] : view[0] + view[2];
+			r[3] = box[1] + box[3] < view[1] + view[3] ? box[1] + box[3] : view[1] + view[3];
+		} else {
+			r[0] = view[0], r[1] = view[1], r[2] = view[0] + view[2], r[3] = view[1] + view[3];
+		}
+	} else {
+		r[0] = 0, r[1] = 0, r[2] = image->width, r[3] = image->height;
+	}
+	r[0] = r[0] < 0 ? 0 : r[0];
+	r[1] = r[1] < 0 ? 0 : r[1];
+	r[2] = r[2] > image->width ? image->width : r[2];
+	r[3] = r[3] > image->height ? image->height : r[3];
+	if (r[2] <= r[0] || r[3] <= r[1]) {
+		return;
+	}
+	if (!image->damaged) {
+		memcpy(image->damage, r, sizeof(r));
+		image->damaged = true;
+		return;
+	}
+	image->damage[0] = r[0] < image->damage[0] ? r[0] : image->damage[0];
+	image->damage[1] = r[1] < image->damage[1] ? r[1] : image->damage[1];
+	image->damage[2] = r[2] > image->damage[2] ? r[2] : image->damage[2];
+	image->damage[3] = r[3] > image->damage[3] ? r[3] : image->damage[3];
+}
+
 /* Something is about to be drawn into the framebuffer that is bound. */
 static void
 drawing(struct eagl *e)
@@ -1421,6 +1525,7 @@ drawing(struct eagl *e)
 	frame_begin(e);
 	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && image->target) {
 		image->drawn = image->painted = true;
+		damage(image, false);
 		if (frame_lines && image->width >= 1000 && image->height >= 2000) {
 			/* the display's picture (a surface of its size): where this frame first draws into it */
 			e->line.into_display++;
@@ -1490,7 +1595,6 @@ my_glClear(void *context, GLbitfield mask)
 }
 
 /* While calls are written down: what a draw has left in the middle of what it drew into, and near its top. */
-#define GL_VIEWPORT             0x0ba2
 
 static void
 trace_pixels(struct eagl *e)
@@ -2854,6 +2958,7 @@ group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
 	static const GLfloat corners[8] = { -1, -1, 1, -1, -1, 1, 1, 1 };
 	GLint view[4], box[4], width = 0, height = 0, enabled[3];
 	GLboolean scissored, blending;
+	struct image *flattened;
 	GLfloat flat[4], alpha = clamp01(g->colours[19]);
 
 	g->state = GROUP_NONE;
@@ -2879,6 +2984,9 @@ group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
 	glViewport(0, 0, width, height);
 	glDisable(GL_SCISSOR_TEST);
+	if ((flattened = image_of(e, texture)) != NULL && flattened->target) {
+		damage(flattened, true);                /* (all of it, whatever the scissor) */
+	}
 	if (flat[3] == 0) {
 		GLfloat colour[4];
 
@@ -4185,7 +4293,7 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	image->wrapped = IOSurfaceGetPixelFormat(surface) == 0;
 	began = now_us();
 	if (!surface_shared(e, image)) {
-		surface_changed(e, image);              /* (what it adds up to now) */
+		surface_changed_all(e, image, true);    /* (what it adds up to now) */
 		surface_to_texture(e, image);
 	}
 	e->attaching += now_us() - began;
@@ -4245,7 +4353,7 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	 */
 	began = now_us();
 	if (surface_mirrored(e, image) || !surface_shared(e, image)) {
-		surface_changed(e, image);              /* (what it adds up to now) */
+		surface_changed_all(e, image, true);    /* (what it adds up to now) */
 		surface_to_texture(e, image);
 	}
 	e->attaching += now_us() - began;
@@ -4412,6 +4520,8 @@ install(void)
 		}
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
+		full_mirror = strstr(arguments, "glmirror=full") != NULL;
+		mirror_unseeded = access("/redwood/glseed", F_OK) != 0;
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
 			wait_for_frames = 0;
