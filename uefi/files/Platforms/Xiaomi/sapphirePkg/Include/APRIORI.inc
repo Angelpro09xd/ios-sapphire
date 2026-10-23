@@ -61,21 +61,21 @@ APRIORI DXE {
 
   INF Binaries/tapas/QcomPkg/Drivers/I2CDxe/I2CDxe.inf
   INF Binaries/tapas/QcomPkg/Drivers/AdcDxe/AdcDxe.inf
-  INF Binaries/tapas/QcomPkg/Drivers/UsbPwrCtrlDxe/UsbPwrCtrlDxe.inf
+  # sapphire: XNU drives the USB controller as ABL leaves it; the UEFI's drivers changed its state. INF Binaries/tapas/QcomPkg/Drivers/UsbPwrCtrlDxe/UsbPwrCtrlDxe.inf
   INF Binaries/tapas/QcomPkg/Drivers/QcomChargerDxe/QcomChargerDxeLA.inf
   INF Binaries/tapas/QcomPkg/Drivers/ChargerExDxe/ChargerExDxe.inf
-  INF Binaries/tapas/QcomPkg/Drivers/UsbfnDwc3Dxe/UsbfnDwc3Dxe.inf
+  # sapphire: XNU drives the USB controller as ABL leaves it; the UEFI's drivers changed its state. INF Binaries/tapas/QcomPkg/Drivers/UsbfnDwc3Dxe/UsbfnDwc3Dxe.inf
 
   INF Binaries/generic/QcomPkg/Drivers/XhciPciEmulationDxe/XhciPciEmulationDxe.inf
   INF Binaries/generic/QcomPkg/Drivers/XhciDxe/XhciDxe.inf
 
-  INF MdeModulePkg/Bus/Usb/UsbBusDxe/UsbBusDxe.inf
-  INF MdeModulePkg/Bus/Usb/UsbKbDxe/UsbKbDxe.inf
-  INF MdeModulePkg/Bus/Usb/UsbMassStorageDxe/UsbMassStorageDxe.inf
+  # sapphire: XNU drives the USB controller as ABL leaves it; the UEFI's drivers changed its state. INF MdeModulePkg/Bus/Usb/UsbBusDxe/UsbBusDxe.inf
+  # sapphire: XNU drives the USB controller as ABL leaves it; the UEFI's drivers changed its state. INF MdeModulePkg/Bus/Usb/UsbKbDxe/UsbKbDxe.inf
+  # sapphire: XNU drives the USB controller as ABL leaves it; the UEFI's drivers changed its state. INF MdeModulePkg/Bus/Usb/UsbMassStorageDxe/UsbMassStorageDxe.inf
 
-  INF Binaries/tapas/QcomPkg/Drivers/UsbMsdDxe/UsbMsdDxe.inf
-  INF Binaries/tapas/QcomPkg/Drivers/UsbDeviceDxe/UsbDeviceDxe.inf
-  INF Binaries/tapas/QcomPkg/Drivers/UsbConfigDxe/UsbConfigDxe.inf
+  # sapphire: XNU drives the USB controller as ABL leaves it; the UEFI's drivers changed its state. INF Binaries/tapas/QcomPkg/Drivers/UsbMsdDxe/UsbMsdDxe.inf
+  # sapphire: XNU drives the USB controller as ABL leaves it; the UEFI's drivers changed its state. INF Binaries/tapas/QcomPkg/Drivers/UsbDeviceDxe/UsbDeviceDxe.inf
+  # sapphire: XNU drives the USB controller as ABL leaves it; the UEFI's drivers changed its state. INF Binaries/tapas/QcomPkg/Drivers/UsbConfigDxe/UsbConfigDxe.inf
   INF Binaries/tapas/QcomPkg/Drivers/ButtonsDxe/ButtonsDxe.inf
   INF Binaries/tapas/QcomPkg/Drivers/TsensDxe/TsensDxe.inf
 

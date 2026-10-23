@@ -8,6 +8,7 @@
  */
 #include <stdint.h>
 #include "console.h"
+#include "fdt.h"
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
@@ -286,7 +287,8 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		gold_cpufreq_max();
 		uint64_t gt = speed_ticks();
 		con_hex2("SPEED", "silver=", (uint32_t)silver_ticks, "gold=", (uint32_t)gt);
-		delay_ms(1000);
+		if (!con_quiet)
+			delay_ms(1000);		/* (time to read the speeds) */
 		con_skip();
 		con_str("LOADER", loader_boot(dtb));
 	}
@@ -507,6 +509,13 @@ void shim_main(uint64_t dtb)
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
+	/*
+	 * Started from our UEFI (uefi/, SapphireXnuBoot.c): the device tree says /chosen/sapphire,quiet,
+	 * and the screen is left as the UEFI drew it: no red console, no 1 s pause on gold.
+	 */
+	uint64_t quiet = 0;
+	if (dtb && fdt_chosen_u64(dtb, "sapphire,quiet", &quiet) && quiet)
+		con_quiet = 1;
 	con_clear(RED);
 	con_str("SHIM", "sweet milestone 4: xnu loader");
 	/* topaz: xnu needs the 16K granule (TGran16 != 0); Cortex-A53 may lack it */

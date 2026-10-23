@@ -21,7 +21,11 @@ raw = bytearray(z.decompress(k))
 assert raw[56:60] == b'ARMd', 'no ARM64 header'
 if shim_path:
     shim = open(shim_path, 'rb').read()
-    dtb = open(dtb_path, 'rb').read()
+    # /chosen/sapphire,quiet = 1: the shim draws nothing (the screen keeps the UEFI's logo)
+    qd = os.path.join(tempfile.mkdtemp(), 'quiet.dtb')
+    open(qd, 'wb').write(open(dtb_path, 'rb').read())
+    subprocess.check_call(['fdtput', '-t', 'u', qd, '/chosen', 'sapphire,quiet', '1'])
+    dtb = open(qd, 'rb').read()
     assert shim[56:60] == b'ARMd', 'the shim is no arm64 Image'
     shim_off = 0x1000
     dtb_off = (shim_off + len(shim) + 0xfff) & ~0xfff
