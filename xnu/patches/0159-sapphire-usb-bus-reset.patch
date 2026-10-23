@@ -1,0 +1,125 @@
+From 59bf8bf70cc414e824f4f502dc7f310a2448adb5 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 23 Oct 2026 10:37:31 +0000
+Subject: [PATCH] sapphire-0159: USB Ethernet survives a bus reset
+
+A bus reset (the host's, or usbipd's when the phone was slow to answer
+under load) loses the data endpoints' configuration in the DWC3. Only
+the address went back to 0: ud.configured stayed true, so the next
+SET_CONFIGURATION set no endpoint up, a frame in flight kept tx_busy,
+and ue0 was dead until a reboot (the live log and SSH with it). As
+Linux's dwc3_gadget_reset_interrupt: end the data endpoints' transfers
+(their resource index kept from STARTTRANSFER), disable them, forget the
+configuration and the TX queue, restart a control transfer caught in the
+middle.
+---
+ bsd/dev/sweet_usb.c | 58 +++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 56 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 2825351..1008f21 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -166,6 +166,8 @@ sweet_usb_probe(void)
+ #define DEPCMD_SETTRANSFRESOURCE 2
+ #define DEPCMD_SETSTALL         4
+ #define DEPCMD_STARTTRANSFER    6
++#define DEPCMD_ENDTRANSFER      8
++#define DEPCMD_HIPRI_FORCERM    (1u << 11)
+ #define DEPCMD_DEPSTARTCFG      9
+ #define DEPCMD_CMDACT           (1u << 10)
+ 
+@@ -220,6 +222,10 @@ static struct {
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
++	/* data endpoints' transfers, to end them on a bus reset */
++	bool        xfer_active[EP_INT + 1];
++	uint8_t     xfer_rsc[EP_INT + 1];
++	uint32_t    resets;
+ } ud;
+ 
+ static inline void
+@@ -289,7 +295,11 @@ ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl
+ 		ud_sync(buf, len);
+ 	}
+ 	uint64_t tpa = ud.dma_pa + trb;
+-	ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++	if (ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0) == 0 && ep > 1 && ep <= EP_INT) {
++		/* the transfer resource index, for ENDTRANSFER (Linux: dwc3_gadget_ep_get_transfer_index) */
++		ud.xfer_rsc[ep] = (uint8_t)((dwc_rd(DEPCMD(ep)) >> 16) & 0x7f);
++		ud.xfer_active[ep] = true;
++	}
+ }
+ 
+ static void
+@@ -655,6 +665,44 @@ ud_if_create(void)
+ 	printf("SWEET USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
+ }
+ 
++/*
++ * A bus reset (the host's, or usbipd's when the phone was slow to answer) loses the data
++ * endpoints' configuration in the controller. Until now only the address went back to 0: the
++ * endpoints stayed "configured" here, so the next SET_CONFIGURATION set nothing up, a frame
++ * being sent kept tx_busy, and the link was dead until a reboot. As Linux's
++ * dwc3_gadget_reset_interrupt: end the data endpoints' transfers, forget the configuration and
++ * the queue, restart a control transfer caught in the middle.
++ */
++static void
++ud_bus_reset(void)
++{
++	for (unsigned ep = EP_RX; ep <= EP_INT; ep++) {
++		if (ud.xfer_active[ep]) {
++			ud_epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_HIPRI_FORCERM | ((uint32_t)ud.xfer_rsc[ep] << 16), 0, 0, 0);
++			delay(100);
++			ud.xfer_active[ep] = false;
++		}
++	}
++	dwc_wr(DALEPENA, dwc_rd(DALEPENA) & ~((1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT)));
++	if (ud.lock != NULL) {
++		lck_mtx_lock(ud.lock);
++	}
++	ud.configured = false;
++	ud.data_alt = 0;
++	ud.tx_busy = false;
++	while (ud.txq_count > 0) {
++		mbuf_freem(ud.txq[ud.txq_head]);
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++		ud.txq_count--;
++	}
++	if (ud.lock != NULL) {
++		lck_mtx_unlock(ud.lock);
++	}
++	if (ud.state != EP0_SETUP) {
++		ud_stall();
++	}
++}
++
+ static void
+ ud_event(uint32_t ev)
+ {
+@@ -662,7 +710,10 @@ ud_event(uint32_t ev)
+ 		uint32_t type = (ev >> 8) & 0xf;
+ 		if (type == 1) {        /* USB reset */
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
+-			printf("SWEET USB: bus reset\n");
++			ud_bus_reset();
++			if (ud.resets++ < 20) {
++				printf("SWEET USB: bus reset\n");
++			}
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t speed = dwc_rd(DSTS) & 7;
+ 			/* ep0 max packet: 64 at high/full speed (modify action) */
+@@ -680,6 +731,9 @@ ud_event(uint32_t ev)
+ 	unsigned type = (ev >> 6) & 0xf;
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
++	if (ep >= EP_RX && ep <= EP_INT && type == 1) {
++		ud.xfer_active[ep] = false;
++	}
+ 	if (ep == EP_RX && type == 1) {
+ 		ud_rx_done();
+ 		return;
+-- 
+2.43.0
+
