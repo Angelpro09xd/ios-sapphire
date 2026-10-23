@@ -1,0 +1,143 @@
+From 1526037c95f2f6ba8c2136b08fef8ef723b0df8d Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 23 Oct 2026 07:56:35 +0000
+Subject: [PATCH] sapphire-0155: display modes at 60 Hz (ios-topaz 0948)
+
+CoreAnimation reads the display's modes (TimingElements, ColorElements)
+and the current one (selector 79, block 0x40) for its frame clock.
+Without them it paced frames 50 ms apart: 20 a second in animations,
+15-25 on this phone. One timing at the presented size and 60 Hz, one
+8-bit RGB colour mode. Ported from ios-topaz 0948, after HackiOS
+MiniIOMobileFramebuffer publishModes() (APSL 2.0).
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 86 +++++++++++++++++++++++++++
+ 1 file changed, 86 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 602cfd5..da78fbe 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -102,6 +102,7 @@ enum {
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
+ 	kSweetFBNotifications           = 72,
++	kSweetFBGetBlock                = 79,
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+@@ -140,6 +141,7 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	uint64_t            fVsyncCount;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	void publishModes(void);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -440,6 +442,7 @@ AppleCLCD::start(IOService *provider)
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
++	publishModes();
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+@@ -449,6 +452,75 @@ AppleCLCD::start(IOService *provider)
+ 	return true;
+ }
+ 
++/*
++ * The display's modes, the way CoreAnimation reads them (properties TimingElements and
++ * ColorElements; the current one is block 0x40 of selector 79): one timing, the presented size
++ * at 60 Hz, one colour mode, 8-bit RGB. Without them CoreAnimation ran its frame clock at a rate
++ * of its own guessing: 20 frames a second, 50 ms apart. (ios-topaz 0948, after HackiOS
++ * MiniIOMobileFramebuffer publishModes(), APSL 2.0.)
++ */
++#define SWEET_FB_TIMING_ID      1
++#define SWEET_FB_COLOR_ID       1
++
++static void
++sweet_set_number(OSDictionary *d, const char *key, uint64_t value)
++{
++	OSNumber *n = OSNumber::withNumber(value, 32);
++	if (n != NULL) {
++		d->setObject(key, n);
++		n->release();
++	}
++}
++
++void
++AppleCLCD::publishModes(void)
++{
++	OSDictionary *timing = OSDictionary::withCapacity(8);
++	OSDictionary *horizontal = OSDictionary::withCapacity(4);
++	OSDictionary *vertical = OSDictionary::withCapacity(4);
++	OSDictionary *color = OSDictionary::withCapacity(8);
++	OSArray *timings = OSArray::withCapacity(1);
++	OSArray *colors = OSArray::withCapacity(1);
++	const uint32_t rate = 60u << 16;        /* 16.16 */
++
++	if (timing != NULL && horizontal != NULL && vertical != NULL && color != NULL && timings != NULL && colors != NULL) {
++		sweet_set_number(color, "ID", SWEET_FB_COLOR_ID);
++		sweet_set_number(color, "PixelEncoding", 0);
++		sweet_set_number(color, "Depth", 8);
++		sweet_set_number(color, "Colorimetry", 1);
++		sweet_set_number(color, "EOTF", 1);
++		sweet_set_number(color, "DynamicRange", 0);
++		sweet_set_number(color, "Score", 1);
++		color->setObject("IsVirtual", kOSBooleanFalse);
++		colors->setObject(color);
++		sweet_set_number(horizontal, "Active", fLogicalW);
++		sweet_set_number(horizontal, "Total", fLogicalW);
++		sweet_set_number(horizontal, "SyncRate", rate);
++		sweet_set_number(horizontal, "PreciseSyncRate", rate);
++		sweet_set_number(vertical, "Active", fLogicalH);
++		sweet_set_number(vertical, "Total", fLogicalH);
++		sweet_set_number(vertical, "SyncRate", rate);
++		sweet_set_number(vertical, "PreciseSyncRate", rate);
++		sweet_set_number(timing, "ID", SWEET_FB_TIMING_ID);
++		sweet_set_number(timing, "Score", 1);
++		timing->setObject("IsVirtual", kOSBooleanFalse);
++		timing->setObject("IsOverscanned", kOSBooleanFalse);
++		timing->setObject("HorizontalAttributes", horizontal);
++		timing->setObject("VerticalAttributes", vertical);
++		timing->setObject("ColorModes", colors);
++		timings->setObject(timing);
++		setProperty("TimingElements", timings);
++		setProperty("ColorElements", colors);
++		IOLog("SWEET FB: modes published: %ux%u at 60 Hz\n", fLogicalW, fLogicalH);
++	}
++	OSSafeReleaseNULL(timings);
++	OSSafeReleaseNULL(colors);
++	OSSafeReleaseNULL(timing);
++	OSSafeReleaseNULL(horizontal);
++	OSSafeReleaseNULL(vertical);
++	OSSafeReleaseNULL(color);
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -1341,6 +1413,20 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		out[0] = SWEET_FB_DOT_PITCH;
+ 		outCount = 1;
+ 		break;
++	case kSweetFBGetBlock:
++		/*
++		 * Block 0x40, the current mode: its colour and timing identifiers (publishModes). Zeros
++		 * here left CoreAnimation without a mode, and its frame clock without the rate.
++		 */
++		if (args->structureOutput != NULL && args->structureOutputDescriptor == NULL) {
++			bzero(args->structureOutput, args->structureOutputSize);
++			if (args->scalarInputCount >= 1 && args->scalarInput[0] == 0x40 && args->structureOutputSize >= 12) {
++				uint32_t ids[2] = { SWEET_FB_COLOR_ID, SWEET_FB_TIMING_ID };
++				memcpy((uint8_t *)args->structureOutput + 4, ids, sizeof(ids));
++			}
++			return kIOReturnSuccess;
++		}
++		break;
+ 	case kSweetFBNotifications:
+ 		if (args->scalarInputCount >= 3 && args->scalarInput[2] < SWEET_FB_NOTIFY_TYPES) {
+ 			uint32_t type = (uint32_t)args->scalarInput[2];
+-- 
+2.43.0
+
