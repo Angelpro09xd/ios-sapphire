@@ -1,0 +1,177 @@
+From 0340da17093f79ea58f65763b409564330d4e65a Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 23 Oct 2026 14:42:04 +0000
+Subject: [PATCH] sapphire-0163: SWEET MEM, every 5 s: what holds memory
+
+Wired memory grows with every animation (13,000 pages at rest, 92,000
+-- 1.4 GB -- with the memory level at 18 % a few minutes later, the
+compressor at 762 MB and frames 6-7 s apart) and never comes back.
+Beside the 5 s display line: SweetSurface objects alive and the bytes
+of their buffers, the msm buffers of every GPU client by kind (imported
+IOSurfaces, GPU pool, kernel memory) and the wired page count, so the
+one that grows names the leak.
+---
+ iokit/Kernel/arm/SapphireGpu.cpp      | 31 +++++++++++++++++++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 11 ++++++++++
+ iokit/Kernel/arm/SweetSurface.cpp     | 15 +++++++++++++
+ iokit/Kernel/arm/SweetSurface.h       |  6 +++++-
+ 4 files changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index 51e16f2..6665a63 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -3364,12 +3364,40 @@ SapphireGPUClient::place(struct msm_bo *b)
+ 	return tlb_flush();
+ }
+ 
++/*
++ * msm buffers of every client, by kind, for the 5 s log (a leak shows as one of them growing):
++ * [0] imported IOSurfaces (their memory stays wired while imported), [1] the GPU pool (outside
++ * the kernel's RAM), [2] ordinary kernel memory (wired).
++ */
++static SInt32  msm_census_n[3];
++static SInt64  msm_census_bytes[3];
++
++static void
++msm_census(const struct msm_bo *b, int delta)
++{
++	unsigned k = b->surf != NULL ? 0 : b->pooled ? 1 : 2;
++
++	OSAddAtomic(delta, &msm_census_n[k]);
++	OSAddAtomic64(delta * (SInt64)b->size, &msm_census_bytes[k]);
++}
++
++extern "C" void
++sapphire_gpu_census(uint32_t n[3], uint64_t bytes[3])
++{
++	for (unsigned k = 0; k < 3; k++) {
++		n[k] = (uint32_t)msm_census_n[k];
++		bytes[k] = (uint64_t)msm_census_bytes[k];
++	}
++}
++
+ /* Free a buffer the GPU is done with. service_lock held. */
+ void
+ SapphireGPUClient::freeBo(struct msm_bo *b)
+ {
+ 	uint64_t n = b->size >> 12;
+ 
++	msm_census(b, -1);
++
+ 	for (uint64_t p = 0; p < n; p++) {
+ 		unmap_page_4k(b->va + (p << 12));
+ 	}
+@@ -3522,6 +3550,7 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 		if (b != NULL) {
+ 			fCount++;
+ 			fBytes += size;
++			msm_census(b, 1);
+ 			r->handle = h;
+ 		} else {
+ 			bits_mark(gpool_bits, (pa - GPOOL_PA) >> 12, size >> 12, false);
+@@ -3556,6 +3585,7 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 	if (b != NULL) {
+ 		fCount++;
+ 		fBytes += size;
++		msm_census(b, 1);
+ 		r->handle = h;
+ 	}
+ 	IOLockUnlock(service_lock);
+@@ -3636,6 +3666,7 @@ SapphireGPUClient::surface(struct msm_surface *r)
+ 		if (place(b)) {
+ 			fCount++;
+ 			fBytes += size;
++			msm_census(b, 1);
+ 			r->handle = h;
+ 			s = NULL;                       /* the buffer keeps the reference */
+ 			ret = kIOReturnSuccess;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 847b1f7..ee9a660 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -41,6 +41,8 @@ extern "C" void sweet_console_retarget(vm_offset_t va);   /* osfmk/console/video
+ extern "C" void (*sweet_console_show_hook)(void);
+ extern "C" void topaz_modem_init(void);
+ extern "C" void sweet_amfi_service_init(void);     /* iokit/Kernel/arm/SweetAMFIService.cpp */
++extern "C" void sapphire_gpu_census(uint32_t n[3], uint64_t bytes[3]);   /* SapphireGpu.cpp */
++extern "C" unsigned int vm_page_wire_count;        /* osfmk/vm (the same kernel) */
+ extern "C" void sapphire_gpu_init(void);            /* iokit/Kernel/arm/SapphireGpu.cpp (boot-arg gpu=N) */
+ extern "C" void sweet_busy_init(void);              /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */             /* iokit/Kernel/arm/TopazModem.cpp (boot-arg modem=1) */
+ extern "C" int sweet_console_copy_dirty(void *dst);
+@@ -963,6 +965,15 @@ sweet_fb_stats_tick(void)
+ 		return;
+ 	}
+ 	uint32_t d = sweet_fb_stats.direct, c = sweet_fb_stats.composed, g = sweet_fb_stats.gpu;
++	{
++		/* what holds memory, to see a leak grow: surfaces, and the GPU's buffers by kind */
++		uint32_t so, gn[3];
++		uint64_t sw, gb[3];
++		sweet_surface_census(&so, &sw);
++		sapphire_gpu_census(gn, gb);
++		IOLog("SWEET MEM: %u surfaces (%llu MB of buffers), GPU: %u imported surfaces (%llu MB), %u pool buffers (%llu MB), %u kernel buffers (%llu MB), wired %u pages\n",
++		    so, sw >> 20, gn[0], gb[0] >> 20, gn[1], gb[1] >> 20, gn[2], gb[2] >> 20, (unsigned)vm_page_wire_count);
++	}
+ 	IOLog("SWEET FB: 5 s: %u direct frames (copy %llu us + clean %llu us avg, copy max %llu us), %u composed by the CPU (%llu us avg), %u by the GPU (clean %llu + GPU %llu + invalidate %llu us avg); %llu ms of CPU\n",
+ 	    d, d ? sweet_fb_stats.copy / d : 0, d ? sweet_fb_stats.clean / d : 0, sweet_fb_stats.copy_max, c,
+ 	    c ? sweet_fb_stats.comp / c : 0, g, g ? sweet_fb_stats.g_clean / g : 0, g ? sweet_fb_stats.g_copy / g : 0,
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 19ef8ab..5920bab 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -94,6 +94,20 @@ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
++static SInt32        sweet_surface_objects;     /* SweetSurface objects alive */
++
++extern "C" void
++sweet_surface_counted(int delta)
++{
++	OSAddAtomic(delta, &sweet_surface_objects);
++}
++
++extern "C" void
++sweet_surface_census(uint32_t *objects, uint64_t *wired)
++{
++	*objects = (uint32_t)sweet_surface_objects;
++	*wired = sweet_surface_wired;
++}
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+ /* topaz scanout: at most 6 contiguous 16 MiB surfaces */
+@@ -176,6 +190,7 @@ SweetSurface::free()
+ 	OSSafeReleaseNULL(state);
+ 	sweet_scanout_free_slot(scanoutSlot);
+ 	scanoutSlot = -1;
++	sweet_surface_counted(-1);
+ 	OSObject::free();
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 626953d..465963e 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -24,6 +24,10 @@ struct sweet_surface_plane {
+ 	uint8_t  elementWidth, elementHeight;
+ };
+ 
++/* SweetSurface objects alive (+1 at init, -1 at free) and bytes of buffer surfaces, for the 5 s log. */
++extern "C" void sweet_surface_counted(int delta);
++extern "C" void sweet_surface_census(uint32_t *objects, uint64_t *wired);
++
+ class SweetSurface : public OSObject {
+ 	OSDeclareDefaultStructors(SweetSurface);
+ 
+@@ -48,7 +52,7 @@ public:
+ 	uint32_t                  wrapDelta;    /* wrapped client memory: where it starts in its first page */
+ 	bool                      wrapped;      /* memory is a prepared range of a task (IOSurfaceWrapClient*) */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { gpuSeed = 0; gpuDrawn = false; scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { sweet_surface_counted(1); gpuSeed = 0; gpuDrawn = false; scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+-- 
+2.43.0
+
