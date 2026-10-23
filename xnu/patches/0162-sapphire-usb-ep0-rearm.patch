@@ -1,0 +1,155 @@
+From 67afd33aed68f438e16a8979006b923883384e25 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 23 Oct 2026 11:30:33 +0000
+Subject: [PATCH] sapphire-0162: USB control endpoint re-armed after a reset in
+ the middle of a transfer
+
+The persistent log of a boot whose USB died for good: "ep0 cmd 0x6
+status 1" (STARTTRANSFER refused: the control transfer the host had
+abandoned was still active), then bus resets and connects by the dozen
+and not one SETUP: ep0 never listened again, and Windows reported a
+device whose descriptor request failed, even after replugging. 0159
+ended only the data endpoints' transfers. Now the control endpoints'
+are tracked too: on a reset a transfer caught in the middle is ended on
+both (Linux: dwc3_ep0_end_control_data) and ep0 armed again, and arming
+SETUP ends a refused leftover and retries. A TX transfer the controller
+refuses no longer leaves tx_busy set for good.
+---
+ bsd/dev/sweet_usb.c | 65 ++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 49 insertions(+), 16 deletions(-)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 1008f21..79295fb 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -222,7 +222,7 @@ static struct {
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
+-	/* data endpoints' transfers, to end them on a bus reset */
++	/* every endpoint's transfer (control 0/1 and data), to end them on a bus reset */
+ 	bool        xfer_active[EP_INT + 1];
+ 	uint8_t     xfer_rsc[EP_INT + 1];
+ 	uint32_t    resets;
+@@ -279,8 +279,8 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ 	return -1;
+ }
+ 
+-/* One TRB (at DMA offset trb) on physical endpoint ep. */
+-static void
++/* One TRB (at DMA offset trb) on physical endpoint ep: 0, or -1 if the controller refused it. */
++static int
+ ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl)
+ {
+ 	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + trb);
+@@ -295,24 +295,52 @@ ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl
+ 		ud_sync(buf, len);
+ 	}
+ 	uint64_t tpa = ud.dma_pa + trb;
+-	if (ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0) == 0 && ep > 1 && ep <= EP_INT) {
++	if (ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0) != 0) {
++		return -1;
++	}
++	if (ep <= EP_INT) {
+ 		/* the transfer resource index, for ENDTRANSFER (Linux: dwc3_gadget_ep_get_transfer_index) */
+ 		ud.xfer_rsc[ep] = (uint8_t)((dwc_rd(DEPCMD(ep)) >> 16) & 0x7f);
+ 		ud.xfer_active[ep] = true;
+ 	}
++	return 0;
+ }
+ 
+-static void
++static int
+ ud_start(unsigned ep, uint32_t buf, uint32_t len, uint32_t ctl)
+ {
+-	ud_start_trb(ep, ep ? UD_TRB_IN : UD_TRB_OUT, buf, len, ctl);
++	return ud_start_trb(ep, ep ? UD_TRB_IN : UD_TRB_OUT, buf, len, ctl);
++}
++
++/* End endpoint ep's transfer, if it has one. */
++static void
++ud_end_transfer(unsigned ep)
++{
++	if (ep <= EP_INT && ud.xfer_active[ep]) {
++		ud_epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_HIPRI_FORCERM | ((uint32_t)ud.xfer_rsc[ep] << 16), 0, 0, 0);
++		delay(100);
++		ud.xfer_active[ep] = false;
++	}
+ }
+ 
++/*
++ * Arm ep0 for the next SETUP. If the controller refuses (a control transfer the host abandoned
++ * is still active: "ep0 cmd 0x6 status 1"), end it and try again: otherwise ep0 never listens
++ * again, and every enumeration after that fails at the first GET_DESCRIPTOR.
++ */
+ static void
+ ud_start_setup(void)
+ {
+ 	ud.state = EP0_SETUP;
+-	ud_start(0, UD_SETUP, 8, TRBCTL_SETUP);
++	if (ud_start(0, UD_SETUP, 8, TRBCTL_SETUP) != 0) {
++		/* the transfer still active on ep0 is ended by the index it was started with */
++		ud.xfer_active[0] = true;
++		ud_end_transfer(0);
++		ud_end_transfer(1);
++		if (ud_start(0, UD_SETUP, 8, TRBCTL_SETUP) != 0) {
++			printf("SWEET USB: ep0 cannot be armed for SETUP\n");
++		}
++	}
+ }
+ 
+ static void
+@@ -546,7 +574,10 @@ ud_tx_kick_locked(void)
+ 		}
+ 		ud.tx_busy = true;
+ 		ud.tx_frames++;
+-		ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, (uint32_t)len, TRBCTL_NORMAL);
++		if (ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, (uint32_t)len, TRBCTL_NORMAL) != 0) {
++			ud.tx_busy = false;     /* refused: that frame is lost, the next ones are not */
++			break;
++		}
+ 	}
+ }
+ 
+@@ -677,11 +708,7 @@ static void
+ ud_bus_reset(void)
+ {
+ 	for (unsigned ep = EP_RX; ep <= EP_INT; ep++) {
+-		if (ud.xfer_active[ep]) {
+-			ud_epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_HIPRI_FORCERM | ((uint32_t)ud.xfer_rsc[ep] << 16), 0, 0, 0);
+-			delay(100);
+-			ud.xfer_active[ep] = false;
+-		}
++		ud_end_transfer(ep);
+ 	}
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) & ~((1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT)));
+ 	if (ud.lock != NULL) {
+@@ -698,8 +725,14 @@ ud_bus_reset(void)
+ 	if (ud.lock != NULL) {
+ 		lck_mtx_unlock(ud.lock);
+ 	}
+-	if (ud.state != EP0_SETUP) {
+-		ud_stall();
++	/*
++	 * ep0: a SETUP already waiting stays; a control transfer caught in the middle is ended on
++	 * both directions (Linux: dwc3_ep0_end_control_data) and ep0 armed again.
++	 */
++	if (ud.state != EP0_SETUP || !ud.xfer_active[0]) {
++		ud_end_transfer(0);
++		ud_end_transfer(1);
++		ud_start_setup();
+ 	}
+ }
+ 
+@@ -731,7 +764,7 @@ ud_event(uint32_t ev)
+ 	unsigned type = (ev >> 6) & 0xf;
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
+-	if (ep >= EP_RX && ep <= EP_INT && type == 1) {
++	if (ep <= EP_INT && type == 1) {
+ 		ud.xfer_active[ep] = false;
+ 	}
+ 	if (ep == EP_RX && type == 1) {
+-- 
+2.43.0
+
