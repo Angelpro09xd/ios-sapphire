@@ -1,0 +1,104 @@
+From ca642d8e5cc88562bdafcc05179f9894205f5398 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 23 Oct 2026 09:14:08 +0000
+Subject: [PATCH] sapphire-0157: the Wi-Fi controller is an
+ IONetworkController, under the wlan device
+
+MobileGestalt, asked by lsd for every bundle it registers, finds the
+"wlan" device and then waits 5 s for an IONetworkController
+(IOServiceMatched): IO80211Controller came straight from IOService, so
+none ever matched and rebuilding the LaunchServices database (once AMFI
+let the app extensions in) took more than an hour, SpringBoard waiting.
+IO80211Controller now derives from IOEthernetController and
+IONetworkController as in IO80211Family, and hangs under the wlan
+device rather than the platform.
+---
+ iokit/Kernel/arm/SapphireWLAN.cpp | 40 ++++++++++++++++++++++++++-----
+ 1 file changed, 34 insertions(+), 6 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SapphireWLAN.cpp b/iokit/Kernel/arm/SapphireWLAN.cpp
+index 430fdfa..b4655dc 100644
+--- a/iokit/Kernel/arm/SapphireWLAN.cpp
++++ b/iokit/Kernel/arm/SapphireWLAN.cpp
+@@ -23,9 +23,15 @@
+  *     service can be the one the system routes through -- which wifid waits for after a join
+  *     ("failed to become routable interface") before Settings ticks the network.
+  *
+- * So: a controller of the class IO80211Controller under the platform, and below it one object
+- * that is both, an IONetworkInterface with wifid's properties. Both classes are ours, named as
+- * IO80211Family and IONetworkingFamily name theirs; neither has anything but properties.
++ *   - MobileGestalt (the Wi-Fi address and the like, asked by lsd for every bundle it registers)
++ *     finds the "wlan" device and then waits, 5 s at a time, for a service of the class
++ *     IONetworkController: with IO80211Controller made directly from IOService none ever came,
++ *     and rebuilding the LaunchServices database took more than an hour.
++ *
++ * So: a controller of the class IO80211Controller (an IOEthernetController, an
++ * IONetworkController, as in IO80211Family) under the "wlan" device, and below it one object
++ * that is both, an IONetworkInterface with wifid's properties. The classes are ours, named as
++ * IO80211Family and IONetworkingFamily name theirs; none has anything but properties.
+  */
+ 
+ #include <IOKit/IOLib.h>
+@@ -37,12 +43,26 @@
+ 
+ extern "C" void SapphireWLANStart(const char * interface, const uint8_t * address);
+ 
+-class IO80211Controller : public IOService
++class IONetworkController : public IOService
++{
++	OSDeclareDefaultStructors(IONetworkController);
++};
++
++OSDefineMetaClassAndStructors(IONetworkController, IOService);
++
++class IOEthernetController : public IONetworkController
++{
++	OSDeclareDefaultStructors(IOEthernetController);
++};
++
++OSDefineMetaClassAndStructors(IOEthernetController, IONetworkController);
++
++class IO80211Controller : public IOEthernetController
+ {
+ 	OSDeclareDefaultStructors(IO80211Controller);
+ };
+ 
+-OSDefineMetaClassAndStructors(IO80211Controller, IOService);
++OSDefineMetaClassAndStructors(IO80211Controller, IOEthernetController);
+ 
+ class IONetworkInterface : public IOService
+ {
+@@ -97,6 +117,8 @@ void
+ SapphireWLANStart(const char * interface, const uint8_t * address)
+ {
+ 	IOService * platform = IOService::getPlatform();
++	OSDictionary * match = IOService::nameMatching("wlan");
++	IOService * device = match != NULL ? IOService::copyMatchingService(match) : NULL;
+ 	IO80211Controller * controller = OSTypeAlloc(IO80211Controller);
+ 	SapphireWLAN * wlan = OSTypeAlloc(SapphireWLAN);
+ 	OSData * mac;
+@@ -105,6 +127,8 @@ SapphireWLANStart(const char * interface, const uint8_t * address)
+ 	if (platform == NULL || controller == NULL || wlan == NULL || !controller->init() || !wlan->init()) {
+ 		OSSafeReleaseNULL(controller);
+ 		OSSafeReleaseNULL(wlan);
++		OSSafeReleaseNULL(device);
++		OSSafeReleaseNULL(match);
+ 		IOLog("SapphireWLAN: cannot create the services\n");
+ 		return;
+ 	}
+@@ -113,7 +137,11 @@ SapphireWLANStart(const char * interface, const uint8_t * address)
+ 		mac->release();
+ 	}
+ 	controller->setProperty("IOBuiltin", true);
+-	if ((controller = (IO80211Controller *) publish(controller, platform, "SapphireWLANController")) == NULL) {
++	OSSafeReleaseNULL(match);
++	/* under the "wlan" device MobileGestalt finds first; the platform if there is none */
++	controller = (IO80211Controller *) publish(controller, device != NULL ? device : platform, "SapphireWLANController");
++	OSSafeReleaseNULL(device);
++	if (controller == NULL) {
+ 		wlan->release();
+ 		IOLog("SapphireWLAN: the controller did not start\n");
+ 		return;
+-- 
+2.43.0
+
