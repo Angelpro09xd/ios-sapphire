@@ -1,0 +1,47 @@
+From 51078242decfbb81cfa760c42438adde5d680343 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 10:16:08 +0000
+Subject: [PATCH] sapphire-0172: the ADSP's shared memory assigned to its VM
+ through TrustZone
+
+0171 on the phone: the first out-of-band graph open (payload in our
+pool at 0xe0443000) reset the whole phone at once, the ADSP raising no
+fatal bit: an access the memory protection refused. Like rmtfs's buffer
+for the modem, the tone's buffers and the command page are now shared
+with hyp_assign (SCM 0x0C/0x16): HLOS keeps them, LPASS (22) and the
+ADSP heap (0x25, qcom,adsp-remoteheap-vmid) get them read-write; if
+that is refused the test stops before the ADSP is pointed at them.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 3b0dd60..5379a88 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -8858,6 +8858,22 @@ audio_test(void)
+ 		LOG("adsp: no buffer");
+ 		return;
+ 	}
++	{
++		/*
++		 * 0171: the first out-of-band command reset the whole phone without the ADSP saying
++		 * anything: memory the ADSP reads must be shared with its VM (as rmtfs's is with the
++		 * modem's). HLOS keeps it, LPASS (22) and the ADSP heap (0x25, the device tree's
++		 * qcom,adsp-remoteheap-vmid) get it read-write.
++		 */
++		static const uint32_t v[] = { VMID_HLOS, 0x16, 0x25 };
++		uint64_t ar = scm_assign(buf_pa, tone + 0x1000, v, 3);
++		LOG("adsp: shared memory %llx+%x assigned to HLOS, LPASS and the ADSP heap: %llx", buf_pa, tone + 0x1000, ar);
++		IOSleep(300);
++		if (ar != 0) {
++			LOG("adsp: not assigned: the ADSP must not touch it, the test stops here");
++			return;
++		}
++	}
+ 	for (unsigned i = 0; i < A_NBUF * A_PERIOD; i++) {
+ 		/* 1 kHz at 48 kHz: 48 samples a period; a triangle is enough to be heard */
+ 		int ph = (int)(i % 48);
+-- 
+2.43.0
+
