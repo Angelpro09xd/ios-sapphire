@@ -1,0 +1,121 @@
+From c64185f4814bda34f341a4da7eceed59f4b9f78e Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 23:19:27 +0000
+Subject: [PATCH] sapphire-0209: the screen goes dark on the power button, the
+ brightness slider works, the charger shows within 2 s
+
+On the phone: the power button left the last frame on the screen until it
+was pressed again, and the display commands logged "NO DONE" now and then
+(off, on, level). The DSI commands are retried up to four times, and at
+display off the frame the panel scans is also made black (twice: a GPU copy
+queued before "off" may land after the first), so the screen goes dark
+even when DCS 0x28 does not get through; at "on" the latest frame is
+presented again. The brightness slider in Control Center was dead because
+the AppleARMBacklight service CoreBrightness looks for was published only
+with sweetbl=1 (off when the CPU drew, for its digital dimming): on by
+default now. SweetBattery polls every 2 s instead of 10.
+---
+ iokit/Kernel/arm/SweetBattery.cpp     |  4 +--
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 42 ++++++++++++++++++++++++---
+ 2 files changed, 40 insertions(+), 6 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index e30d10d..c107ef7 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -355,7 +355,7 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+ 		self->poll();
+-		sender->setTimeoutMS(10000);
++		sender->setTimeoutMS(2000);     /* 0209: was 10 s: plugging in showed 4-5 s late */
+ 	}
+ }
+ 
+@@ -380,7 +380,7 @@ SweetBattery::start(IOService *provider)
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(10000);
++			fTimer->setTimeoutMS(2000);
+ 		} else {
+ 			fReal = false;
+ 			poll();
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1b39554..1ae2ed7 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -365,7 +365,8 @@ AppleCLCD::start(IOService *provider)
+ 		 * runs digital dimming, a colour filter over every frame, which the
+ 		 * CPU renderer cannot afford (the UI dropped to under 1 fps).
+ 		 */
+-		uint32_t blOn = 0;
++		/* 0209: on by default now that the GPU draws (sweetbl=0: off) */
++		uint32_t blOn = 1;
+ 		(void)PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
+ 		AppleARMBacklight *bl = blOn ? OSTypeAlloc(AppleARMBacklight) : NULL;
+ 		if (bl != NULL && bl->init()) {
+@@ -565,8 +566,29 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		 * Fading the uncached boot framebuffer in place crawled down the panel.
+ 		 */
+ 		if (fb->fDsi != NULL) {
+-			/* the panel is dark (DCS 0x51 0); keep the last frame */
++			/*
++			 * 0209: the panel's display off (DCS 0x28) does not always get through ("NO DONE"), and
++			 * the last frame stayed on the screen until the power button again. So the frame the
++			 * panel scans is also made black, once (on AMOLED black is off); at "on" the latest
++			 * frame is presented again (fDirty).
++			 */
++			bool first = fb->fFadeStep < 2;         /* twice: a GPU copy queued before "off" may land after the first */
++			if (first) {
++				fb->fFadeStep++;
++			}
+ 			IOLockUnlock(fb->fLock);
++			if (first && fb->fPixels != 0) {
++				if (fb->fVig0 != NULL && fb->fScanPhys != fb->fBootSrc) {
++					fb->scanFrom(fb->fBootSrc, fb->fBootStride);
++				}
++				for (uint32_t y = 0; y < fb->fHeight; y++) {
++					volatile uint64_t *row = (volatile uint64_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++					for (uint32_t x = 0; x < fb->fWidth / 2; x++) {
++						row[x] = 0;
++					}
++				}
++				__asm__ volatile("dsb sy" ::: "memory");
++			}
+ 			fb->armVsync(sender);
+ 			return;
+ 		}
+@@ -844,7 +866,13 @@ AppleCLCD::setPanelOn(bool on)
+ {
+ 	uint8_t hdr[4] = { (uint8_t)(on ? 0x29 : 0x28), 0, 0x05, 0x80 };
+ 	IOLockLock(fBlLock);
+-	bool done = dsiSend(hdr, NULL, 0);
++	bool done = false;
++	for (int i = 0; i < 4 && !done; i++) {         /* 0209: "NO DONE" now and then (a frame on the link) */
++		done = dsiSend(hdr, NULL, 0);
++		if (!done) {
++			IODelay(2000);
++		}
++	}
+ 	IOLockUnlock(fBlLock);
+ 	IOLog("SWEET FB: panel display %s: %s\n", on ? "on" : "off", done ? "done" : "NO DONE");
+ }
+@@ -854,7 +882,13 @@ AppleCLCD::setPanelLevel(uint32_t level)
+ {
+ 	uint8_t cmd[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };   /* MSB first */
+ 	IOLockLock(fBlLock);
+-	bool done = dsiDcsLong(cmd, sizeof(cmd));
++	bool done = false;
++	for (int i = 0; i < 4 && !done; i++) {
++		done = dsiDcsLong(cmd, sizeof(cmd));
++		if (!done) {
++			IODelay(2000);
++		}
++	}
+ 	IOLockUnlock(fBlLock);
+ 	static uint32_t logs;
+ 	if (logs++ < 8 || !done) {
+-- 
+2.43.0
+
