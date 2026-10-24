@@ -8,11 +8,13 @@
  * there is one GPU and one connection to it in a process.
  */
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #include <IOKit/IOKitLib.h>
+#include <mach/mach_time.h>
 
 #include "xf86drm.h"
 
@@ -89,11 +91,63 @@ buffers_write_combined(void)
 	return wc_buffers;
 }
 
+/* sapphire: what each request costs, a line every 5 s (file /redwood/drmstats: on) */
+static int stats_on = -1;
+static uint64_t stats_us[256], stats_n[256], stats_max[256], stats_t0;
+
+static uint64_t
+now_us(void)
+{
+	static mach_timebase_info_data_t tb;
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	return mach_absolute_time() * tb.numer / tb.denom / 1000;
+}
+
+static void
+stats_add(unsigned number, uint64_t us)
+{
+	char line[512];
+	int n = 0;
+	uint64_t t = now_us();
+
+	stats_us[number & 0xff] += us;
+	stats_n[number & 0xff]++;
+	if (us > stats_max[number & 0xff]) {
+		stats_max[number & 0xff] = us;
+	}
+	if (stats_t0 == 0) {
+		stats_t0 = t;
+	}
+	if (t - stats_t0 < 5000000) {
+		return;
+	}
+	n = snprintf(line, sizeof(line), "redwood-drm: 5 s:");
+	for (unsigned i = 0; i < 256 && n < (int)sizeof(line) - 48; i++) {
+		if (stats_n[i] != 0 && stats_us[i] >= 1000) {
+			n += snprintf(line + n, sizeof(line) - n, " %02x %llux %lluus max %llu;", i, stats_n[i],
+			    stats_us[i] / stats_n[i], stats_max[i]);
+		}
+		stats_us[i] = stats_n[i] = stats_max[i] = 0;
+	}
+	line[n++] = '\n';
+	write(2, line, (size_t)n);
+	stats_t0 = t;
+}
+
 static int
 call(unsigned number, void *data, size_t size)
 {
 	size_t returned = size;
+	if (stats_on < 0) {
+		stats_on = access("/redwood/drmstats", F_OK) == 0;
+	}
+	uint64_t t0 = stats_on ? now_us() : 0;
 	kern_return_t result = IOConnectCallStructMethod(connection, number, data, size, data, &returned);
+	if (stats_on) {
+		stats_add(number, now_us() - t0);
+	}
 
 	switch (result) {
 	case 0:
