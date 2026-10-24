@@ -1,0 +1,78 @@
+From b401a6b3b93299c352205d62087284afd9e025d6 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 15:04:28 +0000
+Subject: [PATCH] sapphire-0194: 15 s of loud beeps, no PMIC reads
+
+0193 on the phone: the PMIC read over SPMI hung the audio thread two
+seconds into the tone (taken out). Before it: the WCD937x showed no
+interrupt, RX supplies c1 and the AUX PA on; the FS1815 has no volume at
+0x06/0x16 (they read back 0). The tone is now near full scale, 0.5 s on
+and 0.5 s off for 15 s, easy to tell from noise; the diagnostics at 8 s.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 27 +++++++++------------------
+ 1 file changed, 9 insertions(+), 18 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index b2a9654..219eeb5 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -9604,18 +9604,7 @@ audio_diag(const char *when)
+ 		    when, w_rd(0x346E), w_rd(0x346F), w_rd(0x3470), w_rd(0x3008), w_rd(0x3128), w_rd(0x3467),
+ 		    c_rxswr ? c_rd(c_rxswr, 0x200) : 0, c_rxswr ? c_rd(c_rxswr, 0x1090) : 0, c_vaswr ? c_rd(c_vaswr, 0x200) : 0);
+ 	}
+-	(void)sweet_spmi_init();
+-	for (unsigned sid = 0; sid <= 1; sid++) {
+-		uint8_t l14[4] = {}, l9[4] = {};
+-		static const uint16_t offs[] = { 0x08, 0x46, 0x40, 0x41 };
+-		int e14 = 0, e9 = 0;
+-		for (unsigned i = 0; i < 4; i++) {
+-			e14 |= sweet_spmi_read_any(sid, 0x4D00 + offs[i], &l14[i]);
+-			e9 |= sweet_spmi_read_any(sid, 0x4800 + offs[i], &l9[i]);
+-		}
+-		LOG("adsp: %s: PMIC sid %u L14 (cdc-vdd-buck): status %02x en %02x volt %02x%02x (%d); L9 (vddpx/rxtx): status %02x en %02x volt %02x%02x (%d)",
+-		    when, sid, l14[0], l14[1], l14[3], l14[2], e14, l9[0], l9[1], l9[3], l9[2], e9);
+-	}
++	/* (0193: reading the PMIC over SPMI from here hung this thread: left out) */
+ }
+ 
+ static void
+@@ -9694,11 +9683,12 @@ audio_test(void)
+ 	IOSleep(300);
+ 	/* kept for the rest of the session: the ADSP may hold on to the mapping */
+ 	for (unsigned i = 0; i < A_NBUF * A_PERIOD; i++) {
+-		/* 1 kHz at 48 kHz: 48 samples a period; a triangle is enough to be heard */
++		/* 1 kHz at 48 kHz: 48 samples a period; a triangle near full scale (the buffers alternate tone / silence below) */
+ 		int ph = (int)(i % 48);
+ 		int tri = ph < 24 ? ph * 2 - 24 : 72 - ph * 2;   /* -24..24 */
+-		buf[i] = (int16_t)(tri * 400);
++		buf[i] = (int16_t)(tri * 1200);
+ 	}
++	bzero(buf + 4 * A_PERIOD, 4 * A_PERIOD * sizeof(int16_t));   /* buffers 4-7 silent: beeps */
+ 	mb();
+ 	{
+ 		uint8_t m[20];
+@@ -9761,16 +9751,17 @@ audio_test(void)
+ 	for (; sent < 4; sent++) {
+ 		a_write(buf_pa + (sent % A_NBUF) * bytes, bytes, sent % A_NBUF);
+ 	}
+-	for (unsigned ms = 0; ms < 6000; ms++) {
++	for (unsigned ms = 0; ms < 15000; ms++) {
+ 		a_service();
+-		while (sent < a_writes_done + 4 && sent < 600) {
+-			a_write(buf_pa + (sent % A_NBUF) * bytes, bytes, sent % A_NBUF);
++		while (sent < a_writes_done + 4 && sent < 1500) {
++			unsigned k = (sent / 50) % 2 == 0 ? sent % 4 : 4 + sent % 4;   /* 0.5 s tone, 0.5 s silence */
++			a_write(buf_pa + k * bytes, bytes, k);
+ 			sent++;
+ 		}
+ 		if (ms % 1000 == 999) {
+ 			LOG("adsp: t+%u ms: %u buffers written, %u returned", a_ms - t0, sent, a_writes_done);
+ 		}
+-		if (ms == 2000 && codec) {
++		if (ms == 8000 && codec) {
+ 			audio_diag("playing");
+ 		}
+ 		IOSleep(1);
+-- 
+2.43.0
+
