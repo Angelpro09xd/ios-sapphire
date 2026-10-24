@@ -1,0 +1,539 @@
+From 181949bd1193920d7a81fd82680c453e4506138f Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 15:27:29 +0000
+Subject: [PATCH] sapphire-0195: the codec's buck supply from the RPM, and the
+ headphones
+
+0194 on the phone: every stage of the speaker path powered and silent.
+The WCD937x's buck and flyback, which feed all its outputs, run from
+cdc-vdd-buck, pm6125 LDO14: an on-demand supply that Android's driver asks
+the RPM for while it plays, and that nobody asked for here. A small RPM
+client (mainline qcom_glink_rpm.c + smd-rpm.c: the message RAM FIFOs, the
+APCS doorbell, an intentless rpm_requests channel) turns it on at 1.8 V.
+
+The tone now also goes to the headphones (INT0/INT1 from RX2, CLSH_DSM_OUT,
+-20 dB, SoundWire port 1 on lane 1 as swrm_port_config.h has it), and the
+whole RX side runs in CLS_AB, the mode mixer_paths_bengal_idp.xml uses.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 437 ++++++++++++++++++++++++++++++--
+ 1 file changed, 412 insertions(+), 25 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 219eeb5..b998263 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -9103,6 +9103,322 @@ a_amp_probe(void)
+ 	}
+ }
+ 
++/* ---------------- the RPM: the codec's buck supply (pm6125 LDO14, cdc-vdd-buck) */
++
++/*
++ * 0194 on the phone: every stage of the speaker path powered and silent. The WCD937x's buck and
++ * flyback, which feed every one of its outputs, run from cdc-vdd-buck -- the PMIC's LDO14, an
++ * "on demand" supply Android's wcd937x driver asks the RPM for only while it plays (the static
++ * ones, LDO9, keep SoundWire alive). Nobody asks for it here. Mainline's qcom_glink_rpm.c (the
++ * transport: two FIFOs in the RPM's message RAM, found through its table of contents, and the
++ * APCS doorbell) and smd-rpm.c / qcom_smd-regulator.c (an intentless "rpm_requests" channel,
++ * "req" packets of key-value pairs), written out.
++ */
++#define RPM_MSG_RAM_PA  0x045F0000ull
++#define RPM_MSG_RAM_SZ  0x7000u
++#define APCS_IPC_PA     0x0F111000ull           /* +8: the IPC register, bit 0 the RPM */
++
++struct rpm_pipe { volatile uint32_t *tail, *head; volatile uint8_t *fifo; uint32_t len; };
++static struct rpm_pipe rpm_rx, rpm_tx;
++static volatile uint8_t *rpm_apcs;
++static uint32_t rpm_rcid, rpm_msg_id = 1;
++static bool rpm_version, rpm_remote_open, rpm_open_sent, rpm_open_acked;
++static int rpm_status = 1;                      /* the last answer: 1 none yet, 0 ok, < 0 refused */
++static uint8_t rpm_buf[256];
++static uint32_t rpm_len;
++
++static void
++rpm_peek(uint32_t off, void *dst, uint32_t n)   /* whole words */
++{
++	uint32_t t = *rpm_rx.tail + off;
++	while (t >= rpm_rx.len) {
++		t -= rpm_rx.len;
++	}
++	for (uint32_t i = 0; i < n; i += 4) {
++		((uint32_t *)dst)[i / 4] = *(volatile uint32_t *)(rpm_rx.fifo + t);
++		t += 4;
++		if (t >= rpm_rx.len) {
++			t = 0;
++		}
++	}
++}
++
++static void
++rpm_advance(uint32_t n)
++{
++	uint32_t t = *rpm_rx.tail + n;
++	while (t >= rpm_rx.len) {
++		t -= rpm_rx.len;
++	}
++	mb();
++	*rpm_rx.tail = t;
++}
++
++static bool
++rpm_write(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
++{
++	uint32_t w[80] = {};
++	uint32_t total = (hlen + dlen + 7) & ~7u;
++	if (total > sizeof(w)) {
++		return false;
++	}
++	memcpy(w, hdr, hlen);
++	if (dlen != 0) {
++		memcpy((uint8_t *)w + hlen, data, dlen);
++	}
++	uint32_t head = *rpm_tx.head, tail = *rpm_tx.tail;
++	uint32_t avail = tail <= head ? rpm_tx.len - head + tail : tail - head;
++	if (avail <= total) {
++		LOG("adsp: RPM: TX FIFO full (head %x tail %x)", head, tail);
++		return false;
++	}
++	for (uint32_t i = 0; i < total; i += 4) {
++		*(volatile uint32_t *)(rpm_tx.fifo + head) = w[i / 4];
++		head += 4;
++		if (head >= rpm_tx.len) {
++			head = 0;
++		}
++	}
++	mb();
++	*rpm_tx.head = head;
++	mb();
++	*(volatile uint32_t *)(rpm_apcs + 8) = 1;
++	return true;
++}
++
++static void
++rpm_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	struct glink_msg m = { cmd, p1, p2 };
++	(void)rpm_write(&m, sizeof(m), NULL, 0);
++}
++
++static void
++rpm_open(void)
++{
++	struct { struct glink_msg m; char name[16]; } __attribute__((packed)) req = {};
++	req.m.cmd = CMD_OPEN;
++	req.m.p1 = 1;                                   /* our lcid */
++	req.m.p2 = sizeof("rpm_requests");
++	memcpy(req.name, "rpm_requests", sizeof("rpm_requests"));
++	(void)rpm_write(&req, sizeof(req), NULL, 0);
++	rpm_open_sent = true;
++}
++
++/* an answer: "req" holding "msg#" and, when refused, "err" with a string */
++static void
++rpm_answer(const uint8_t *p, uint32_t len)
++{
++	const uint32_t *h = (const uint32_t *)p;
++	int st = 0;
++	if (len < 8 || h[0] != 0x00716572) {
++		LOG("adsp: RPM: answer of %u bytes, not \"req\" (%08x)", len, len >= 4 ? h[0] : 0);
++		rpm_status = -1;
++		return;
++	}
++	uint32_t off = 8, end = MIN(len, 8 + h[1]);
++	while (off + 8 <= end) {
++		uint32_t type = *(const uint32_t *)(p + off), mlen = *(const uint32_t *)(p + off + 4);
++		if (type == 0x00727265) {                       /* "err" */
++			char s[40] = {};
++			memcpy(s, p + off + 8, MIN(mlen, (uint32_t)sizeof(s) - 1));
++			LOG("adsp: RPM: refused: \"%s\"", s);
++			st = -2;
++		}
++		off += (8 + mlen + 3) & ~3u;
++	}
++	rpm_status = st;
++}
++
++static bool
++rpm_rx_one(void)
++{
++	uint32_t h = *rpm_rx.head, t = *rpm_rx.tail;
++	uint32_t avail = h >= t ? h - t : rpm_rx.len - t + h, n;
++	struct glink_msg m;
++
++	if (avail < 8) {
++		return false;
++	}
++	rpm_peek(0, &m, 8);
++	switch (m.cmd) {
++	case CMD_VERSION:
++		rpm_advance(8);
++		LOG("adsp: RPM: glink VERSION %u features %x", m.p1, m.p2);
++		rpm_cmd(CMD_VERSION_ACK, 1, 0);
++		rpm_version = true;
++		break;
++	case CMD_VERSION_ACK:
++		rpm_advance(8);
++		LOG("adsp: RPM: glink VERSION_ACK %u features %x", m.p1, m.p2);
++		rpm_version = true;
++		break;
++	case CMD_OPEN: {
++		uint32_t name[8] = {};
++		n = (8 + m.p2 + 7) & ~7u;
++		if (avail < n) {
++			return false;
++		}
++		rpm_peek(8, name, MIN((m.p2 + 3) & ~3u, (uint32_t)sizeof(name) - 4));
++		rpm_advance(n);
++		bool ours = strcmp((const char *)name, "rpm_requests") == 0;
++		LOG("adsp: RPM: glink OPEN \"%s\" rcid %u%s", (const char *)name, m.p1, ours ? "" : " (not ours)");
++		if (ours) {
++			rpm_rcid = m.p1;
++			rpm_remote_open = true;
++			rpm_cmd(CMD_OPEN_ACK, m.p1, 0);
++			if (!rpm_open_sent) {
++				rpm_open();
++			}
++		}
++		break;
++	}
++	case CMD_OPEN_ACK:
++		rpm_advance(8);
++		LOG("adsp: RPM: glink OPEN_ACK lcid %u", m.p1);
++		rpm_open_acked = true;
++		break;
++	case CMD_CLOSE:
++		rpm_advance(8);
++		LOG("adsp: RPM: glink CLOSE rcid %u", m.p1);
++		rpm_cmd(CMD_CLOSE_ACK, m.p1, 0);
++		rpm_remote_open = false;
++		break;
++	case CMD_INTENT:
++		n = (8 + 8 * m.p2 + 7) & ~7u;
++		if (avail < n) {
++			return false;
++		}
++		rpm_advance(n);
++		break;
++	case CMD_TX_DATA:
++	case CMD_TX_DATA_CONT: {
++		uint32_t cl[2];
++		if (avail < 16) {
++			return false;
++		}
++		rpm_peek(8, cl, 8);
++		n = (16 + cl[0] + 7) & ~7u;
++		if (avail < n) {
++			return false;
++		}
++		if (m.cmd == CMD_TX_DATA) {
++			rpm_len = 0;
++		}
++		if (rpm_len + cl[0] <= sizeof(rpm_buf) - 4) {
++			rpm_peek(16, rpm_buf + rpm_len, (cl[0] + 3) & ~3u);
++			rpm_len += cl[0];
++		}
++		rpm_advance(n);
++		if (cl[1] == 0) {
++			rpm_answer(rpm_buf, rpm_len);
++		}
++		break;
++	}
++	case CMD_READ_NOTIF:
++		rpm_advance(8);
++		*(volatile uint32_t *)(rpm_apcs + 8) = 1;
++		break;
++	default:
++		rpm_advance(8);
++		LOG("adsp: RPM: glink cmd %u (%x %x)", m.cmd, m.p1, m.p2);
++		break;
++	}
++	return true;
++}
++
++static void
++rpm_poll(unsigned ms, bool (*done)(void))
++{
++	for (unsigned i = 0; i < ms && !done(); i++) {
++		while (rpm_rx_one()) {
++		}
++		if (!done()) {
++			IOSleep(1);
++		}
++	}
++}
++
++static bool rpm_is_up(void) { return rpm_remote_open && rpm_open_acked; }
++static bool rpm_answered(void) { return rpm_status != 1; }
++
++static bool
++rpm_start(void)
++{
++	volatile uint8_t *ram = (volatile uint8_t *)ml_io_map(RPM_MSG_RAM_PA, RPM_MSG_RAM_SZ);
++	rpm_apcs = (volatile uint8_t *)ml_io_map(APCS_IPC_PA, 0x1000);
++	if (ram == NULL || rpm_apcs == NULL) {
++		LOG("adsp: RPM: mapping failed");
++		return false;
++	}
++	volatile uint32_t *toc = (volatile uint32_t *)(ram + RPM_MSG_RAM_SZ - 256);
++	if (toc[0] != 0x67727430) {                     /* "grt0" */
++		LOG("adsp: RPM: no table of contents (magic %08x)", toc[0]);
++		return false;
++	}
++	for (uint32_t i = 0; i < toc[1] && i < 20; i++) {
++		uint32_t id = toc[2 + 3 * i], off = toc[3 + 3 * i], size = toc[4 + 3 * i];
++		struct rpm_pipe *p = id == 0x72326170 ? &rpm_rx : id == 0x61703272 ? &rpm_tx : NULL;   /* r2ap, ap2r */
++		if (p != NULL && off + size <= RPM_MSG_RAM_SZ) {
++			p->tail = (volatile uint32_t *)(ram + off);
++			p->head = (volatile uint32_t *)(ram + off + 4);
++			p->fifo = ram + off + 8;
++			p->len = size;
++		}
++	}
++	if (rpm_rx.fifo == NULL || rpm_tx.fifo == NULL) {
++		LOG("adsp: RPM: FIFOs not in the table (%u entries)", toc[1]);
++		return false;
++	}
++	LOG("adsp: RPM: RX FIFO %u bytes (head %x tail %x), TX %u bytes (head %x tail %x)", rpm_rx.len, *rpm_rx.head,
++	    *rpm_rx.tail, rpm_tx.len, *rpm_tx.head, *rpm_tx.tail);
++	*rpm_tx.head = 0;                               /* as Linux: a fresh link */
++	*rpm_rx.tail = 0;
++	mb();
++	rpm_cmd(CMD_VERSION, 1, 0);
++	rpm_poll(1000, rpm_is_up);
++	if (!rpm_is_up() && rpm_version && !rpm_open_sent) {
++		/* (the RPM may still hold the channel open from the boot loader) */
++		rpm_open();
++		rpm_poll(500, rpm_is_up);
++	}
++	LOG("adsp: RPM: version %s, rpm_requests %s (remote open %d, ack %d)", rpm_version ? "agreed" : "NO ANSWER",
++	    rpm_is_up() ? "open" : "NOT open", rpm_remote_open, rpm_open_acked);
++	return rpm_open_acked;
++}
++
++/* an LDO: on, at uv, for ma; set 0 the active set, 1 the sleep set */
++static int
++rpm_ldo(uint32_t id, uint32_t uv, uint32_t ma, uint32_t set)
++{
++	struct {
++		struct glink_msg m;
++		uint32_t chunk, left;
++		uint32_t svc, len, msg_id, flags, type, rid, dlen;
++		uint32_t kvp[9];
++	} __attribute__((packed)) pkt = {};
++	pkt.m.cmd = CMD_TX_DATA;
++	pkt.m.p1 = 1;
++	pkt.m.p2 = 0;                                   /* intentless */
++	pkt.chunk = 8 + 20 + sizeof(pkt.kvp);
++	pkt.svc = 0x00716572;                           /* "req" */
++	pkt.len = 20 + sizeof(pkt.kvp);
++	pkt.msg_id = rpm_msg_id++;
++	pkt.flags = set;
++	pkt.type = 0x616f646c;                          /* "ldoa" */
++	pkt.rid = id;
++	pkt.dlen = sizeof(pkt.kvp);
++	pkt.kvp[0] = 0x6e657773; pkt.kvp[1] = 4; pkt.kvp[2] = 1;       /* "swen" */
++	pkt.kvp[3] = 0x00007675; pkt.kvp[4] = 4; pkt.kvp[5] = uv;      /* "uv" */
++	pkt.kvp[6] = 0x0000616d; pkt.kvp[7] = 4; pkt.kvp[8] = ma;      /* "ma" */
++	rpm_status = 1;
++	if (!rpm_write(&pkt, sizeof(pkt), NULL, 0)) {
++		return -3;
++	}
++	rpm_poll(1000, rpm_answered);
++	return rpm_status == 1 ? -4 : rpm_status;
++}
++
+ /* ---------------- the codec: from the RX macro to the speaker (audio=2) */
+ 
+ /*
+@@ -9498,6 +9814,17 @@ swr_ports_on(void)
+ 		swr_write(m, dev, (uint16_t)(0x124 + o4 + bk), 1);
+ 		swr_write(m, dev, (uint16_t)(0x125 + o4 + bk), 0);
+ 		swr_write(m, dev, (uint16_t)(0x128 + o4 + bk), 0);
++		/* slave DP1 (HPH L+R, swrm_port_config.h rx_frame_params): si 3, off1 0, off2 0, word length 1, lane 1 */
++		swr_write(m, dev, (uint16_t)(0x120 + bk), 0x3);
++		swr_write(m, dev, (uint16_t)(0x122 + bk), 3);
++		swr_write(m, dev, (uint16_t)(0x124 + bk), 0);
++		swr_write(m, dev, (uint16_t)(0x125 + bk), 0);
++		swr_write(m, dev, (uint16_t)0x103, 1);
++		swr_write(m, dev, (uint16_t)(0x128 + bk), 1);
++		c_wr(m->b, 0x1124 + 0x40 * bank, (3u << 24) | (0 << 16) | (0 << 8) | 3);
++		c_wr(m->b, 0x1128 + 0x40 * bank, 1);                      /* lane 1 */
++		c_wr(m->b, 0x112C, 1);
++		c_wr(m->b, 0x1134 + 0x40 * bank, (0xF << 4) | 0);
+ 		/* master port 2 and 4 (DP_PORT_CTRL: channels << 24 | off2 << 16 | off1 << 8 | si) */
+ 		c_wr(m->b, 0x1124 + 0x100 * 1 + 0x40 * bank, (1u << 24) | (0 << 16) | (0 << 8) | 31);
+ 		c_wr(m->b, 0x1128 + 0x100 * 1 + 0x40 * bank, 0);          /* lane */
+@@ -9517,39 +9844,68 @@ swr_ports_on(void)
+ 			bank ^= 1;                      /* and the same into the other bank */
+ 		}
+ 	}
+-	LOG("adsp: SoundWire RX: bank now %u, port 2 %08x port 4 %08x, frame %08x/%08x; slave DP4 ch %02x", c_rd(m->b, 0x104C) & 1,
+-	    c_rd(m->b, 0x1124 + 0x100 + 0x40 * (c_rd(m->b, 0x104C) & 1)), c_rd(m->b, 0x1124 + 0x300 + 0x40 * (c_rd(m->b, 0x104C) & 1)),
+-	    c_rd(m->b, 0x101C), c_rd(m->b, 0x105C), 0);
++	uint32_t nb = c_rd(m->b, 0x104C) & 1;
++	uint8_t d1 = 0, d4 = 0;
++	(void)swr_read(m, dev, (uint16_t)(0x120 + 0x10 * nb), &d1);
++	(void)swr_read(m, dev, (uint16_t)(0x420 + 0x10 * nb), &d4);
++	LOG("adsp: SoundWire RX: bank now %u, port 1 %08x port 2 %08x port 4 %08x, frame %08x/%08x; slave DP1 ch %02x DP4 ch %02x, errors %u",
++	    nb, c_rd(m->b, 0x1124 + 0x40 * nb), c_rd(m->b, 0x1124 + 0x100 + 0x40 * nb), c_rd(m->b, 0x1124 + 0x300 + 0x40 * nb),
++	    c_rd(m->b, 0x101C), c_rd(m->b, 0x105C), d1, d4, m->errors);
+ }
+ 
+-/* the AUX output of the WCD937x (wcd937x.c RDAC4 / AUX PGA, class-H v3 AUX in CLS_H_ULP) */
++/*
++ * The AUX output (to the FS1815s) and both headphone outputs at once, all fed from RX2 -- mainline
++ * lpass-rx-macro.c / wcd937x.c / wcd-clsh-v2.c (v3) in mixer_paths_bengal_idp.xml's mode, CLS_AB
++ * ("RX HPH Mode"), compander off; the headphones as its "headphones" path (INT0/INT1, CLSH_DSM_OUT)
++ * but 20 dB down (the tone is near full scale).
++ */
+ static void
+-codec_aux_on(void)
++codec_rx_on(void)
+ {
+-	/* RX macro, interpolator INT2 (the AUX one), 48 kHz from RX2 */
+-	c_upd(c_rx, 0x190, 0x0F, 7);                /* INT2_CFG0: INP0 = RX2 */
+-	c_upd(c_rx, 0x500, 0x0F, 0x4);              /* RX2 path: 48 kHz */
+-	c_upd(c_rx, 0x500, 0x10, 0x10);             /* PGA mute while it starts */
++	/* RX macro: INT0 (HPHL), INT1 (HPHR), INT2 (AUX), each from RX2 at 48 kHz, muted while they start */
++	c_upd(c_rx, 0x180, 0x0F, 7);                /* INT0_CFG0: INP0 = RX2 */
++	c_upd(c_rx, 0x188, 0x0F, 7);                /* INT1_CFG0 */
++	c_upd(c_rx, 0x190, 0x0F, 7);                /* INT2_CFG0 */
++	c_upd(c_rx, 0x200, 0x01, 0x01);             /* class-H block clock */
++	c_wr(c_rx, 0x220, 0xC0);                    /* CLSH_K1_LSB, K1_MSB 0 (16 ohm) */
++	c_upd(c_rx, 0x21C, 0x0F, 0x00);
++	c_upd(c_rx, 0x20C, 0x3F, 0x1C);             /* CLSH_HPH_V_PA */
++	c_upd(c_rx, 0x208, 0x07, 0x00);             /* CLSH_DECAY_CTRL */
++	for (unsigned k = 0; k < 2; k++) {
++		uint32_t b = 0x400 + 0x80 * k;
++		c_upd(c_rx, b + 0x00, 0x1F, 0x14);      /* PGA mute, 48 kHz */
++		c_upd(c_rx, b + 0x40, 0x01, 0x01);      /* DSM clock */
++		c_upd(c_rx, b + 0x0C, 0x03, 0x03);      /* HPF cut */
++		c_upd(c_rx, k == 0 ? 0x28 : 0x3C, 0x80, 0x80);   /* TOP_HPHx_COMP_LUT: bypass */
++		c_upd(c_rx, b + 0x04, 0x40, 0x40);      /* CFG0: class-H */
++		c_upd(c_rx, b + 0x08, 0x01, 0x01);      /* CFG1: DEM mux CLSH_DSM_OUT */
++		c_wr(c_rx, b + 0x14, 0xEC);             /* volume -20 dB */
++		c_upd(c_rx, b + 0x00, 0x20, 0x20);      /* path clock */
++	}
++	c_upd(c_rx, 0x500, 0x1F, 0x14);             /* RX2 path: PGA mute, 48 kHz */
+ 	c_upd(c_rx, 0x54C, 0x01, 0x01);             /* DSM clock (0x440 + 2 * 0x80 + 0xc) */
+ 	c_upd(c_rx, 0x50C, 0x03, 0x03);             /* HPF cut */
+ 	c_upd(c_rx, 0x508, 0x04, 0x00);             /* AUX HPF off */
+-	c_upd(c_rx, 0x200, 0x01, 0x01);             /* class-H block clock */
+-	c_upd(c_rx, 0x504, 0x10, 0x10);             /* INT2 class-H */
++	c_upd(c_rx, 0x504, 0x18, 0x18);             /* INT2 delay zone + class-H */
+ 	c_wr(c_rx, 0x514, 0x00);                    /* volume 0 dB */
+ 	c_upd(c_rx, 0x500, 0x20, 0x20);             /* path clock */
+ 
+-	/* WCD937x: RX clocks */
++	/* WCD937x: RX clocks (wcd937x_rx_clk_enable) */
+ 	w_upd(0x3409, 0x08, 0x08);                  /* DIG_CLK_CTL */
+ 	w_upd(0x3408, 0x01, 0x01);                  /* ANA_CLK_CTL */
+ 	w_upd(0x3008, 0x01, 0x01);                  /* RX_SUPPLIES */
+ 	w_upd(0x340D, 0x40, 0x00); w_upd(0x340E, 0x40, 0x00); w_upd(0x340F, 0x40, 0x00);
+ 	w_upd(0x3408, 0x02, 0x02);
+-	/* AUX DAC */
++	/* RDAC1 / RDAC2 (HPHL / HPHR DACs), PRE_PMU */
++	w_upd(0x3409, 0x03, 0x03);                  /* DIG_CLK_CTL: RX0, RX1 */
++	w_upd(0x344E, 0x0C, 0x0C);                  /* CDC_HPH_GAIN_CTL */
++	w_upd(0x30D9, 0x80, 0x00);                  /* HPH_RDAC_CLK_CTL1 */
++	/* RDAC4 (AUX DAC), PRE_PMU */
+ 	w_upd(0x3408, 0x04, 0x04);
+ 	w_upd(0x3128, 0x10, 0x10);                  /* AUX_AUXPA */
+ 	w_upd(0x3409, 0x04, 0x04);
+ 	w_upd(0x344F, 0x01, 0x01);                  /* CDC_AUX_GAIN_CTL */
+-	/* class-H v3, AUX, CLS_H_ULP: buck and flyback */
++	/* class-H v3, AUX then HPH, CLS_AB: buck and flyback (once), the HPH quiescent current */
+ 	w_upd(0x3008, 0x08, 0x00);                  /* buck mode: default */
+ 	w_upd(0x3008, 0x04, 0x00);                  /* flyback mode: default */
+ 	w_upd(0x30A8, 0xF0, 0x70);                  /* FLYBACK_VNEG_CTRL_4 */
+@@ -9563,21 +9919,46 @@ codec_aux_on(void)
+ 	IODelay(110);
+ 	w_upd(0x3008, 0x80, 0x80);                  /* buck on */
+ 	IODelay(510);
+-	w_upd(0x3099, 0x02, 0x00);                  /* CLASSH_MODE_3 */
+ 	w_wr(0x3098, 0x3A);                         /* CLASSH_MODE_2 */
+ 	IODelay(550);
+ 	/* the SoundWire data path */
+ 	swr_ports_on();
+-	/* AUX PA */
+-	w_upd(0x3467, 0x07, 0x07);                  /* PDM watchdog: enable, timeout, hold off */
+-	w_upd(0x3128, 0x80, 0x80);                  /* AUX PA power */
+-	IOSleep(1);
++	/* RDAC1 / RDAC2 POST_PMU, compander off */
++	w_upd(0x3414, 0x03, 0x00);                  /* CDC_COMP_CTL_0 */
++	w_upd(0x30D3, 0x20, 0x20);                  /* HPH_L_EN */
++	w_upd(0x30D6, 0x20, 0x20);                  /* HPH_R_EN */
++	w_upd(0x313A, 0x02, 0x00);                  /* HPH_NEW_INT_HPH_TIMER1 */
++	/* HPHL / HPHR PGA, PRE_PMU: class-H HPH state (v3, CLS_AB) */
++	w_upd(0x3008, 0x02, 0x00);                  /* buck regulator mode */
++	w_upd(0x30AF, 0xE0, 0xA0);                  /* force IQ */
++	IODelay(110);
++	w_upd(0x3099, 0x02, 0x02);                  /* CLASSH_MODE_3 */
++	w_wr(0x3098, 0x1C);                         /* CLASSH_MODE_2 */
++	w_upd(0x30C7, 0x0F, 0x0A);
++	w_upd(0x30C7, 0xF0, 0xA0);
++	IODelay(110);
++	w_upd(0x3009, 0x0C, 0x0C);                  /* ANA_HPH: CLS_AB */
++	w_upd(0x3009, 0x30, 0x30);                  /* ANA_HPH: HPHL, HPHR references */
++	IODelay(110);
++	w_upd(0x3465, 0x07, 0x03);                  /* PDM watchdogs HPHL, HPHR, AUX */
++	w_upd(0x3466, 0x07, 0x03);
++	w_upd(0x3467, 0x07, 0x07);
++	/* the PAs */
++	w_upd(0x3009, 0xC0, 0xC0);                  /* ANA_HPH: HPHL, HPHR PA */
++	w_upd(0x3128, 0x80, 0x80);                  /* AUX PA */
++	IOSleep(21);
++	/* POST_PMU */
++	w_upd(0x313A, 0x02, 0x02);
++	w_upd(0x3008, 0x02, 0x02);                  /* CLS_AB regulator mode */
+ 	w_upd(0x3008, 0x40, 0x40);                  /* AUX PA supplies */
+ 	w_upd(0x3008, 0x80, 0x80);
+-	/* unmute INT2 */
++	/* unmute */
++	c_upd(c_rx, 0x400, 0x10, 0x00);
++	c_upd(c_rx, 0x480, 0x10, 0x00);
+ 	c_upd(c_rx, 0x500, 0x10, 0x00);
+-	LOG("adsp: AUX on: WCD RX_SUPPLIES %02x AUXPA %02x ANA_CLK %02x DIG_CLK %02x; RX2 path %08x cfg0 %08x; SWR VA errors %u",
+-	    w_rd(0x3008), w_rd(0x3128), w_rd(0x3408), w_rd(0x3409), c_rd(c_rx, 0x500), c_rd(c_rx, 0x504), s_va.errors);
++	LOG("adsp: RX on: WCD RX_SUPPLIES %02x ANA_HPH %02x AUXPA %02x HPH_L_EN %02x ANA_CLK %02x DIG_CLK %02x; RX0 %08x RX1 %08x RX2 %08x; SWR VA errors %u",
++	    w_rd(0x3008), w_rd(0x3009), w_rd(0x3128), w_rd(0x30D3), w_rd(0x3408), w_rd(0x3409), c_rd(c_rx, 0x400),
++	    c_rd(c_rx, 0x480), c_rd(c_rx, 0x500), s_va.errors);
+ }
+ 
+ extern "C" int sweet_spmi_init(void);
+@@ -9600,8 +9981,8 @@ audio_diag(const char *when)
+ 		LOG("adsp: %s: %s", when, line);
+ 	}
+ 	if (w_tx_dev != 0) {
+-		LOG("adsp: %s: WCD intr status %02x %02x %02x, RX_SUPPLIES %02x AUXPA %02x PDM_WD_CTL2 %02x; SWR RX intr %08x status %08x, VA intr %08x",
+-		    when, w_rd(0x346E), w_rd(0x346F), w_rd(0x3470), w_rd(0x3008), w_rd(0x3128), w_rd(0x3467),
++		LOG("adsp: %s: WCD intr status %02x %02x %02x, RX_SUPPLIES %02x ANA_HPH %02x AUXPA %02x PDM_WD %02x %02x %02x; SWR RX intr %08x status %08x, VA intr %08x",
++		    when, w_rd(0x346E), w_rd(0x346F), w_rd(0x3470), w_rd(0x3008), w_rd(0x3009), w_rd(0x3128), w_rd(0x3465), w_rd(0x3466), w_rd(0x3467),
+ 		    c_rxswr ? c_rd(c_rxswr, 0x200) : 0, c_rxswr ? c_rd(c_rxswr, 0x1090) : 0, c_vaswr ? c_rd(c_vaswr, 0x200) : 0);
+ 	}
+ 	/* (0193: reading the PMIC over SPMI from here hung this thread: left out) */
+@@ -9638,6 +10019,12 @@ audio_test(void)
+ 	IOSleep(300);
+ 	a_amp_probe();
+ 	IOSleep(300);
++	{
++		bool rpm = rpm_start();
++		int act = rpm ? rpm_ldo(14, 1800000, 650, 0) : -9, slp = rpm ? rpm_ldo(14, 1800000, 650, 1) : -9;
++		LOG("adsp: RPM: LDO14 (cdc-vdd-buck) on at 1.8 V: active set %d, sleep set %d (0: taken)", act, slp);
++		IOSleep(10);
++	}
+ 	bool codec = codec_up();
+ 	LOG("adsp: codec %s", codec ? "up" : "NOT up: the tone will go nowhere");
+ 	IOSleep(300);
+@@ -9740,7 +10127,7 @@ audio_test(void)
+ 		return;
+ 	}
+ 	if (codec) {
+-		codec_aux_on();
++		codec_rx_on();
+ 		IOSleep(200);
+ 		bool a = fs_init(0x34, 0x000b), b = fs_init(0x35, 0x000e);
+ 		LOG("adsp: speaker amplifiers: 0x34 %s, 0x35 %s", a ? "on" : "not found", b ? "on" : "not found");
+-- 
+2.43.0
+
