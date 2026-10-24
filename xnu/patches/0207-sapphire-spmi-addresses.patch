@@ -1,0 +1,41 @@
+From 75d6c0bc9da24c4a36c6b2e91339541b98993b77 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 23:00:02 +0000
+Subject: [PATCH] sapphire-0207: the SPMI arbiter at sapphire's own addresses
+
+0206 on the phone: the boot stopped in SweetBattery::start(), at the first
+PMIC read. sweet_spmi.c still had sweet's arbiter addresses (core 0x0c440000,
+obsrvr 0x0e600000, cnfg 0x0c40a000); on bengal/khaje it is at 0x1c40000,
+0x3e00000 and 0x1c0a000 (device tree, and sweet_keys.c, which reads the
+power key there). A read at the old addresses never returns: the same hang
+as the audio thread's PMIC read in 0193.
+---
+ bsd/dev/sweet_spmi.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 0992c98..ec42cd3 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -14,9 +14,15 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+-#define SP_CORE_PA 0x0c440000u
+-#define SP_OBS_PA  0x0e600000u
+-#define SP_CFG_PA  0x0c40a000u
++/*
++ * sapphire (bengal/khaje): the arbiter at core 0x1c40000, obsrvr 0x3e00000, cnfg 0x1c0a000 (its
++ * device tree; sweet_keys.c has the same). The addresses here were sweet's (0x0c440000 / 0x0e600000 /
++ * 0x0c40a000): on this SoC a read there never comes back -- the boot stopped in SweetBattery (0206)
++ * and the audio thread in 0193.
++ */
++#define SP_CORE_PA 0x01c40000u
++#define SP_OBS_PA  0x03e00000u
++#define SP_CFG_PA  0x01c0a000u
+ #define SP_NO_APID 0xffffu
+ 
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
+-- 
+2.43.0
+
