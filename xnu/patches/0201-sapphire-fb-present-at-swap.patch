@@ -1,0 +1,218 @@
+From 897a954c7b379c6a4455f28d2cfa2b3f16959303 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 21:40:55 +0000
+Subject: [PATCH] sapphire-0201: frames presented at SwapEnd, their surfaces
+ given back at once, vsync on a 60 Hz grid
+
+Measured on the phone (0200): backboardd's render thread idle half of the
+time while animating, drawing 69 frames a second of animation, and the
+panel getting 25-30 of them. Swaps waited for the next tick of the vsync
+timer (two to a tick: one dropped), and a surface stayed in use from
+SwapEnd until a tick after the next frame had replaced it on the panel --
+2-3 ticks of CoreAnimation's two or three surfaces.
+
+Now a frame is presented in SwapEnd itself (boot-arg sweetfb_now=0: as
+before), and a frame the GPU (or the CPU) copies into the panel's memory
+gives its surface back at once: the GPU runs one queue in order, so what
+CoreAnimation draws into it next comes after the copy. Directly scanned
+frames keep their surfaces as before. The vsync timer, re-armed 16667 us
+after it had run (57 Hz against the panel's frame counter), now ticks on
+an absolute 60.000 Hz grid.
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 89 ++++++++++++++++++++++++---
+ 1 file changed, 80 insertions(+), 9 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ee9a660..1b39554 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -145,6 +145,8 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 	void publishModes(void);
++	uint64_t            fNextVsync;     /* 0201: the next vsync, on an absolute 60.000 Hz grid */
++	void armVsync(IOTimerEventSource *t);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -210,7 +212,9 @@ public:
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+-	void present(const uint8_t *rec);
++	bool present(const uint8_t *rec);
++	IOLock       *fPresentLock;   /* 0201: present() from SwapEnd and from the vsync timer */
++	bool          fNow;           /* 0201: boot-arg sweetfb_now (default 1): present at SwapEnd */
+ };
+ 
+ /*
+@@ -322,6 +326,12 @@ AppleCLCD::start(IOService *provider)
+ 	fOffX = ((int32_t)(fLogicalW - fWidth) / 2) & ~3;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
++	fPresentLock = IOLockAlloc();
++	{
++		uint32_t now = 1;
++		PE_parse_boot_argn("sweetfb_now", &now, sizeof(now));
++		fNow = now != 0 && fPresentLock != NULL;
++	}
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+@@ -557,7 +567,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		if (fb->fDsi != NULL) {
+ 			/* the panel is dark (DCS 0x51 0); keep the last frame */
+ 			IOLockUnlock(fb->fLock);
+-			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++			fb->armVsync(sender);
+ 			return;
+ 		}
+ 		if (fb->fFadeOrig != NULL) {
+@@ -575,7 +585,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			if (step <= SWEET_FB_FADE_STEPS) {
+ 				fb->fadeStep(src, srcStride, step);
+ 			}
+-			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++			fb->armVsync(sender);
+ 			return;
+ 		}
+ 		if (fb->fVig0 != NULL && fb->fScanPhys != fb->fBootSrc) {
+@@ -595,7 +605,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				}
+ 			}
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		fb->armVsync(sender);
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+@@ -620,14 +630,37 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->flipBack();
+ 	}
+ 	if (rec != NULL) {
++		if (fb->fPresentLock != NULL) {
++			IOLockLock(fb->fPresentLock);
++		}
+ 		fb->present(rec);
++		if (fb->fPresentLock != NULL) {
++			IOLockUnlock(fb->fPresentLock);
++		}
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 		IOLockLock(fb->fLock);
+ 		memcpy(fb->fRetireHold, fb->fShowHold, sizeof(taken));
+ 		memcpy(fb->fShowHold, taken, sizeof(taken));
+ 		IOLockUnlock(fb->fLock);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	fb->armVsync(sender);
++}
++
++/*
++ * 0201: the vsync timer re-armed 16667 us after it had run (and after the frame it presented):
++ * every period was that much longer -- 57 Hz measured against the panel's frame counter. Now the
++ * ticks sit on an absolute 60.000 Hz grid; after a stall longer than a period the grid restarts.
++ */
++void
++AppleCLCD::armVsync(IOTimerEventSource *t)
++{
++	uint64_t period, now = mach_absolute_time();
++	nanoseconds_to_absolutetime(16666667ull, &period);
++	if (fNextVsync == 0 || now > fNextVsync + period) {
++		fNextVsync = now;
++	}
++	fNextVsync += period;
++	t->wakeAtTime(fNextVsync);
+ }
+ 
+ void
+@@ -678,6 +711,43 @@ AppleCLCD::swap(const uint8_t *rec)
+ 			sweet_hold(held[i], true);
+ 		}
+ 	}
++	/*
++	 * 0201: presented here, at SwapEnd, rather than at the next tick of the vsync timer: frames that
++	 * came two to a tick were dropped and every frame waited up to a tick (the panel showed 25-30 of
++	 * the 60 a second backboardd drew). A frame the GPU copies into the panel's memory leaves its
++	 * surface at once -- the GPU runs one queue in order, so whatever CoreAnimation draws into that
++	 * surface next is drawn after the copy -- instead of 2-3 ticks later: CoreAnimation has two or
++	 * three surfaces and waited for a free one. A frame the MDP scans directly keeps its surface
++	 * until the next one has replaced it on the panel, as before.
++	 */
++	IOLockLock(fLock);
++	bool now = fNow && !fPowerOff && fFadeOrig == NULL;
++	IOLockUnlock(fLock);
++	if (now) {
++		IOLockLock(fPresentLock);
++		bool copied = present(rec);
++		IOLockUnlock(fPresentLock);
++		SweetSurface *release[4] = {};
++		IOLockLock(fLock);
++		fDirty = false;
++		SweetSurface *pend[4];
++		memcpy(pend, fPendHold, sizeof(pend));         /* (a frame of the timer's path, now replaced) */
++		bzero(fPendHold, sizeof(fPendHold));
++		if (copied) {
++			memcpy(release, held, sizeof(release));
++		} else {
++			memcpy(release, fRetireHold, sizeof(release));
++			memcpy(fRetireHold, fShowHold, sizeof(fRetireHold));
++			memcpy(fShowHold, held, sizeof(fShowHold));
++		}
++		IOLockUnlock(fLock);
++		sweet_hold_set(pend, false);
++		sweet_hold_set(release, false);
++		if ((++sweet_fb_swap_count % 1000) == 0) {
++			IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
++		}
++		return;
++	}
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+@@ -1115,7 +1185,7 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 	return ok;
+ }
+ 
+-void
++bool
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+@@ -1128,7 +1198,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	}
+ 	if (console_only > 0 && fConsShown) {
+ 		(void)mask;
+-		return;
++		return false;
+ 	}
+ 	fConsShown = false;
+ 	if (directPresent(rec)) {
+@@ -1139,7 +1209,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 				sweet_console_muted = 1;
+ 			}
+ 		}
+-		return;
++		return false;           /* the MDP scans the surface itself: it stays held */
+ 	}
+ 	IOLockLock(fLock);
+ 	fLastVA = NULL;
+@@ -1296,7 +1366,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			sweet_fb_stats.gpu++;
+ 			sweet_fb_stats_tick();
+ 		}
+-		return;
++		return true;
+ 	}
+ 	if (fFlip[0] != NULL) {
+ 		flipBack();
+@@ -1306,6 +1376,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		sweet_fb_stats.composed++;
+ 		sweet_fb_stats_tick();
+ 	}
++	return true;                    /* copied by the CPU: the surface is free */
+ }
+ 
+ bool
+-- 
+2.43.0
+

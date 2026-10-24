@@ -71,6 +71,9 @@
 #include <IOKit/IOKitLib.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <mach/mach_time.h>
+#include <mach/mach.h>
+#include <dlfcn.h>
+#include <pthread.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <stdarg.h>
@@ -1327,6 +1330,169 @@ frame_begin(struct eagl *e)
  * glFlush, glFinish: what was drawn must be where the display takes it from. `finished`: the
  * library has been waited for already.
  */
+/*
+ * A sampling profiler of the thread that renders (file /redwood/glsample holding the seconds; a
+ * restart of backboardd starts it): every millisecond that thread is suspended, its pc and a
+ * frame-pointer backtrace taken, and it is resumed (as macOS's sample(1) does it). At the end the
+ * functions with the most samples, by dladdr(), go to the log: "self" where the pc was, "total"
+ * anywhere in the backtrace.
+ */
+#define SMP_MAX         60000
+#define SMP_DEPTH       12
+static mach_port_t render_thread;
+static uint64_t (*smp_pcs)[SMP_DEPTH];
+static unsigned smp_n, smp_frames0;
+static struct eagl *smp_e;
+
+struct smp_slot { uint64_t key; uint32_t self, total, seen; };
+
+static uint64_t
+smp_key(uint64_t pc, Dl_info *info)
+{
+	if (dladdr((const void *)pc, info) && info->dli_saddr != NULL) {
+		return (uint64_t)info->dli_saddr;
+	}
+	return pc & ~0xfffull;
+}
+
+static void
+smp_name(uint64_t key, char *out, size_t size)
+{
+	Dl_info info;
+	if (dladdr((const void *)key, &info) && info.dli_fname != NULL) {
+		const char *base = strrchr(info.dli_fname, '/');
+		snprintf(out, size, "%s %s+%#llx", base ? base + 1 : info.dli_fname, info.dli_sname ? info.dli_sname : "?",
+		    key - (uint64_t)(info.dli_saddr ? info.dli_saddr : info.dli_fbase));
+	} else {
+		snprintf(out, size, "%#llx", key);
+	}
+}
+
+static int
+smp_cmp_self(const void *a, const void *b)
+{
+	return (int)((const struct smp_slot *)b)->self - (int)((const struct smp_slot *)a)->self;
+}
+
+static int
+smp_cmp_total(const void *a, const void *b)
+{
+	return (int)((const struct smp_slot *)b)->total - (int)((const struct smp_slot *)a)->total;
+}
+
+static void *
+sampler_main(void *arg)
+{
+	unsigned secs = (unsigned)(uintptr_t)arg;
+	uint64_t end = now_us() + 600 * 1000000ull;     /* at most 10 minutes of waiting for activity */
+	uint64_t t0 = now_us(), active_us = 0, last_change = 0;
+	unsigned last_frames = smp_e->frames;
+
+	smp_pcs = calloc(SMP_MAX, sizeof(*smp_pcs));
+	if (smp_pcs == NULL) {
+		return NULL;
+	}
+	smp_frames0 = smp_e->frames;
+	say("redwood-gl: sampling the render thread for %u s\n", secs);
+	while (now_us() < end && smp_n < SMP_MAX && active_us < (uint64_t)secs * 1000000) {
+		arm_thread_state64_t st;
+		uint64_t now = now_us();
+		if (smp_e->frames != last_frames) {
+			last_frames = smp_e->frames;
+			last_change = now;
+		}
+		if (last_change == 0 || now - last_change > 100000) {
+			usleep(2000);                   /* nothing drawn lately: not counted */
+			continue;
+		}
+		active_us += 1000;
+		mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+		if (thread_suspend(render_thread) == KERN_SUCCESS) {
+			if (thread_get_state(render_thread, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
+				uint64_t *sm = smp_pcs[smp_n++];
+				uint64_t fp = arm_thread_state64_get_fp(st);
+				sm[0] = arm_thread_state64_get_pc(st);
+				sm[1] = arm_thread_state64_get_lr(st);
+				for (int i = 2; i < SMP_DEPTH && fp != 0 && (fp & 7) == 0; i++) {
+					const uint64_t *f = (const uint64_t *)fp;
+					sm[i] = f[1];
+					if (f[0] <= fp) {
+						break;
+					}
+					fp = f[0];
+				}
+			}
+			thread_resume(render_thread);
+		}
+		usleep(1000);
+	}
+	unsigned frames = smp_e->frames - smp_frames0;
+	uint64_t took = active_us;
+	(void)t0;
+	enum { SMP_SLOTS = 8192 };
+	struct smp_slot *slot = calloc(SMP_SLOTS, sizeof(*slot));
+	if (slot == NULL) {
+		return NULL;
+	}
+	for (unsigned n = 0; n < smp_n; n++) {
+		for (int i = 0; i < SMP_DEPTH && smp_pcs[n][i] != 0; i++) {
+			Dl_info info;
+			uint64_t key = smp_key(smp_pcs[n][i] - (i > 0 ? 4 : 0), &info);
+			uint32_t h = (uint32_t)((key >> 2) * 2654435761u) % SMP_SLOTS;
+			while (slot[h].key != 0 && slot[h].key != key) {
+				h = (h + 1) % SMP_SLOTS;
+			}
+			slot[h].key = key;
+			if (i == 0) {
+				slot[h].self++;
+			}
+			if (slot[h].seen != n + 1) {
+				slot[h].seen = n + 1;
+				slot[h].total++;
+			}
+		}
+	}
+	say("redwood-gl: samples: %u in %llu ms of drawing, %u frames (%.1f a second of drawing)\n", smp_n, took / 1000, frames,
+	    took ? frames * 1e6 / took : 0.0);
+	char name[200];
+	qsort(slot, SMP_SLOTS, sizeof(*slot), smp_cmp_self);
+	for (int i = 0; i < 40 && slot[i].self != 0; i++) {
+		smp_name(slot[i].key, name, sizeof(name));
+		say("redwood-gl: self  %5.1f%%  %s\n", 100.0 * slot[i].self / smp_n, name);
+	}
+	qsort(slot, SMP_SLOTS, sizeof(*slot), smp_cmp_total);
+	for (int i = 0; i < 50 && slot[i].total != 0; i++) {
+		smp_name(slot[i].key, name, sizeof(name));
+		say("redwood-gl: total %5.1f%%  %s\n", 100.0 * slot[i].total / smp_n, name);
+	}
+	free(slot);
+	return NULL;
+}
+
+static void
+sampler_maybe_start(struct eagl *e)
+{
+	static bool tried;
+	if (tried) {
+		return;
+	}
+	tried = true;
+	FILE *f = fopen("/redwood/glsample", "r");
+	unsigned secs = 0;
+	if (f == NULL) {
+		return;
+	}
+	if (fscanf(f, "%u", &secs) != 1 || secs == 0) {
+		secs = 20;
+	}
+	fclose(f);
+	render_thread = mach_thread_self();
+	smp_e = e;
+	pthread_t t;
+	pthread_create(&t, NULL, sampler_main, (void *)(uintptr_t)secs);
+	pthread_detach(t);
+}
+
 static void frame_functions(struct eagl *e);
 static void
 frame_end(struct eagl *e, bool finished)
@@ -1382,6 +1548,9 @@ frame_end(struct eagl *e, bool finished)
 	after = now_us();
 	e->in_frame = false;
 	e->frames++;
+	if (e->frames == 100) {
+		sampler_maybe_start(e);
+	}
 	if (latency_lines) {
 		/* "tl: g FRAME began US ended US DRAWS": microseconds of mach_absolute_time (tools/latency.py) */
 		say("tl: g %u began %llu ended %llu %u\n", e->frames, e->began, after, e->draws);
@@ -4484,6 +4653,17 @@ install(void)
 		if ((argument = strstr(arguments, "glslow=")) != NULL) {
 			slow_calls_us = strtoull(argument + 7, NULL, 10);
 		}
+		/* (or the file /redwood/glslow holding the microseconds: no reboot) */
+		FILE *slow = fopen("/redwood/glslow", "r");
+		if (slow != NULL) {
+			unsigned long long us = 0;
+			if (fscanf(slow, "%llu", &us) == 1 && us > 0) {
+				slow_calls_us = us;
+			}
+			fclose(slow);
+		}
+		/* likewise /redwood/glframes: a line for every frame */
+		frame_lines |= access("/redwood/glframes", F_OK) == 0;
 		full_precision = strstr(arguments, "glprecision=0") == NULL;
 		vblur_on = strstr(arguments, "vblur=0") != NULL ? 0 : strstr(arguments, "vblur=2") != NULL ? 2 : 1;
 		if ((argument = strstr(arguments, "glplain=")) != NULL) {
