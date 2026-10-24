@@ -1,0 +1,94 @@
+From 0576c692294d9f25a0953e34f922c0e52bbe4e88 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 13:47:54 +0000
+Subject: [PATCH] sapphire-0189: the SMMU stream in the upper bits of every
+ address for the ADSP
+
+Qualcomm's msm_audio_ion.c appends (sid & qcom,smmu-sid-mask) << 32
+(MSM_AUDIO_SMMU_SID_OFFSET) to every IOVA it hands the ADSP: with 0
+there the ADSP reads around the SMMU as its own VM and the memory
+protection resets the phone (0171, 0177, 0181-0183); with 1 there by
+chance (0174/0175, buffers at 0x1_b8270000) it read through stream
+0x1c1's bypass at the low 32 bits, garbage, and the graph open failed.
+The buffers stay at IOVA 0x10000000 through our stage-1 tables, and the
+ADSP is given 0x1_10000000. The hyp_assign tries (0185-0188) go: Android
+assigns nothing for this memory.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 45 ++++++++-------------------------
+ 1 file changed, 10 insertions(+), 35 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index da0e6ab..d21a68f 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -8563,6 +8563,7 @@ a_gpr_rx(const uint8_t *p, uint32_t len)
+ #define A_SG        0x4001u
+ #define A_SG_DEV    0x4002u
+ #define A_IOVA      0x10000000ull               /* where the ADSP sees our buffers (smmu_s1) */
++#define A_SID_BITS  (1ull << 32)                /* (0x1c1 & 0xf) << 32: msm_audio_ion's smmu_sid_bits */
+ #define A_CONT_STR  0x5001u
+ #define A_CONT_DEV  0x5002u
+ #define A_WRSH      0x6001u
+@@ -9151,36 +9152,8 @@ audio_test(void)
+ 	IOBufferMemoryDescriptor *bmd = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 0x10000, 0x0000000FFFFF0000ull);
+ 	IOMemoryMap *bmap = NULL;
+-	uint64_t assigned = ~0ull;
+ 	if (bmd != NULL && bmd->prepare() == kIOReturnSuccess) {
+ 		buf_pa = bmd->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+-		/*
+-		 * 0187: every ADSP VM set refused, on a block already mapped write-combined and into our
+-		 * SMMU tables, while the control block (fresh) went to the modem: shared first now,
+-		 * before either mapping exists; the control repeated with LPASS on another fresh block.
+-		 */
+-		static const struct { uint32_t v[3]; unsigned n; uint32_t perm; const char *what; } tries[] = {
+-			{ { VMID_HLOS, 0x16, 0x25 }, 3, 7, "HLOS + LPASS + ADSP heap, RWX" },
+-			{ { VMID_HLOS, 0x16 }, 2, 6, "HLOS + LPASS, RW" },
+-			{ { VMID_HLOS, 0x16 }, 2, 7, "HLOS + LPASS, RWX" },
+-			{ { VMID_HLOS, 6 }, 2, 6, "HLOS + ADSP_Q6, RW" },
+-		};
+-		for (unsigned t = 0; t < sizeof(tries) / sizeof(tries[0]) && assigned != 0; t++) {
+-			scm_perm = tries[t].perm;
+-			assigned = scm_assign(buf_pa, 0x10000, tries[t].v, tries[t].n);
+-			LOG("adsp: fresh kernel 64 KB %llx shared with %s: %llx", buf_pa, tries[t].what, assigned);
+-		}
+-		scm_perm = PERM_RW;
+-		if (assigned != 0) {
+-			static const uint32_t lv[] = { VMID_HLOS, 0x16 }, mv[] = { VMID_HLOS, VMID_MSS_MSA };
+-			IOBufferMemoryDescriptor *probe = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-			    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 0x10000, 0x0000000FFFFF0000ull);
+-			uint64_t ppa = probe != NULL && probe->prepare() == kIOReturnSuccess ?
+-			    probe->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+-			uint64_t l = ppa ? scm_assign(ppa, 0x10000, lv, 2) : ~0ull;
+-			uint64_t m = ppa && l != 0 ? scm_assign(ppa, 0x10000, mv, 2) : ~0ull;
+-			LOG("adsp: (control: another fresh 64 KB %llx to HLOS + LPASS: %llx, to HLOS + modem: %llx)", ppa, l, m);
+-		}
+ 		bmap = bmd->map(kIOMapWriteCombineCache);
+ 	}
+ 	buf = bmap != NULL ? (int16_t *)bmap->getVirtualAddress() : NULL;
+@@ -9204,13 +9177,15 @@ audio_test(void)
+ 			LOG("adsp: no translation for the ADSP: the test stops here");
+ 			return;
+ 		}
+-		(void)tbl_pa;
+-		IOSleep(300);
+-		if (assigned != 0) {
+-			LOG("adsp: the ADSP may not read our memory: the test stops before it does");
+-			return;
+-		}
+-		buf_pa = A_IOVA;                        /* from here on, the address the ADSP uses */
++		/*
++		 * What 0171-0188 missed (Qualcomm's msm_audio_ion.c, MSM_AUDIO_SMMU_SID_OFFSET): every
++		 * address handed to the ADSP carries the SMMU stream in its upper 32 bits, (0x1c1 & the
++		 * device tree's sid mask 0xf) << 32. With 0 there the ADSP reads around the SMMU, as its
++		 * own VM, and the memory protection resets the phone (0171, 0177, 0181-0183); with 1 there
++		 * by chance (0174/0175: buffers at 0x1_b8270000) it read through 0x1c1's bypass at the
++		 * low 32 bits, garbage, and the graph open failed. IOVA 0x10000000 | 1 << 32, then.
++		 */
++		buf_pa = A_IOVA | A_SID_BITS;           /* from here on, the address the ADSP uses */
+ 		IOSleep(300);
+ 	}
+ 	/* kept for the rest of the session: the ADSP may hold on to the mapping */
+-- 
+2.43.0
+
