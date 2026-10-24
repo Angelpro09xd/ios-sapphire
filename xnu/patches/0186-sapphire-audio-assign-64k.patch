@@ -1,0 +1,58 @@
+From 3746ca7a9a5119a548b3bffda7fa975066e55e5b Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 13:26:24 +0000
+Subject: [PATCH] sapphire-0186: hyp_assign of a 64 KB aligned kernel block,
+ and a control
+
+0185 on the phone: hyp_assign of the 16 KB kernel page (and of the
+tables') refused for every VM set (ret -2, res 0x56); the test stopped
+before the ADSP read, no reset. rmtfs's 3 MB in our pool is taken: the
+buffers are now 64 KB, 64 KB aligned, and if that is refused too another
+such block goes to HLOS + the modem's MSA, the set rmtfs takes, to tell
+the memory from the VMs.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 19 ++++++++++++++-----
+ 1 file changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index f14b557..706487a 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -9145,8 +9145,9 @@ audio_test(void)
+ 	 * the phone, wherever in the pool), but kernel memory, as Android does (that never reset
+ 	 * anything), through SMMU stream 0x1c1; this XNU has it only above 4 GB.
+ 	 */
++	/* 64 KB, 64 KB aligned: hyp_assign of 16 KB was refused (0185), rmtfs's 3 MB is taken */
+ 	IOBufferMemoryDescriptor *bmd = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 0x4000, 0x0000000FFFFFC000ull);
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 0x10000, 0x0000000FFFFF0000ull);
+ 	IOMemoryMap *bmap = NULL;
+ 	if (bmd != NULL && bmd->prepare() == kIOReturnSuccess) {
+ 		bmap = bmd->map(kIOMapWriteCombineCache);
+@@ -9187,11 +9188,19 @@ audio_test(void)
+ 		};
+ 		uint64_t ar = ~0ull;
+ 		for (unsigned t = 0; t < sizeof(tries) / sizeof(tries[0]) && ar != 0; t++) {
+-			ar = scm_assign(buf_pa, 0x4000, tries[t].v, tries[t].n);
+-			LOG("adsp: kernel page %llx shared with %s: %llx", buf_pa, tries[t].what, ar);
++			ar = scm_assign(buf_pa, 0x10000, tries[t].v, tries[t].n);
++			LOG("adsp: kernel 64 KB %llx shared with %s: %llx", buf_pa, tries[t].what, ar);
+ 		}
+-		uint64_t tr = scm_assign(tbl_pa, 0x4000, tries[0].v, 3);
+-		LOG("adsp: the tables' page %llx too: %llx", tbl_pa, tr);
++		if (ar != 0) {
++			/* is it the memory or the VMs? the modem's set, which rmtfs's buffer takes, on a second 64 KB */
++			static const uint32_t mv[] = { VMID_HLOS, VMID_MSS_MSA };
++			IOBufferMemoryDescriptor *probe = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++			    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 0x10000, 0x0000000FFFFF0000ull);
++			uint64_t ppa = probe != NULL && probe->prepare() == kIOReturnSuccess ?
++			    probe->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
++			LOG("adsp: (another kernel 64 KB %llx to HLOS + modem: %llx)", ppa, ppa ? scm_assign(ppa, 0x10000, mv, 2) : ~0ull);
++		}
++		(void)tbl_pa;
+ 		IOSleep(300);
+ 		if (ar != 0) {
+ 			LOG("adsp: the ADSP may not read our memory: the test stops before it does");
+-- 
+2.43.0
+
