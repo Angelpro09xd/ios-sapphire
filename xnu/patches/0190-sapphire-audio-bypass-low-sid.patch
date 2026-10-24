@@ -1,0 +1,96 @@
+From ff7749e8a9eec5cb8d2cc03dc156acec00251cbb Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 13:57:32 +0000
+Subject: [PATCH] sapphire-0190: the WLAN engine's way for the ADSP: bypass
+ stream, low memory, stream bits
+
+0189 on the phone: with the stream bits in the address (0x1_10000000)
+the ADSP's read through our stage-1 tables into kernel memory above
+4 GB still reset the phone. Now as the WLAN engine works: streams
+0x1c0-0x1cf in bypass (smmu_identity), the buffers in our pool's last
+64 KB below 4 GB, and the ADSP given pa | 1 << 32 (0174/0175, stream
+bits 1 and a low address by chance, read without a reset).
+---
+ iokit/Kernel/arm/TopazModem.cpp | 51 ++++++++++++---------------------
+ 1 file changed, 18 insertions(+), 33 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index d21a68f..c038a78 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -4970,7 +4970,7 @@ smmu_identity(uint32_t sid, uint32_t mask, const char *name)
+  */
+ static volatile uint8_t *s1_cbp, *s1_smmu;       /* the bank smmu_s1() set up, and the SMMU: fault registers for the log */
+ 
+-static bool
++static bool __attribute__((unused))
+ smmu_s1(uint32_t sid, uint32_t mask, const char *name, uint64_t iova, uint64_t pa, unsigned n, uint64_t *tbl,
+     uint64_t tbl_pa)
+ {
+@@ -9148,46 +9148,31 @@ audio_test(void)
+ 	 * the phone, wherever in the pool), but kernel memory, as Android does (that never reset
+ 	 * anything), through SMMU stream 0x1c1; this XNU has it only above 4 GB.
+ 	 */
+-	/* 64 KB, 64 KB aligned: hyp_assign of 16 KB was refused (0185), rmtfs's 3 MB is taken */
+-	IOBufferMemoryDescriptor *bmd = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 0x10000, 0x0000000FFFFF0000ull);
++	/*
++	 * 0189: with the stream bits right (0x1_10000000) the ADSP's read through our stage-1 tables
++	 * into kernel memory above 4 GB still reset the phone. What works for the WLAN engine works
++	 * here too, it is to be hoped: the stream in bypass (smmu_identity(), as WLAN's 0x1a0) and
++	 * memory below 4 GB, our pool's last 64 KB -- and 0174/0175, by chance stream bits 1 and a
++	 * low address, read without a reset. The ADSP is given pa | 1 << 32.
++	 */
+ 	IOMemoryMap *bmap = NULL;
+-	if (bmd != NULL && bmd->prepare() == kIOReturnSuccess) {
+-		buf_pa = bmd->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+-		bmap = bmd->map(kIOMapWriteCombineCache);
++	buf_pa = MODEM_POOL_BASE + MODEM_POOL_SIZE - 0x10000;
++	if (pool_used + 0x10000 <= MODEM_POOL_SIZE) {
++		bmap = map_phys(buf_pa, 0x4000, true);
+ 	}
+ 	buf = bmap != NULL ? (int16_t *)bmap->getVirtualAddress() : NULL;
+-	if (buf == NULL || buf_pa == 0) {
++	if (buf == NULL) {
+ 		LOG("adsp: no buffer (map %p pa %llx)", bmap, buf_pa);
+ 		return;
+ 	}
+ 	bzero(buf, tone + 0x1000);
+-	LOG("adsp: %u bytes of buffers at %llx, write-combined", tone + 0x1000, buf_pa);
+-	{
+-		/* the ADSP sees them at a 32-bit IOVA, as on Android (0x10000000), through real tables */
+-		IOBufferMemoryDescriptor *tmd = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 0x4000, 0x0000000FFFFFC000ull);
+-		IOMemoryMap *tmap = NULL;
+-		uint64_t tbl_pa = 0;
+-		if (tmd != NULL && tmd->prepare() == kIOReturnSuccess && (tmap = tmd->map(kIOMapWriteCombineCache)) != NULL) {
+-			tbl_pa = tmd->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+-		}
+-		if (tmap == NULL || tbl_pa == 0 ||
+-		    !smmu_s1(0x1c1, 0, "audio (ADSP buffers)", A_IOVA, buf_pa, 4, (uint64_t *)tmap->getVirtualAddress(), tbl_pa)) {
+-			LOG("adsp: no translation for the ADSP: the test stops here");
+-			return;
+-		}
+-		/*
+-		 * What 0171-0188 missed (Qualcomm's msm_audio_ion.c, MSM_AUDIO_SMMU_SID_OFFSET): every
+-		 * address handed to the ADSP carries the SMMU stream in its upper 32 bits, (0x1c1 & the
+-		 * device tree's sid mask 0xf) << 32. With 0 there the ADSP reads around the SMMU, as its
+-		 * own VM, and the memory protection resets the phone (0171, 0177, 0181-0183); with 1 there
+-		 * by chance (0174/0175: buffers at 0x1_b8270000) it read through 0x1c1's bypass at the
+-		 * low 32 bits, garbage, and the graph open failed. IOVA 0x10000000 | 1 << 32, then.
+-		 */
+-		buf_pa = A_IOVA | A_SID_BITS;           /* from here on, the address the ADSP uses */
+-		IOSleep(300);
++	LOG("adsp: %u bytes of buffers at %llx (the pool's end), write-combined", tone + 0x1000, buf_pa);
++	if (!smmu_identity(0x1c0, 0xF, "audio (ADSP buffers, streams 0x1c0-0x1cf)")) {
++		LOG("adsp: no SMMU stream for the ADSP: the test stops here");
++		return;
+ 	}
++	buf_pa |= A_SID_BITS;                       /* from here on, the address the ADSP uses */
++	IOSleep(300);
+ 	/* kept for the rest of the session: the ADSP may hold on to the mapping */
+ 	for (unsigned i = 0; i < A_NBUF * A_PERIOD; i++) {
+ 		/* 1 kHz at 48 kHz: 48 samples a period; a triangle is enough to be heard */
+-- 
+2.43.0
+
