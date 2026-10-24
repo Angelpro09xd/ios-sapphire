@@ -1,0 +1,110 @@
+From bba4a0452fcae603e2517a139c02e86d5f36501b Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 11:02:36 +0000
+Subject: [PATCH] sapphire-0176: the ADSP's buffers in a page below 4 GB, the
+ out-of-band path checked
+
+0175 on the phone: every graph open failed (status 1), even one module
+alone; the buffer had come at 0x1b8270000, the physical mask not
+honoured, while the ADSP's side of stream 0x1c1 takes 32-bit addresses
+(Android's IOVA pool is 0x10000000-0x20000000). The 12 KB now sit in one
+16 KB page searched for below 4 GB (up to 4096 tries, the others given
+back), and before the graph the LPASS vote, which works in band, is sent
+out of band to see that the ADSP reads that path right.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 48 ++++++++++++++++++++++++++++-----
+ 1 file changed, 42 insertions(+), 6 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index d64be27..4562441 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -8557,7 +8557,7 @@ static uint8_t *a_cmd_area;
+  * advertised, so a packet over 128 bytes waits for ever (and everything queued behind it):
+  * payloads that would not fit go out of band.
+  */
+-static bool a_oob;
++static bool a_oob, a_oob_force;
+ static uint64_t a_cmd_pa;
+ 
+ static int64_t
+@@ -8567,7 +8567,7 @@ a_cmd_sync(uint32_t src, uint32_t dst, uint32_t opcode, const void *payload, uin
+ 	uint8_t *b;
+ 	int64_t r;
+ 
+-	if (a_oob && 24 + 16 + len > 128 && a_cmd_area != NULL && a_mem_handle != 0 && len <= 4096) {
++	if ((a_oob_force || (a_oob && 24 + 16 + len > 128)) && a_cmd_area != NULL && a_mem_handle != 0 && len <= 4096) {
+ 		uint32_t h[4] = { (uint32_t)a_cmd_pa, (uint32_t)(a_cmd_pa >> 32), a_mem_handle, len };
+ 		memcpy(a_cmd_area, payload, len);
+ 		mb();
+@@ -8902,7 +8902,7 @@ audio_test(void)
+ 	a_amp_probe();
+ 	IOSleep(300);
+ 
+-	const uint32_t tone = (A_NBUF * bytes + 0xfff) & ~0xfffu;
++	const uint32_t tone = (A_NBUF * bytes + 0xfff) & ~0xfffu;   /* 0x2000: with the command page, 12 KB */
+ 	/*
+ 	 * 0173: hyp_assign of pool memory refused for every VM set (ret -2 res 0x56), while the
+ 	 * modem's rmtfs buffer in the same pool is taken: the pool is not plain HLOS memory to the
+@@ -8910,12 +8910,37 @@ audio_test(void)
+ 	 * SMMU stream 0x1c1, no assignment): so does this now -- physically contiguous below 4 GB,
+ 	 * written through a write-combined mapping (the ADSP does not snoop our caches).
+ 	 */
+-	IOBufferMemoryDescriptor *bmd = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, tone + 0x1000, 0x00000000FFFFF000ull);
++	/*
++	 * 0175: the physical mask is not honoured (the buffer came at 0x1b8270000) and every graph
++	 * open read from there failed: the ADSP's side of SMMU stream 0x1c1 takes 32-bit addresses
++	 * (Android's IOVAs are 0x10000000-0x20000000). Everything fits one 16 KB page: pages are
++	 * taken until one lies below 4 GB, the others given back.
++	 */
++	IOBufferMemoryDescriptor *bmd = NULL, *held[256];
++	unsigned nheld = 0, tries = 0;
+ 	IOMemoryMap *bmap = NULL;
++	for (; tries < 4096 && bmd == NULL; tries++) {
++		IOBufferMemoryDescriptor *m = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 0x4000, 0x00000000FFFFC000ull);
++		if (m == NULL) {
++			break;
++		}
++		uint64_t pa = m->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++		if (pa != 0 && pa + 0x4000 <= 0x100000000ull) {
++			bmd = m;
++			buf_pa = pa;
++		} else if (nheld < 256) {
++			held[nheld++] = m;              /* kept until the search ends, so the next one is another page */
++		} else {
++			m->release();
++		}
++	}
++	for (unsigned i = 0; i < nheld; i++) {
++		held[i]->release();
++	}
++	LOG("adsp: a page below 4 GB after %u tries: %llx", tries, bmd != NULL ? buf_pa : 0ull);
+ 	if (bmd != NULL && bmd->prepare() == kIOReturnSuccess) {
+ 		bmap = bmd->map(kIOMapWriteCombineCache);
+-		buf_pa = bmd->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+ 	}
+ 	buf = bmap != NULL ? (int16_t *)bmap->getVirtualAddress() : NULL;
+ 	if (buf == NULL || buf_pa == 0) {
+@@ -8952,6 +8977,17 @@ audio_test(void)
+ 	}
+ 	a_verbose = true;
+ 	a_oob = true;
++	{
++		/* is the out-of-band path read right? a command known to work in band, sent out of band */
++		struct a_pb pb = {};
++		uint8_t *p = a_param(&pb, PRM_PORT, PARAM_ID_RSC_HW_CORE, 4);
++		a_put32(&p, 1);
++		a_oob_force = true;
++		int64_t rr = a_cmd_sync(GPR_PORT_PRM_CLIENT, PRM_PORT, PRM_CMD_REQUEST_HW_RSC, pb.b, pb.n,
++		    PRM_CMD_RSP_REQUEST_HW_RSC);
++		a_oob_force = false;
++		LOG("adsp: the LPASS vote again, out of band: %lld (answer %08x: %08x %08x)", rr, a_box.opcode, a_box.p[0], a_box.p[1]);
++	}
+ 	IOSleep(300);                                           /* (the USB log goes out every 100 ms) */
+ 	a_graph_probe();
+ 	a_verbose = false;
+-- 
+2.43.0
+
