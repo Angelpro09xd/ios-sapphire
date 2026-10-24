@@ -1,0 +1,91 @@
+From 144636ab58658592b10d7768bd5c23815c9d0a32 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 10:41:09 +0000
+Subject: [PATCH] sapphire-0174: the ADSP's buffers in ordinary kernel memory,
+ no hyp_assign
+
+0173 on the phone: hyp_assign of the pool region was refused for every
+VM set (ret -2, res 0x56), while rmtfs's buffer in the same pool is
+taken. Android gives the ADSP ordinary kernel memory through SMMU stream
+0x1c1 without assigning it: the tone's buffers and the command page are
+now a physically contiguous IOBufferMemoryDescriptor below 4 GB, written
+through a write-combined mapping.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 52 +++++++++++++--------------------
+ 1 file changed, 21 insertions(+), 31 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 2730cae..4bf0537 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -18,6 +18,7 @@
+ #if defined(SWEET)
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/crc.h>
+@@ -8853,39 +8854,28 @@ audio_test(void)
+ 	IOSleep(300);
+ 
+ 	const uint32_t tone = (A_NBUF * bytes + 0xfff) & ~0xfffu;
+-	buf = (int16_t *)pool_alloc(tone + 0x1000, &buf_pa);
+-	if (buf == NULL) {
+-		LOG("adsp: no buffer");
++	/*
++	 * 0173: hyp_assign of pool memory refused for every VM set (ret -2 res 0x56), while the
++	 * modem's rmtfs buffer in the same pool is taken: the pool is not plain HLOS memory to the
++	 * hypervisor everywhere. Android gives the ADSP ordinary kernel memory (msm_audio_ion, through
++	 * SMMU stream 0x1c1, no assignment): so does this now -- physically contiguous below 4 GB,
++	 * written through a write-combined mapping (the ADSP does not snoop our caches).
++	 */
++	IOBufferMemoryDescriptor *bmd = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, tone + 0x1000, 0x00000000FFFFF000ull);
++	IOMemoryMap *bmap = NULL;
++	if (bmd != NULL && bmd->prepare() == kIOReturnSuccess) {
++		bmap = bmd->map(kIOMapWriteCombineCache);
++		buf_pa = bmd->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++	}
++	buf = bmap != NULL ? (int16_t *)bmap->getVirtualAddress() : NULL;
++	if (buf == NULL || buf_pa == 0) {
++		LOG("adsp: no buffer (descriptor %p map %p pa %llx)", bmd, bmap, buf_pa);
+ 		return;
+ 	}
+-	{
+-		/*
+-		 * 0171: the first out-of-band command reset the whole phone without the ADSP saying
+-		 * anything: memory the ADSP reads must be shared with its VM (as rmtfs's is with the
+-		 * modem's). HLOS keeps it, LPASS (22) and the ADSP heap (0x25, the device tree's
+-		 * qcom,adsp-remoteheap-vmid) get it read-write.
+-		 */
+-		/*
+-		 * 0172: { HLOS, LPASS, ADSP heap } refused (ret -2, res 0x56). The first of these
+-		 * TrustZone takes: LPASS (22) alone with HLOS, the ADSP Q6 (6), the heap (0x25).
+-		 */
+-		static const struct { uint32_t v[3]; unsigned n; const char *what; } tries[] = {
+-			{ { VMID_HLOS, 0x16 }, 2, "HLOS + LPASS" },
+-			{ { VMID_HLOS, 6 }, 2, "HLOS + ADSP_Q6" },
+-			{ { VMID_HLOS, 0x25 }, 2, "HLOS + ADSP heap" },
+-			{ { VMID_HLOS, 0x16, 6 }, 3, "HLOS + LPASS + ADSP_Q6" },
+-		};
+-		uint64_t ar = ~0ull;
+-		for (unsigned t = 0; t < sizeof(tries) / sizeof(tries[0]) && ar != 0; t++) {
+-			ar = scm_assign(buf_pa, tone + 0x1000, tries[t].v, tries[t].n);
+-			LOG("adsp: shared memory %llx+%x to %s: %llx", buf_pa, tone + 0x1000, tries[t].what, ar);
+-		}
+-		IOSleep(300);
+-		if (ar != 0) {
+-			LOG("adsp: not assigned: the ADSP must not touch it, the test stops here");
+-			return;
+-		}
+-	}
++	bzero(buf, tone + 0x1000);
++	LOG("adsp: buffers in kernel memory at %llx (%u bytes), write-combined", buf_pa, tone + 0x1000);
++	/* kept for the rest of the session: the ADSP may hold on to the mapping */
+ 	for (unsigned i = 0; i < A_NBUF * A_PERIOD; i++) {
+ 		/* 1 kHz at 48 kHz: 48 samples a period; a triangle is enough to be heard */
+ 		int ph = (int)(i % 48);
+-- 
+2.43.0
+
