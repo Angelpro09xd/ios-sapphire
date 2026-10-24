@@ -1,0 +1,89 @@
+From 3b26faea6c102b282fc718c8f8759204f70323ef Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 22:08:12 +0000
+Subject: [PATCH] sapphire-0202: RPM votes over kern.sweet_audio (op 6): the
+ DDR's clock and the buses
+
+memcpy on the phone moves 1.7 GB/s: the DDR runs far below its clock (an
+A73 on LPDDR4X at speed gets 6-8), and the GPU's blurs, tens of MB a
+frame, wait on it. Nothing here votes the BIMC (the DDR) or the NoCs.
+rpm_kvp() sends one key-value pair to any RPM resource; kern.sweet_audio
+op 6 sends it from user space (clk2 memory: BIMC 0; clk1 bus: SNOC 2,
+CNOC 1; clk0 misc: RPM clock scaling), so the votes can be tried live
+before any is made at boot.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 51 +++++++++++++++++++++++++++++++++
+ 1 file changed, 51 insertions(+)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index e7e0e91..d89e9c8 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -9424,6 +9424,39 @@ rpm_ldo(uint32_t id, uint32_t uv, uint32_t ma, uint32_t set)
+ 	return rpm_status == 1 ? -4 : rpm_status;
+ }
+ 
++/*
++ * One key-value pair to an RPM resource (0202, kern.sweet_audio op 6): the buses and the DDR.
++ * smd-rpm types: "clk0" misc (key "Enab": RPM clock scaling), "clk1" bus (SNOC 2, CNOC 1),
++ * "clk2" memory (BIMC 0, the DDR), key "KHz" (Xiaomi topaz clk-smd-rpm.c, khaje = holi's clocks).
++ */
++static int
++rpm_kvp(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value)
++{
++	struct {
++		struct glink_msg m;
++		uint32_t chunk, left;
++		uint32_t svc, len, msg_id, flags, type, rid, dlen;
++		uint32_t kvp[3];
++	} __attribute__((packed)) pkt = {};
++	pkt.m.cmd = CMD_TX_DATA;
++	pkt.m.p1 = 1;
++	pkt.chunk = 8 + 20 + sizeof(pkt.kvp);
++	pkt.svc = 0x00716572;
++	pkt.len = 20 + sizeof(pkt.kvp);
++	pkt.msg_id = rpm_msg_id++;
++	pkt.flags = set;
++	pkt.type = type;
++	pkt.rid = id;
++	pkt.dlen = sizeof(pkt.kvp);
++	pkt.kvp[0] = key; pkt.kvp[1] = 4; pkt.kvp[2] = value;
++	rpm_status = 1;
++	if (!rpm_write(&pkt, sizeof(pkt), NULL, 0)) {
++		return -3;
++	}
++	rpm_poll(1000, rpm_answered);
++	return rpm_status == 1 ? -4 : rpm_status;
++}
++
+ /* ---------------- the codec: from the RX macro to the speaker (audio=2) */
+ 
+ /*
+@@ -10464,6 +10497,24 @@ audio_request(void)
+ 		audio_test();
+ 		rsp = a_live;
+ 		break;
++	case 6: {
++		/* an RPM vote: target = resource (1 "clk2" memory, 2 "clk1" bus, 3 "clk0" misc), addr = id | set << 15,
++		 * value: kHz (misc: "Enab" value) */
++		static const uint32_t types[] = { 0, 0x326b6c63, 0x316b6c63, 0x306b6c63 };
++		if (!rpm_is_up() && !rpm_start()) {
++			rsp = ~0ull;
++			break;
++		}
++		if (tg >= 1 && tg <= 3) {
++			int r = rpm_kvp((ad >> 15) & 1, types[tg], ad & 0x7fff, tg == 3 ? 0x62616e45 : 0x007a484b, v);
++			LOG("adsp: RPM vote %s %u set %u = %u: %d", tg == 1 ? "clk2" : tg == 2 ? "clk1" : "clk0", ad & 0x7fff,
++			    (ad >> 15) & 1, v, r);
++			rsp = (uint64_t)(int64_t)r;
++		} else {
++			rsp = ~0ull;
++		}
++		break;
++	}
+ 	case 5:
+ 		a_flags = v;
+ 		rsp = a_flags;
+-- 
+2.43.0
+
