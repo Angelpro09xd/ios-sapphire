@@ -1,0 +1,143 @@
+From 19e0f640a930e069388405ac2ed8c069953d08e5 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 14:54:32 +0000
+Subject: [PATCH] sapphire-0193: the FS1815 volume, and what every stage says
+ while the tone plays
+
+0192 on the phone: every stage came up (both SoundWire links, both
+WCD937x slaves, its efuses read without an error, AUX on, both FS1815
+started, the ADSP taking the tone at 48 kHz) and nothing was heard.
+fsm_config_vol was left out of the amplifiers' start: volume 0xff << 8
+now goes to 0x06 (and 0x16 | 0x80, the module's other variant). Two
+seconds into the tone: both amplifiers' registers, the WCD937x's
+interrupt status (AUX short circuit, PDM watchdog), supplies and AUX
+PA, the RX SoundWire master's interrupt and slave status, and the PMIC's
+L14 (cdc-vdd-buck) and L9 (vddpx/rxtx) as the RPM left them, read over
+SPMI (sweet_spmi_read_any, read only).
+---
+ bsd/dev/sweet_spmi.c            | 34 +++++++++++++++++++++++
+ iokit/Kernel/arm/TopazModem.cpp | 48 +++++++++++++++++++++++++++++++++
+ 2 files changed, 82 insertions(+)
+
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490..d0c5073 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -83,6 +83,40 @@ sweet_spmi_init(void)
+ 	return 0;
+ }
+ 
++/* Any PMIC register, read only (the audio test looks at regulators the RPM owns). */
++int sweet_spmi_read_any(unsigned sid, unsigned addr, uint8_t *out);
++int
++sweet_spmi_read_any(unsigned sid, unsigned addr, uint8_t *out)
++{
++	if (!sp_ready || !out || sid > 15 || addr > 0xffffu) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid((sid << 8) | (addr >> 8));
++	if (apid == SP_NO_APID || sp_poisoned[apid]) {
++		IOLockUnlock(sp_lock);
++		return -2;
++	}
++	unsigned off = 0x80u * apid;
++	uint32_t cmd = (1u << 27) | ((addr & 0xffu) << 4);
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(sp_obs + off) = cmd;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(sp_obs, off + 0x08u);
++		if (status & 1u) {
++			int r = (status & 0x0eu) ? -3 : 0;
++			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
++			IOLockUnlock(sp_lock);
++			return r;
++		}
++		delay(1);
++	}
++	sp_poisoned[apid] = true;
++	IOLockUnlock(sp_lock);
++	return -4;
++}
++
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 3803ce6..b2a9654 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -9339,7 +9339,14 @@ fs_init(uint8_t a, uint16_t scene_vol)
+ 	(void)fs_wr(a, 0xbc, 0x9433);
+ 	(void)fs_wr(a, 0x11, 0x8f);
+ 	(void)fs_wr(a, 0x10, 0x0000);
++	/* fsm_config_vol (0192 left it out): volume 0xff (0 dB) << 8 into 0x06, or into 0x16 with 0x80 */
++	uint16_t v06 = 0, v16 = 0;
++	(void)fs_rd(a, 0x06, &v06);
++	(void)fs_rd(a, 0x16, &v16);
++	(void)fs_wr(a, 0x06, 0xff00);
++	(void)fs_wr(a, 0x16, 0xff80);
+ 	IOSleep(10);
++	LOG("adsp: FS1815 0x%02x: volume registers were 06 %04x 16 %04x", a, v06, v16);
+ 	uint16_t st = 0, s11 = 0;
+ 	(void)fs_rd(a, 0x00, &st);
+ 	(void)fs_rd(a, 0x11, &s11);
+@@ -9573,6 +9580,44 @@ codec_aux_on(void)
+ 	    w_rd(0x3008), w_rd(0x3128), w_rd(0x3408), w_rd(0x3409), c_rd(c_rx, 0x500), c_rd(c_rx, 0x504), s_va.errors);
+ }
+ 
++extern "C" int sweet_spmi_init(void);
++extern "C" int sweet_spmi_read_any(unsigned sid, unsigned addr, uint8_t *out);
++
++/* what each stage of the speaker path says while the tone plays */
++static void
++audio_diag(const char *when)
++{
++	char line[200];
++	unsigned n = 0;
++	for (unsigned a = 0x34; a <= 0x35; a++) {
++		n = (unsigned)snprintf(line, sizeof(line), "FS1815 0x%02x:", a);
++		static const uint8_t regs[] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x0e, 0x10, 0x11, 0x14, 0x16, 0x18, 0x19, 0x20, 0x22, 0x23 };
++		for (unsigned i = 0; i < sizeof(regs) && n < sizeof(line) - 12; i++) {
++			uint16_t v = 0;
++			(void)fs_rd((uint8_t)a, regs[i], &v);
++			n += (unsigned)snprintf(line + n, sizeof(line) - n, " %02x=%04x", regs[i], v);
++		}
++		LOG("adsp: %s: %s", when, line);
++	}
++	if (w_tx_dev != 0) {
++		LOG("adsp: %s: WCD intr status %02x %02x %02x, RX_SUPPLIES %02x AUXPA %02x PDM_WD_CTL2 %02x; SWR RX intr %08x status %08x, VA intr %08x",
++		    when, w_rd(0x346E), w_rd(0x346F), w_rd(0x3470), w_rd(0x3008), w_rd(0x3128), w_rd(0x3467),
++		    c_rxswr ? c_rd(c_rxswr, 0x200) : 0, c_rxswr ? c_rd(c_rxswr, 0x1090) : 0, c_vaswr ? c_rd(c_vaswr, 0x200) : 0);
++	}
++	(void)sweet_spmi_init();
++	for (unsigned sid = 0; sid <= 1; sid++) {
++		uint8_t l14[4] = {}, l9[4] = {};
++		static const uint16_t offs[] = { 0x08, 0x46, 0x40, 0x41 };
++		int e14 = 0, e9 = 0;
++		for (unsigned i = 0; i < 4; i++) {
++			e14 |= sweet_spmi_read_any(sid, 0x4D00 + offs[i], &l14[i]);
++			e9 |= sweet_spmi_read_any(sid, 0x4800 + offs[i], &l9[i]);
++		}
++		LOG("adsp: %s: PMIC sid %u L14 (cdc-vdd-buck): status %02x en %02x volt %02x%02x (%d); L9 (vddpx/rxtx): status %02x en %02x volt %02x%02x (%d)",
++		    when, sid, l14[0], l14[1], l14[3], l14[2], e14, l9[0], l9[1], l9[3], l9[2], e9);
++	}
++}
++
+ static void
+ audio_test(void)
+ {
+@@ -9725,6 +9770,9 @@ audio_test(void)
+ 		if (ms % 1000 == 999) {
+ 			LOG("adsp: t+%u ms: %u buffers written, %u returned", a_ms - t0, sent, a_writes_done);
+ 		}
++		if (ms == 2000 && codec) {
++			audio_diag("playing");
++		}
+ 		IOSleep(1);
+ 		a_ms++;
+ 	}
+-- 
+2.43.0
+
