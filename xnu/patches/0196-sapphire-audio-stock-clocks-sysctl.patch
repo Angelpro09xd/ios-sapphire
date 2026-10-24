@@ -1,0 +1,579 @@
+From bf315fdfc1786954469dd65cf7d6b27feed0c53b Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 15:59:16 +0000
+Subject: [PATCH] sapphire-0196: the stock codec clocks and RX macro table
+ (topaz), beeps over ssh
+
+0195 on the phone: L14 on, everything powered, nothing heard, not even
+from the headphones. ios-topaz / topaz-woa (same SoC, same WCD937x AUX
+path) only heard sound once they did as stock Android does: ask the DSP
+for the TX core/NPL clocks only and leave the RX MCLK mux at 0 (RX and VA
+run on the TX MCLK), start the TX macro's clocks, pulse the SoundWire
+CGCRs, and write the 119 RX macro registers of a stock dump taken while
+playing. All that here, with the stock WCD937x values; the headphones
+only on request.
+
+kern.sweet_audio (bsd/dev/sweet_audio_ctl.c) hands requests to the ADSP
+thread: beeps on the graph the 45 s test leaves open, register reads and
+writes (WCD937x, RX/VA macros, SoundWire masters and slave, FS1815), the
+whole test again, and flags that bring back the 0195 ways one by one.
+---
+ bsd/conf/files                  |   1 +
+ bsd/dev/sweet_audio_ctl.c       |  44 +++++
+ iokit/Kernel/arm/TopazModem.cpp | 325 ++++++++++++++++++++++++--------
+ 3 files changed, 293 insertions(+), 77 deletions(-)
+ create mode 100644 bsd/dev/sweet_audio_ctl.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index f9e6ae1..2b91060 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
++bsd/dev/sweet_audio_ctl.c		standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+diff --git a/bsd/dev/sweet_audio_ctl.c b/bsd/dev/sweet_audio_ctl.c
+new file mode 100644
+index 0000000..4e2049c
+--- /dev/null
++++ b/bsd/dev/sweet_audio_ctl.c
+@@ -0,0 +1,44 @@
++/*
++ * kern.sweet_audio: the audio test driven from user space (ssh), carried out by TopazModem's
++ * ADSP thread, which owns the GLINK edge and the SoundWire buses.
++ * Write a request, read the answer:
++ *   op << 56 | target << 48 | addr << 32 | value
++ *   op 1 beep (value: seconds), 2 write, 3 read (the answer: the value), 4 the whole test again,
++ *   5 test flags (value; TopazModem.cpp a_flags)
++ *   target 1 WCD937x, 2 RX macro, 3 VA macro, 4 RX SoundWire master, 5 VA SoundWire master,
++ *   6 FS1815 (addr: I2C address << 8 | register), 7 the WCD937x's RX SoundWire slave
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/kernel.h>
++#include <sys/sysctl.h>
++#include <sys/errno.h>
++#include <libkern/libkern.h>
++
++extern void IOSleep(unsigned int milliseconds);
++
++volatile uint64_t sweet_audio_req, sweet_audio_rsp;
++volatile uint32_t sweet_audio_seq, sweet_audio_done;
++
++static int
++sysctl_sweet_audio SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint64_t v = sweet_audio_rsp;
++	int err = sysctl_io_number(req, (long long)v, sizeof(v), &v, NULL);
++	if (err != 0 || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	uint32_t seq = sweet_audio_seq + 1;
++	sweet_audio_req = v;
++	__asm__ volatile("dmb ish" ::: "memory");
++	sweet_audio_seq = seq;
++	for (int i = 0; i < 60000 && sweet_audio_done != seq; i++) {
++		IOSleep(1);
++	}
++	return sweet_audio_done == seq ? 0 : ETIMEDOUT;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_audio, CTLTYPE_QUAD | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_audio, "Q", "audio test requests (sweet_audio_ctl.c)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index b998263..69c0fc2 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -9437,12 +9437,13 @@ rpm_ldo(uint32_t id, uint32_t uv, uint32_t ma, uint32_t set)
+ #define RXSWR_HCTL_PA   0x0A6A9098ull
+ #define RX_MUXSEL_PA    0x0A5640D8ull           /* qcom,rx_mclk_mode_muxsel */
+ #define VAM_PA          0x0A730000ull           /* VA macro */
++#define TXM_PA          0x0A620000ull           /* TX macro */
+ #define VASWR_PA        0x0A740000ull
+ #define VASWR_HCTL_PA   0x0A7EC100ull
+ #define VA_WAKEUP_PA    0x003CA04Cull           /* qcom,chip-wakeup-reg of the VA SoundWire pins */
+ #define TLMM_WEST_PA    0x00500000ull           /* GPIO 92: the WCD937x's reset */
+ 
+-static volatile uint8_t *c_rx, *c_va, *c_rxswr, *c_vaswr;
++static volatile uint8_t *c_rx, *c_va, *c_tx, *c_rxswr, *c_vaswr;
+ 
+ static inline uint32_t c_rd(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
+ static inline void c_wr(volatile uint8_t *b, uint32_t o, uint32_t v) { mb(); *(volatile uint32_t *)(b + o) = v; mb(); }
+@@ -9670,11 +9671,41 @@ fs_init(uint8_t a, uint16_t scene_vol)
+ 	return id == 0x0003 || id == 0x0300;
+ }
+ 
++/*
++ * a_flags (kern.sweet_audio op 5): 1 the RX clocks and RX MCLK mux 1 as 0192-0195 had them (stock
++ * asks only for the TX ones: topaz-woa P9_audio.md, "root cause"), 2 without the stock RX macro
++ * table, 4 the headphones too, 8 without the FS1815 init.
++ */
++static uint32_t a_flags;
++
++/* RX macro registers from the stock Android dump while playing (topaz-woa TopazSpeaker rxtab.h) */
++static const uint16_t rx_stock[][2] = {
++	{ 0x070, 0x11 }, { 0x074, 0x20 }, { 0x080, 0x11 }, { 0x084, 0x20 }, { 0x090, 0x0c }, { 0x094, 0x0c },
++	{ 0x098, 0x0c }, { 0x110, 0x08 }, { 0x144, 0x38 }, { 0x190, 0x07 }, { 0x200, 0x01 }, { 0x204, 0x03 },
++	{ 0x208, 0x02 }, { 0x20c, 0x1c }, { 0x210, 0x39 }, { 0x214, 0x0c }, { 0x218, 0x0c }, { 0x21c, 0x01 },
++	{ 0x228, 0x80 }, { 0x238, 0x07 }, { 0x244, 0x02 }, { 0x248, 0x9a }, { 0x24c, 0x10 }, { 0x284, 0x10 },
++	{ 0x290, 0x04 }, { 0x294, 0xe0 }, { 0x298, 0x01 }, { 0x29c, 0x40 }, { 0x2a0, 0x2a }, { 0x2ac, 0x18 },
++	{ 0x2b0, 0x18 }, { 0x2b4, 0x03 }, { 0x2b8, 0x01 }, { 0x2c4, 0x64 }, { 0x2c8, 0x01 }, { 0x2d8, 0x0c },
++	{ 0x2e0, 0x77 }, { 0x2e4, 0x01 }, { 0x2ec, 0x4b }, { 0x2f4, 0x01 }, { 0x300, 0x04 }, { 0x304, 0x08 },
++	{ 0x308, 0x0c }, { 0x30c, 0xe2 }, { 0x314, 0x04 }, { 0x318, 0x3e }, { 0x360, 0xff }, { 0x380, 0xff },
++	{ 0x408, 0x64 }, { 0x40c, 0x8f }, { 0x410, 0x02 }, { 0x418, 0x04 }, { 0x41c, 0x7e }, { 0x424, 0x08 },
++	{ 0x434, 0x02 }, { 0x438, 0x08 }, { 0x440, 0x08 }, { 0x450, 0x55 }, { 0x454, 0x55 }, { 0x458, 0x55 },
++	{ 0x488, 0x64 }, { 0x48c, 0x8f }, { 0x490, 0x02 }, { 0x498, 0x04 }, { 0x49c, 0x7e }, { 0x4a4, 0x08 },
++	{ 0x4b4, 0x02 }, { 0x4b8, 0x08 }, { 0x4c0, 0x08 }, { 0x4d0, 0x55 }, { 0x4d4, 0x55 }, { 0x4d8, 0x55 },
++	{ 0x504, 0x18 }, { 0x508, 0x64 }, { 0x50c, 0x8f }, { 0x510, 0x02 }, { 0x518, 0x04 }, { 0x51c, 0x7e },
++	{ 0x524, 0x04 }, { 0x528, 0x08 }, { 0x540, 0x02 }, { 0x544, 0x08 }, { 0x54c, 0x01 }, { 0x784, 0x07 },
++	{ 0x788, 0x3c }, { 0x800, 0x60 }, { 0x804, 0xdb }, { 0x808, 0xff }, { 0x80c, 0x35 }, { 0x810, 0xff },
++	{ 0x818, 0x01 }, { 0x81c, 0x28 }, { 0x840, 0x60 }, { 0x844, 0xdb }, { 0x848, 0xff }, { 0x84c, 0x35 },
++	{ 0x850, 0xff }, { 0x858, 0x01 }, { 0x85c, 0x28 }, { 0xa24, 0x40 }, { 0xaa4, 0x40 }, { 0xb40, 0x04 },
++	{ 0xb50, 0x04 }, { 0xc04, 0x01 }, { 0xc44, 0x01 }, { 0xc84, 0x01 }, { 0xd0c, 0xa8 }, { 0xd4c, 0xa8 },
++	{ 0xd8c, 0xa8 }, { 0xf08, 0x62 }, { 0xf0c, 0x96 }, { 0xf88, 0x62 }, { 0xf8c, 0x96 },
++};
++
+ static void
+ lpi_pin(volatile uint8_t *lpi, unsigned gpio, unsigned pull)
+ {
+-	/* LPI cfg: pull [1:0], function [5:2] = 1, drive [8:6] = 10 mA */
+-	c_wr(lpi, gpio * 0x1000u, (pull & 3) | (1u << 2) | (4u << 6));
++	/* LPI cfg: pull [1:0], function [5:2] = 1, drive [8:6] = 10 mA, bits 10/11 as stock (0xD04 / 0xD06) */
++	c_wr(lpi, gpio * 0x1000u, (pull & 3) | (1u << 2) | (4u << 6) | (3u << 10));
+ }
+ 
+ /* everything from the clocks to the amplifiers; returns whether the codec is there */
+@@ -9692,50 +9723,45 @@ codec_up(void)
+ 	volatile uint8_t *west = (volatile uint8_t *)ml_io_map(TLMM_WEST_PA + 92 * 0x1000u, 0x1000);
+ 	c_rx = (volatile uint8_t *)ml_io_map(RXM_PA, 0x1000);
+ 	c_va = (volatile uint8_t *)ml_io_map(VAM_PA, 0x1000);
++	c_tx = (volatile uint8_t *)ml_io_map(TXM_PA, 0x1000);
+ 	c_rxswr = (volatile uint8_t *)ml_io_map(RXSWR_PA, 0x2000);
+ 	c_vaswr = (volatile uint8_t *)ml_io_map(VASWR_PA, 0x2000);
+ 	volatile uint8_t *rxh = (volatile uint8_t *)ml_io_map(RXSWR_HCTL_PA & ~0xFFFull, 0x1000);
+ 	volatile uint8_t *vah = (volatile uint8_t *)ml_io_map(VASWR_HCTL_PA & ~0xFFFull, 0x1000);
+-	if (!lpi || !slew || !muxsel || !wake || !west || !c_rx || !c_va || !c_rxswr || !c_vaswr || !rxh || !vah) {
++	if (!lpi || !slew || !muxsel || !wake || !west || !c_rx || !c_va || !c_tx || !c_rxswr || !c_vaswr || !rxh || !vah) {
+ 		LOG("adsp: codec: a mapping failed");
+ 		return false;
+ 	}
+ 	s_rx.b = c_rxswr;
+ 	s_va.b = c_vaswr;
+ 
+-	/* RX macro clock from the RX core clock (bolero-clk-rsc: the mux after the clock is on) */
+-	c_wr(muxsel, RX_MUXSEL_PA & 0xFFF, 1);
++	/* RX macro clock: from the TX MCLK as stock (mux 0); 0192-0195 had the RX core clock (mux 1) */
++	if (a_flags & 1) {
++		c_wr(muxsel, RX_MUXSEL_PA & 0xFFF, 1);
++	}
+ 	/* SoundWire pins: VA 0 clk, 1/2 data; RX 3 clk, 4/5 data (bus keeper on data), slew 3 */
+ 	lpi_pin(lpi, 0, 0); lpi_pin(lpi, 1, 2); lpi_pin(lpi, 2, 2);
+ 	lpi_pin(lpi, 3, 0); lpi_pin(lpi, 4, 2); lpi_pin(lpi, 5, 2);
+ 	{
+-		static const uint8_t so[] = { 0x00, 0x02, 0x04, 0x08, 0x0a, 0x0c };
+-		uint32_t v = c_rd(slew, 0);
+-		for (unsigned i = 0; i < 6; i++) {
+-			v |= 3u << so[i];
+-		}
+-		c_wr(slew, 0, v);
++		c_wr(slew, 0, 0x3F3F);                  /* as stock */
+ 	}
+ 	c_upd(wake, VA_WAKEUP_PA & 0xFFF, 1, 1);
+-	/* FS generation (the device tree's qcom,fs-gen-sequence, VA macro registers) */
+-	c_upd(c_va, 0x000, 0x1, 0x1);
+-	c_upd(c_va, 0x004, 0x3, 0x3);
+-	c_upd(c_va, 0x004, 0x3, 0x1);
+-	c_upd(c_va, 0x080, 0x2, 0x2);
+-	/* RX macro: probe-time settings, MCLK, FS counter, SoundWire clock with a reset */
++	/* topaz-woa TopazSpeaker hw.c CodecBringUp(), the stock sequence: VA fs-gen + SWR clock */
++	c_wr(c_va, 0x000, 1); c_wr(c_va, 0x004, 3); c_wr(c_va, 0x004, 1); c_wr(c_va, 0x080, 2);
++	c_wr(c_va, 0x008, 2); c_wr(c_va, 0x008, 3); c_wr(c_va, 0x008, 1);
++	/* RX macro probe-time settings, MCLK, FS counter, SWR clock */
+ 	c_upd(c_rx, 0x434, 0x7, 0x2); c_upd(c_rx, 0x4b4, 0x7, 0x2); c_upd(c_rx, 0x540, 0x7, 0x2);
+ 	c_upd(c_rx, 0x410, 0x3, 0x2); c_upd(c_rx, 0x490, 0x3, 0x2); c_upd(c_rx, 0x510, 0x3, 0x2);
+-	c_upd(c_rx, 0x100, 0x3, 0x3);
+-	c_upd(c_rx, 0x104, 0x2, 0x0);
+-	c_upd(c_rx, 0x104, 0x1, 0x1);
+-	c_upd(c_rx, 0x108, 0x2, 0x2); c_upd(c_rx, 0x108, 0x1, 0x1); c_upd(c_rx, 0x108, 0x2, 0x0);
+-	/* VA macro's SoundWire clock with a reset */
+-	c_upd(c_va, 0x008, 0x2, 0x2); c_upd(c_va, 0x008, 0x1, 0x1); c_upd(c_va, 0x008, 0x2, 0x0);
++	c_wr(c_rx, 0x100, 3); c_wr(c_rx, 0x104, 3); c_wr(c_rx, 0x104, 1);
++	c_wr(c_rx, 0x108, 2); c_wr(c_rx, 0x108, 3); c_wr(c_rx, 0x108, 1);
++	/* TX macro MCLK, FS, SWR clock: RX and VA run on the TX MCLK (0192-0195 left it off) */
++	c_wr(c_tx, 0x000, 1); c_wr(c_tx, 0x004, 3); c_wr(c_tx, 0x004, 1);
++	c_wr(c_tx, 0x008, 2); c_wr(c_tx, 0x008, 3); c_wr(c_tx, 0x008, 1);
+ 	LOG("adsp: RX macro MCLK %08x FS %08x SWR %08x; VA MCLK %08x FS %08x SWR %08x TOP %08x", c_rd(c_rx, 0x100),
+ 	    c_rd(c_rx, 0x104), c_rd(c_rx, 0x108), c_rd(c_va, 0x0), c_rd(c_va, 0x4), c_rd(c_va, 0x8), c_rd(c_va, 0x80));
+-	/* the SWR 1.6 hardware-control workaround: gate hw_ctl */
+-	c_upd(rxh, RXSWR_HCTL_PA & 0xFFF, 0x2, 0x0);
+-	c_upd(vah, VASWR_HCTL_PA & 0xFFF, 0x2, 0x0);
++	/* the SoundWire CGCRs: clock on with a reset pulse (stock) */
++	c_wr(rxh, RXSWR_HCTL_PA & 0xFFF, 3); IOSleep(1); c_wr(rxh, RXSWR_HCTL_PA & 0xFFF, 1);
++	c_wr(vah, VASWR_HCTL_PA & 0xFFF, 3); IOSleep(1); c_wr(vah, VASWR_HCTL_PA & 0xFFF, 1);
+ 
+ 	/* WCD937x out of reset (active low, GPIO 92 as an output) */
+ 	{
+@@ -9782,13 +9808,25 @@ codec_up(void)
+ 	if (e16 == 0x01 || e16 == 0x02) {
+ 		w_upd(0x3029, 0xF0, 0xB0);
+ 	}
+-	LOG("adsp: WCD937x init: SLEEP_CTL %02x ANA_BIAS %02x", w_rd(0x3103), w_rd(0x3001));
++	/* the stock values topaz-woa wcd_aux.ps1 / wcd_auxpa.ps1 write */
++	w_wr(0x30A5, 0xEB);                         /* FLYBACK_VNEG_CTRL_1 */
++	w_wr(0x340D, 0xBC); w_wr(0x340E, 0xBC); w_wr(0x340F, 0xBC);   /* CDC_RX0..2_CTL */
++	w_wr(0x300A, 0x40); w_wr(0x300B, 0x12);     /* ANA_EAR, ANA_EAR_COMPANDER_CTL */
++	w_wr(0x346B, 0x4C); w_wr(0x346C, 0x7F); w_wr(0x346D, 0x0F);
++	if (!(a_flags & 2)) {
++		for (unsigned i = 0; i < sizeof(rx_stock) / sizeof(rx_stock[0]); i++) {
++			c_wr(c_rx, rx_stock[i][0], rx_stock[i][1]);
++		}
++		c_wr(c_rx, 0x400, 4); c_wr(c_rx, 0x480, 4); c_wr(c_rx, 0x500, 4);
++	}
++	LOG("adsp: WCD937x init: SLEEP_CTL %02x ANA_BIAS %02x; RX macro stock table %s, flags %x", w_rd(0x3103), w_rd(0x3001),
++	    (a_flags & 2) ? "skipped" : "written", a_flags);
+ 	return true;
+ }
+ 
+ /* SoundWire ports for the AUX path on the RX master and the WCD937x's RX slave, then a bank switch */
+ static void
+-swr_ports_on(void)
++swr_ports_on(bool hph)
+ {
+ 	struct swrm *m = &s_rx;
+ 	uint8_t dev = w_rx_dev;
+@@ -9815,13 +9853,13 @@ swr_ports_on(void)
+ 		swr_write(m, dev, (uint16_t)(0x125 + o4 + bk), 0);
+ 		swr_write(m, dev, (uint16_t)(0x128 + o4 + bk), 0);
+ 		/* slave DP1 (HPH L+R, swrm_port_config.h rx_frame_params): si 3, off1 0, off2 0, word length 1, lane 1 */
+-		swr_write(m, dev, (uint16_t)(0x120 + bk), 0x3);
++		swr_write(m, dev, (uint16_t)(0x120 + bk), hph ? 0x3 : 0);
+ 		swr_write(m, dev, (uint16_t)(0x122 + bk), 3);
+ 		swr_write(m, dev, (uint16_t)(0x124 + bk), 0);
+ 		swr_write(m, dev, (uint16_t)(0x125 + bk), 0);
+ 		swr_write(m, dev, (uint16_t)0x103, 1);
+ 		swr_write(m, dev, (uint16_t)(0x128 + bk), 1);
+-		c_wr(m->b, 0x1124 + 0x40 * bank, (3u << 24) | (0 << 16) | (0 << 8) | 3);
++		c_wr(m->b, 0x1124 + 0x40 * bank, (hph ? 3u << 24 : 0) | (0 << 16) | (0 << 8) | 3);
+ 		c_wr(m->b, 0x1128 + 0x40 * bank, 1);                      /* lane 1 */
+ 		c_wr(m->b, 0x112C, 1);
+ 		c_wr(m->b, 0x1134 + 0x40 * bank, (0xF << 4) | 0);
+@@ -9833,7 +9871,7 @@ swr_ports_on(void)
+ 		c_wr(m->b, 0x1138 + 0x100 * 1 + 0x40 * bank, 0);          /* block pack mode */
+ 		c_wr(m->b, 0x1124 + 0x100 * 3 + 0x40 * bank, (1u << 24) | (0 << 16) | (1 << 8) | 7);
+ 		c_wr(m->b, 0x1128 + 0x100 * 3 + 0x40 * bank, 0);
+-		c_wr(m->b, 0x1134 + 0x100 * 3 + 0x40 * bank, (0xF << 4) | 0);
++		c_wr(m->b, 0x1134 + 0x100 * 3 + 0x40 * bank, 0);             /* stock: 0 */
+ 		if (pass == 0) {
+ 			/* frame for data: 50 rows, 16 columns, SSP period 6, divider 1; switch to that bank */
+ 			uint32_t v = c_rd(m->b, 0x101C + 0x40 * bank) & ~0x00FF07FFu;
+@@ -9863,15 +9901,18 @@ static void
+ codec_rx_on(void)
+ {
+ 	/* RX macro: INT0 (HPHL), INT1 (HPHR), INT2 (AUX), each from RX2 at 48 kHz, muted while they start */
+-	c_upd(c_rx, 0x180, 0x0F, 7);                /* INT0_CFG0: INP0 = RX2 */
+-	c_upd(c_rx, 0x188, 0x0F, 7);                /* INT1_CFG0 */
+-	c_upd(c_rx, 0x190, 0x0F, 7);                /* INT2_CFG0 */
++	const bool hph = (a_flags & 4) != 0;
++	c_upd(c_rx, 0x190, 0x0F, 7);                /* INT2_CFG0: INP0 = RX2 */
+ 	c_upd(c_rx, 0x200, 0x01, 0x01);             /* class-H block clock */
+-	c_wr(c_rx, 0x220, 0xC0);                    /* CLSH_K1_LSB, K1_MSB 0 (16 ohm) */
+-	c_upd(c_rx, 0x21C, 0x0F, 0x00);
+-	c_upd(c_rx, 0x20C, 0x3F, 0x1C);             /* CLSH_HPH_V_PA */
+-	c_upd(c_rx, 0x208, 0x07, 0x00);             /* CLSH_DECAY_CTRL */
+-	for (unsigned k = 0; k < 2; k++) {
++	if (hph) {
++		c_upd(c_rx, 0x180, 0x0F, 7);        /* INT0_CFG0: INP0 = RX2 */
++		c_upd(c_rx, 0x188, 0x0F, 7);        /* INT1_CFG0 */
++		c_wr(c_rx, 0x220, 0xC0);            /* CLSH_K1_LSB, K1_MSB 0 (16 ohm) */
++		c_upd(c_rx, 0x21C, 0x0F, 0x00);
++		c_upd(c_rx, 0x20C, 0x3F, 0x1C);     /* CLSH_HPH_V_PA */
++		c_upd(c_rx, 0x208, 0x07, 0x00);     /* CLSH_DECAY_CTRL */
++	}
++	for (unsigned k = 0; hph && k < 2; k++) {
+ 		uint32_t b = 0x400 + 0x80 * k;
+ 		c_upd(c_rx, b + 0x00, 0x1F, 0x14);      /* PGA mute, 48 kHz */
+ 		c_upd(c_rx, b + 0x40, 0x01, 0x01);      /* DSM clock */
+@@ -9885,9 +9926,9 @@ codec_rx_on(void)
+ 	c_upd(c_rx, 0x500, 0x1F, 0x14);             /* RX2 path: PGA mute, 48 kHz */
+ 	c_upd(c_rx, 0x54C, 0x01, 0x01);             /* DSM clock (0x440 + 2 * 0x80 + 0xc) */
+ 	c_upd(c_rx, 0x50C, 0x03, 0x03);             /* HPF cut */
+-	c_upd(c_rx, 0x508, 0x04, 0x00);             /* AUX HPF off */
+ 	c_upd(c_rx, 0x504, 0x18, 0x18);             /* INT2 delay zone + class-H */
+ 	c_wr(c_rx, 0x514, 0x00);                    /* volume 0 dB */
++	c_wr(c_rx, 0x518, 0x04);                    /* RX2 mix path: 48 kHz (stock) */
+ 	c_upd(c_rx, 0x500, 0x20, 0x20);             /* path clock */
+ 
+ 	/* WCD937x: RX clocks (wcd937x_rx_clk_enable) */
+@@ -9897,9 +9938,11 @@ codec_rx_on(void)
+ 	w_upd(0x340D, 0x40, 0x00); w_upd(0x340E, 0x40, 0x00); w_upd(0x340F, 0x40, 0x00);
+ 	w_upd(0x3408, 0x02, 0x02);
+ 	/* RDAC1 / RDAC2 (HPHL / HPHR DACs), PRE_PMU */
+-	w_upd(0x3409, 0x03, 0x03);                  /* DIG_CLK_CTL: RX0, RX1 */
+-	w_upd(0x344E, 0x0C, 0x0C);                  /* CDC_HPH_GAIN_CTL */
+-	w_upd(0x30D9, 0x80, 0x00);                  /* HPH_RDAC_CLK_CTL1 */
++	if (hph) {
++		w_upd(0x3409, 0x03, 0x03);          /* DIG_CLK_CTL: RX0, RX1 */
++		w_upd(0x344E, 0x0C, 0x0C);          /* CDC_HPH_GAIN_CTL */
++		w_upd(0x30D9, 0x80, 0x00);          /* HPH_RDAC_CLK_CTL1 */
++	}
+ 	/* RDAC4 (AUX DAC), PRE_PMU */
+ 	w_upd(0x3408, 0x04, 0x04);
+ 	w_upd(0x3128, 0x10, 0x10);                  /* AUX_AUXPA */
+@@ -9922,39 +9965,46 @@ codec_rx_on(void)
+ 	w_wr(0x3098, 0x3A);                         /* CLASSH_MODE_2 */
+ 	IODelay(550);
+ 	/* the SoundWire data path */
+-	swr_ports_on();
+-	/* RDAC1 / RDAC2 POST_PMU, compander off */
+-	w_upd(0x3414, 0x03, 0x00);                  /* CDC_COMP_CTL_0 */
+-	w_upd(0x30D3, 0x20, 0x20);                  /* HPH_L_EN */
+-	w_upd(0x30D6, 0x20, 0x20);                  /* HPH_R_EN */
+-	w_upd(0x313A, 0x02, 0x00);                  /* HPH_NEW_INT_HPH_TIMER1 */
+-	/* HPHL / HPHR PGA, PRE_PMU: class-H HPH state (v3, CLS_AB) */
+-	w_upd(0x3008, 0x02, 0x00);                  /* buck regulator mode */
+-	w_upd(0x30AF, 0xE0, 0xA0);                  /* force IQ */
+-	IODelay(110);
+-	w_upd(0x3099, 0x02, 0x02);                  /* CLASSH_MODE_3 */
+-	w_wr(0x3098, 0x1C);                         /* CLASSH_MODE_2 */
+-	w_upd(0x30C7, 0x0F, 0x0A);
+-	w_upd(0x30C7, 0xF0, 0xA0);
+-	IODelay(110);
+-	w_upd(0x3009, 0x0C, 0x0C);                  /* ANA_HPH: CLS_AB */
+-	w_upd(0x3009, 0x30, 0x30);                  /* ANA_HPH: HPHL, HPHR references */
+-	IODelay(110);
+-	w_upd(0x3465, 0x07, 0x03);                  /* PDM watchdogs HPHL, HPHR, AUX */
+-	w_upd(0x3466, 0x07, 0x03);
+-	w_upd(0x3467, 0x07, 0x07);
+-	/* the PAs */
+-	w_upd(0x3009, 0xC0, 0xC0);                  /* ANA_HPH: HPHL, HPHR PA */
++	swr_ports_on(hph);
++	w_upd(0x3009, 0x0C, 0x0C);                  /* ANA_HPH: CLS_AB (stock writes it for AUX too) */
++	if (hph) {
++		/* RDAC1 / RDAC2 POST_PMU, compander off */
++		w_upd(0x3414, 0x03, 0x00);                  /* CDC_COMP_CTL_0 */
++		w_upd(0x30D3, 0x20, 0x20);                  /* HPH_L_EN */
++		w_upd(0x30D6, 0x20, 0x20);                  /* HPH_R_EN */
++		w_upd(0x313A, 0x02, 0x00);                  /* HPH_NEW_INT_HPH_TIMER1 */
++		/* HPHL / HPHR PGA, PRE_PMU: class-H HPH state (v3, CLS_AB) */
++		w_upd(0x3008, 0x02, 0x00);                  /* buck regulator mode */
++		w_upd(0x30AF, 0xE0, 0xA0);                  /* force IQ */
++		IODelay(110);
++		w_upd(0x3099, 0x02, 0x02);                  /* CLASSH_MODE_3 */
++		w_wr(0x3098, 0x1C);                         /* CLASSH_MODE_2 */
++		w_upd(0x30C7, 0x0F, 0x0A);
++		w_upd(0x30C7, 0xF0, 0xA0);
++		IODelay(110);
++		w_upd(0x3009, 0x0C, 0x0C);                  /* ANA_HPH: CLS_AB */
++		w_upd(0x3009, 0x30, 0x30);                  /* ANA_HPH: HPHL, HPHR references */
++		IODelay(110);
++		w_upd(0x3465, 0x07, 0x03);                  /* PDM watchdogs HPHL, HPHR */
++		w_upd(0x3466, 0x07, 0x03);
++		w_upd(0x3009, 0xC0, 0xC0);                  /* ANA_HPH: HPHL, HPHR PA */
++	}
++	/* the AUX PA (topaz-woa wcd_auxpa.ps1) */
++	w_wr(0x3467, 0x05);                         /* PDM watchdog AUX */
+ 	w_upd(0x3128, 0x80, 0x80);                  /* AUX PA */
+ 	IOSleep(21);
+ 	/* POST_PMU */
+-	w_upd(0x313A, 0x02, 0x02);
+-	w_upd(0x3008, 0x02, 0x02);                  /* CLS_AB regulator mode */
++	if (hph) {
++		w_upd(0x313A, 0x02, 0x02);
++		w_upd(0x3008, 0x02, 0x02);          /* CLS_AB regulator mode */
++	}
+ 	w_upd(0x3008, 0x40, 0x40);                  /* AUX PA supplies */
+ 	w_upd(0x3008, 0x80, 0x80);
+ 	/* unmute */
+-	c_upd(c_rx, 0x400, 0x10, 0x00);
+-	c_upd(c_rx, 0x480, 0x10, 0x00);
++	if (hph) {
++		c_upd(c_rx, 0x400, 0x10, 0x00);
++		c_upd(c_rx, 0x480, 0x10, 0x00);
++	}
+ 	c_upd(c_rx, 0x500, 0x10, 0x00);
+ 	LOG("adsp: RX on: WCD RX_SUPPLIES %02x ANA_HPH %02x AUXPA %02x HPH_L_EN %02x ANA_CLK %02x DIG_CLK %02x; RX0 %08x RX1 %08x RX2 %08x; SWR VA errors %u",
+ 	    w_rd(0x3008), w_rd(0x3009), w_rd(0x3128), w_rd(0x30D3), w_rd(0x3408), w_rd(0x3409), c_rd(c_rx, 0x400),
+@@ -9988,6 +10038,9 @@ audio_diag(const char *when)
+ 	/* (0193: reading the PMIC over SPMI from here hung this thread: left out) */
+ }
+ 
++static bool a_live;
++static uint64_t a_live_buf;
++
+ static void
+ audio_test(void)
+ {
+@@ -10002,8 +10055,11 @@ audio_test(void)
+ 	crumbs_start();
+ 	r1 = a_prm(PARAM_ID_RSC_HW_CORE, macro, 1);
+ 	r2 = a_prm(PARAM_ID_RSC_HW_CORE, dcodec, 1);
+-	r3 = a_prm(PARAM_ID_RSC_AUDIO_HW_CLK, rx_core, 5);
+-	r4 = a_prm(PARAM_ID_RSC_AUDIO_HW_CLK, rx_npl, 5);
++	r3 = r4 = 0;
++	if (a_flags & 1) {                          /* stock asks only for the TX clocks (codec_up()) */
++		r3 = a_prm(PARAM_ID_RSC_AUDIO_HW_CLK, rx_core, 5);
++		r4 = a_prm(PARAM_ID_RSC_AUDIO_HW_CLK, rx_npl, 5);
++	}
+ 	LOG("adsp: PRM: LPASS core vote %lld, digital codec vote %lld, RX core clock %lld, RX NPL clock %lld (box %08x %08x %08x)",
+ 	    r1, r2, r3, r4, a_box.opcode, a_box.p[0], a_box.p[1]);
+ 	if (r1 == 0 && r3 == 0) {
+@@ -10019,7 +10075,9 @@ audio_test(void)
+ 	IOSleep(300);
+ 	a_amp_probe();
+ 	IOSleep(300);
+-	{
++	static bool rpm_done;
++	if (!rpm_done) {
++		rpm_done = true;
+ 		bool rpm = rpm_start();
+ 		int act = rpm ? rpm_ldo(14, 1800000, 650, 0) : -9, slp = rpm ? rpm_ldo(14, 1800000, 650, 1) : -9;
+ 		LOG("adsp: RPM: LDO14 (cdc-vdd-buck) on at 1.8 V: active set %d, sleep set %d (0: taken)", act, slp);
+@@ -10129,7 +10187,7 @@ audio_test(void)
+ 	if (codec) {
+ 		codec_rx_on();
+ 		IOSleep(200);
+-		bool a = fs_init(0x34, 0x000b), b = fs_init(0x35, 0x000e);
++		bool a = (a_flags & 8) || fs_init(0x34, 0x000b), b = (a_flags & 8) || fs_init(0x35, 0x000e);
+ 		LOG("adsp: speaker amplifiers: 0x34 %s, 0x35 %s", a ? "on" : "not found", b ? "on" : "not found");
+ 		IOSleep(200);
+ 	}
+@@ -10160,8 +10218,118 @@ audio_test(void)
+ 		    r32(s1_cbp, 0x68));
+ 	}
+ 	r1 = a_graph_mgmt(APM_CMD_GRAPH_STOP);
+-	r2 = a_graph_mgmt(APM_CMD_GRAPH_CLOSE);
+-	LOG("adsp: stop %lld, close %lld", r1, r2);
++	a_live = true;                              /* open and stopped: kern.sweet_audio beeps start it again */
++	a_live_buf = buf_pa;
++	LOG("adsp: stop %lld (the graph stays open for kern.sweet_audio)", r1);
++}
++
++/* kern.sweet_audio op 1: N seconds of beeps on the open graph */
++static void
++audio_beep(unsigned seconds)
++{
++	const uint32_t bytes = A_PERIOD * 2;
++	int64_t r1 = a_graph_mgmt(APM_CMD_GRAPH_PREPARE), r2 = a_graph_mgmt(APM_CMD_GRAPH_START);
++	LOG("adsp: beep %u s: prepare %lld, start %lld", seconds, r1, r2);
++	if (r2 != 0) {
++		return;
++	}
++	unsigned sent = 0, n = seconds * 100, t0 = a_ms;
++	a_writes_done = 0;
++	for (; sent < 4; sent++) {
++		a_write(a_live_buf + (sent % A_NBUF) * bytes, bytes, sent % A_NBUF);
++	}
++	for (unsigned ms = 0; ms < seconds * 1000 + 100; ms++) {
++		a_service();
++		while (sent < a_writes_done + 4 && sent < n) {
++			unsigned k = (sent / 50) % 2 == 0 ? sent % 4 : 4 + sent % 4;
++			a_write(a_live_buf + k * bytes, bytes, k);
++			sent++;
++		}
++		if (ms == 1500 && w_tx_dev != 0) {
++			audio_diag("beep");
++		}
++		IOSleep(1);
++		a_ms++;
++	}
++	r1 = a_graph_mgmt(APM_CMD_GRAPH_STOP);
++	LOG("adsp: beep done: %u of %u buffers back in %u ms, stop %lld", a_writes_done, sent, a_ms - t0, r1);
++}
++
++extern "C" {
++extern volatile uint64_t sweet_audio_req, sweet_audio_rsp;
++extern volatile uint32_t sweet_audio_seq, sweet_audio_done;
++}
++
++/* one kern.sweet_audio request (sweet_audio_ctl.c), on this thread */
++static void
++audio_request(void)
++{
++	if (sweet_audio_seq == sweet_audio_done) {
++		return;
++	}
++	mb();
++	uint64_t q = sweet_audio_req, rsp = 0;
++	uint32_t op = (uint32_t)(q >> 56), tg = (uint32_t)(q >> 48) & 0xFF, ad = (uint32_t)(q >> 32) & 0xFFFF, v = (uint32_t)q;
++	bool wr = op == 2;
++	volatile uint8_t *mm = tg == 2 ? c_rx : tg == 3 ? c_va : tg == 4 ? c_rxswr : tg == 5 ? c_vaswr : NULL;
++	switch (op) {
++	case 1:
++		if (a_live) {
++			audio_beep(MIN(MAX(v, 1u), 20u));
++		} else {
++			LOG("adsp: beep: no graph (the test at 45 s did not get that far)");
++			rsp = ~0ull;
++		}
++		break;
++	case 2:
++	case 3:
++		if (tg == 1 && w_tx_dev != 0) {
++			if (wr) {
++				w_wr((uint16_t)ad, (uint8_t)v);
++			}
++			rsp = w_rd((uint16_t)ad);
++		} else if (tg == 7 && w_rx_dev != 0) {
++			uint8_t b = 0;
++			if (wr) {
++				swr_write(&s_rx, w_rx_dev, (uint16_t)ad, (uint8_t)v);
++			}
++			rsp = swr_read(&s_rx, w_rx_dev, (uint16_t)ad, &b) == 0 ? b : ~0ull;
++		} else if (mm != NULL && ad < (tg >= 4 ? 0x2000u : 0x1000u)) {
++			if (wr) {
++				c_wr(mm, ad & ~3u, v);
++			}
++			rsp = c_rd(mm, ad & ~3u);
++		} else if (tg == 6) {
++			uint16_t x = 0;
++			if (wr) {
++				(void)fs_wr((uint8_t)(ad >> 8), (uint8_t)ad, (uint16_t)v);
++			}
++			rsp = fs_rd((uint8_t)(ad >> 8), (uint8_t)ad, &x) == 0 ? x : ~0ull;
++		} else {
++			rsp = ~0ull;
++		}
++		LOG("adsp: sweet_audio %s target %u %04x%s -> %llx", wr ? "write" : "read", tg, ad, wr ? "" : "", rsp);
++		break;
++	case 4:
++		if (a_live) {
++			(void)a_graph_mgmt(APM_CMD_GRAPH_CLOSE);
++			a_live = false;
++		}
++		audio_test();
++		rsp = a_live;
++		break;
++	case 5:
++		a_flags = v;
++		rsp = a_flags;
++		LOG("adsp: sweet_audio flags %x", a_flags);
++		break;
++	default:
++		rsp = ~0ull;
++		break;
++	}
++	sweet_audio_rsp = rsp;
++	mb();
++	sweet_audio_done = sweet_audio_seq;
+ }
+ 
+ /* ---------------- the ADSP's watch thread */
+@@ -10241,6 +10409,9 @@ adsp_thread(void *arg __unused, wait_result_t wr __unused)
+ 				tested = true;
+ 				audio_test();
+ 			}
++			if (tested) {
++				audio_request();
++			}
+ 			if (a_up(&a_ch[0]) && a_hello_rx && !a_hello_sent) {
+ 				struct qrtr_ctrl c = { QRTR_TYPE_HELLO, 0, 0, 0, 0 };
+ 				qrtr_send(QRTR_TYPE_HELLO, QRTR_PORT_CTRL, a_node, QRTR_PORT_CTRL, &c, sizeof(c));
+-- 
+2.43.0
+
