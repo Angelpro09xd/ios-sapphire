@@ -1,0 +1,131 @@
+From 01f2d83d1dddabcee673f7019f4185508ed2586d Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 23:09:22 +0000
+Subject: [PATCH] sapphire-0208: the battery's voltage from whichever QG
+ register holds one; the charger's state even without
+
+0207 on the phone: the PM7250B answers (QG type 0x0d, battery present) but
+LAST_ADC_V (0x48c0) reads 0 -- it is filled once Linux's QG driver has set
+the gauge going. Now, in this order: LAST_ADC_V, the S2 average (0x80), the
+newest FIFO sample (0x90), the OCV taken at power on (0x70), and the current
+from the matching register. Without any voltage the charger's state is still
+published as it is (external power, charging), with the percent the boot's
+charging code left in QG_SOC_MONOTONIC (0xbf) or a neutral 50, not 100% on
+external power. Once, the QG's and the charger's registers go to the log.
+---
+ iokit/Kernel/arm/SweetBattery.cpp | 76 +++++++++++++++++++++----------
+ 1 file changed, 53 insertions(+), 23 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 6f77d0b..e30d10d 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -270,29 +270,50 @@ SweetBattery::poll(void)
+ 		return;
+ 	}
+ 	const unsigned sid = fSid;
+-	uint8_t type = 0, present = 0, usb = 0, path = 0, charger = 0, error = 0, temperature = 0;
+-	uint16_t rawVoltage = 0;
+-	bool valid =
++	static bool dumped;
++	if (!dumped && sweet_spmi_init() == 0) {
++		/* 0208: once, what the QG and the charger hold, for the register choices below */
++		dumped = true;
++		static const uint16_t bases[] = { 0x4800, 0x4880, 0x1000, 0x1080, 0x1300 };
++		for (unsigned b = 0; b < sizeof(bases) / sizeof(bases[0]); b++) {
++			char line[400];
++			int n = snprintf(line, sizeof(line), "SWEET BATTERY: sid %u %04x:", sid, bases[b]);
++			for (unsigned i = 0; i < 0x80 && n < (int)sizeof(line) - 4; i += 1) {
++				uint8_t v = 0;
++				(void)sweet_spmi_read(sid, bases[b] + i, &v);
++				n += snprintf(line + n, sizeof(line) - n, "%s%02x", (i % 16) ? "" : " ", v);
++			}
++			IOLog("%s\n", line);
++		}
++	}
++	uint8_t type = 0, present = 0, usb = 0, path = 0, charger = 0, error = 0, temperature = 0, msoc = 0;
++	bool regs =
+ 	    !sweet_spmi_read(sid, 0x4804, &type) && type == 0x0d &&
+-	    !sweet_spmi_read(sid, 0x4808, &present) && (present & 1u) &&
+-	    readWord(sid, 0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
++	    !sweet_spmi_read(sid, 0x4808, &present) &&
+ 	    !sweet_spmi_read(sid, 0x1310, &usb) &&
+ 	    !sweet_spmi_read(sid, 0x110b, &path) &&
+ 	    !sweet_spmi_read(sid, 0x1006, &charger) &&
+ 	    !sweet_spmi_read(sid, 0x1007, &error) &&
+ 	    !sweet_spmi_read(sid, 0x100d, &temperature);
+-	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u) : 0;
+-	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+-	valid = valid && mv >= 2800 && mv <= 4600;
+-	if (!valid) {
+-		static unsigned bad;
+-		if (bad++ % 30 == 0) {
+-			IOLog("SWEET BATTERY: sid %u: no valid reading (type %#x present %#x raw %#x)\n", sid, type, present, rawVoltage);
++	/*
++	 * 0208: LAST_ADC_V (0xc0) stays 0 until Linux's QG driver sets the gauge going. Then, in this
++	 * order: the S2 average (0x80), the newest FIFO sample (0x90), the OCV taken at power on (0x70).
++	 */
++	static const uint16_t vregs[] = { 0x48c0, 0x4880, 0x4890, 0x4870 }, iregs[] = { 0x48c2, 0x4882, 0x48a0, 0x4872 };
++	uint16_t rawVoltage = 0, rawCurrent = 0;
++	unsigned which = 0, mv = 0;
++	for (; regs && which < 4; which++) {
++		if (readWord(sid, vregs[which], &rawVoltage) && rawVoltage != 0 && rawVoltage != 0x8000) {
++			mv = (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u);
++			if (mv >= 2800 && mv <= 4600) {
++				break;
++			}
+ 		}
+-		publish(100, 4200, 0, true, true, false, true, false, false);
+-		return;
++		mv = 0;
+ 	}
+-	bool external = (usb & 0x10u) != 0;
++	bool haveV = mv != 0;
++	(void)sweet_spmi_read(sid, 0x48bf, &msoc);     /* QG_SOC_MONOTONIC: what the boot's charging code left */
++	bool external = regs && (usb & 0x10u) != 0;
+ 	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
+ 	unsigned state = charger & 7u;
+ 	bool charging = capable && state >= 1 && state <= 4 &&
+@@ -300,22 +321,31 @@ SweetBattery::poll(void)
+ 	/* Inhibit (0) does not by itself establish full capacity. */
+ 	bool full = external && state == 5 && !(error & 2u);
+ 	int ma = 0;
+-	uint8_t subtype;
+-	uint16_t rawCurrent;
+-	bool currentValid = !sweet_spmi_read(sid, 0x4805, &subtype) &&
+-	    (subtype == 3 || subtype == 4) && readWord(sid, 0x48c2, &rawCurrent) &&
++	uint8_t subtype = 0;
++	bool currentValid = haveV && !sweet_spmi_read(sid, 0x4805, &subtype) &&
++	    (subtype == 3 || subtype == 4) && readWord(sid, iregs[which < 4 ? which : 0], &rawCurrent) &&
+ 	    rawCurrent != 0x8000;
+ 	if (currentValid) {
+ 		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
+ 		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */
+ 		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
+ 	}
+-	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
+-	    charging, full, true, currentValid);
++	unsigned percent = haveV ? estimatePercent(mv) : (msoc >= 1 && msoc <= 100) ? msoc : 50;
++	if (!regs) {
++		static unsigned bad;
++		if (bad++ % 30 == 0) {
++			IOLog("SWEET BATTERY: sid %u: the PMIC does not answer (type %#x)\n", sid, type);
++		}
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	/* (no voltage: the charger's state is still real; the percent is the boot's, or a neutral 50) */
++	publish(full ? 100 : percent, haveV ? mv : 3900, ma, external, capable, charging, full, haveV, currentValid);
+ 	static unsigned logs;
+ 	if (logs++ % 30 == 0) {
+-		IOLog("SWEET BATTERY: sid %u: %umV (~%u%%) %dmA usb %#x path %#x chgr %#x err %#x -> external=%d charging=%d full=%d\n",
+-		    sid, mv, estimatePercent(mv), ma, usb, path, charger, error, external, charging, full);
++		IOLog("SWEET BATTERY: sid %u: %umV from %#x (~%u%%, monotonic soc %u) %dmA usb %#x path %#x chgr %#x err %#x present %#x "
++		    "-> external=%d charging=%d full=%d\n", sid, mv, haveV ? vregs[which] : 0, percent, msoc, ma, usb, path, charger,
++		    error, present, external, charging, full);
+ 	}
+ }
+ 
+-- 
+2.43.0
+
