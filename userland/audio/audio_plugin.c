@@ -257,6 +257,14 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	write(2, line, (size_t)n);
+	/* sapphire: launchd sends mediaserverd's stderr nowhere; keep a copy */
+	static int log_fd = -2;
+	if (log_fd == -2) {
+		log_fd = open("/var/tmp/redwood-audio.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+	}
+	if (log_fd >= 0) {
+		write(log_fd, line, (size_t)n);
+	}
 }
 
 /* The volume control's scale: a straight line of decibels over VOLUME_RANGE_DB. */
