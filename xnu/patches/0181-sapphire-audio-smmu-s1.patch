@@ -1,0 +1,340 @@
+From 0e4afdbdcdb121661e17becce421f61c34671daa Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 11:49:39 +0000
+Subject: [PATCH] sapphire-0181: the ADSP sees our buffers through real SMMU
+ tables, at a 32-bit IOVA
+
+0180 on the phone: a container with its first module in one 128-byte
+packet still killed the ADSP's audio process in the container's thread;
+Android's ACDB gives each container seven properties (type GC, graph
+position, stack, domain, heap, parent 0xffffffff, 0x0800124D), which do
+not fit 128 bytes with a module. So the shared memory has to work: the
+ADSP issues 32-bit addresses (Android's IOVA pool 0x10000000-0x20000000)
+and this XNU's memory is all above 4 GB, which the identity bypass could
+not reach (and our low pool resets the phone). smmu_s1() gives stream
+0x1c1 an LPAE stage-1 context: our 16 KB of kernel memory at IOVA
+0x10000000 through three non-cacheable tables; the graph open goes out
+of band again, one packet a subgraph with Android's container
+properties; the bank's fault registers are logged.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 215 ++++++++++++++++++++++++--------
+ 1 file changed, 163 insertions(+), 52 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 8ba4aaf..f622ea2 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -4959,6 +4959,93 @@ smmu_identity(uint32_t sid, uint32_t mask, const char *name)
+ 	return ok;
+ }
+ 
++/*
++ * A stream with real stage-1 translation (the ADSP's, sapphire audio): the ADSP issues 32-bit
++ * addresses -- Android's IOVA pool for it is 0x10000000-0x20000000 -- while this XNU's memory is
++ * all above 4 GB, so a bypass (smmu_identity()) cannot reach it. `n` 4 KB pages from `pa` appear
++ * at `iova` (inside one 2 MB block), through three tables in `tbl` (12 KB, write-combined: the
++ * walks are non-cacheable). LPAE stage 1, 4 KB granule, T0SZ 32 (the walk starts at level 1).
++ */
++static volatile uint8_t *s1_cbp;                /* the bank smmu_s1() set up: its fault registers for the log */
++
++static bool
++smmu_s1(uint32_t sid, uint32_t mask, const char *name, uint64_t iova, uint64_t pa, unsigned n, uint64_t *tbl,
++    uint64_t tbl_pa)
++{
++	volatile uint8_t *s = (volatile uint8_t *)ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (s == NULL || ((iova >> 21) != ((iova + n * 0x1000ull - 1) >> 21))) {
++		LOG("smmu: %s: map failed or the range crosses a 2 MB block", name);
++		return false;
++	}
++	uint32_t id0 = r32(s, 0x20), id1 = r32(s, 0x24);
++	uint32_t nsmr = id0 & 0xFF, ncb = id1 & 0xFF;
++	uint32_t psize = (id1 & (1u << 31)) ? 0x10000 : 0x1000, npage = 1u << (((id1 >> 28) & 7) + 1);
++	uint32_t slot = ~0u, cb = ~0u, smr, s2cr;
++	uint64_t used = 0;
++
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		smr = r32(s, 0x800 + 4 * i);
++		s2cr = r32(s, 0xC00 + 4 * i);
++		if ((smr >> 31) != 0 && smmu_sid_match(smr, sid, mask)) {
++			slot = i;
++		} else if ((smr >> 31) == 0 && slot == ~0u) {
++			slot = i;
++		}
++		if ((smr >> 31) != 0 && ((s2cr >> 16) & 3) == 0) {
++			used |= 1ull << (s2cr & 0x3F);
++		}
++	}
++	/* a stream already ours (an earlier identity) keeps its bank */
++	if (slot != ~0u && (r32(s, 0x800 + 4 * slot) >> 31) != 0 && ((r32(s, 0xC00 + 4 * slot) >> 16) & 3) == 0) {
++		cb = r32(s, 0xC00 + 4 * slot) & 0x3F;
++	}
++	for (uint32_t i = 4; cb == ~0u && i < ncb && i < 64; i++) {
++		if ((used & (1ull << i)) == 0) {
++			cb = i;
++		}
++	}
++	if (slot == ~0u || cb == ~0u || (uint64_t)(npage + cb + 1) * psize > SMMU_SIZE) {
++		LOG("smmu: %s: no free SMR/CB (slot %u cb %u)", name, slot, cb);
++		return false;
++	}
++	/* tables: level 1 at tbl[0..], level 2 at tbl[512..], level 3 at tbl[1024..] */
++	bzero(tbl, 3 * 0x1000);
++	tbl[(iova >> 30) & 3] = (tbl_pa + 0x1000) | 3;
++	tbl[512 + ((iova >> 21) & 511)] = (tbl_pa + 0x2000) | 3;
++	for (unsigned i = 0; i < n; i++) {
++		/* page, AF, AP read-write, attribute 0 (normal non-cacheable), non-shareable */
++		tbl[1024 + (((iova >> 12) + i) & 511)] = (pa + i * 0x1000ull) | (1u << 10) | (1u << 6) | 3;
++	}
++	mb();
++	volatile uint8_t *gr1 = s + psize, *cbp = s + (uint64_t)npage * psize + (uint64_t)cb * psize;
++	w32(cbp, 0x0, 0);                           /* SCTLR off while it changes */
++	w32(cbp, 0x58, 0xFFFFFFFF);                 /* FSR */
++	w32(cbp, 0x20, (uint32_t)tbl_pa);           /* TTBR0, ASID 0 */
++	w32(cbp, 0x24, (uint32_t)(tbl_pa >> 32));
++	w32(cbp, 0x30, 32u | (1u << 23));           /* TCR: T0SZ 32, walks non-cacheable non-shareable, 4 KB, EPD1 */
++	w32(cbp, 0x10, (7u << 15) | 2u);            /* TCR2: SEP upstream, 40-bit output */
++	w32(cbp, 0x38, 0x44);                       /* MAIR0: attribute 0 normal non-cacheable */
++	w32(cbp, 0x3C, 0);
++	w32(gr1, 0x800 + 4 * cb, CB_CLONE_CBA2R);
++	w32(gr1, 0x000 + 4 * cb, CB_CLONE_CBAR);
++	w32(cbp, 0x610, 0);                         /* TLBIASID 0 */
++	w32(cbp, 0x7F0, 0);                         /* TLBSYNC */
++	for (uint32_t k = 0; k < 100000 && (r32(cbp, 0x7F4) & 1) != 0; k++) {
++		IODelay(1);
++	}
++	w32(cbp, 0x0, CB_CLONE_SCTLR | 1u);         /* SCTLR: translate */
++	s1_cbp = cbp;
++	w32(s, 0xC00 + 4 * slot, cb);
++	w32(s, 0x800 + 4 * slot, (1u << 31) | (mask << 16) | sid);
++	w32(s, 0x70, 0);
++	for (uint32_t k = 0; k < 100000 && (r32(s, 0x74) & 1) != 0; k++) {
++		IODelay(1);
++	}
++	LOG("smmu: %s: sid %x CB%u SMR%u, %u pages %llx at iova %llx, tables %llx: SCTLR %08x TCR %08x FSR %08x", name, sid,
++	    cb, slot, n, pa, iova, tbl_pa, r32(cbp, 0x0), r32(cbp, 0x30), r32(cbp, 0x58));
++	return true;
++}
++
+ /* ---------------- copy engines (ath10k ce.c, WCN3990: 64-bit descriptors, shadow regs, RRI in DDR) */
+ 
+ #define CE_PA               (0x0C800000ull + 0x240000)
+@@ -8444,6 +8531,7 @@ a_gpr_rx(const uint8_t *p, uint32_t len)
+ #define DATA_CMD_RSP_WR_SH_MEM_EP_DATA_BUFFER_DONE_V2 0x05001004u
+ #define A_SG        0x4001u
+ #define A_SG_DEV    0x4002u
++#define A_IOVA      0x10000000ull               /* where the ADSP sees our buffers (smmu_s1) */
+ #define A_CONT_STR  0x5001u
+ #define A_CONT_DEV  0x5002u
+ #define A_WRSH      0x6001u
+@@ -8626,7 +8714,7 @@ a_put16(uint8_t **p, uint16_t v)
+  * packet so that each fits the ADSP's 128-byte receive buffers: APM takes a graph open (or a
+  * SET_CFG) in pieces, each naming what an earlier one created.
+  */
+-static int64_t
++static int64_t __attribute__((unused))
+ a_cmd_each(uint32_t src, uint32_t dst, uint32_t opcode, const struct a_pb *pb, const char *what)
+ {
+ 	int64_t first = 0;
+@@ -8691,15 +8779,12 @@ a_in(unsigned i, uint32_t sg)
+  *   4. each module's properties (its ports);
+  *   5. the connections.
+  */
+-static int64_t
+-a_open_send(struct a_pb *pb, const char *what)
+-{
+-	int64_t r = a_cmd_sync(GPR_PORT_APM_CLIENT, APM_PORT, APM_CMD_GRAPH_OPEN, pb->b, pb->n, 0);
+-	LOG("adsp: graph open: %s (%u bytes) -> %lld", what, pb->n, r);
+-	pb->n = 0;
+-	return r;
+-}
+-
++/*
++ * One subgraph a graph open, its payload in the shared command page (the ADSP reaches it now, at
++ * its IOVA). The container as Android's ACDB has it (e0000123 there): type GC, graph position,
++ * stack 4 KB, domain ADSP, heap 1, no parent (0xffffffff), and 0x0800124D = 1 -- 0178-0180: one
++ * property alone (or four) made the ADSP's audio process die in the container's thread.
++ */
+ static int64_t
+ a_graph_open_part(uint32_t sg, uint32_t direction, uint32_t cont, uint32_t cap, uint32_t link_from)
+ {
+@@ -8707,12 +8792,18 @@ a_graph_open_part(uint32_t sg, uint32_t direction, uint32_t cont, uint32_t cap,
+ 	struct a_pb *pb = (struct a_pb *)IOMalloc(sizeof(*pb));
+ 	unsigned nm = 0, nc = 0, last = ~0u;
+ 	uint8_t *p;
+-	int64_t r = 0;
+-	bool first = true;
++	int64_t r;
+ 
+ 	if (pb == NULL) {
+ 		return -1;
+ 	}
++	for (unsigned i = 0; i < all; i++) {
++		if (a_in(i, sg)) {
++			nc += last != ~0u || link_from != 0;
++			last = i;
++			nm++;
++		}
++	}
+ 	pb->n = 0;
+ 	p = a_param(pb, APM_PORT, 0x08001001, 4 + 44);
+ 	a_put32(&p, 1);
+@@ -8720,51 +8811,47 @@ a_graph_open_part(uint32_t sg, uint32_t direction, uint32_t cont, uint32_t cap,
+ 	a_put32(&p, 0x0800100E); a_put32(&p, 4); a_put32(&p, 2);    /* perf mode: low latency */
+ 	a_put32(&p, 0x0800100F); a_put32(&p, 4); a_put32(&p, direction);
+ 	a_put32(&p, 0x08001010); a_put32(&p, 4); a_put32(&p, 1);    /* scenario: playback */
+-	r = a_open_send(pb, "subgraph");
+-	for (unsigned i = 0; i < all && r == 0; i++) {
+-		if (!a_in(i, sg)) {
+-			continue;
++	p = a_param(pb, APM_PORT, 0x08001000, 4 + 8 + 16 + 6 * 12);
++	a_put32(&p, 1);
++	a_put32(&p, cont); a_put32(&p, 7);
++	a_put32(&p, 0x08001011); a_put32(&p, 8); a_put32(&p, 1); a_put32(&p, cap);
++	a_put32(&p, 0x08001012); a_put32(&p, 4); a_put32(&p, 1);    /* graph position: stream */
++	a_put32(&p, 0x08001013); a_put32(&p, 4); a_put32(&p, 0x1000);
++	a_put32(&p, 0x08001014); a_put32(&p, 4); a_put32(&p, 2);    /* processing domain: ADSP */
++	a_put32(&p, 0x08001174); a_put32(&p, 4); a_put32(&p, 1);    /* heap: default */
++	a_put32(&p, 0x080010CB); a_put32(&p, 4); a_put32(&p, 0xFFFFFFFF);   /* no parent container */
++	a_put32(&p, 0x0800124D); a_put32(&p, 4); a_put32(&p, 1);
++	p = a_param(pb, APM_PORT, 0x08001002, 4 + 12 + nm * 8);
++	a_put32(&p, 1);
++	a_put32(&p, sg); a_put32(&p, cont); a_put32(&p, nm);
++	for (unsigned i = 0; i < all; i++) {
++		if (a_in(i, sg)) {
++			a_put32(&p, a_mods[i].mid); a_put32(&p, a_mods[i].iid);
+ 		}
+-		if (first) {
+-			p = a_param(pb, APM_PORT, 0x08001000, 4 + 8 + 16);
+-			a_put32(&p, 1);
+-			a_put32(&p, cont); a_put32(&p, 1);
+-			a_put32(&p, 0x08001011); a_put32(&p, 8); a_put32(&p, 1); a_put32(&p, cap);
+-		}
+-		p = a_param(pb, APM_PORT, 0x08001002, 4 + 12 + 8);
+-		a_put32(&p, 1);
+-		a_put32(&p, sg); a_put32(&p, cont); a_put32(&p, 1);
+-		a_put32(&p, a_mods[i].mid); a_put32(&p, a_mods[i].iid);
+-		r = a_open_send(pb, first ? "container and its first module" : "a module");
+-		first = false;
+-		nm++;
+-	}
+-	for (unsigned i = 0; i < all && r == 0; i++) {
++	}
++	p = a_param(pb, APM_PORT, 0x08001003, 4 + nm * 24);
++	a_put32(&p, nm);
++	for (unsigned i = 0; i < all; i++) {
+ 		if (a_in(i, sg)) {
+-			p = a_param(pb, APM_PORT, 0x08001003, 4 + 24);
+-			a_put32(&p, 1);
+ 			a_put32(&p, a_mods[i].iid); a_put32(&p, 1);
+ 			a_put32(&p, 0x08001015); a_put32(&p, 8); a_put32(&p, a_mods[i].ip); a_put32(&p, a_mods[i].op);
+-			r = a_open_send(pb, "a module's ports");
+ 		}
+ 	}
+-	for (unsigned i = 0; i < all && r == 0; i++) {
+-		if (!a_in(i, sg)) {
+-			continue;
+-		}
+-		uint32_t from = last != ~0u ? a_mods[last].iid : link_from;
+-		last = i;
+-		if (from == 0) {
+-			continue;
++	p = a_param(pb, APM_PORT, 0x08001004, 4 + nc * 16);
++	a_put32(&p, nc);
++	last = ~0u;
++	for (unsigned i = 0; i < all; i++) {
++		if (a_in(i, sg)) {
++			uint32_t from = last != ~0u ? a_mods[last].iid : link_from;
++			if (from != 0) {
++				a_put32(&p, from); a_put32(&p, 1); a_put32(&p, a_mods[i].iid); a_put32(&p, 2);
++			}
++			last = i;
+ 		}
+-		p = a_param(pb, APM_PORT, 0x08001004, 4 + 16);
+-		a_put32(&p, 1);
+-		a_put32(&p, from); a_put32(&p, 1); a_put32(&p, a_mods[i].iid); a_put32(&p, 2);
+-		r = a_open_send(pb, "a connection");
+-		nc++;
+ 	}
+-	LOG("adsp: graph open of subgraph %x (%u modules, %u connections, direction %u, container %x) -> %lld", sg, nm, nc,
+-	    direction, cap, r);
++	r = a_cmd_sync(GPR_PORT_APM_CLIENT, APM_PORT, APM_CMD_GRAPH_OPEN, pb->b, pb->n, 0);
++	LOG("adsp: graph open of subgraph %x (%u modules, %u connections, direction %u, container %x, %u bytes) -> %lld", sg,
++	    nm, nc, direction, cap, pb->n, r);
+ 	IOFree(pb, sizeof(*pb));
+ 	return r;
+ }
+@@ -8861,7 +8948,7 @@ a_formats(void)
+ 	a_put32(&p, 1); a_put32(&p, 2); a_put32(&p, 1);              /* RXTX, RX1, channel 0 */
+ 	p = a_param(pb, A_CDMA, 0x08001176, 4);
+ 	a_put32(&p, 0);
+-	r = a_cmd_each(GPR_PORT_APM_CLIENT, APM_PORT, APM_CMD_SET_CFG, pb, "formats");
++	r = a_cmd_sync(GPR_PORT_APM_CLIENT, APM_PORT, APM_CMD_SET_CFG, pb->b, pb->n, 0);
+ 	/* the shared memory endpoint's input format: SET_CFG sent to the module itself */
+ 	pb->n = 0;
+ 	p = a_param(pb, A_WRSH, 0x0800100C, 12 + 16 + 1);
+@@ -8924,7 +9011,6 @@ audio_test(void)
+ 	const uint32_t bytes = A_PERIOD * 2;
+ 
+ 	LOG("adsp: audio test begins (t=%u ms)", a_ms);
+-	(void)smmu_identity(0x1c1, 0, "audio (ADSP buffers)");
+ 	r1 = a_prm(PARAM_ID_RSC_HW_CORE, macro, 1);
+ 	r2 = a_prm(PARAM_ID_RSC_HW_CORE, dcodec, 1);
+ 	r3 = a_prm(PARAM_ID_RSC_AUDIO_HW_CLK, rx_core, 5);
+@@ -8972,6 +9058,23 @@ audio_test(void)
+ 	}
+ 	bzero(buf, tone + 0x1000);
+ 	LOG("adsp: %u bytes of buffers at %llx, write-combined", tone + 0x1000, buf_pa);
++	{
++		/* the ADSP sees them at a 32-bit IOVA, as on Android (0x10000000), through real tables */
++		IOBufferMemoryDescriptor *tmd = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 0x4000, 0x0000000FFFFFC000ull);
++		IOMemoryMap *tmap = NULL;
++		uint64_t tbl_pa = 0;
++		if (tmd != NULL && tmd->prepare() == kIOReturnSuccess && (tmap = tmd->map(kIOMapWriteCombineCache)) != NULL) {
++			tbl_pa = tmd->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++		}
++		if (tmap == NULL || tbl_pa == 0 ||
++		    !smmu_s1(0x1c1, 0, "audio (ADSP buffers)", A_IOVA, buf_pa, 4, (uint64_t *)tmap->getVirtualAddress(), tbl_pa)) {
++			LOG("adsp: no translation for the ADSP: the test stops here");
++			return;
++		}
++		buf_pa = A_IOVA;                        /* from here on, the address the ADSP uses */
++		IOSleep(300);
++	}
+ 	/* kept for the rest of the session: the ADSP may hold on to the mapping */
+ 	for (unsigned i = 0; i < A_NBUF * A_PERIOD; i++) {
+ 		/* 1 kHz at 48 kHz: 48 samples a period; a triangle is enough to be heard */
+@@ -8999,7 +9102,7 @@ audio_test(void)
+ 		}
+ 	}
+ 	a_verbose = false;
+-	a_oob = false;
++	a_oob = true;
+ 	IOSleep(300);                                           /* (the USB log goes out every 100 ms) */
+ 	/*
+ 	 * 0178: the subgraph was taken; a container with "capability" 2 was answered status 1 and
+@@ -9010,6 +9113,10 @@ audio_test(void)
+ 	r = a_graph_open(0x0B001001, 0x0B001001);
+ 	a_verbose = false;
+ 	LOG("adsp: graph open -> %lld", r);
++	if (s1_cbp != NULL) {
++		LOG("adsp: SMMU bank: FSR %08x FAR %08x%08x FSYNR0 %08x", r32(s1_cbp, 0x58), r32(s1_cbp, 0x64), r32(s1_cbp, 0x60),
++		    r32(s1_cbp, 0x68));
++	}
+ 	if (r != 0) {
+ 		return;
+ 	}
+@@ -9039,6 +9146,10 @@ audio_test(void)
+ 		a_ms++;
+ 	}
+ 	LOG("adsp: tone done: %u of %u buffers came back in %u ms (10 ms each)", a_writes_done, sent, a_ms - t0);
++	if (s1_cbp != NULL) {
++		LOG("adsp: SMMU bank: FSR %08x FAR %08x%08x FSYNR0 %08x", r32(s1_cbp, 0x58), r32(s1_cbp, 0x64), r32(s1_cbp, 0x60),
++		    r32(s1_cbp, 0x68));
++	}
+ 	r1 = a_graph_mgmt(APM_CMD_GRAPH_STOP);
+ 	r2 = a_graph_mgmt(APM_CMD_GRAPH_CLOSE);
+ 	LOG("adsp: stop %lld, close %lld", r1, r2);
+-- 
+2.43.0
+
