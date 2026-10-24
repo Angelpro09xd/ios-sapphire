@@ -1,0 +1,49 @@
+From b464b70cb1c3875e54ad6daefca0869c6d913ec4 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 22:15:35 +0000
+Subject: [PATCH] sapphire-0203: kern.sweet_audio RPM votes for every clock
+ type the apps vote (QUP, IPA, MMAXI, CE)
+
+0202 on the phone: the BIMC vote is taken (status 0) and changes nothing,
+memcpy stays at 2.1-2.3 GB/s: nobody has enabled RPM clock scaling, so
+the RPM keeps the clocks where the boot left them. Enabling it drops every
+clock to its votes, and the apps vote QUP (I2C, UART), IPA, MMRT/MMNRT
+(the display's NoC) and CE too (khaje: holi's clocks): all of them can now
+be voted before scaling is turned on.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index d89e9c8..d223467 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -10498,17 +10498,19 @@ audio_request(void)
+ 		rsp = a_live;
+ 		break;
+ 	case 6: {
+-		/* an RPM vote: target = resource (1 "clk2" memory, 2 "clk1" bus, 3 "clk0" misc), addr = id | set << 15,
+-		 * value: kHz (misc: "Enab" value) */
+-		static const uint32_t types[] = { 0, 0x326b6c63, 0x316b6c63, 0x306b6c63 };
++		/*
++		 * an RPM vote: target = resource type (1 "clk2" memory, 2 "clk1" bus, 3 "clk0" misc, 4 "qup",
++		 * 5 "ipa", 6 "mmxi", 7 "ce"), addr = id | set << 15, value: kHz (misc: "Enab" value)
++		 */
++		static const uint32_t types[] = { 0, 0x326b6c63, 0x316b6c63, 0x306b6c63, 0x00707571, 0x00617069, 0x69786d6d,
++			0x00006563 };
+ 		if (!rpm_is_up() && !rpm_start()) {
+ 			rsp = ~0ull;
+ 			break;
+ 		}
+-		if (tg >= 1 && tg <= 3) {
++		if (tg >= 1 && tg <= 7) {
+ 			int r = rpm_kvp((ad >> 15) & 1, types[tg], ad & 0x7fff, tg == 3 ? 0x62616e45 : 0x007a484b, v);
+-			LOG("adsp: RPM vote %s %u set %u = %u: %d", tg == 1 ? "clk2" : tg == 2 ? "clk1" : "clk0", ad & 0x7fff,
+-			    (ad >> 15) & 1, v, r);
++			LOG("adsp: RPM vote %.4s %u set %u = %u: %d", (const char *)&types[tg], ad & 0x7fff, (ad >> 15) & 1, v, r);
+ 			rsp = (uint64_t)(int64_t)r;
+ 		} else {
+ 			rsp = ~0ull;
+-- 
+2.43.0
+
