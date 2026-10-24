@@ -1,0 +1,69 @@
+From 8661164c80a731e0b4f70ff1b5bf0e73653f9694 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 13:35:02 +0000
+Subject: [PATCH] sapphire-0187: the ADSP's VMs given read-write-execute, as
+ fastrpc does
+
+0186 on the phone: a kernel 64 KB block goes to HLOS + the modem's MSA
+(ret 0), so the memory is assignable; HLOS + LPASS (22) / ADSP heap
+(0x25) read-write is refused (ret -2 res 0x56). fastrpc shares with
+those VMs read-write-execute: tried now, then the ADSP Q6 (6) read-write
+and read-write-execute.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 20 +++++++++++++++-----
+ 1 file changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 706487a..ff603d6 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -4296,6 +4296,8 @@ static uint8_t *rmtfs_va;
+ static unsigned rmtfs_reads, rmtfs_writes, rmtfs_err;
+ 
+ /* hyp_assign_phys (SCM 0x0C/0x16): from HLOS to the given VMIDs, read-write */
++static uint32_t scm_perm = PERM_RW;            /* what scm_assign() gives each destination */
++
+ static uint64_t
+ scm_assign(uint64_t addr, uint64_t size, const uint32_t *vmids, unsigned count)
+ {
+@@ -4312,7 +4314,7 @@ scm_assign(uint64_t addr, uint64_t size, const uint32_t *vmids, unsigned count)
+ 	uint32_t *dst = (uint32_t *)(p + 16);       /* 0x080: {vmid, perm, ctx(8), ctx_size, unused} x3 */
+ 	for (unsigned i = 0; i < count && i < 8; i++) {
+ 		dst[6 * i] = vmids[i];
+-		dst[6 * i + 1] = PERM_RW;
++		dst[6 * i + 1] = scm_perm;
+ 	}
+ 	p[32] = 4;                                  /* 0x100: extended args: src size */
+ 	p[33] = pa + 0x80;                          /* dest */
+@@ -9181,16 +9183,24 @@ audio_test(void)
+ 		 * the device tree's qcom,adsp-remoteheap-vmid); our pool was refused that (0172/0173),
+ 		 * kernel memory may not be. Refused here: stop before the ADSP reads anything.
+ 		 */
+-		static const struct { uint32_t v[3]; unsigned n; const char *what; } tries[] = {
+-			{ { VMID_HLOS, 0x16, 0x25 }, 3, "HLOS + LPASS + ADSP heap" },
+-			{ { VMID_HLOS, 0x16 }, 2, "HLOS + LPASS" },
+-			{ { VMID_HLOS, 0x25 }, 2, "HLOS + ADSP heap" },
++		/*
++		 * 0186: kernel memory itself is assignable (to HLOS + the modem's MSA: ret 0); the
++		 * ADSP's VMs with read-write were refused. fastrpc gives them read-write-execute.
++		 */
++		static const struct { uint32_t v[3]; unsigned n; uint32_t perm; const char *what; } tries[] = {
++			{ { VMID_HLOS, 0x16, 0x25 }, 3, 7, "HLOS + LPASS + ADSP heap, RWX" },
++			{ { VMID_HLOS, 0x16 }, 2, 7, "HLOS + LPASS, RWX" },
++			{ { VMID_HLOS, 0x25 }, 2, 7, "HLOS + ADSP heap, RWX" },
++			{ { VMID_HLOS, 6 }, 2, 6, "HLOS + ADSP_Q6, RW" },
++			{ { VMID_HLOS, 6 }, 2, 7, "HLOS + ADSP_Q6, RWX" },
+ 		};
+ 		uint64_t ar = ~0ull;
+ 		for (unsigned t = 0; t < sizeof(tries) / sizeof(tries[0]) && ar != 0; t++) {
++			scm_perm = tries[t].perm;
+ 			ar = scm_assign(buf_pa, 0x10000, tries[t].v, tries[t].n);
+ 			LOG("adsp: kernel 64 KB %llx shared with %s: %llx", buf_pa, tries[t].what, ar);
+ 		}
++		scm_perm = PERM_RW;
+ 		if (ar != 0) {
+ 			/* is it the memory or the VMs? the modem's set, which rmtfs's buffer takes, on a second 64 KB */
+ 			static const uint32_t mv[] = { VMID_HLOS, VMID_MSS_MSA };
+-- 
+2.43.0
+
