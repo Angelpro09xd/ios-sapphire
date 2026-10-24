@@ -1,0 +1,61 @@
+From 0782990df70e95a939ffcc4830c1af2e543ee0fe Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 22:46:12 +0000
+Subject: [PATCH] sapphire-0205: large GPU buffers are not zeroed (nor mapped
+ into the kernel for it)
+
+Measured on the phone (libdrm request timing): while CoreAnimation animates,
+GEM_NEW comes 100 times a second at 0.5 ms each, on Mesa's driver thread --
+CoreAnimation makes and drops screen-sized textures, render targets it then
+draws all of, and every one was mapped into the kernel and zeroed
+write-combined. Buffers of 256 KB and more are now handed out as they are;
+smaller ones (state, queries) are still zeroed. boot-arg gpu_zero=1: all
+zeroed, as before.
+---
+ iokit/Kernel/arm/SapphireGpu.cpp | 28 +++++++++++++++++++++++-----
+ 1 file changed, 23 insertions(+), 5 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index eb082f6..c4f3869 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -3555,13 +3555,31 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 			return kIOReturnNoMemory;
+ 		}
+ 		IOMemoryDescriptor *pm = IOMemoryDescriptor::withPhysicalAddress(pa, size, kIODirectionInOut);
+-		IOMemoryMap *km = pm != NULL ? pm->map(kIOMapWriteCombineCache) : NULL;
+-		if (km != NULL) {
+-			bzero((void *)km->getVirtualAddress(), size);
+-			km->release();
++		/*
++		 * 0205: zeroed only when small. CoreAnimation makes and drops screen-sized textures many
++		 * times a second while it animates (render targets it then draws all of); mapping 11 MB into
++		 * the kernel and zeroing it write-combined made every such GEM_NEW cost 0.5 ms and more on
++		 * Mesa's driver thread. Small buffers (state, queries) are still zeroed; boot-arg gpu_zero=1:
++		 * every buffer, as before.
++		 */
++		static int zero_all = -1;
++		if (zero_all < 0) {
++			int z = 0;
++			PE_parse_boot_argn("gpu_zero", &z, sizeof(z));
++			zero_all = z != 0;
++		}
++		bool zeroed = pm != NULL;
++		if (pm != NULL && (zero_all || size < 256 * 1024)) {
++			IOMemoryMap *km = pm->map(kIOMapWriteCombineCache);
++			if (km != NULL) {
++				bzero((void *)km->getVirtualAddress(), size);
++				km->release();
++			} else {
++				zeroed = false;
++			}
+ 		}
+ 		IOLockLock(service_lock);
+-		struct msm_bo *b = km != NULL ? slot(&h) : NULL;
++		struct msm_bo *b = zeroed ? slot(&h) : NULL;
+ 		if (b != NULL) {
+ 			b->md = pm;
+ 			b->kva = NULL;                  /* never cleaned: write-combined everywhere */
+-- 
+2.43.0
+
