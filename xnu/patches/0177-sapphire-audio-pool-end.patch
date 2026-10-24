@@ -1,0 +1,90 @@
+From 9fb44fc4355a2546b07a6eb3f1290c26c58c077a Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 11:11:48 +0000
+Subject: [PATCH] sapphire-0177: the ADSP's buffers in the last 64 KB of our
+ pool
+
+0176 on the phone: not one of 4096 kernel pages lay below 4 GB (this
+XNU's RAM starts at 0x140000000). Back in our pool, which is HLOS memory
+below 4 GB, but away from what TrustZone holds: in 0171 the buffer sat
+right behind the ADSP's PAS metadata (the access reset the phone, the
+range could not be assigned, while rmtfs's lower one could). The last
+64 KB of the pool are now kept for the ADSP's buffers.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 45 ++++++++++-----------------------
+ 1 file changed, 14 insertions(+), 31 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 4562441..dd0a133 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -109,7 +109,7 @@ static void *
+ pool_alloc(uint64_t size, uint64_t *pa)
+ {
+ 	size = (size + 0xfff) & ~0xfffull;
+-	if (pool == NULL || pool_used + size > MODEM_POOL_SIZE) {
++	if (pool == NULL || pool_used + size > MODEM_POOL_SIZE - 0x10000) {     /* (the last 64 KB: the ADSP's buffers) */
+ 		return NULL;
+ 	}
+ 	*pa = MODEM_POOL_BASE + pool_used;
+@@ -8911,44 +8911,27 @@ audio_test(void)
+ 	 * written through a write-combined mapping (the ADSP does not snoop our caches).
+ 	 */
+ 	/*
+-	 * 0175: the physical mask is not honoured (the buffer came at 0x1b8270000) and every graph
+-	 * open read from there failed: the ADSP's side of SMMU stream 0x1c1 takes 32-bit addresses
+-	 * (Android's IOVAs are 0x10000000-0x20000000). Everything fits one 16 KB page: pages are
+-	 * taken until one lies below 4 GB, the others given back.
++	 * Where the ADSP's buffers go, after 0171-0176:
++	 *  - 0171: right behind the ADSP's PAS metadata in our pool (0xe0442000): the first access
++	 *    reset the phone, and hyp_assign of that range was refused, while rmtfs's range lower in
++	 *    the same pool is taken: TrustZone guards the metadata's neighbourhood since init_image;
++	 *  - 0174/0175: kernel memory, which this XNU only has above 4 GB (0x1b8270000; not one of 4096
++	 *    pages came lower): the ADSP's 32-bit side read the wrong place, every graph open failed.
++	 * So: the last 64 KB of our pool, HLOS memory below 4 GB, far from anything TrustZone holds.
+ 	 */
+-	IOBufferMemoryDescriptor *bmd = NULL, *held[256];
+-	unsigned nheld = 0, tries = 0;
+ 	IOMemoryMap *bmap = NULL;
+-	for (; tries < 4096 && bmd == NULL; tries++) {
+-		IOBufferMemoryDescriptor *m = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 0x4000, 0x00000000FFFFC000ull);
+-		if (m == NULL) {
+-			break;
+-		}
+-		uint64_t pa = m->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+-		if (pa != 0 && pa + 0x4000 <= 0x100000000ull) {
+-			bmd = m;
+-			buf_pa = pa;
+-		} else if (nheld < 256) {
+-			held[nheld++] = m;              /* kept until the search ends, so the next one is another page */
+-		} else {
+-			m->release();
+-		}
+-	}
+-	for (unsigned i = 0; i < nheld; i++) {
+-		held[i]->release();
+-	}
+-	LOG("adsp: a page below 4 GB after %u tries: %llx", tries, bmd != NULL ? buf_pa : 0ull);
+-	if (bmd != NULL && bmd->prepare() == kIOReturnSuccess) {
+-		bmap = bmd->map(kIOMapWriteCombineCache);
++	buf_pa = MODEM_POOL_BASE + MODEM_POOL_SIZE - 0x10000;
++	if (pool_used + 0x10000 <= MODEM_POOL_SIZE) {
++		bmap = map_phys(buf_pa, 0x4000, true);
+ 	}
++	LOG("adsp: buffers at the end of the pool, %llx (pool used %llx)", buf_pa, pool_used);
+ 	buf = bmap != NULL ? (int16_t *)bmap->getVirtualAddress() : NULL;
+ 	if (buf == NULL || buf_pa == 0) {
+-		LOG("adsp: no buffer (descriptor %p map %p pa %llx)", bmd, bmap, buf_pa);
++		LOG("adsp: no buffer (map %p pa %llx)", bmap, buf_pa);
+ 		return;
+ 	}
+ 	bzero(buf, tone + 0x1000);
+-	LOG("adsp: buffers in kernel memory at %llx (%u bytes), write-combined", buf_pa, tone + 0x1000);
++	LOG("adsp: %u bytes of buffers at %llx, write-combined", tone + 0x1000, buf_pa);
+ 	/* kept for the rest of the session: the ADSP may hold on to the mapping */
+ 	for (unsigned i = 0; i < A_NBUF * A_PERIOD; i++) {
+ 		/* 1 kHz at 48 kHz: 48 samples a period; a triangle is enough to be heard */
+-- 
+2.43.0
+
