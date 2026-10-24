@@ -283,6 +283,34 @@ db_to_scalar(Float32 db)
 	return scalar < 0 ? 0 : scalar > 1 ? 1 : scalar;
 }
 
+/*
+ * sapphire: the kernel makes /dev/redwood-audio only once the audio DSP's graph is up, ~45 s into
+ * the boot, and mediaserverd loads this plug-in before that: the open in initialize() failed, and
+ * nothing was heard until mediaserverd restarted. So the device is opened again, at most once a
+ * second, until it is there (and the volume given to it then).
+ */
+static uint64_t sink_tried;
+static void volume_to_kernel(void);
+
+static bool
+sink_ensure(void)
+{
+	if (sink >= 0) {
+		return true;
+	}
+	uint64_t now = mach_absolute_time();
+	if (sink_tried != 0 && (double)(now - sink_tried) < ticks_per_frame * REDWOOD_AUDIO_RATE) {
+		return false;
+	}
+	sink_tried = now;
+	sink = open(REDWOOD_AUDIO_DEVICE, O_WRONLY);
+	if (sink >= 0) {
+		say("redwood: audio: %s is there now: open\n", REDWOOD_AUDIO_DEVICE);
+		volume_to_kernel();
+	}
+	return sink >= 0;
+}
+
 /* The volume, to the kernel. With the lock held. */
 static void
 volume_to_kernel(void)
@@ -1025,7 +1053,7 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 		actuator_write(buffer, frames);
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
 		/* the kernel takes it all or leaves it: this thread must not wait */
-		if (sink < 0 || write(sink, buffer, (size_t)frames * REDWOOD_AUDIO_FRAME) < 0) {
+		if (!sink_ensure() || write(sink, buffer, (size_t)frames * REDWOOD_AUDIO_FRAME) < 0) {
 			refused += frames;
 		}
 		written += frames;

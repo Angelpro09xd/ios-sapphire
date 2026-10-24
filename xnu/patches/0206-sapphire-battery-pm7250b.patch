@@ -1,0 +1,162 @@
+From 6b5de3db9c14bcfc97abd89092e25009ae03330f Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 22:50:28 +0000
+Subject: [PATCH] sapphire-0206: the battery from sapphire's own PMIC
+ (PM7250B), not a fixed 100% on external power
+
+iOS always showed the battery charging at 100%: SweetBattery reads topaz's
+fuel gauge (I2C 0x71) and charger (0x6a), which sapphire does not have, and
+when that read failed it published 100%, external power, fully charged.
+Sapphire's charger and gauge are the PM7250B's (SPMI sid 2: SMB5 at
+0x1000-0x13ff, QG at 0x4800, in its device tree), laid out like the
+PM6150's the SPMI path here was written for: that path now runs on sid 2
+(boot-arg sweetbattery_sid=0: the old PM6150 / topaz one), with the SPMI
+reads allowed on sid 2. Percent from the voltage (an estimate), current
+from the QG, external power and charging from the SMB5; a log line every
+30 polls.
+---
+ bsd/dev/sweet_spmi.c              |  3 +-
+ iokit/Kernel/arm/SweetBattery.cpp | 61 +++++++++++++++++++------------
+ 2 files changed, 40 insertions(+), 24 deletions(-)
+
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index d0c5073..0992c98 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -122,7 +122,8 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
++	/* sid 0: PM6150 (sweet); sid 2: PM7250B, sapphire's charger (SMB5) and gauge (QG) */
++	if (!sp_ready || !out || (sid != 0 && sid != 2) || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+ 	    peripheral != 0x13 && peripheral != 0x48)) {
+ 		return -1;
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 824c022..6f77d0b 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -31,6 +31,7 @@ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
++	unsigned fSid;          /* the PMIC with the charger and the gauge: 0 PM6150 (sweet), 2 PM7250B (sapphire) */
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+@@ -40,7 +41,7 @@ private:
+ 	bool pollTopaz(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+-	static bool readWord(unsigned address, uint16_t *value);
++	static bool readWord(unsigned sid, unsigned address, uint16_t *value);
+ 	static unsigned estimatePercent(unsigned mv);
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+@@ -169,13 +170,13 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+  * words to reject most torn ADC samples without writing the QG HOLD bit.
+  * This is a bounded consistency check, not a hardware snapshot guarantee. */
+ bool
+-SweetBattery::readWord(unsigned address, uint16_t *value)
++SweetBattery::readWord(unsigned sid, unsigned address, uint16_t *value)
+ {
+ 	uint16_t previous = 0;
+ 	for (unsigned attempt = 0; attempt < 4; ++attempt) {
+ 		uint8_t lo, hi;
+-		if (sweet_spmi_read(0, address, &lo) ||
+-		    sweet_spmi_read(0, address + 1, &hi)) {
++		if (sweet_spmi_read(sid, address, &lo) ||
++		    sweet_spmi_read(sid, address + 1, &hi)) {
+ 			return false;
+ 		}
+ 		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
+@@ -260,28 +261,34 @@ SweetBattery::pollTopaz(void)
+ void
+ SweetBattery::poll(void)
+ {
+-	if (fReal && pollTopaz()) {
++	/*
++	 * sapphire: topaz's gauge (I2C 0x71) is not there; the charger and the gauge are the PM7250B's
++	 * (SPMI sid 2: SMB5 at 0x1000-0x13ff, QG at 0x4800), laid out as the PM6150's below. Before,
++	 * the failed topaz read published 100%, external power, fully charged, forever.
++	 */
++	if (fReal && fSid == 0 && pollTopaz()) {
+ 		return;
+ 	}
+-	if (fReal) {
+-		publish(100, 4200, 0, true, true, false, true, false, false);
+-		return;
+-	}
+-	uint8_t type, present, usb, path, charger, error, temperature;
+-	uint16_t rawVoltage;
+-	bool valid = fReal &&
+-	    !sweet_spmi_read(0, 0x4804, &type) && type == 0x0d &&
+-	    !sweet_spmi_read(0, 0x4808, &present) && (present & 1u) &&
+-	    readWord(0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
+-	    !sweet_spmi_read(0, 0x1310, &usb) &&
+-	    !sweet_spmi_read(0, 0x110b, &path) &&
+-	    !sweet_spmi_read(0, 0x1006, &charger) &&
+-	    !sweet_spmi_read(0, 0x1007, &error) &&
+-	    !sweet_spmi_read(0, 0x100d, &temperature);
++	const unsigned sid = fSid;
++	uint8_t type = 0, present = 0, usb = 0, path = 0, charger = 0, error = 0, temperature = 0;
++	uint16_t rawVoltage = 0;
++	bool valid =
++	    !sweet_spmi_read(sid, 0x4804, &type) && type == 0x0d &&
++	    !sweet_spmi_read(sid, 0x4808, &present) && (present & 1u) &&
++	    readWord(sid, 0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
++	    !sweet_spmi_read(sid, 0x1310, &usb) &&
++	    !sweet_spmi_read(sid, 0x110b, &path) &&
++	    !sweet_spmi_read(sid, 0x1006, &charger) &&
++	    !sweet_spmi_read(sid, 0x1007, &error) &&
++	    !sweet_spmi_read(sid, 0x100d, &temperature);
+ 	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u) : 0;
+ 	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+ 	valid = valid && mv >= 2800 && mv <= 4600;
+ 	if (!valid) {
++		static unsigned bad;
++		if (bad++ % 30 == 0) {
++			IOLog("SWEET BATTERY: sid %u: no valid reading (type %#x present %#x raw %#x)\n", sid, type, present, rawVoltage);
++		}
+ 		publish(100, 4200, 0, true, true, false, true, false, false);
+ 		return;
+ 	}
+@@ -295,8 +302,8 @@ SweetBattery::poll(void)
+ 	int ma = 0;
+ 	uint8_t subtype;
+ 	uint16_t rawCurrent;
+-	bool currentValid = !sweet_spmi_read(0, 0x4805, &subtype) &&
+-	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
++	bool currentValid = !sweet_spmi_read(sid, 0x4805, &subtype) &&
++	    (subtype == 3 || subtype == 4) && readWord(sid, 0x48c2, &rawCurrent) &&
+ 	    rawCurrent != 0x8000;
+ 	if (currentValid) {
+ 		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
+@@ -305,6 +312,11 @@ SweetBattery::poll(void)
+ 	}
+ 	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
+ 	    charging, full, true, currentValid);
++	static unsigned logs;
++	if (logs++ % 30 == 0) {
++		IOLog("SWEET BATTERY: sid %u: %umV (~%u%%) %dmA usb %#x path %#x chgr %#x err %#x -> external=%d charging=%d full=%d\n",
++		    sid, mv, estimatePercent(mv), ma, usb, path, charger, error, external, charging, full);
++	}
+ }
+ 
+ void
+@@ -326,7 +338,10 @@ SweetBattery::start(IOService *provider)
+ 	(void)sweet_cpufreq_max();
+ 	int real = 1;   /* topaz: real gauge by default; sweetbattery=0 for the static fallback */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_i2c1_init() == 0;
++	unsigned sid = 2;       /* sapphire: PM7250B; boot-arg sweetbattery_sid=0 for the PM6150 / topaz path */
++	(void)PE_parse_boot_argn("sweetbattery_sid", &sid, sizeof(sid));
++	fSid = sid;
++	fReal = real == 1 && (fSid == 0 ? sweet_i2c1_init() == 0 : sweet_spmi_init() == 0);
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+-- 
+2.43.0
+
