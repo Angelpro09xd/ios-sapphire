@@ -1,0 +1,44 @@
+From 78851233ebd75ba00985600157d0200bdc2eb2b9 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 11:29:46 +0000
+Subject: [PATCH] sapphire-0179: generic containers (type 0x0B001001) from the
+ start
+
+0178 on the phone, in band a block a packet: the subgraph was taken
+(status 0); the container with capability 2 came back status 1 and the
+ADSP's audio process then crashed in its thread (err_qdi.c:1045
+EX:audio_process GC_5001). This SPF reads the field as the container
+type, as Android's ACDB does (GC 0x0B001001 1867 times): only generic
+containers now.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index c7b81dc..798d50f 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -8984,13 +8984,13 @@ audio_test(void)
+ 	a_verbose = false;
+ 	a_oob = false;
+ 	IOSleep(300);                                           /* (the USB log goes out every 100 ms) */
+-	r = a_graph_open(2, 3);                                 /* CD, EP, in band, a block a packet */
+-	if (r != 0 && r != -3) {
+-		LOG("adsp: graph open (capabilities) -> %lld; again with generic containers", r);
+-		IOSleep(300);
+-		(void)a_graph_mgmt(APM_CMD_GRAPH_CLOSE);
+-		r = a_graph_open(0x0B001001, 0x0B001001);
+-	}
++	/*
++	 * 0178: the subgraph was taken; a container with "capability" 2 was answered status 1 and
++	 * then the ADSP's audio process died in that container's thread (err_qdi.c EX:audio_process
++	 * GC_5001): this SPF takes the field as a container type, as Android's ACDB has it -- the
++	 * generic container 0x0B001001 throughout.
++	 */
++	r = a_graph_open(0x0B001001, 0x0B001001);
+ 	a_verbose = false;
+ 	LOG("adsp: graph open -> %lld", r);
+ 	if (r != 0) {
+-- 
+2.43.0
+
