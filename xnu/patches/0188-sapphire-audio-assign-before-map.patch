@@ -1,0 +1,107 @@
+From 82bd234a1932eea65e8ee88dc5b05a591321435f Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 13:43:19 +0000
+Subject: [PATCH] sapphire-0188: the ADSP's block shared before it is mapped
+ anywhere
+
+0187 on the phone: read-write-execute too, LPASS, the ADSP heap and the
+Q6 were all refused on the buffer block, which by then was mapped
+write-combined and into our SMMU tables; the control block, fresh, went
+to the modem. The block is now shared right after it is allocated,
+before either mapping, and the control is repeated on another fresh
+block with HLOS + LPASS before the modem's set.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 66 +++++++++++++++------------------
+ 1 file changed, 30 insertions(+), 36 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index ff603d6..da0e6ab 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -9151,9 +9151,37 @@ audio_test(void)
+ 	IOBufferMemoryDescriptor *bmd = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 0x10000, 0x0000000FFFFF0000ull);
+ 	IOMemoryMap *bmap = NULL;
++	uint64_t assigned = ~0ull;
+ 	if (bmd != NULL && bmd->prepare() == kIOReturnSuccess) {
+-		bmap = bmd->map(kIOMapWriteCombineCache);
+ 		buf_pa = bmd->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++		/*
++		 * 0187: every ADSP VM set refused, on a block already mapped write-combined and into our
++		 * SMMU tables, while the control block (fresh) went to the modem: shared first now,
++		 * before either mapping exists; the control repeated with LPASS on another fresh block.
++		 */
++		static const struct { uint32_t v[3]; unsigned n; uint32_t perm; const char *what; } tries[] = {
++			{ { VMID_HLOS, 0x16, 0x25 }, 3, 7, "HLOS + LPASS + ADSP heap, RWX" },
++			{ { VMID_HLOS, 0x16 }, 2, 6, "HLOS + LPASS, RW" },
++			{ { VMID_HLOS, 0x16 }, 2, 7, "HLOS + LPASS, RWX" },
++			{ { VMID_HLOS, 6 }, 2, 6, "HLOS + ADSP_Q6, RW" },
++		};
++		for (unsigned t = 0; t < sizeof(tries) / sizeof(tries[0]) && assigned != 0; t++) {
++			scm_perm = tries[t].perm;
++			assigned = scm_assign(buf_pa, 0x10000, tries[t].v, tries[t].n);
++			LOG("adsp: fresh kernel 64 KB %llx shared with %s: %llx", buf_pa, tries[t].what, assigned);
++		}
++		scm_perm = PERM_RW;
++		if (assigned != 0) {
++			static const uint32_t lv[] = { VMID_HLOS, 0x16 }, mv[] = { VMID_HLOS, VMID_MSS_MSA };
++			IOBufferMemoryDescriptor *probe = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++			    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 0x10000, 0x0000000FFFFF0000ull);
++			uint64_t ppa = probe != NULL && probe->prepare() == kIOReturnSuccess ?
++			    probe->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
++			uint64_t l = ppa ? scm_assign(ppa, 0x10000, lv, 2) : ~0ull;
++			uint64_t m = ppa && l != 0 ? scm_assign(ppa, 0x10000, mv, 2) : ~0ull;
++			LOG("adsp: (control: another fresh 64 KB %llx to HLOS + LPASS: %llx, to HLOS + modem: %llx)", ppa, l, m);
++		}
++		bmap = bmd->map(kIOMapWriteCombineCache);
+ 	}
+ 	buf = bmap != NULL ? (int16_t *)bmap->getVirtualAddress() : NULL;
+ 	if (buf == NULL || buf_pa == 0) {
+@@ -9176,43 +9204,9 @@ audio_test(void)
+ 			LOG("adsp: no translation for the ADSP: the test stops here");
+ 			return;
+ 		}
+-		/*
+-		 * 0181-0184: with our tables in place (no fault recorded) the ADSP's first read of this
+-		 * kernel memory still reset the phone: what protects memory from the ADSP's VM refuses it.
+-		 * fastrpc gives the ADSP memory by hyp_assign (src HLOS, dst LPASS and the ADSP heap,
+-		 * the device tree's qcom,adsp-remoteheap-vmid); our pool was refused that (0172/0173),
+-		 * kernel memory may not be. Refused here: stop before the ADSP reads anything.
+-		 */
+-		/*
+-		 * 0186: kernel memory itself is assignable (to HLOS + the modem's MSA: ret 0); the
+-		 * ADSP's VMs with read-write were refused. fastrpc gives them read-write-execute.
+-		 */
+-		static const struct { uint32_t v[3]; unsigned n; uint32_t perm; const char *what; } tries[] = {
+-			{ { VMID_HLOS, 0x16, 0x25 }, 3, 7, "HLOS + LPASS + ADSP heap, RWX" },
+-			{ { VMID_HLOS, 0x16 }, 2, 7, "HLOS + LPASS, RWX" },
+-			{ { VMID_HLOS, 0x25 }, 2, 7, "HLOS + ADSP heap, RWX" },
+-			{ { VMID_HLOS, 6 }, 2, 6, "HLOS + ADSP_Q6, RW" },
+-			{ { VMID_HLOS, 6 }, 2, 7, "HLOS + ADSP_Q6, RWX" },
+-		};
+-		uint64_t ar = ~0ull;
+-		for (unsigned t = 0; t < sizeof(tries) / sizeof(tries[0]) && ar != 0; t++) {
+-			scm_perm = tries[t].perm;
+-			ar = scm_assign(buf_pa, 0x10000, tries[t].v, tries[t].n);
+-			LOG("adsp: kernel 64 KB %llx shared with %s: %llx", buf_pa, tries[t].what, ar);
+-		}
+-		scm_perm = PERM_RW;
+-		if (ar != 0) {
+-			/* is it the memory or the VMs? the modem's set, which rmtfs's buffer takes, on a second 64 KB */
+-			static const uint32_t mv[] = { VMID_HLOS, VMID_MSS_MSA };
+-			IOBufferMemoryDescriptor *probe = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-			    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 0x10000, 0x0000000FFFFF0000ull);
+-			uint64_t ppa = probe != NULL && probe->prepare() == kIOReturnSuccess ?
+-			    probe->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+-			LOG("adsp: (another kernel 64 KB %llx to HLOS + modem: %llx)", ppa, ppa ? scm_assign(ppa, 0x10000, mv, 2) : ~0ull);
+-		}
+ 		(void)tbl_pa;
+ 		IOSleep(300);
+-		if (ar != 0) {
++		if (assigned != 0) {
+ 			LOG("adsp: the ADSP may not read our memory: the test stops before it does");
+ 			return;
+ 		}
+-- 
+2.43.0
+
