@@ -1,0 +1,32 @@
+From cdd984498af631485f315eab05a8503e03dc3651 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 14:06:47 +0000
+Subject: [PATCH] sapphire-0191: stream 0x1c1 alone (an SMR with mask 0xf is
+ refused)
+
+0190 on the phone: the SMR for 0x1c0 mask 0xf read back 0, not as
+written: from 0182 to 0189 the ADSP had no matching stream at all (and
+the unmatched-stream fault followed its first read). Stream 0x1c1 with
+mask 0 reads back right (0170-0181); in bypass, with the pool's low
+memory and the stream bits in the address.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index c038a78..129211b 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -9167,7 +9167,8 @@ audio_test(void)
+ 	}
+ 	bzero(buf, tone + 0x1000);
+ 	LOG("adsp: %u bytes of buffers at %llx (the pool's end), write-combined", tone + 0x1000, buf_pa);
+-	if (!smmu_identity(0x1c0, 0xF, "audio (ADSP buffers, streams 0x1c0-0x1cf)")) {
++	/* 0190: an SMR with mask 0xf reads back 0 (refused): 0182-0189 had no stream for the ADSP at all */
++	if (!smmu_identity(0x1c1, 0, "audio (ADSP buffers, stream 0x1c1)")) {
+ 		LOG("adsp: no SMMU stream for the ADSP: the test stops here");
+ 		return;
+ 	}
+-- 
+2.43.0
+
