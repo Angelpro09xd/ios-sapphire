@@ -1,0 +1,43 @@
+From b8dff83bf424163223a40ecc255a01e07f7ff963 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 16:15:09 +0000
+Subject: [PATCH] sapphire-0197: the test again over ssh keeps its shared
+ memory map; headphones in the boot test
+
+0196 on the phone: stock clocks and RX macro table, still silent from the
+speaker; the second run (kern.sweet_audio op 4) stopped at the shared
+memory map, which the DSP refuses for a region it already has. Keep the
+first handle. The boot test now drives the headphones as well (a_flags 4),
+which leave the FS1815s out of the question.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 69c0fc2..c9f139d 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -9676,7 +9676,7 @@ fs_init(uint8_t a, uint16_t scene_vol)
+  * asks only for the TX ones: topaz-woa P9_audio.md, "root cause"), 2 without the stock RX macro
+  * table, 4 the headphones too, 8 without the FS1815 init.
+  */
+-static uint32_t a_flags;
++static uint32_t a_flags = 4;                    /* 0197: the boot test plays on the headphones too */
+ 
+ /* RX macro registers from the stock Android dump while playing (topaz-woa TopazSpeaker rxtab.h) */
+ static const uint16_t rx_stock[][2] = {
+@@ -10135,7 +10135,10 @@ audio_test(void)
+ 	}
+ 	bzero(buf + 4 * A_PERIOD, 4 * A_PERIOD * sizeof(int16_t));   /* buffers 4-7 silent: beeps */
+ 	mb();
+-	{
++	if (a_mem_handle != 0) {
++		/* 0196: a second map of the same region is refused (status 1): keep the first */
++		LOG("adsp: shared memory %llx already mapped, handle %x", buf_pa, a_mem_handle);
++	} else {
+ 		uint8_t m[20];
+ 		uint8_t *p = m;
+ 		a_put16(&p, 3);                                       /* APM_MEMORY_MAP_SHMEM8_4K_POOL */
+-- 
+2.43.0
+
