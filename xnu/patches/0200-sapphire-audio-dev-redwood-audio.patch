@@ -1,0 +1,348 @@
+From cd47eb2d0312173e042a98eb905517c50e59cbee Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 16:58:39 +0000
+Subject: [PATCH] sapphire-0200: /dev/redwood-audio, iOS's sound to both
+ speakers
+
+Both speakers play since 0199. What iOS plays now reaches them: HackiOS's
+RedwoodAudio.driver HAL plug-in (in mediaserverd) writes 48 kHz 16-bit
+stereo frames to /dev/redwood-audio (and /dev/topaz-audio), the ABI of
+its sys/redwood_audio.h as ios-topaz 0146/0935 use it: write() never
+waits, ioctl _IOW('r', 1, {below, muted}) sets the volume. The ADSP
+thread mixes them to the graph's one channel and feeds the DSP 10 ms at
+a time, 4 periods ahead; the graph starts on 20 ms of frames and stops
+after 0.5 s with none. The volume goes to the RX macro's digital gains.
+The boot test only beeps with audio=3 now; audio=2 leaves everything
+ready.
+---
+ bsd/conf/files                  |   1 +
+ bsd/dev/sweet_audio_dev.c       | 147 ++++++++++++++++++++++++++++++++
+ iokit/Kernel/arm/TopazModem.cpp | 102 ++++++++++++++++++++--
+ 3 files changed, 243 insertions(+), 7 deletions(-)
+ create mode 100644 bsd/dev/sweet_audio_dev.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 2b91060..35af81b 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,6 +117,7 @@ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_audio_ctl.c		standard
++bsd/dev/sweet_audio_dev.c		standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+diff --git a/bsd/dev/sweet_audio_dev.c b/bsd/dev/sweet_audio_dev.c
+new file mode 100644
+index 0000000..4508e54
+--- /dev/null
++++ b/bsd/dev/sweet_audio_dev.c
+@@ -0,0 +1,147 @@
++/*
++ * /dev/redwood-audio (and /dev/topaz-audio): the sound iOS plays. HackiOS's RedwoodAudio.driver
++ * HAL plug-in in mediaserverd writes whole 48 kHz 16-bit stereo frames here (ABI of its
++ * sys/redwood_audio.h, as in ios-topaz 0146 / 0935) and sets the volume with
++ * ioctl _IOW('r', 1, {below, muted}): eighths of a dB under the loudest, and whether muted.
++ * write() never waits: the writer is the audio server's real-time thread; what does not fit
++ * is dropped. TopazModem's ADSP thread takes the frames out (sweet_audio_take(), mixed to the
++ * one channel of its graph) and feeds the DSP 10 ms at a time.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/errno.h>
++#include <sys/ioccom.h>
++#include <sys/proc.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++
++#define SA_RING         16384u                  /* frames, 341 ms */
++
++struct sa_volume { uint32_t below, muted; };
++#define SA_SET_VOLUME   _IOW('r', 1, struct sa_volume)
++
++static int16_t sa_ring[SA_RING * 2];
++static volatile uint32_t sa_head, sa_tail;      /* frames written / taken, wrapping counters */
++volatile uint64_t sweet_audio_last_write;       /* mach_absolute_time() of the last write */
++volatile uint32_t sweet_audio_vol_below, sweet_audio_vol_muted, sweet_audio_vol_gen;
++volatile uint64_t sweet_audio_frames_in, sweet_audio_frames_dropped;
++
++uint32_t sweet_audio_avail(void);
++uint32_t sweet_audio_take(int16_t *mono, uint32_t frames);
++void sweet_audio_flush(void);
++void sweet_audio_dev_init(void);
++
++uint32_t
++sweet_audio_avail(void)
++{
++	return sa_head - sa_tail;
++}
++
++uint32_t
++sweet_audio_take(int16_t *mono, uint32_t frames)
++{
++	uint32_t t = sa_tail, n = sa_head - t;
++	__asm__ volatile("dmb ish" ::: "memory");
++	if (n > frames) {
++		n = frames;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t k = (t + i) % SA_RING;
++		mono[i] = (int16_t)(((int32_t)sa_ring[2 * k] + sa_ring[2 * k + 1]) / 2);
++	}
++	__asm__ volatile("dmb ish" ::: "memory");
++	sa_tail = t + n;
++	return n;
++}
++
++void
++sweet_audio_flush(void)
++{
++	sa_tail = sa_head;
++}
++
++static int
++sa_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++sa_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++sa_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	int16_t buf[512 * 2];
++
++	while (uio_resid(uio) >= 4) {
++		user_ssize_t n = uio_resid(uio);
++		if (n > (user_ssize_t)sizeof(buf)) {
++			n = sizeof(buf);
++		}
++		n &= ~3;
++		int err = uiomove((char *)buf, (int)n, uio);
++		if (err != 0) {
++			return err;
++		}
++		uint32_t frames = (uint32_t)(n / 4), h = sa_head, room = SA_RING - 1 - (h - sa_tail);
++		if (frames > room) {
++			sweet_audio_frames_dropped += frames - room;
++			frames = room;
++		}
++		for (uint32_t i = 0; i < frames; i++) {
++			uint32_t k = (h + i) % SA_RING;
++			sa_ring[2 * k] = buf[2 * i];
++			sa_ring[2 * k + 1] = buf[2 * i + 1];
++		}
++		__asm__ volatile("dmb ish" ::: "memory");
++		sa_head = h + frames;
++		sweet_audio_frames_in += frames;
++		sweet_audio_last_write = mach_absolute_time();
++	}
++	return 0;
++}
++
++static int
++sa_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
++{
++	if (cmd != SA_SET_VOLUME) {
++		return ENOTTY;
++	}
++	const struct sa_volume *v = (const struct sa_volume *)data;
++	sweet_audio_vol_below = v->below;
++	sweet_audio_vol_muted = v->muted;
++	sweet_audio_vol_gen++;
++	return 0;
++}
++
++static const struct cdevsw sa_cdevsw = {
++	.d_open = sa_open, .d_close = sa_close, .d_read = eno_rdwrt, .d_write = sa_write, .d_ioctl = sa_ioctl,
++	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select, .d_mmap = eno_mmap,
++	.d_strategy = eno_strat, .d_type = 0,
++};
++
++/* once the DSP's graph is ready (TopazModem audio_test()) */
++void
++sweet_audio_dev_init(void)
++{
++	static int major = -1;
++	if (major >= 0) {
++		return;
++	}
++	major = cdevsw_add(-1, &sa_cdevsw);
++	if (major < 0) {
++		printf("sweet audio: no major\n");
++		return;
++	}
++	void *a = devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-audio");
++	void *b = devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "topaz-audio");
++	printf("sweet audio: /dev/redwood-audio %s, /dev/topaz-audio %s\n", a ? "ready" : "failed", b ? "ready" : "failed");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 9b3b517..e7e0e91 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -10079,7 +10079,16 @@ audio_diag(const char *when)
+ }
+ 
+ static bool a_live;
+-static uint64_t a_live_buf;
++static uint64_t a_live_buf, a_stream_pa;
++static int16_t *a_stream_va;
++extern "C" {
++uint32_t sweet_audio_avail(void);
++uint32_t sweet_audio_take(int16_t *mono, uint32_t frames);
++void sweet_audio_flush(void);
++void sweet_audio_dev_init(void);
++extern volatile uint32_t sweet_audio_vol_below, sweet_audio_vol_muted, sweet_audio_vol_gen;
++extern volatile uint64_t sweet_audio_frames_in, sweet_audio_frames_dropped;
++}
+ 
+ static void
+ audio_test(void)
+@@ -10150,7 +10159,7 @@ audio_test(void)
+ 	IOMemoryMap *bmap = NULL;
+ 	buf_pa = MODEM_POOL_BASE + MODEM_POOL_SIZE - 0x10000;
+ 	if (pool_used + 0x10000 <= MODEM_POOL_SIZE) {
+-		bmap = map_phys(buf_pa, 0x4000, true);
++		bmap = map_phys(buf_pa, 0x6000, true);    /* tone 8 KB, command page, iOS's stream 12 KB */
+ 	}
+ 	buf = bmap != NULL ? (int16_t *)bmap->getVirtualAddress() : NULL;
+ 	if (buf == NULL) {
+@@ -10185,7 +10194,7 @@ audio_test(void)
+ 		a_put16(&p, 1);
+ 		a_put32(&p, 0);                                       /* physical addresses */
+ 		a_put32(&p, (uint32_t)buf_pa); a_put32(&p, (uint32_t)(buf_pa >> 32));
+-		a_put32(&p, tone + 0x1000);
++		a_put32(&p, tone + 0x4000);
+ 		a_gpr_pkt(GPR_PORT_APM_CLIENT, APM_PORT, APM_CMD_SHARED_MEM_MAP_REGIONS, 1, m, sizeof(m));
+ 		r = a_wait(APM_CMD_SHARED_MEM_MAP_REGIONS, APM_CMD_RSP_SHARED_MEM_MAP_REGIONS, 2000);
+ 		a_mem_handle = r == 0 ? a_box.p[0] : 0;
+@@ -10236,10 +10245,11 @@ audio_test(void)
+ 	}
+ 	unsigned sent = 0, t0 = a_ms;
+ 	a_writes_done = 0;
+-	for (; sent < 4; sent++) {
++	/* 0200: the beeps only with audio=3; audio=2 leaves everything ready for iOS's sound */
++	for (; audio_on >= 3 && sent < 4; sent++) {
+ 		a_write(buf_pa + (sent % A_NBUF) * bytes, bytes, sent % A_NBUF);
+ 	}
+-	for (unsigned ms = 0; ms < 15000; ms++) {
++	for (unsigned ms = 0; audio_on >= 3 && ms < 15000; ms++) {
+ 		a_service();
+ 		while (sent < a_writes_done + 4 && sent < 1500) {
+ 			unsigned k = (sent / 50) % 2 == 0 ? sent % 4 : 4 + sent % 4;   /* 0.5 s tone, 0.5 s silence */
+@@ -10263,7 +10273,84 @@ audio_test(void)
+ 	r1 = a_graph_mgmt(APM_CMD_GRAPH_STOP);
+ 	a_live = true;                              /* open and stopped: kern.sweet_audio beeps start it again */
+ 	a_live_buf = buf_pa;
+-	LOG("adsp: stop %lld (the graph stays open for kern.sweet_audio)", r1);
++	a_stream_va = (int16_t *)((uint8_t *)buf + tone + 0x1000);
++	a_stream_pa = buf_pa + tone + 0x1000;
++	LOG("adsp: stop %lld (the graph stays open for iOS's sound and kern.sweet_audio)", r1);
++	sweet_audio_dev_init();
++}
++
++/*
++ * iOS's sound: what RedwoodAudio.driver writes to /dev/redwood-audio (bsd/dev/sweet_audio_dev.c),
++ * 10 ms at a time into the open graph, 4 periods ahead of the DSP. The graph starts when 20 ms
++ * have come and stops after 0.5 s with nothing; the volume iOS sets goes to the RX macro's
++ * digital gains (EAR INT0, AUX INT2; the headphones 20 dB under).
++ */
++static bool s_playing;
++static unsigned s_sent, s_quiet;
++static uint32_t s_vol_gen = ~0u;
++
++static void
++stream_volume(void)
++{
++	int db = sweet_audio_vol_muted ? -84 : -(int)(sweet_audio_vol_below / 8);
++	if (db < -84) {
++		db = -84;
++	}
++	s_vol_gen = sweet_audio_vol_gen;
++	if (c_rx == NULL) {
++		return;
++	}
++	int hdb = MAX(db - 20, -84);
++	c_wr(c_rx, 0x414, (uint32_t)((a_flags & 4) ? hdb : db) & 0xFF);
++	c_wr(c_rx, 0x494, (uint32_t)hdb & 0xFF);
++	c_wr(c_rx, 0x514, (uint32_t)db & 0xFF);
++}
++
++static void
++stream_service(void)
++{
++	const uint32_t bytes = A_PERIOD * 2;
++	if (!a_live || a_stream_va == NULL) {
++		return;
++	}
++	if (!s_playing) {
++		if (sweet_audio_avail() < 2 * A_PERIOD) {
++			return;
++		}
++		int64_t r1 = a_graph_mgmt(APM_CMD_GRAPH_PREPARE), r2 = a_graph_mgmt(APM_CMD_GRAPH_START);
++		if (r2 != 0) {
++			LOG("adsp: iOS sound: start failed (prepare %lld, start %lld)", r1, r2);
++			sweet_audio_flush();
++			return;
++		}
++		s_playing = true;
++		s_sent = 0;
++		s_quiet = 0;
++		a_writes_done = 0;
++		stream_volume();
++		LOG("adsp: iOS sound: playing (%llu frames so far, %llu dropped)", sweet_audio_frames_in, sweet_audio_frames_dropped);
++	}
++	if (s_vol_gen != sweet_audio_vol_gen) {
++		stream_volume();
++	}
++	while (s_sent < a_writes_done + 4) {
++		unsigned k = s_sent % A_NBUF;
++		int16_t *d = a_stream_va + k * A_PERIOD;
++		uint32_t n = sweet_audio_take(d, A_PERIOD);
++		if (n < A_PERIOD) {
++			bzero(d + n, (A_PERIOD - n) * sizeof(int16_t));
++		}
++		s_quiet = n == 0 ? s_quiet + 1 : 0;
++		mb();
++		a_write(a_stream_pa + k * bytes, bytes, 0x100 + k);
++		s_sent++;
++	}
++	if (s_quiet >= 50) {                        /* 0.5 s of nothing */
++		int64_t r = a_graph_mgmt(APM_CMD_GRAPH_STOP);
++		s_playing = false;
++		LOG("adsp: iOS sound: stopped (stop %lld; %llu frames in, %llu dropped)", r, sweet_audio_frames_in,
++		    sweet_audio_frames_dropped);
++	}
+ }
+ 
+ /* kern.sweet_audio op 1: N seconds of beeps on the open graph */
+@@ -10320,7 +10407,7 @@ audio_request(void)
+ 	volatile uint8_t *mm = tg == 2 ? c_rx : tg == 3 ? c_va : tg == 4 ? c_rxswr : tg == 5 ? c_vaswr : NULL;
+ 	switch (op) {
+ 	case 1:
+-		if (a_live) {
++		if (a_live && !s_playing) {
+ 			audio_beep(MIN(MAX(v, 1u), 20u));
+ 		} else {
+ 			LOG("adsp: beep: no graph (the test at 45 s did not get that far)");
+@@ -10470,6 +10557,7 @@ adsp_thread(void *arg __unused, wait_result_t wr __unused)
+ 			}
+ 			if (tested) {
+ 				audio_request();
++				stream_service();
+ 			}
+ 			if (a_up(&a_ch[0]) && a_hello_rx && !a_hello_sent) {
+ 				struct qrtr_ctrl c = { QRTR_TYPE_HELLO, 0, 0, 0, 0 };
+-- 
+2.43.0
+
