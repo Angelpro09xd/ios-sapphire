@@ -1,0 +1,156 @@
+From 8a57ae1fcac7984b12ba366b2f0d98592836a4ca Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 11:21:27 +0000
+Subject: [PATCH] sapphire-0178: the AudioReach graph in band, a parameter
+ block a packet
+
+0177 on the phone: from the end of our pool too, the ADSP's first
+out-of-band read reset the phone (the out-of-band PRM vote just before
+came back status 2): the ADSP cannot read our pool at all. Kernel memory
+never reset anything, but this XNU has it only above 4 GB. So nothing
+goes out of band any more: the graph open and the SET_CFG are sent one
+parameter block a packet (module properties one module a block), each
+under the ADSP's 128-byte receive buffers; the tone's buffers are back
+in kernel memory.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 76 +++++++++++++++++++--------------
+ 1 file changed, 43 insertions(+), 33 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index dd0a133..c7b81dc 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -8620,6 +8620,32 @@ a_put16(uint8_t **p, uint16_t v)
+ 	*p += 2;
+ }
+ 
++/*
++ * 0177: the ADSP cannot read our pool (the out-of-band graph open reset the phone from its end
++ * too), and kernel memory is above 4 GB. Everything goes in band, then, one parameter block a
++ * packet so that each fits the ADSP's 128-byte receive buffers: APM takes a graph open (or a
++ * SET_CFG) in pieces, each naming what an earlier one created.
++ */
++static int64_t
++a_cmd_each(uint32_t src, uint32_t dst, uint32_t opcode, const struct a_pb *pb, const char *what)
++{
++	int64_t first = 0;
++	unsigned n = 0;
++
++	for (uint32_t at = 0; at + 16 <= pb->n; n++) {
++		uint32_t h[4];
++		memcpy(h, pb->b + at, 16);
++		uint32_t len = 16 + h[2];
++		int64_t r = a_cmd_sync(src, dst, opcode, pb->b + at, len, 0);
++		LOG("adsp: %s, block %u (module %x, param %08x, %u bytes) -> %lld", what, n, h[0], h[1], len, r);
++		if (r != 0 && first == 0) {
++			first = r;
++		}
++		at += len;
++	}
++	return first;
++}
++
+ static int64_t
+ a_prm(uint32_t pid, const uint32_t *v, unsigned n)
+ {
+@@ -8697,11 +8723,11 @@ a_graph_open_part(uint32_t sg, uint32_t direction, uint32_t cont, uint32_t cap,
+ 			a_put32(&p, a_mods[i].mid); a_put32(&p, a_mods[i].iid);
+ 		}
+ 	}
+-	p = a_param(pb, APM_PORT, 0x08001003, 4 + nm * 24);
+-	a_put32(&p, nm);
+ 	for (unsigned i = 0; i < all; i++) {
+ 		if (a_in(i, sg)) {
+-			/* a module whose neighbour is left out of the probe keeps its ports */
++			/* one block per module (three in one would not fit 128 bytes) */
++			p = a_param(pb, APM_PORT, 0x08001003, 4 + 24);
++			a_put32(&p, 1);
+ 			a_put32(&p, a_mods[i].iid); a_put32(&p, 1);
+ 			a_put32(&p, 0x08001015); a_put32(&p, 8); a_put32(&p, a_mods[i].ip); a_put32(&p, a_mods[i].op);
+ 		}
+@@ -8719,7 +8745,7 @@ a_graph_open_part(uint32_t sg, uint32_t direction, uint32_t cont, uint32_t cap,
+ 			last = i;
+ 		}
+ 	}
+-	r = a_cmd_sync(GPR_PORT_APM_CLIENT, APM_PORT, APM_CMD_GRAPH_OPEN, pb->b, pb->n, 0);
++	r = a_cmd_each(GPR_PORT_APM_CLIENT, APM_PORT, APM_CMD_GRAPH_OPEN, pb, "graph open");
+ 	LOG("adsp: graph open of subgraph %x (modules %x, %u connections, direction %u, container %x) -> %lld", sg,
+ 	    a_mask, nc, direction, cap, r);
+ 	IOFree(pb, sizeof(*pb));
+@@ -8750,7 +8776,7 @@ a_graph_mgmt(uint32_t opcode)
+  * (AR_EFAILED) for both kinds of container. Which part is refused: the stream's modules one by
+  * one, then the device's, each with both container kinds, each closed again when it opens.
+  */
+-static void
++static void __attribute__((unused))
+ a_graph_probe(void)
+ {
+ 	static const uint32_t caps[][2] = { { 2, 3 }, { 0x0B001001, 0x0B001001 } };
+@@ -8818,7 +8844,7 @@ a_formats(void)
+ 	a_put32(&p, 1); a_put32(&p, 2); a_put32(&p, 1);              /* RXTX, RX1, channel 0 */
+ 	p = a_param(pb, A_CDMA, 0x08001176, 4);
+ 	a_put32(&p, 0);
+-	r = a_cmd_sync(GPR_PORT_APM_CLIENT, APM_PORT, APM_CMD_SET_CFG, pb->b, pb->n, 0);
++	r = a_cmd_each(GPR_PORT_APM_CLIENT, APM_PORT, APM_CMD_SET_CFG, pb, "formats");
+ 	/* the shared memory endpoint's input format: SET_CFG sent to the module itself */
+ 	pb->n = 0;
+ 	p = a_param(pb, A_WRSH, 0x0800100C, 12 + 16 + 1);
+@@ -8911,20 +8937,17 @@ audio_test(void)
+ 	 * written through a write-combined mapping (the ADSP does not snoop our caches).
+ 	 */
+ 	/*
+-	 * Where the ADSP's buffers go, after 0171-0176:
+-	 *  - 0171: right behind the ADSP's PAS metadata in our pool (0xe0442000): the first access
+-	 *    reset the phone, and hyp_assign of that range was refused, while rmtfs's range lower in
+-	 *    the same pool is taken: TrustZone guards the metadata's neighbourhood since init_image;
+-	 *  - 0174/0175: kernel memory, which this XNU only has above 4 GB (0x1b8270000; not one of 4096
+-	 *    pages came lower): the ADSP's 32-bit side read the wrong place, every graph open failed.
+-	 * So: the last 64 KB of our pool, HLOS memory below 4 GB, far from anything TrustZone holds.
++	 * Where the ADSP's buffers go: not our pool (0171 and 0177: the ADSP's first read of it reset
++	 * the phone, wherever in the pool), but kernel memory, as Android does (that never reset
++	 * anything), through SMMU stream 0x1c1; this XNU has it only above 4 GB.
+ 	 */
++	IOBufferMemoryDescriptor *bmd = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 0x4000, 0x0000000FFFFFC000ull);
+ 	IOMemoryMap *bmap = NULL;
+-	buf_pa = MODEM_POOL_BASE + MODEM_POOL_SIZE - 0x10000;
+-	if (pool_used + 0x10000 <= MODEM_POOL_SIZE) {
+-		bmap = map_phys(buf_pa, 0x4000, true);
++	if (bmd != NULL && bmd->prepare() == kIOReturnSuccess) {
++		bmap = bmd->map(kIOMapWriteCombineCache);
++		buf_pa = bmd->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+ 	}
+-	LOG("adsp: buffers at the end of the pool, %llx (pool used %llx)", buf_pa, pool_used);
+ 	buf = bmap != NULL ? (int16_t *)bmap->getVirtualAddress() : NULL;
+ 	if (buf == NULL || buf_pa == 0) {
+ 		LOG("adsp: no buffer (map %p pa %llx)", bmap, buf_pa);
+@@ -8958,23 +8981,10 @@ audio_test(void)
+ 			return;
+ 		}
+ 	}
+-	a_verbose = true;
+-	a_oob = true;
+-	{
+-		/* is the out-of-band path read right? a command known to work in band, sent out of band */
+-		struct a_pb pb = {};
+-		uint8_t *p = a_param(&pb, PRM_PORT, PARAM_ID_RSC_HW_CORE, 4);
+-		a_put32(&p, 1);
+-		a_oob_force = true;
+-		int64_t rr = a_cmd_sync(GPR_PORT_PRM_CLIENT, PRM_PORT, PRM_CMD_REQUEST_HW_RSC, pb.b, pb.n,
+-		    PRM_CMD_RSP_REQUEST_HW_RSC);
+-		a_oob_force = false;
+-		LOG("adsp: the LPASS vote again, out of band: %lld (answer %08x: %08x %08x)", rr, a_box.opcode, a_box.p[0], a_box.p[1]);
+-	}
+-	IOSleep(300);                                           /* (the USB log goes out every 100 ms) */
+-	a_graph_probe();
+ 	a_verbose = false;
+-	r = a_graph_open(2, 3);                                 /* CD, EP, out of band */
++	a_oob = false;
++	IOSleep(300);                                           /* (the USB log goes out every 100 ms) */
++	r = a_graph_open(2, 3);                                 /* CD, EP, in band, a block a packet */
+ 	if (r != 0 && r != -3) {
+ 		LOG("adsp: graph open (capabilities) -> %lld; again with generic containers", r);
+ 		IOSleep(300);
+-- 
+2.43.0
+
