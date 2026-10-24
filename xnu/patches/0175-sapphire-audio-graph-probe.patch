@@ -1,0 +1,180 @@
+From 69a6006fdd01d835bd1ca8b0a165dd46f1c75e2b Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 10:52:54 +0000
+Subject: [PATCH] sapphire-0175: which part of the AudioReach graph the ADSP
+ refuses
+
+0174 on the phone: with the buffers in ordinary kernel memory nothing
+resets any more and the ADSP reads the out-of-band graph open, but
+answers status 1 (AR_EFAILED) for both kinds of container. Before the
+whole graph, a probe opens (and closes again) the stream subgraph with
+WR_SHARED_MEM_EP alone, + PCM_DEC, + PCM_CNV, and the device subgraph
+with CODEC_DMA_SINK alone (TX and RX) and with MFC, each with capability
+containers and with generic ones.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 95 +++++++++++++++++++++++++--------
+ 1 file changed, 73 insertions(+), 22 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 4bf0537..d64be27 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -8647,12 +8647,20 @@ static const struct { uint32_t sg, cont, mid, iid, ip, op; } a_mods[] = {
+ 	{ A_SG_DEV, A_CONT_DEV, 0x07001023, A_CDMA, 1, 0 },        /* CODEC_DMA_SINK */
+ };
+ 
++static uint32_t a_mask = ~0u;                   /* which of a_mods a graph open takes (a_graph_probe()) */
++
++static bool
++a_in(unsigned i, uint32_t sg)
++{
++	return a_mods[i].sg == sg && ((a_mask >> i) & 1) != 0;
++}
++
+ static int64_t
+ a_graph_open_part(uint32_t sg, uint32_t direction, uint32_t cont, uint32_t cap, uint32_t link_from)
+ {
+ 	const unsigned all = sizeof(a_mods) / sizeof(a_mods[0]);
+ 	struct a_pb *pb = (struct a_pb *)IOMalloc(sizeof(*pb));
+-	unsigned nm = 0, nc = 0;
++	unsigned nm = 0, nc = 0, last = ~0u;
+ 	uint8_t *p;
+ 	int64_t r;
+ 
+@@ -8660,12 +8668,13 @@ a_graph_open_part(uint32_t sg, uint32_t direction, uint32_t cont, uint32_t cap,
+ 		return -1;
+ 	}
+ 	for (unsigned i = 0; i < all; i++) {
+-		if (a_mods[i].sg == sg) {
++		if (a_in(i, sg)) {
++			nc += last != ~0u;
++			last = i;
+ 			nm++;
+-			nc += i + 1 < all && a_mods[i + 1].sg == sg;
+ 		}
+ 	}
+-	nc += link_from != 0;
++	nc += link_from != 0 && nm != 0;
+ 	pb->n = 0;
+ 	p = a_param(pb, APM_PORT, 0x08001001, 4 + 44);
+ 	a_put32(&p, 1);
+@@ -8684,49 +8693,89 @@ a_graph_open_part(uint32_t sg, uint32_t direction, uint32_t cont, uint32_t cap,
+ 	a_put32(&p, 1);
+ 	a_put32(&p, sg); a_put32(&p, cont); a_put32(&p, nm);
+ 	for (unsigned i = 0; i < all; i++) {
+-		if (a_mods[i].sg == sg) {
++		if (a_in(i, sg)) {
+ 			a_put32(&p, a_mods[i].mid); a_put32(&p, a_mods[i].iid);
+ 		}
+ 	}
+ 	p = a_param(pb, APM_PORT, 0x08001003, 4 + nm * 24);
+ 	a_put32(&p, nm);
+ 	for (unsigned i = 0; i < all; i++) {
+-		if (a_mods[i].sg == sg) {
++		if (a_in(i, sg)) {
++			/* a module whose neighbour is left out of the probe keeps its ports */
+ 			a_put32(&p, a_mods[i].iid); a_put32(&p, 1);
+ 			a_put32(&p, 0x08001015); a_put32(&p, 8); a_put32(&p, a_mods[i].ip); a_put32(&p, a_mods[i].op);
+ 		}
+ 	}
+ 	p = a_param(pb, APM_PORT, 0x08001004, 4 + nc * 16);
+ 	a_put32(&p, nc);
+-	for (unsigned i = 0; i + 1 < all; i++) {
+-		if (a_mods[i].sg == sg && a_mods[i + 1].sg == sg) {
+-			a_put32(&p, a_mods[i].iid); a_put32(&p, 1); a_put32(&p, a_mods[i + 1].iid); a_put32(&p, 2);
+-		}
+-	}
+-	for (unsigned i = 0; link_from != 0 && i < all; i++) {
+-		if (a_mods[i].sg == sg) {
+-			a_put32(&p, link_from); a_put32(&p, 1); a_put32(&p, a_mods[i].iid); a_put32(&p, 2);
+-			break;
++	last = ~0u;
++	for (unsigned i = 0; i < all; i++) {
++		if (a_in(i, sg)) {
++			if (last != ~0u) {
++				a_put32(&p, a_mods[last].iid); a_put32(&p, 1); a_put32(&p, a_mods[i].iid); a_put32(&p, 2);
++			} else if (link_from != 0) {
++				a_put32(&p, link_from); a_put32(&p, 1); a_put32(&p, a_mods[i].iid); a_put32(&p, 2);
++			}
++			last = i;
+ 		}
+ 	}
+ 	r = a_cmd_sync(GPR_PORT_APM_CLIENT, APM_PORT, APM_CMD_GRAPH_OPEN, pb->b, pb->n, 0);
+-	LOG("adsp: graph open of subgraph %x (%u modules, %u connections, container %x, %u bytes) -> %lld", sg, nm, nc,
+-	    cap, pb->n + 40, r);
++	LOG("adsp: graph open of subgraph %x (modules %x, %u connections, direction %u, container %x) -> %lld", sg,
++	    a_mask, nc, direction, cap, r);
+ 	IOFree(pb, sizeof(*pb));
+ 	return r;
+ }
+ 
+ static int64_t
+-a_graph_mgmt(uint32_t opcode)
++a_graph_mgmt_list(uint32_t opcode, const uint32_t *sgs, unsigned n)
+ {
+ 	struct a_pb pb = {};
+-	uint8_t *p = a_param(&pb, APM_PORT, 0x08001005, 12);   /* APM_PARAM_ID_SUB_GRAPH_LIST */
+-	a_put32(&p, 2);
+-	a_put32(&p, A_SG);
+-	a_put32(&p, A_SG_DEV);
++	uint8_t *p = a_param(&pb, APM_PORT, 0x08001005, 4 + 4 * n);   /* APM_PARAM_ID_SUB_GRAPH_LIST */
++	a_put32(&p, n);
++	for (unsigned i = 0; i < n; i++) {
++		a_put32(&p, sgs[i]);
++	}
+ 	return a_cmd_sync(GPR_PORT_APM_CLIENT, APM_PORT, opcode, pb.b, pb.n, 0);
+ }
+ 
++static int64_t
++a_graph_mgmt(uint32_t opcode)
++{
++	static const uint32_t both[] = { A_SG, A_SG_DEV };
++	return a_graph_mgmt_list(opcode, both, 2);
++}
++
++/*
++ * 0174 on the phone: the graph open read from shared memory is answered with status 1
++ * (AR_EFAILED) for both kinds of container. Which part is refused: the stream's modules one by
++ * one, then the device's, each with both container kinds, each closed again when it opens.
++ */
++static void
++a_graph_probe(void)
++{
++	static const uint32_t caps[][2] = { { 2, 3 }, { 0x0B001001, 0x0B001001 } };
++	static const struct { uint32_t mask, sg, dir, cont; } steps[] = {
++		{ 0x01, A_SG, 2, A_CONT_STR },          /* WR_SHARED_MEM_EP alone */
++		{ 0x03, A_SG, 2, A_CONT_STR },          /* + PCM_DEC */
++		{ 0x07, A_SG, 2, A_CONT_STR },          /* + PCM_CNV */
++		{ 0x10, A_SG_DEV, 1, A_CONT_DEV },      /* CODEC_DMA_SINK alone, TX */
++		{ 0x10, A_SG_DEV, 2, A_CONT_DEV },      /* ... RX */
++		{ 0x18, A_SG_DEV, 1, A_CONT_DEV },      /* MFC + CODEC_DMA_SINK */
++	};
++	for (unsigned c = 0; c < 2; c++) {
++		for (unsigned k = 0; k < sizeof(steps) / sizeof(steps[0]); k++) {
++			a_mask = steps[k].mask;
++			int64_t r = a_graph_open_part(steps[k].sg, steps[k].dir, steps[k].cont,
++			    steps[k].sg == A_SG ? caps[c][0] : caps[c][1], 0);
++			if (r == 0) {
++				(void)a_graph_mgmt_list(APM_CMD_GRAPH_CLOSE, &steps[k].sg, 1);
++			}
++			IOSleep(150);
++		}
++	}
++	a_mask = ~0u;
++}
++
+ static int64_t
+ a_graph_open(uint32_t cap_str, uint32_t cap_dev)
+ {
+@@ -8904,6 +8953,8 @@ audio_test(void)
+ 	a_verbose = true;
+ 	a_oob = true;
+ 	IOSleep(300);                                           /* (the USB log goes out every 100 ms) */
++	a_graph_probe();
++	a_verbose = false;
+ 	r = a_graph_open(2, 3);                                 /* CD, EP, out of band */
+ 	if (r != 0 && r != -3) {
+ 		LOG("adsp: graph open (capabilities) -> %lld; again with generic containers", r);
+-- 
+2.43.0
+
