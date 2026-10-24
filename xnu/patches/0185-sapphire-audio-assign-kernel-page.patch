@@ -1,0 +1,55 @@
+From 2719a8328ad6f202fa20994668863fa0d8d6171b Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 13:18:03 +0000
+Subject: [PATCH] sapphire-0185: the ADSP's kernel page shared with its VM by
+ hyp_assign first
+
+0184 on the phone: the IMEM's last KB is cleared by the boot chain too
+(no crumbs). With the stage-1 tables in place and no fault recorded,
+the ADSP's first read of kernel memory still resets the phone: memory
+protection refuses its VM. fastrpc gives the ADSP memory by hyp_assign
+(HLOS -> LPASS + ADSP heap); our pool was refused it, ordinary kernel
+memory may not be: tried with three VM sets, the tables' page too, and
+the test stops before the ADSP reads anything if all are refused.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 247448b..f14b557 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -9173,6 +9173,30 @@ audio_test(void)
+ 			LOG("adsp: no translation for the ADSP: the test stops here");
+ 			return;
+ 		}
++		/*
++		 * 0181-0184: with our tables in place (no fault recorded) the ADSP's first read of this
++		 * kernel memory still reset the phone: what protects memory from the ADSP's VM refuses it.
++		 * fastrpc gives the ADSP memory by hyp_assign (src HLOS, dst LPASS and the ADSP heap,
++		 * the device tree's qcom,adsp-remoteheap-vmid); our pool was refused that (0172/0173),
++		 * kernel memory may not be. Refused here: stop before the ADSP reads anything.
++		 */
++		static const struct { uint32_t v[3]; unsigned n; const char *what; } tries[] = {
++			{ { VMID_HLOS, 0x16, 0x25 }, 3, "HLOS + LPASS + ADSP heap" },
++			{ { VMID_HLOS, 0x16 }, 2, "HLOS + LPASS" },
++			{ { VMID_HLOS, 0x25 }, 2, "HLOS + ADSP heap" },
++		};
++		uint64_t ar = ~0ull;
++		for (unsigned t = 0; t < sizeof(tries) / sizeof(tries[0]) && ar != 0; t++) {
++			ar = scm_assign(buf_pa, 0x4000, tries[t].v, tries[t].n);
++			LOG("adsp: kernel page %llx shared with %s: %llx", buf_pa, tries[t].what, ar);
++		}
++		uint64_t tr = scm_assign(tbl_pa, 0x4000, tries[0].v, 3);
++		LOG("adsp: the tables' page %llx too: %llx", tbl_pa, tr);
++		IOSleep(300);
++		if (ar != 0) {
++			LOG("adsp: the ADSP may not read our memory: the test stops before it does");
++			return;
++		}
+ 		buf_pa = A_IOVA;                        /* from here on, the address the ADSP uses */
+ 		IOSleep(300);
+ 	}
+-- 
+2.43.0
+
