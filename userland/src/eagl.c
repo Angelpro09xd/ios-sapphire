@@ -1337,7 +1337,7 @@ frame_begin(struct eagl *e)
  * functions with the most samples, by dladdr(), go to the log: "self" where the pc was, "total"
  * anywhere in the backtrace.
  */
-#define SMP_MAX         60000
+#define SMP_MAX         120000
 #define SMP_DEPTH       12
 static mach_port_t render_thread;
 static uint64_t (*smp_pcs)[SMP_DEPTH];
@@ -1380,22 +1380,72 @@ smp_cmp_total(const void *a, const void *b)
 	return (int)((const struct smp_slot *)b)->total - (int)((const struct smp_slot *)a)->total;
 }
 
+static void
+smp_report(const char *who, uint64_t (*pcs)[SMP_DEPTH], unsigned n, unsigned idle)
+{
+	enum { SMP_SLOTS = 8192 };
+	struct smp_slot *slot = calloc(SMP_SLOTS, sizeof(*slot));
+	char name[200];
+	if (slot == NULL || n == 0) {
+		free(slot);
+		return;
+	}
+	for (unsigned k = 0; k < n; k++) {
+		for (int i = 0; i < SMP_DEPTH && pcs[k][i] != 0; i++) {
+			Dl_info info;
+			uint64_t key = smp_key(pcs[k][i] - (i > 0 ? 4 : 0), &info);
+			uint32_t h = (uint32_t)((key >> 2) * 2654435761u) % SMP_SLOTS;
+			while (slot[h].key != 0 && slot[h].key != key) {
+				h = (h + 1) % SMP_SLOTS;
+			}
+			slot[h].key = key;
+			if (i == 0) {
+				slot[h].self++;
+			}
+			if (slot[h].seen != k + 1) {
+				slot[h].seen = k + 1;
+				slot[h].total++;
+			}
+		}
+	}
+	say("redwood-gl: thread %s: %u samples, %u%% of them waiting\n", who, n, idle * 100 / n);
+	qsort(slot, SMP_SLOTS, sizeof(*slot), smp_cmp_self);
+	for (int i = 0; i < 25 && slot[i].self != 0; i++) {
+		smp_name(slot[i].key, name, sizeof(name));
+		say("redwood-gl:  %s self  %5.1f%%  %s\n", who, 100.0 * slot[i].self / n, name);
+	}
+	qsort(slot, SMP_SLOTS, sizeof(*slot), smp_cmp_total);
+	for (int i = 0; i < 35 && slot[i].total != 0; i++) {
+		smp_name(slot[i].key, name, sizeof(name));
+		say("redwood-gl:  %s total %5.1f%%  %s\n", who, 100.0 * slot[i].total / n, name);
+	}
+	free(slot);
+}
+
+/* a pc in a kernel trap stub: the thread waits (mach_msg, psynch, select, ...) */
+static bool
+smp_waiting(uint64_t pc)
+{
+	Dl_info info;
+	return dladdr((const void *)pc, &info) && info.dli_fname != NULL && strstr(info.dli_fname, "libsystem_kernel") != NULL;
+}
+
+#define SMP_THREADS     40
 static void *
 sampler_main(void *arg)
 {
 	unsigned secs = (unsigned)(uintptr_t)arg;
 	uint64_t end = now_us() + 600 * 1000000ull;     /* at most 10 minutes of waiting for activity */
-	uint64_t t0 = now_us(), active_us = 0, last_change = 0;
+	uint64_t active_us = 0, last_change = 0;
 	unsigned last_frames = smp_e->frames;
+	mach_port_t self = mach_thread_self(), tid[SMP_THREADS] = {};
+	char tname[SMP_THREADS][32] = {};
+	uint64_t (*pcs[SMP_THREADS])[SMP_DEPTH] = {};
+	unsigned cnt[SMP_THREADS] = {}, idle[SMP_THREADS] = {}, nt = 0, per = SMP_MAX / SMP_THREADS;
 
-	smp_pcs = calloc(SMP_MAX, sizeof(*smp_pcs));
-	if (smp_pcs == NULL) {
-		return NULL;
-	}
 	smp_frames0 = smp_e->frames;
-	say("redwood-gl: sampling the render thread for %u s\n", secs);
-	while (now_us() < end && smp_n < SMP_MAX && active_us < (uint64_t)secs * 1000000) {
-		arm_thread_state64_t st;
+	say("redwood-gl: sampling backboardd's threads for %u s of drawing\n", secs);
+	while (now_us() < end && active_us < (uint64_t)secs * 1000000) {
 		uint64_t now = now_us();
 		if (smp_e->frames != last_frames) {
 			last_frames = smp_e->frames;
@@ -1406,66 +1456,80 @@ sampler_main(void *arg)
 			continue;
 		}
 		active_us += 1000;
-		mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
-		if (thread_suspend(render_thread) == KERN_SUCCESS) {
-			if (thread_get_state(render_thread, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
-				uint64_t *sm = smp_pcs[smp_n++];
-				uint64_t fp = arm_thread_state64_get_fp(st);
-				sm[0] = arm_thread_state64_get_pc(st);
-				sm[1] = arm_thread_state64_get_lr(st);
-				for (int i = 2; i < SMP_DEPTH && fp != 0 && (fp & 7) == 0; i++) {
-					const uint64_t *f = (const uint64_t *)fp;
-					sm[i] = f[1];
-					if (f[0] <= fp) {
-						break;
+		thread_act_array_t list;
+		mach_msg_type_number_t n = 0;
+		if (task_threads(mach_task_self(), &list, &n) != KERN_SUCCESS) {
+			break;
+		}
+		for (mach_msg_type_number_t t = 0; t < n; t++) {
+			if (list[t] == self) {
+				continue;
+			}
+			unsigned k;
+			for (k = 0; k < nt && tid[k] != list[t]; k++) {
+			}
+			if (k == nt) {
+				/* only the thread that draws and Mesa's own ("gdrv": the threaded context's driver thread) */
+				char nm[32] = "";
+				pthread_t pt = pthread_from_mach_thread_np(list[t]);
+				if (pt != NULL) {
+					(void)pthread_getname_np(pt, nm, sizeof(nm));
+				}
+				if (nt == SMP_THREADS) {
+					continue;
+				}
+				tid[nt] = list[t];
+				pcs[nt] = calloc(per, sizeof(*pcs[0]));
+				snprintf(tname[nt], sizeof(tname[nt]), "%s%s", list[t] == render_thread ? "GL:" : "", nm[0] ? nm : "?");
+				nt++;
+			}
+			arm_thread_state64_t st;
+			mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+			if (pcs[k] != NULL && cnt[k] < per && thread_suspend(list[t]) == KERN_SUCCESS) {
+				if (thread_get_state(list[t], ARM_THREAD_STATE64, (thread_state_t)&st, &sc) == KERN_SUCCESS) {
+					uint64_t *sm = pcs[k][cnt[k]++];
+					uint64_t fp = arm_thread_state64_get_fp(st);
+					sm[0] = arm_thread_state64_get_pc(st);
+					sm[1] = arm_thread_state64_get_lr(st);
+					for (int i = 2; i < SMP_DEPTH && fp != 0 && (fp & 7) == 0; i++) {
+						const uint64_t *f = (const uint64_t *)fp;
+						sm[i] = f[1];
+						if (f[0] <= fp) {
+							break;
+						}
+						fp = f[0];
 					}
-					fp = f[0];
+				}
+				thread_resume(list[t]);
+			}
+		}
+		for (mach_msg_type_number_t t = 0; t < n; t++) {
+			if (list[t] != self) {
+				bool known = false;
+				for (unsigned k = 0; k < nt; k++) {
+					known |= tid[k] == list[t];
+				}
+				if (!known) {
+					mach_port_deallocate(mach_task_self(), list[t]);
 				}
 			}
-			thread_resume(render_thread);
 		}
+		vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(list[0]));
 		usleep(1000);
 	}
 	unsigned frames = smp_e->frames - smp_frames0;
-	uint64_t took = active_us;
-	(void)t0;
-	enum { SMP_SLOTS = 8192 };
-	struct smp_slot *slot = calloc(SMP_SLOTS, sizeof(*slot));
-	if (slot == NULL) {
-		return NULL;
-	}
-	for (unsigned n = 0; n < smp_n; n++) {
-		for (int i = 0; i < SMP_DEPTH && smp_pcs[n][i] != 0; i++) {
-			Dl_info info;
-			uint64_t key = smp_key(smp_pcs[n][i] - (i > 0 ? 4 : 0), &info);
-			uint32_t h = (uint32_t)((key >> 2) * 2654435761u) % SMP_SLOTS;
-			while (slot[h].key != 0 && slot[h].key != key) {
-				h = (h + 1) % SMP_SLOTS;
-			}
-			slot[h].key = key;
-			if (i == 0) {
-				slot[h].self++;
-			}
-			if (slot[h].seen != n + 1) {
-				slot[h].seen = n + 1;
-				slot[h].total++;
-			}
+	say("redwood-gl: samples of %llu ms of drawing, %u frames (%.1f a second of drawing)\n", active_us / 1000, frames,
+	    active_us ? frames * 1e6 / active_us : 0.0);
+	for (unsigned k = 0; k < nt; k++) {
+		for (unsigned i = 0; i < cnt[k]; i++) {
+			idle[k] += smp_waiting(pcs[k][i][0]);
 		}
+		/* only threads that did something */
+		if (cnt[k] != 0 && idle[k] * 100 / cnt[k] < 95) {
+			smp_report(tname[k], pcs[k], cnt[k], idle[k]);
+		}
+		free(pcs[k]);
 	}
-	say("redwood-gl: samples: %u in %llu ms of drawing, %u frames (%.1f a second of drawing)\n", smp_n, took / 1000, frames,
-	    took ? frames * 1e6 / took : 0.0);
-	char name[200];
-	qsort(slot, SMP_SLOTS, sizeof(*slot), smp_cmp_self);
-	for (int i = 0; i < 40 && slot[i].self != 0; i++) {
-		smp_name(slot[i].key, name, sizeof(name));
-		say("redwood-gl: self  %5.1f%%  %s\n", 100.0 * slot[i].self / smp_n, name);
-	}
-	qsort(slot, SMP_SLOTS, sizeof(*slot), smp_cmp_total);
-	for (int i = 0; i < 50 && slot[i].total != 0; i++) {
-		smp_name(slot[i].key, name, sizeof(name));
-		say("redwood-gl: total %5.1f%%  %s\n", 100.0 * slot[i].total / smp_n, name);
-	}
-	free(slot);
 	return NULL;
 }
 
@@ -1486,7 +1550,7 @@ sampler_maybe_start(struct eagl *e)
 		secs = 20;
 	}
 	fclose(f);
-	render_thread = mach_thread_self();
+	render_thread = pthread_mach_thread_np(pthread_self());
 	smp_e = e;
 	pthread_t t;
 	pthread_create(&t, NULL, sampler_main, (void *)(uintptr_t)secs);
@@ -4722,6 +4786,23 @@ install(void)
 					say("redwood-gl: in the environment: %s=%s\n", setting, value + 1);
 				}
 			}
+		}
+	}
+	/* (and NAME=VALUE lines of the file /redwood/glenv: no reboot, a restart of backboardd) */
+	{
+		FILE *f = fopen("/redwood/glenv", "r");
+		char line[160];
+		while (f != NULL && fgets(line, sizeof(line), f) != NULL) {
+			char *value;
+			line[strcspn(line, "\r\n")] = 0;
+			if (line[0] != '#' && (value = strchr(line, '=')) != NULL) {
+				*value = 0;
+				setenv(line, value + 1, 1);
+				say("redwood-gl: in the environment (/redwood/glenv): %s=%s\n", line, value + 1);
+			}
+		}
+		if (f != NULL) {
+			fclose(f);
 		}
 	}
 

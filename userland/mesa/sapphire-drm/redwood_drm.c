@@ -143,6 +143,15 @@ call(unsigned number, void *data, size_t size)
 	if (stats_on < 0) {
 		stats_on = access("/redwood/drmstats", F_OK) == 0;
 	}
+	/*
+	 * MSM_GEM_MADVISE: the kernel keeps every buffer and answers "retained" (xnu 0149), and
+	 * freedreno's buffer cache asks it at every reuse and every return: 1100 calls a second of
+	 * animation measured, 56 us each through IOKit -- 6% of the drawing thread for nothing. Answered here.
+	 */
+	if (number == 0x48 && size >= 12) {
+		((uint32_t *)data)[2] = 1;
+		return 0;
+	}
 	uint64_t t0 = stats_on ? now_us() : 0;
 	kern_return_t result = IOConnectCallStructMethod(connection, number, data, size, data, &returned);
 	if (stats_on) {
