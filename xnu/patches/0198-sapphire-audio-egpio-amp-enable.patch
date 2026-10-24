@@ -1,0 +1,95 @@
+From 052e5f3bf3f67eaa08eeb466a5c3756ee7a46547 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 16:40:17 +0000
+Subject: [PATCH] sapphire-0198: the FS1815 enables are eGPIOs; AUX in Xiaomi's
+ HP_MODE; TLMM over kern.sweet_audio
+
+0197 on the phone: the headphones play, the speakers do not. The FS1815s
+answer on I2C but their ANASTAT stays 0 (FourSemi's fs18v2: 0x000D when
+running). GPIO 99 and 105 are eGPIOs (pinctrl-sm6115.c): their ctl read
+0xa00, EGPIO_ENABLE (bit 12) clear, so the pins were not driven from here.
+Set it. Xiaomi's AUX PATH Mode HP_MODE is enum index 0: AUX_AUXPA bit 4 and
+CDC_PATH_MODE bit 6 clear. kern.sweet_audio targets 8/9 read and write a
+TLMM pin's ctl / io.
+---
+ bsd/dev/sweet_audio_ctl.c       |  3 ++-
+ iokit/Kernel/arm/TopazModem.cpp | 28 ++++++++++++++++++++++++++--
+ 2 files changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/sweet_audio_ctl.c b/bsd/dev/sweet_audio_ctl.c
+index 4e2049c..72774e3 100644
+--- a/bsd/dev/sweet_audio_ctl.c
++++ b/bsd/dev/sweet_audio_ctl.c
+@@ -6,7 +6,8 @@
+  *   op 1 beep (value: seconds), 2 write, 3 read (the answer: the value), 4 the whole test again,
+  *   5 test flags (value; TopazModem.cpp a_flags)
+  *   target 1 WCD937x, 2 RX macro, 3 VA macro, 4 RX SoundWire master, 5 VA SoundWire master,
+- *   6 FS1815 (addr: I2C address << 8 | register), 7 the WCD937x's RX SoundWire slave
++ *   6 FS1815 (addr: I2C address << 8 | register), 7 the WCD937x's RX SoundWire slave,
++ *   8 a TLMM pin's ctl, 9 its io (addr: the GPIO; the answer io << 32 | ctl)
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index c9f139d..eec9e32 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -9088,7 +9088,12 @@ a_amp_probe(void)
+ 			uint32_t was = ctl[0], io = ctl[1];
+ 			ctl[1] = 2;                             /* output high */
+ 			mb();
+-			ctl[0] = (was & ~0x3ffu) | (1u << 9);   /* function 0 (GPIO), output enabled, 2 mA, no pull */
++			/*
++			 * function 0 (GPIO), output enabled, 2 mA, no pull -- and bit 12, EGPIO_ENABLE:
++			 * 99 and 105 are eGPIOs (pinctrl-sm6115.c egpio_present 11 / egpio_enable 12);
++			 * with it clear (0192-0197, ctl 0xa00) the pin is not ours to drive
++			 */
++			ctl[0] = (was & ~0x13ffu) | (1u << 9) | (1u << 12);
+ 			mb();
+ 			LOG("adsp: amp reset GPIO %u: ctl %08x io %08x -> %08x", gpios[i], was, io, ctl[0]);
+ 		}
+@@ -9945,7 +9950,10 @@ codec_rx_on(void)
+ 	}
+ 	/* RDAC4 (AUX DAC), PRE_PMU */
+ 	w_upd(0x3408, 0x04, 0x04);
+-	w_upd(0x3128, 0x10, 0x10);                  /* AUX_AUXPA */
++	/* Xiaomi's "AUX PATH Mode" HP_MODE (enum index 0, mixer_paths_bengal_idp speaker): AUX_AUXPA bit 4 and
++	 * CDC_PATH_MODE bit 6 clear (mainline's AUX DAC sets bit 4; stock topaz reads 0x80 too) */
++	w_upd(0x3128, 0x10, 0x00);
++	w_upd(0x340B, 0x40, 0x00);
+ 	w_upd(0x3409, 0x04, 0x04);
+ 	w_upd(0x344F, 0x01, 0x01);                  /* CDC_AUX_GAIN_CTL */
+ 	/* class-H v3, AUX then HPH, CLS_AB: buck and flyback (once), the HPH quiescent current */
+@@ -10263,6 +10271,9 @@ extern volatile uint64_t sweet_audio_req, sweet_audio_rsp;
+ extern volatile uint32_t sweet_audio_seq, sweet_audio_done;
+ }
+ 
++/* the TLMM tile of each GPIO (pinctrl-sm6115.c): S south 0x900000, E east 0xd00000, W west 0x500000 */
++static const char tlmm_tile[] = "WWWWWWWWEEEEWWWWWWEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEWWWWWWWSSSSSSSSWWWWWWWEEWEEWWWWWWSSSSSSSSSSSSSSS";
++
+ /* one kern.sweet_audio request (sweet_audio_ctl.c), on this thread */
+ static void
+ audio_request(void)
+@@ -10302,6 +10313,19 @@ audio_request(void)
+ 				c_wr(mm, ad & ~3u, v);
+ 			}
+ 			rsp = c_rd(mm, ad & ~3u);
++		} else if ((tg == 8 || tg == 9) && ad < sizeof(tlmm_tile) - 1) {
++			/* TLMM pin ad: 8 writes its ctl, 9 its io (bit 1 the output); the answer io << 32 | ctl */
++			uint64_t base = tlmm_tile[ad] == 'S' ? 0x00900000ull : tlmm_tile[ad] == 'E' ? 0x00D00000ull : 0x00500000ull;
++			volatile uint32_t *g = (volatile uint32_t *)ml_io_map(base + ad * 0x1000ull, 0x1000);
++			if (g != NULL) {
++				if (wr) {
++					g[tg == 8 ? 0 : 1] = v;
++					mb();
++				}
++				rsp = ((uint64_t)g[1] << 32) | g[0];
++			} else {
++				rsp = ~0ull;
++			}
+ 		} else if (tg == 6) {
+ 			uint16_t x = 0;
+ 			if (wr) {
+-- 
+2.43.0
+
