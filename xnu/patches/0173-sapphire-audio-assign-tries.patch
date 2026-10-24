@@ -1,0 +1,46 @@
+From 80414d0eefb6a1a56c5745b09c9f884ac62bd5b5 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 10:23:27 +0000
+Subject: [PATCH] sapphire-0173: the shared memory assigned to the first VM set
+ TrustZone takes
+
+0172 on the phone: hyp_assign to { HLOS, LPASS 22, ADSP heap 0x25 }
+was refused (ret -2, res 0x56) and the test stopped before the ADSP was
+pointed at the memory (no reset this time). Now tried in turn: HLOS +
+LPASS, HLOS + ADSP_Q6 (6), HLOS + ADSP heap, HLOS + LPASS + ADSP_Q6.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 5379a88..2730cae 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -8865,9 +8865,21 @@ audio_test(void)
+ 		 * modem's). HLOS keeps it, LPASS (22) and the ADSP heap (0x25, the device tree's
+ 		 * qcom,adsp-remoteheap-vmid) get it read-write.
+ 		 */
+-		static const uint32_t v[] = { VMID_HLOS, 0x16, 0x25 };
+-		uint64_t ar = scm_assign(buf_pa, tone + 0x1000, v, 3);
+-		LOG("adsp: shared memory %llx+%x assigned to HLOS, LPASS and the ADSP heap: %llx", buf_pa, tone + 0x1000, ar);
++		/*
++		 * 0172: { HLOS, LPASS, ADSP heap } refused (ret -2, res 0x56). The first of these
++		 * TrustZone takes: LPASS (22) alone with HLOS, the ADSP Q6 (6), the heap (0x25).
++		 */
++		static const struct { uint32_t v[3]; unsigned n; const char *what; } tries[] = {
++			{ { VMID_HLOS, 0x16 }, 2, "HLOS + LPASS" },
++			{ { VMID_HLOS, 6 }, 2, "HLOS + ADSP_Q6" },
++			{ { VMID_HLOS, 0x25 }, 2, "HLOS + ADSP heap" },
++			{ { VMID_HLOS, 0x16, 6 }, 3, "HLOS + LPASS + ADSP_Q6" },
++		};
++		uint64_t ar = ~0ull;
++		for (unsigned t = 0; t < sizeof(tries) / sizeof(tries[0]) && ar != 0; t++) {
++			ar = scm_assign(buf_pa, tone + 0x1000, tries[t].v, tries[t].n);
++			LOG("adsp: shared memory %llx+%x to %s: %llx", buf_pa, tone + 0x1000, tries[t].what, ar);
++		}
+ 		IOSleep(300);
+ 		if (ar != 0) {
+ 			LOG("adsp: not assigned: the ADSP must not touch it, the test stops here");
+-- 
+2.43.0
+
