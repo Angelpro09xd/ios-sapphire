@@ -1,0 +1,132 @@
+From 9f1d345d415e10fce99fc144cb1ac1c97d9608c8 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 22:24:38 +0000
+Subject: [PATCH] sapphire-0204: the CX rail's level from the RPM before a
+ faster GPU clock
+
+0203 on the phone: with every apps clock voted high and RPM clock scaling
+on, memcpy out of the DDR stays at 2.2-2.5 GB/s (cached 12.6 GB/s, the
+cores at 2.8 GHz): the single A73 is the limit there, not the DDR. The
+GPU then: it runs at 980 MHz on whatever level the boot left the CX rail
+at, which gpu_gx_gdsc hangs from (pm6125 S3, RPM rwcx 0). The stock
+levels: 1025 MHz TURBO, 1114.8 and 1260 MHz TURBO_L1.
+
+topaz_rpm_vote() gives the RPM client to the rest of the kernel (started
+by its first caller, one lock for all), and SapphireGpu votes CX to TURBO
+for gpu_mhz >= 980 and TURBO_L1 above 1025 before it sets the clock
+(1025 MHz instead if the vote is refused). kern.sweet_audio op 6 target 8
+votes rwcx levels live.
+---
+ iokit/Kernel/arm/SapphireGpu.cpp | 15 ++++++++++
+ iokit/Kernel/arm/TopazModem.cpp  | 47 ++++++++++++++++++++++++++------
+ 2 files changed, 54 insertions(+), 8 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index 9552236..eb082f6 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -261,6 +261,7 @@ static uint32_t core_div = 2;
+  * bootloader's corner holds may hang the GPU. 0 = off (gpu_div decides).
+  */
+ static uint32_t core_mhz;
++extern "C" int topaz_rpm_vote(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
+ /*
+  * boot-arg gpu_smmu_early: program the identity context bank as soon as its clock is voted,
+  * before the GX domain comes up, instead of in cp_start(). The GPU's SMMU comes out of the
+@@ -689,6 +690,20 @@ power_up(void)
+ 	if (!gdsc_on(0x100c, 0x1008, 0x1508, 0x100c, "gpu_gx_gdsc")) {
+ 		return false;
+ 	}
++	/*
++	 * 0204: the GX domain is fed by the CX rail (pm6125 S3, RPM "rwcx" 0, its level by key "vlvl";
++	 * gpu_gx_gdsc's parent in the device tree). The stock levels: 1025 MHz TURBO (0x180),
++	 * 1114.8 and 1260 MHz TURBO_L1 (0x1a0). Raised before the clock, never lowered.
++	 */
++	if (core_mhz >= 980) {
++		uint32_t level = core_mhz > 1025 ? 0x1a0 : 0x180;
++		int r = topaz_rpm_vote(0, 0x78637772, 0, 0x6c766c76, level);
++		LOG("  CX rail to RPM level %#x for %u MHz: %d", level, core_mhz, r);
++		if (r != 0 && core_mhz > 1025) {
++			LOG("  the CX level was not taken: 1025 MHz instead of %u", core_mhz);
++			core_mhz = 1025;
++		}
++	}
+ 	if (core_mhz != 0 && gpu_pll_start(core_mhz)) {
+ 		ok &= rcg_set(0x101c, SRC_GPU_PLL0, 1, "gx_gfx3d_clk_src");
+ 	} else {
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index d223467..71262af 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -9457,6 +9457,33 @@ rpm_kvp(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value)
+ 	return rpm_status == 1 ? -4 : rpm_status;
+ }
+ 
++/*
++ * 0204: the RPM for the rest of the kernel (SapphireGpu: the CX rail's level before a faster GPU
++ * clock). The first caller starts the client; one lock for every user of it.
++ */
++static IOLock *rpm_lock;
++
++static bool
++rpm_ensure(void)
++{
++	return rpm_is_up() || rpm_start();
++}
++
++extern "C" int
++topaz_rpm_vote(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value)
++{
++	if (rpm_lock == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (!OSCompareAndSwapPtr(NULL, l, (void * volatile *)&rpm_lock)) {
++			IOLockFree(l);
++		}
++	}
++	IOLockLock(rpm_lock);
++	int r = rpm_ensure() ? rpm_kvp(set, type, id, key, value) : -5;
++	IOLockUnlock(rpm_lock);
++	return r;
++}
++
+ /* ---------------- the codec: from the RX macro to the speaker (audio=2) */
+ 
+ /*
+@@ -10160,8 +10187,14 @@ audio_test(void)
+ 	static bool rpm_done;
+ 	if (!rpm_done) {
+ 		rpm_done = true;
+-		bool rpm = rpm_start();
++		if (rpm_lock != NULL) {
++			IOLockLock(rpm_lock);
++		}
++		bool rpm = rpm_ensure();
+ 		int act = rpm ? rpm_ldo(14, 1800000, 650, 0) : -9, slp = rpm ? rpm_ldo(14, 1800000, 650, 1) : -9;
++		if (rpm_lock != NULL) {
++			IOLockUnlock(rpm_lock);
++		}
+ 		LOG("adsp: RPM: LDO14 (cdc-vdd-buck) on at 1.8 V: active set %d, sleep set %d (0: taken)", act, slp);
+ 		IOSleep(10);
+ 	}
+@@ -10503,13 +10536,11 @@ audio_request(void)
+ 		 * 5 "ipa", 6 "mmxi", 7 "ce"), addr = id | set << 15, value: kHz (misc: "Enab" value)
+ 		 */
+ 		static const uint32_t types[] = { 0, 0x326b6c63, 0x316b6c63, 0x306b6c63, 0x00707571, 0x00617069, 0x69786d6d,
+-			0x00006563 };
+-		if (!rpm_is_up() && !rpm_start()) {
+-			rsp = ~0ull;
+-			break;
+-		}
+-		if (tg >= 1 && tg <= 7) {
+-			int r = rpm_kvp((ad >> 15) & 1, types[tg], ad & 0x7fff, tg == 3 ? 0x62616e45 : 0x007a484b, v);
++			0x00006563, 0x78637772 };
++		if (tg >= 1 && tg <= 8) {
++			/* (8 "rwcx": the CX rail, key "vlvl": an RPM level, 0x180 TURBO, 0x1a0 TURBO_L1) */
++			uint32_t key = tg == 3 ? 0x62616e45 : tg == 8 ? 0x6c766c76 : 0x007a484b;
++			int r = topaz_rpm_vote((ad >> 15) & 1, types[tg], ad & 0x7fff, key, v);
+ 			LOG("adsp: RPM vote %.4s %u set %u = %u: %d", (const char *)&types[tg], ad & 0x7fff, (ad >> 15) & 1, v, r);
+ 			rsp = (uint64_t)(int64_t)r;
+ 		} else {
+-- 
+2.43.0
+
