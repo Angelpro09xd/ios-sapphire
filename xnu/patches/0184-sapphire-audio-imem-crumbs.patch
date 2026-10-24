@@ -1,0 +1,69 @@
+From 4ef2e903d4085a26833a9e25de7a72a3b9a902dc Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 12:28:27 +0000
+Subject: [PATCH] sapphire-0184: breadcrumbs in the IMEM, and the IMEM's
+ restart reason
+
+0183 on the phone: the crumbs in our pool's last page were gone on the
+next boot (the fastboot download, it seems, lands there). They now go
+to the last KB of the IMEM (0x0C125C00, 31 entries; the device tree's
+users of it all lie lower), and the audio test prints the IMEM's restart
+reason and download type too.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 20 ++++++++++++--------
+ 1 file changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 3afb557..247448b 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -8624,21 +8624,23 @@ a_gpr_pkt(uint32_t src, uint32_t dst, uint32_t opcode, uint32_t token, const voi
+  */
+ /*
+  * 0181/0182: the ADSP's first read of our memory resets the phone before the USB log gets out.
+- * Breadcrumbs, then, in the last page of our pool (RAM a warm reset leaves alone): while a
++ * Breadcrumbs, then, in the IMEM (0183's place in our pool did not survive: the next boot's
++ * download goes there, it seems): while a
+  * command waits, every change of the SMMU bank's and the SMMU's fault status and of the ADSP's
+  * state is written there, and the next boot's audio test prints what the last one left.
+  */
+-#define CRUMB_PA    (MODEM_POOL_BASE + MODEM_POOL_SIZE - 0x1000)
++#define IMEM_PA     0x0C125000ull               /* qcom,msm-imem: 4 KB of on-chip RAM a reset keeps */
++#define CRUMB_OFF   0xC00                       /* its last KB, which no listed user takes */
+ #define CRUMB_MAGIC 0x44524241u                 /* "ABRD" */
+ struct crumb { uint32_t ms, stage, fsr, far_lo, far_hi, gfsr, sk, cmd; };
+-struct crumbs { uint32_t magic, boot, n, pad; struct crumb e[120]; };
++struct crumbs { uint32_t magic, boot, n, pad; struct crumb e[31]; };
+ static volatile struct crumbs *a_crumbs;
+ static uint32_t a_stage;
+ 
+ static void
+ crumb(bool force)
+ {
+-	if (a_crumbs == NULL || a_crumbs->n >= 120) {
++	if (a_crumbs == NULL || a_crumbs->n >= 31) {
+ 		return;
+ 	}
+ 	struct crumb c = { a_ms, a_stage, s1_cbp ? r32(s1_cbp, 0x58) : 0, s1_cbp ? r32(s1_cbp, 0x60) : 0,
+@@ -8665,12 +8667,14 @@ crumb(bool force)
+ static void
+ crumbs_start(void)
+ {
+-	IOMemoryMap *m = map_phys(CRUMB_PA, 0x1000, true);
+-	if (m == NULL) {
++	volatile uint8_t *imem = (volatile uint8_t *)ml_io_map(IMEM_PA, 0x1000);
++	if (imem == NULL) {
+ 		return;
+ 	}
+-	a_crumbs = (volatile struct crumbs *)m->getVirtualAddress();
+-	if (a_crumbs->magic == CRUMB_MAGIC && a_crumbs->n <= 120) {
++	LOG("adsp: IMEM restart reason %08x, dload type %08x", *(volatile uint32_t *)(imem + 0x65c),
++	    *(volatile uint32_t *)(imem + 0x1c));
++	a_crumbs = (volatile struct crumbs *)(imem + CRUMB_OFF);
++	if (a_crumbs->magic == CRUMB_MAGIC && a_crumbs->n <= 31) {
+ 		LOG("adsp: the last boot's breadcrumbs (%u):", a_crumbs->n);
+ 		for (uint32_t i = 0; i < a_crumbs->n; i++) {
+ 			volatile struct crumb *c = &a_crumbs->e[i];
+-- 
+2.43.0
+
