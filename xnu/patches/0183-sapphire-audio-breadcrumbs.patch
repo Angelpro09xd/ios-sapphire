@@ -1,0 +1,135 @@
+From 786fd5cb37ee1dcf05d199fcaa4c72693ac7925a Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 12:16:40 +0000
+Subject: [PATCH] sapphire-0183: breadcrumbs of the ADSP's last moments, read
+ back on the next boot
+
+0182 on the phone: no other SMR matches 0x1c0-0x1cf (ours now has the
+whole mask), the SMMU's global and bank fault status are clean before
+the first read, and the phone still resets as soon as the ADSP reads
+the out-of-band graph open. The reset beats the USB log, so: while a
+command waits, every change of the bank's FSR/FAR, the SMMU's GFSR and
+the ADSP's SMP2P state goes to the last page of our pool, which a warm
+reset leaves; the next audio test prints the previous boot's crumbs.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 71 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 70 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index f987056..3afb557 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -4966,7 +4966,7 @@ smmu_identity(uint32_t sid, uint32_t mask, const char *name)
+  * at `iova` (inside one 2 MB block), through three tables in `tbl` (12 KB, write-combined: the
+  * walks are non-cacheable). LPAE stage 1, 4 KB granule, T0SZ 32 (the walk starts at level 1).
+  */
+-static volatile uint8_t *s1_cbp;                /* the bank smmu_s1() set up: its fault registers for the log */
++static volatile uint8_t *s1_cbp, *s1_smmu;       /* the bank smmu_s1() set up, and the SMMU: fault registers for the log */
+ 
+ static bool
+ smmu_s1(uint32_t sid, uint32_t mask, const char *name, uint64_t iova, uint64_t pa, unsigned n, uint64_t *tbl,
+@@ -5059,6 +5059,7 @@ smmu_s1(uint32_t sid, uint32_t mask, const char *name, uint64_t iova, uint64_t p
+ 	/* SCTLR: translate; faults reported and terminated (no CFCFG stall: a stalled ADSP read is a hung bus) */
+ 	w32(cbp, 0x0, (1u << 6) | (1u << 5) | 1u);
+ 	s1_cbp = cbp;
++	s1_smmu = s;
+ 	for (uint32_t i = 0; i < nnear; i++) {
+ 		w32(s, 0xC00 + 4 * near[i], cb);
+ 		LOG("smmu: %s: SMR%u now through CB%u too", name, near[i], cb);
+@@ -8621,11 +8622,76 @@ a_gpr_pkt(uint32_t src, uint32_t dst, uint32_t opcode, uint32_t token, const voi
+  * Wait for the answer to `cmd`: a GPR_BASIC_RSP_RESULT naming it (returns its status), or a
+  * packet with opcode `rsp` (returns 0, payload in a_box). -1 after `ms` without one.
+  */
++/*
++ * 0181/0182: the ADSP's first read of our memory resets the phone before the USB log gets out.
++ * Breadcrumbs, then, in the last page of our pool (RAM a warm reset leaves alone): while a
++ * command waits, every change of the SMMU bank's and the SMMU's fault status and of the ADSP's
++ * state is written there, and the next boot's audio test prints what the last one left.
++ */
++#define CRUMB_PA    (MODEM_POOL_BASE + MODEM_POOL_SIZE - 0x1000)
++#define CRUMB_MAGIC 0x44524241u                 /* "ABRD" */
++struct crumb { uint32_t ms, stage, fsr, far_lo, far_hi, gfsr, sk, cmd; };
++struct crumbs { uint32_t magic, boot, n, pad; struct crumb e[120]; };
++static volatile struct crumbs *a_crumbs;
++static uint32_t a_stage;
++
++static void
++crumb(bool force)
++{
++	if (a_crumbs == NULL || a_crumbs->n >= 120) {
++		return;
++	}
++	struct crumb c = { a_ms, a_stage, s1_cbp ? r32(s1_cbp, 0x58) : 0, s1_cbp ? r32(s1_cbp, 0x60) : 0,
++		s1_cbp ? r32(s1_cbp, 0x64) : 0, s1_smmu ? r32(s1_smmu, 0x48) : 0, a_sk ? *a_sk : 0, 0 };
++	uint32_t n = a_crumbs->n;
++	if (!force && n != 0) {
++		volatile struct crumb *l = &a_crumbs->e[n - 1];
++		if (l->stage == c.stage && l->fsr == c.fsr && l->gfsr == c.gfsr && l->sk == c.sk && c.ms - l->ms < 100) {
++			return;
++		}
++	}
++	a_crumbs->e[n].ms = c.ms;
++	a_crumbs->e[n].stage = c.stage;
++	a_crumbs->e[n].fsr = c.fsr;
++	a_crumbs->e[n].far_lo = c.far_lo;
++	a_crumbs->e[n].far_hi = c.far_hi;
++	a_crumbs->e[n].gfsr = c.gfsr;
++	a_crumbs->e[n].sk = c.sk;
++	mb();
++	a_crumbs->n = n + 1;
++	mb();
++}
++
++static void
++crumbs_start(void)
++{
++	IOMemoryMap *m = map_phys(CRUMB_PA, 0x1000, true);
++	if (m == NULL) {
++		return;
++	}
++	a_crumbs = (volatile struct crumbs *)m->getVirtualAddress();
++	if (a_crumbs->magic == CRUMB_MAGIC && a_crumbs->n <= 120) {
++		LOG("adsp: the last boot's breadcrumbs (%u):", a_crumbs->n);
++		for (uint32_t i = 0; i < a_crumbs->n; i++) {
++			volatile struct crumb *c = &a_crumbs->e[i];
++			LOG("adsp:   t=%u ms stage %u: bank FSR %08x FAR %08x%08x, SMMU GFSR %08x, ADSP %08x", c->ms, c->stage, c->fsr,
++			    c->far_hi, c->far_lo, c->gfsr, c->sk);
++		}
++		IOSleep(300);
++	} else {
++		LOG("adsp: no breadcrumbs from the last boot");
++	}
++	a_crumbs->magic = CRUMB_MAGIC;
++	a_crumbs->n = 0;
++	mb();
++}
++
+ static int64_t
+ a_wait(uint32_t cmd, uint32_t rsp, unsigned ms)
+ {
+ 	for (unsigned t = 0; t < ms; t++) {
+ 		a_service();
++		crumb(t == 0);
+ 		if (a_sk != NULL && (*a_sk & 1)) {
+ 			uint32_t sz = 0;
+ 			const char *why = (const char *)smem_get(smem_partition(SMEM_GLOBAL_HOST, SMEM_GLOBAL_HOST), 423, &sz);
+@@ -8687,6 +8753,8 @@ a_cmd_sync(uint32_t src, uint32_t dst, uint32_t opcode, const void *payload, uin
+ 		uint32_t h[4] = { (uint32_t)a_cmd_pa, (uint32_t)(a_cmd_pa >> 32), a_mem_handle, len };
+ 		memcpy(a_cmd_area, payload, len);
+ 		mb();
++		a_stage = opcode & 0xFFFF;              /* (in the breadcrumbs: which command was out) */
++		crumb(true);
+ 		a_gpr_pkt(src, dst, opcode, 0, h, sizeof(h));
+ 		return a_wait(opcode, rsp, 2000);
+ 	}
+@@ -9039,6 +9107,7 @@ audio_test(void)
+ 	const uint32_t bytes = A_PERIOD * 2;
+ 
+ 	LOG("adsp: audio test begins (t=%u ms)", a_ms);
++	crumbs_start();
+ 	r1 = a_prm(PARAM_ID_RSC_HW_CORE, macro, 1);
+ 	r2 = a_prm(PARAM_ID_RSC_HW_CORE, dcodec, 1);
+ 	r3 = a_prm(PARAM_ID_RSC_AUDIO_HW_CLK, rx_core, 5);
+-- 
+2.43.0
+
