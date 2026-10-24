@@ -1,0 +1,83 @@
+From 7a152a77af20ca345f9a8ea089b27e556469ca46 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 12:03:43 +0000
+Subject: [PATCH] sapphire-0182: all the audio streams (0x1c0-0x1cf) through
+ our bank, faults terminate
+
+0181 on the phone: the bank translated (SCTLR e1, TCR 00800020) and the
+map was taken, then the ADSP's first read reset the phone. Android maps
+the audio streams with mask 0xf; the ADSP may read through another of
+0x1c0-0x1cf, matched elsewhere or not at all. The SMRs matching any of
+them are logged and pointed at our bank, ours takes the mask when none
+does; context faults are now terminated rather than stalled (CFCFG off:
+a stalled ADSP read hangs its bus); the global fault status is logged.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 36 +++++++++++++++++++++++++++++++--
+ 1 file changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index f622ea2..f987056 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -4995,6 +4995,29 @@ smmu_s1(uint32_t sid, uint32_t mask, const char *name, uint64_t iova, uint64_t p
+ 			used |= 1ull << (s2cr & 0x3F);
+ 		}
+ 	}
++	/*
++	 * 0181: the ADSP's first read through this bank reset the phone. Android maps the audio
++	 * streams with mask 0xf (msm-audio-ion: qcom,smmu-sid-mask 0xf, 0x1c0-0x1cf): the ADSP may read
++	 * through a neighbour of 0x1c1. Every valid SMR that matches any of them is listed (and later
++	 * pointed at this bank too); ours then takes the whole mask.
++	 */
++	uint32_t near[8], nnear = 0;
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		smr = r32(s, 0x800 + 4 * i);
++		s2cr = r32(s, 0xC00 + 4 * i);
++		bool hit = false;
++		for (uint32_t k = 0; k < 16 && !hit; k++) {
++			hit = (smr >> 31) != 0 && smmu_sid_match(smr, (sid & ~0xFu) | k, 0);
++		}
++		if (hit) {
++			LOG("smmu: %s: SMR%u %08x (id %x mask %x) S2CR %08x matches the audio streams", name, i, smr, smr & 0x7FFF,
++			    (smr >> 16) & 0x7FFF, s2cr);
++			if (nnear < 8 && i != slot) {
++				near[nnear++] = i;
++			}
++		}
++	}
++	LOG("smmu: sCR0 %08x sGFSR %08x sGFSYNR0 %08x", r32(s, 0x0), r32(s, 0x48), r32(s, 0x50));
+ 	/* a stream already ours (an earlier identity) keeps its bank */
+ 	if (slot != ~0u && (r32(s, 0x800 + 4 * slot) >> 31) != 0 && ((r32(s, 0xC00 + 4 * slot) >> 16) & 3) == 0) {
+ 		cb = r32(s, 0xC00 + 4 * slot) & 0x3F;
+@@ -5033,10 +5056,15 @@ smmu_s1(uint32_t sid, uint32_t mask, const char *name, uint64_t iova, uint64_t p
+ 	for (uint32_t k = 0; k < 100000 && (r32(cbp, 0x7F4) & 1) != 0; k++) {
+ 		IODelay(1);
+ 	}
+-	w32(cbp, 0x0, CB_CLONE_SCTLR | 1u);         /* SCTLR: translate */
++	/* SCTLR: translate; faults reported and terminated (no CFCFG stall: a stalled ADSP read is a hung bus) */
++	w32(cbp, 0x0, (1u << 6) | (1u << 5) | 1u);
+ 	s1_cbp = cbp;
++	for (uint32_t i = 0; i < nnear; i++) {
++		w32(s, 0xC00 + 4 * near[i], cb);
++		LOG("smmu: %s: SMR%u now through CB%u too", name, near[i], cb);
++	}
+ 	w32(s, 0xC00 + 4 * slot, cb);
+-	w32(s, 0x800 + 4 * slot, (1u << 31) | (mask << 16) | sid);
++	w32(s, 0x800 + 4 * slot, (1u << 31) | ((nnear == 0 ? 0xFu : mask) << 16) | (nnear == 0 ? (sid & ~0xFu) : sid));
+ 	w32(s, 0x70, 0);
+ 	for (uint32_t k = 0; k < 100000 && (r32(s, 0x74) & 1) != 0; k++) {
+ 		IODelay(1);
+@@ -9110,6 +9138,10 @@ audio_test(void)
+ 	 * GC_5001): this SPF takes the field as a container type, as Android's ACDB has it -- the
+ 	 * generic container 0x0B001001 throughout.
+ 	 */
++	if (s1_cbp != NULL) {
++		LOG("adsp: SMMU bank before the first read: FSR %08x", r32(s1_cbp, 0x58));
++		IOSleep(300);
++	}
+ 	r = a_graph_open(0x0B001001, 0x0B001001);
+ 	a_verbose = false;
+ 	LOG("adsp: graph open -> %lld", r);
+-- 
+2.43.0
+
