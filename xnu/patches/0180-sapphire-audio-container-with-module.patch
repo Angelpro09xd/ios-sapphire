@@ -1,0 +1,153 @@
+From d74bc3724cd8f20f147b60a2e01fcdcebe7ef927 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 24 Oct 2026 11:38:02 +0000
+Subject: [PATCH] sapphire-0180: a container is opened together with its first
+ module
+
+0179 on the phone: with generic containers too, the container sent
+alone (no module yet) came back status 1 and the ADSP's audio process
+died in its thread (GC_5001). The container (its type only, 48 bytes)
+now goes with the first module's list entry (40 bytes) in one 128-byte
+packet; further modules, their ports and the connections follow one a
+packet.
+---
+ iokit/Kernel/arm/TopazModem.cpp | 95 +++++++++++++++++++--------------
+ 1 file changed, 56 insertions(+), 39 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 798d50f..8ba4aaf 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -8681,6 +8681,25 @@ a_in(unsigned i, uint32_t sg)
+ 	return a_mods[i].sg == sg && ((a_mask >> i) & 1) != 0;
+ }
+ 
++/*
++ * A graph open in band, in packets that fit the ADSP's 128-byte receive buffers (0178/0179:
++ * the subgraph alone is taken; a container sent alone, with no module, makes the ADSP's audio
++ * process die in that container's thread):
++ *   1. the subgraph's configuration;
++ *   2. the container (its type only: 48 bytes) with the first module's list entry (40 bytes);
++ *   3. each further module's list entry into the same container;
++ *   4. each module's properties (its ports);
++ *   5. the connections.
++ */
++static int64_t
++a_open_send(struct a_pb *pb, const char *what)
++{
++	int64_t r = a_cmd_sync(GPR_PORT_APM_CLIENT, APM_PORT, APM_CMD_GRAPH_OPEN, pb->b, pb->n, 0);
++	LOG("adsp: graph open: %s (%u bytes) -> %lld", what, pb->n, r);
++	pb->n = 0;
++	return r;
++}
++
+ static int64_t
+ a_graph_open_part(uint32_t sg, uint32_t direction, uint32_t cont, uint32_t cap, uint32_t link_from)
+ {
+@@ -8688,19 +8707,12 @@ a_graph_open_part(uint32_t sg, uint32_t direction, uint32_t cont, uint32_t cap,
+ 	struct a_pb *pb = (struct a_pb *)IOMalloc(sizeof(*pb));
+ 	unsigned nm = 0, nc = 0, last = ~0u;
+ 	uint8_t *p;
+-	int64_t r;
++	int64_t r = 0;
++	bool first = true;
+ 
+ 	if (pb == NULL) {
+ 		return -1;
+ 	}
+-	for (unsigned i = 0; i < all; i++) {
+-		if (a_in(i, sg)) {
+-			nc += last != ~0u;
+-			last = i;
+-			nm++;
+-		}
+-	}
+-	nc += link_from != 0 && nm != 0;
+ 	pb->n = 0;
+ 	p = a_param(pb, APM_PORT, 0x08001001, 4 + 44);
+ 	a_put32(&p, 1);
+@@ -8708,46 +8720,51 @@ a_graph_open_part(uint32_t sg, uint32_t direction, uint32_t cont, uint32_t cap,
+ 	a_put32(&p, 0x0800100E); a_put32(&p, 4); a_put32(&p, 2);    /* perf mode: low latency */
+ 	a_put32(&p, 0x0800100F); a_put32(&p, 4); a_put32(&p, direction);
+ 	a_put32(&p, 0x08001010); a_put32(&p, 4); a_put32(&p, 1);    /* scenario: playback */
+-	p = a_param(pb, APM_PORT, 0x08001000, 4 + 60);
+-	a_put32(&p, 1);
+-	a_put32(&p, cont); a_put32(&p, 4);
+-	a_put32(&p, 0x08001011); a_put32(&p, 8); a_put32(&p, 1); a_put32(&p, cap);
+-	a_put32(&p, 0x08001012); a_put32(&p, 4); a_put32(&p, 1);    /* graph position: stream */
+-	a_put32(&p, 0x08001013); a_put32(&p, 4); a_put32(&p, 8192);
+-	a_put32(&p, 0x08001014); a_put32(&p, 4); a_put32(&p, 2);    /* processing domain: ADSP */
+-	p = a_param(pb, APM_PORT, 0x08001002, 4 + 12 + nm * 8);
+-	a_put32(&p, 1);
+-	a_put32(&p, sg); a_put32(&p, cont); a_put32(&p, nm);
+-	for (unsigned i = 0; i < all; i++) {
+-		if (a_in(i, sg)) {
+-			a_put32(&p, a_mods[i].mid); a_put32(&p, a_mods[i].iid);
++	r = a_open_send(pb, "subgraph");
++	for (unsigned i = 0; i < all && r == 0; i++) {
++		if (!a_in(i, sg)) {
++			continue;
+ 		}
+-	}
+-	for (unsigned i = 0; i < all; i++) {
++		if (first) {
++			p = a_param(pb, APM_PORT, 0x08001000, 4 + 8 + 16);
++			a_put32(&p, 1);
++			a_put32(&p, cont); a_put32(&p, 1);
++			a_put32(&p, 0x08001011); a_put32(&p, 8); a_put32(&p, 1); a_put32(&p, cap);
++		}
++		p = a_param(pb, APM_PORT, 0x08001002, 4 + 12 + 8);
++		a_put32(&p, 1);
++		a_put32(&p, sg); a_put32(&p, cont); a_put32(&p, 1);
++		a_put32(&p, a_mods[i].mid); a_put32(&p, a_mods[i].iid);
++		r = a_open_send(pb, first ? "container and its first module" : "a module");
++		first = false;
++		nm++;
++	}
++	for (unsigned i = 0; i < all && r == 0; i++) {
+ 		if (a_in(i, sg)) {
+-			/* one block per module (three in one would not fit 128 bytes) */
+ 			p = a_param(pb, APM_PORT, 0x08001003, 4 + 24);
+ 			a_put32(&p, 1);
+ 			a_put32(&p, a_mods[i].iid); a_put32(&p, 1);
+ 			a_put32(&p, 0x08001015); a_put32(&p, 8); a_put32(&p, a_mods[i].ip); a_put32(&p, a_mods[i].op);
++			r = a_open_send(pb, "a module's ports");
+ 		}
+ 	}
+-	p = a_param(pb, APM_PORT, 0x08001004, 4 + nc * 16);
+-	a_put32(&p, nc);
+-	last = ~0u;
+-	for (unsigned i = 0; i < all; i++) {
+-		if (a_in(i, sg)) {
+-			if (last != ~0u) {
+-				a_put32(&p, a_mods[last].iid); a_put32(&p, 1); a_put32(&p, a_mods[i].iid); a_put32(&p, 2);
+-			} else if (link_from != 0) {
+-				a_put32(&p, link_from); a_put32(&p, 1); a_put32(&p, a_mods[i].iid); a_put32(&p, 2);
+-			}
+-			last = i;
++	for (unsigned i = 0; i < all && r == 0; i++) {
++		if (!a_in(i, sg)) {
++			continue;
++		}
++		uint32_t from = last != ~0u ? a_mods[last].iid : link_from;
++		last = i;
++		if (from == 0) {
++			continue;
+ 		}
++		p = a_param(pb, APM_PORT, 0x08001004, 4 + 16);
++		a_put32(&p, 1);
++		a_put32(&p, from); a_put32(&p, 1); a_put32(&p, a_mods[i].iid); a_put32(&p, 2);
++		r = a_open_send(pb, "a connection");
++		nc++;
+ 	}
+-	r = a_cmd_each(GPR_PORT_APM_CLIENT, APM_PORT, APM_CMD_GRAPH_OPEN, pb, "graph open");
+-	LOG("adsp: graph open of subgraph %x (modules %x, %u connections, direction %u, container %x) -> %lld", sg,
+-	    a_mask, nc, direction, cap, r);
++	LOG("adsp: graph open of subgraph %x (%u modules, %u connections, direction %u, container %x) -> %lld", sg, nm, nc,
++	    direction, cap, r);
+ 	IOFree(pb, sizeof(*pb));
+ 	return r;
+ }
+-- 
+2.43.0
+
