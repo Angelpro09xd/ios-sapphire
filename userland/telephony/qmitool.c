@@ -1036,6 +1036,43 @@ cmd_ping(const char *dst_s, const char *src_s)
 		}
 	}
 	int got = 0;
+	int burst = getenv("PING_BURST") ? atoi(getenv("PING_BURST")) : 0;
+	if (burst > 0) {
+		/* a burst of echo requests back to back (the modem's receive channel stays awake), then
+		 * whatever comes back within 5 s */
+		uint8_t pkt[1 + 84];
+		for (int k = 0; k < burst; k++) {
+			memset(pkt, 0, sizeof(pkt));
+			uint8_t *ip = pkt + 1, *ic = ip + 20;
+			pkt[0] = 1;
+			ip[0] = 0x45; ip[3] = 84; ip[4] = 0x13; ip[5] = (uint8_t)k; ip[8] = 64; ip[9] = 1;
+			memcpy(ip + 12, &src, 4);
+			memcpy(ip + 16, &dst, 4);
+			uint16_t c = ip_sum(ip, 20);
+			ip[10] = (uint8_t)(c >> 8); ip[11] = (uint8_t)c;
+			ic[0] = 8; ic[4] = 0x53; ic[5] = 0x57; ic[7] = (uint8_t)k;
+			c = ip_sum(ic, 64);
+			ic[2] = (uint8_t)(c >> 8); ic[3] = (uint8_t)c;
+			for (int t = 0; t < 100 && sysctlbyname("kern.sweet_ipa_tx", NULL, NULL, pkt, sizeof(pkt)) != 0; t++) {
+				usleep(2000);
+			}
+		}
+		for (int w = 0; w < 500; w++) {
+			usleep(10000);
+			rl = sizeof(rx);
+			if (sysctlbyname("kern.sweet_ipa_rx", rx, &rl, NULL, 0) != 0) continue;
+			for (unsigned i = 0; i < 8; i++) {
+				if (rx[i].seq <= last) continue;
+				const uint8_t *r = rx[i].data;
+				printf("from the modem: %u bytes, proto %u, %u.%u.%u.%u -> %u.%u.%u.%u, icmp type %u\n", rx[i].len, r[9],
+				    r[12], r[13], r[14], r[15], r[16], r[17], r[18], r[19], r[20]);
+				last = rx[i].seq;
+				got++;
+			}
+		}
+		printf("%d of %d answered\n", got, burst);
+		return got ? 0 : 1;
+	}
 	for (uint16_t seq = 1; seq <= 4; seq++) {
 		uint8_t pkt[1 + 84];
 		uint8_t *ip = pkt + 1, *ic = ip + 20;
@@ -1175,6 +1212,63 @@ cmd_dns(const char *server_s, const char *name)
 	return 1;
 }
 
+/* one TCP SYN through the call: a SYN-ACK or RST back shows the downlink works */
+static int
+cmd_syn(const char *dst_s, int port)
+{
+	char srcbuf[32] = "";
+	FILE *f = fopen("/var/tmp/datacall.ip", "r");
+	if (f == NULL || fgets(srcbuf, sizeof(srcbuf), f) == NULL) {
+		return 1;
+	}
+	fclose(f);
+	srcbuf[strcspn(srcbuf, "\n")] = 0;
+	struct in_addr src, dst;
+	if (inet_aton(srcbuf, &src) == 0 || inet_aton(dst_s, &dst) == 0) {
+		return 2;
+	}
+	uint8_t pkt[1 + 40] = { 1 };
+	uint8_t *ip = pkt + 1, *t = ip + 20;
+	ip[0] = 0x45; ip[3] = 40; ip[4] = 0x54; ip[6] = 0x40; ip[8] = 64; ip[9] = 6;
+	memcpy(ip + 12, &src, 4);
+	memcpy(ip + 16, &dst, 4);
+	uint16_t c = ip_sum(ip, 20);
+	ip[10] = (uint8_t)(c >> 8); ip[11] = (uint8_t)c;
+	t[0] = 0xc3; t[1] = 0x51; t[2] = (uint8_t)(port >> 8); t[3] = (uint8_t)port;
+	t[4] = 0x12; t[5] = 0x34; t[6] = 0x56; t[7] = 0x78;
+	t[12] = 0x50; t[13] = 0x02; t[14] = 0xff; t[15] = 0xff;           /* 20-byte header, SYN, window */
+	uint8_t ph[12 + 20];
+	memcpy(ph, ip + 12, 8);
+	ph[8] = 0; ph[9] = 6; ph[10] = 0; ph[11] = 20;
+	memcpy(ph + 12, t, 20);
+	c = ip_sum(ph, sizeof(ph));
+	t[16] = (uint8_t)(c >> 8); t[17] = (uint8_t)c;
+	struct rxrec rx[8];
+	size_t rl = sizeof(rx);
+	uint32_t last = 0;
+	if (sysctlbyname("kern.sweet_ipa_rx", rx, &rl, NULL, 0) == 0) {
+		for (unsigned i = 0; i < 8; i++) last = rx[i].seq > last ? rx[i].seq : last;
+	}
+	if (sysctlbyname("kern.sweet_ipa_tx", NULL, NULL, pkt, sizeof(pkt)) != 0) {
+		fprintf(stderr, "kern.sweet_ipa_tx: %s\n", strerror(errno));
+		return 1;
+	}
+	for (int w = 0; w < 300; w++) {
+		usleep(10000);
+		rl = sizeof(rx);
+		if (sysctlbyname("kern.sweet_ipa_rx", rx, &rl, NULL, 0) != 0) continue;
+		for (unsigned i = 0; i < 8; i++) {
+			if (rx[i].seq <= last) continue;
+			const uint8_t *r = rx[i].data;
+			printf("answer: %u bytes proto %u from %u.%u.%u.%u flags %02x\n", rx[i].len, r[9], r[12], r[13], r[14], r[15],
+			    rx[i].len > 33 ? r[33] : 0);
+			return 0;
+		}
+	}
+	printf("no answer in 3 s\n");
+	return 1;
+}
+
 /* the last raw frames the kernel received from the IPA (kern.sweet_ipa_raw, kernel 0228+) */
 static int
 cmd_ipa_raw(void)
@@ -1242,6 +1336,7 @@ main(int argc, char **argv)
 	if (!strcmp(cmd, "raw") && argc > 3) return cmd_raw(argc - 2, argv + 2);
 	if (!strcmp(cmd, "datacall")) return cmd_datacall(argc > 2 ? argv[2] : NULL);
 	if (!strcmp(cmd, "ipa-raw")) return cmd_ipa_raw();
+	if (!strcmp(cmd, "syn") && argc > 3) return cmd_syn(argv[2], atoi(argv[3]));
 	if (!strcmp(cmd, "peek") && argc > 3) return cmd_peek(argc - 2, argv + 2);
 	if (!strcmp(cmd, "dns") && argc > 3) return cmd_dns(argv[2], argv[3]);
 	if (!strcmp(cmd, "ping") && argc > 2) return cmd_ping(argv[2], argc > 3 ? argv[3] : NULL);
