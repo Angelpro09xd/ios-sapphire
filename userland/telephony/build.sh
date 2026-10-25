@@ -18,5 +18,5 @@ $L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -o ..
 echo "../obj/ccstart"
 # pdpnet: the data call's IPv4 + DNS published to configd (/var/root/pdpnet, run by qmitool datacall)
 $L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -Wextra -Wno-unused-parameter \
-	-framework CoreFoundation -framework SystemConfiguration -o ../obj/pdpnet pdpnet.c
+	-framework CoreFoundation -framework SystemConfiguration -framework CoreTelephony -o ../obj/pdpnet pdpnet.c
 echo "../obj/pdpnet"
