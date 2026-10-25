@@ -1,0 +1,43 @@
+From 248bd576f15b87cdf3c0cddd74b41adfca9e0981 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 15:14:05 +0000
+Subject: [PATCH] sapphire-0222: /dev/redwood-qmi0..31, group _wireless (25),
+ mode 0660: Apple's CommCenter runs as _wireless and opens one per QMI service
+ and channel
+
+---
+ bsd/dev/sweet_qmi_dev.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/sweet_qmi_dev.c b/bsd/dev/sweet_qmi_dev.c
+index 2fb1635..41629d4 100644
+--- a/bsd/dev/sweet_qmi_dev.c
++++ b/bsd/dev/sweet_qmi_dev.c
+@@ -1,5 +1,5 @@
+ /*
+- * /dev/redwood-qmi0 .. /dev/redwood-qmi15: QMI to the modem for userland (IMEI, SIM, network,
++ * /dev/redwood-qmi0 .. /dev/redwood-qmi31: QMI to the modem for userland (IMEI, SIM, network,
+  * SMS), the way Linux's AF_QIPCRTR sockets give it to libqmi / rild. The kernel only carries
+  * messages: each node is one QRTR client port (0x3000 + minor) on the apps node, opened by one
+  * process at a time.
+@@ -27,7 +27,7 @@
+ #include <kern/locks.h>
+ #include <kern/kalloc.h>
+ 
+-#define SQ_SLOTS        16
++#define SQ_SLOTS        32                      /* 0222: CommCenter opens one per QMI service and channel */
+ #define SQ_PORT0        0x3000u
+ #define SQ_MAX_MSG      0x4000u                 /* the modem's own intent size is 0x4400 */
+ #define SQ_RXQ          64                      /* messages waiting per port */
+@@ -293,7 +293,7 @@ sweet_qmi_dev_init(void)
+ 	}
+ 	int made = 0;
+ 	for (int i = 0; i < SQ_SLOTS; i++) {
+-		if (devfs_make_node(makedev(major, i), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "redwood-qmi%d", i) != NULL) {
++		if (devfs_make_node(makedev(major, i), DEVFS_CHAR, UID_ROOT, 25 /* _wireless: CommCenter */, 0660, "redwood-qmi%d", i) != NULL) {
+ 			made++;
+ 		}
+ 	}
+-- 
+2.43.0
+
