@@ -655,11 +655,15 @@ print_address(const uint8_t *p)
 	}
 }
 
-/* an SMS-DELIVER (with its SMSC prefix): sender, time, text */
+/*
+ * an SMS-DELIVER: sender, time, text. Stored messages may start with the SMSC address,
+ * transfer-route ones do not (the SMSC comes in its own TLV): an SMSC field is a length of
+ * 1..12 octets followed by a type of number (0x8x/0x9x), never a TPDU's first octet + OA length.
+ */
 static void
 print_deliver(const uint8_t *p, int n)
 {
-	int k = 1 + p[0];                       /* past the SMSC */
+	int k = (n > 2 && p[0] >= 1 && p[0] <= 12 && (p[1] & 0x80)) ? 1 + p[0] : 0;
 	if (k >= n) return;
 	uint8_t first = p[k++];
 	if ((first & 3) != 0) {
@@ -796,6 +800,21 @@ wms_indication(struct cli *c, const struct msg *m)
 		memcpy(&n, v + 6, 2);
 		printf("new SMS (not stored):\n  ");
 		print_deliver(v + 8, n < l - 8 ? n : l - 8);
+		if (v[0] == 0) {
+			/* "ack required": WMS Send Ack {transaction, protocol WCDMA, success}, else the network sends it again */
+			struct msg q, r;
+			m_init(&q, 0, 0x0037);
+			uint8_t a[6];
+			memcpy(a, v + 1, 4);
+			a[4] = 1;
+			a[5] = 1;
+			m_tlv(&q, 0x01, a, 6);
+			void (*saved)(struct cli *, const struct msg *) = on_indication;
+			on_indication = NULL;
+			int e = request(c, &q, &r);
+			on_indication = saved;
+			printf("  (acknowledged: %s)\n", e == 0 ? "ok" : "QMI error");
+		}
 	}
 	fflush(stdout);
 }
