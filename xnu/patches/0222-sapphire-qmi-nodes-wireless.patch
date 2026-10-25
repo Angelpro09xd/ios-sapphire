@@ -1,25 +1,30 @@
-From 248bd576f15b87cdf3c0cddd74b41adfca9e0981 Mon Sep 17 00:00:00 2001
+From 6dc664ae1b317a7728517779ca8e95854bd6a8cf Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Sun, 25 Oct 2026 15:14:05 +0000
-Subject: [PATCH] sapphire-0222: /dev/redwood-qmi0..31, group _wireless (25),
- mode 0660: Apple's CommCenter runs as _wireless and opens one per QMI service
- and channel
+Subject: [PATCH] sapphire-0222: /dev/redwood-qmi0..31 (group _wireless 0660,
+ CommCenter is the client), a fresh QRTR port at every open (a reused port,
+ after QRTR DEL_CLIENT, got no more answers from the modem)
 
 ---
- bsd/dev/sweet_qmi_dev.c | 6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
+ bsd/dev/sweet_qmi_dev.c | 40 +++++++++++++++++++++++++++++-----------
+ 1 file changed, 29 insertions(+), 11 deletions(-)
 
 diff --git a/bsd/dev/sweet_qmi_dev.c b/bsd/dev/sweet_qmi_dev.c
-index 2fb1635..41629d4 100644
+index 2fb1635..0c716d3 100644
 --- a/bsd/dev/sweet_qmi_dev.c
 +++ b/bsd/dev/sweet_qmi_dev.c
-@@ -1,5 +1,5 @@
+@@ -1,8 +1,8 @@
  /*
 - * /dev/redwood-qmi0 .. /dev/redwood-qmi15: QMI to the modem for userland (IMEI, SIM, network,
 + * /dev/redwood-qmi0 .. /dev/redwood-qmi31: QMI to the modem for userland (IMEI, SIM, network,
   * SMS), the way Linux's AF_QIPCRTR sockets give it to libqmi / rild. The kernel only carries
-  * messages: each node is one QRTR client port (0x3000 + minor) on the apps node, opened by one
-  * process at a time.
+- * messages: each node is one QRTR client port (0x3000 + minor) on the apps node, opened by one
+- * process at a time.
++ * messages: each node is one QRTR client port on the apps node (a fresh one from 0x3000..0x3fff at
++ * every open, 0222), opened by one process at a time.
+  *   write(): struct sweet_qmi_hdr {node, port} + one QMI message (type, txn, msg id, length,
+  *            TLVs), queued and sent by TopazModem's modem thread (it owns the GLINK FIFO).
+  *   read():  the next message for this port, with the sender's {node, port} in front; blocks
 @@ -27,7 +27,7 @@
  #include <kern/locks.h>
  #include <kern/kalloc.h>
@@ -29,7 +34,95 @@ index 2fb1635..41629d4 100644
  #define SQ_PORT0        0x3000u
  #define SQ_MAX_MSG      0x4000u                 /* the modem's own intent size is 0x4400 */
  #define SQ_RXQ          64                      /* messages waiting per port */
-@@ -293,7 +293,7 @@ sweet_qmi_dev_init(void)
+@@ -41,6 +41,7 @@ struct sweet_qmi_lookup { uint32_t svc, inst, index, node, port, found_inst; };
+ struct sq_msg { uint32_t src, node, port, len, ctrl; uint8_t *data; };
+ struct sq_slot {
+ 	bool open;
++	uint32_t port;                  /* 0222: a fresh QRTR port at every open, as Linux's sockets */
+ 	uint32_t head, tail;                    /* rx ring, wrapping counters */
+ 	struct sq_msg rx[SQ_RXQ];
+ 	struct selinfo sel;
+@@ -52,6 +53,7 @@ static LCK_MTX_DECLARE(sq_mtx, &sq_grp);
+ static struct sq_slot sq_slots[SQ_SLOTS];
+ static struct sq_msg sq_tx[SQ_TXQ];
+ static uint32_t sq_tx_head, sq_tx_tail;
++static uint32_t sq_next_port = SQ_PORT0;
+ 
+ int sweet_qmi_deliver(uint32_t dst_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t len);
+ void sweet_qmi_pump(void (*send)(uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len, int ctrl));
+@@ -71,10 +73,9 @@ sq_free(struct sq_msg *m)
+ int
+ sweet_qmi_deliver(uint32_t dst_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t len)
+ {
+-	if (dst_port < SQ_PORT0 || dst_port >= SQ_PORT0 + SQ_SLOTS) {
++	if (dst_port < SQ_PORT0 || dst_port >= SQ_PORT0 + 0x1000) {
+ 		return 0;
+ 	}
+-	struct sq_slot *s = &sq_slots[dst_port - SQ_PORT0];
+ 	if (len == 0 || len > SQ_MAX_MSG) {
+ 		return 1;
+ 	}
+@@ -84,7 +85,18 @@ sweet_qmi_deliver(uint32_t dst_port, uint32_t node, uint32_t port, const uint8_t
+ 	}
+ 	memcpy(copy, data, len);
+ 	lck_mtx_lock(&sq_mtx);
+-	if (!s->open || s->head - s->tail >= SQ_RXQ) {
++	struct sq_slot *s = NULL;
++	for (int i = 0; i < SQ_SLOTS; i++) {
++		if (sq_slots[i].open && sq_slots[i].port == dst_port) {
++			s = &sq_slots[i];
++		}
++	}
++	if (s == NULL) {
++		lck_mtx_unlock(&sq_mtx);
++		kfree_data(copy, len);
++		return 1;               /* a closed client's port: dropped */
++	}
++	if (s->head - s->tail >= SQ_RXQ) {
+ 		s->dropped++;
+ 		lck_mtx_unlock(&sq_mtx);
+ 		kfree_data(copy, len);
+@@ -157,6 +169,12 @@ sq_open(dev_t dev, __unused int flags, __unused int devtype, __unused struct pro
+ 	}
+ 	s->open = true;
+ 	s->head = s->tail = 0;
++	/*
++	 * 0222: never the port the last owner had. The modem got QRTR DEL_CLIENT for it at close and
++	 * stopped answering a reused port (CommCenter restarted often: no answer at all after a while).
++	 */
++	s->port = sq_next_port;
++	sq_next_port = sq_next_port + 1 >= SQ_PORT0 + 0x1000 ? SQ_PORT0 : sq_next_port + 1;
+ 	lck_mtx_unlock(&sq_mtx);
+ 	return 0;
+ }
+@@ -174,7 +192,7 @@ sq_close(dev_t dev, __unused int flags, __unused int devtype, __unused struct pr
+ 		s->tail++;
+ 	}
+ 	lck_mtx_unlock(&sq_mtx);
+-	(void)sq_queue_tx(SQ_PORT0 + (uint32_t)unit, 0, 0, NULL, 0, 1);
++	(void)sq_queue_tx(s->port, 0, 0, NULL, 0, 1);
+ 	return 0;
+ }
+ 
+@@ -231,7 +249,7 @@ sq_write(dev_t dev, struct uio *uio, __unused int ioflag)
+ 	}
+ 	err = uiomove((char *)d, (int)len, uio);
+ 	if (err == 0) {
+-		err = sq_queue_tx(SQ_PORT0 + (uint32_t)minor(dev), h.node, h.port, d, len, 0);
++		err = sq_queue_tx(sq_slots[minor(dev)].port, h.node, h.port, d, len, 0);
+ 	}
+ 	if (err != 0) {
+ 		kfree_data(d, len);
+@@ -243,7 +261,7 @@ static int
+ sq_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
+ {
+ 	if (cmd == SWEET_QMI_PORT) {
+-		*(uint32_t *)data = SQ_PORT0 + (uint32_t)minor(dev);
++		*(uint32_t *)data = sq_slots[minor(dev)].port;
+ 		return 0;
+ 	}
+ 	if (cmd != SWEET_QMI_LOOKUP) {
+@@ -293,7 +311,7 @@ sweet_qmi_dev_init(void)
  	}
  	int made = 0;
  	for (int i = 0; i < SQ_SLOTS; i++) {
