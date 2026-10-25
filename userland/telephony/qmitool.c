@@ -910,10 +910,16 @@ cmd_datacall(const char *apn)
 	}
 	/*
 	 * DPM Open Port first (netmgr's qmi_dpm_enabled on IPA SoCs): the embedded hardware data port,
-	 * IPA endpoints 9 (modem -> AP) and 1 (AP -> modem). Without it WDA and WDS answer
+	 * IPA consumer pipe 1 (AP -> modem) then producer pipe 9 (modem -> AP), as rmnet_ipa's RMNET_IOCTL_GET_EP_PAIR gives netmgr. Without it WDA and WDS answer
 	 * INVALID_OPERATION. The client stays open with the call.
 	 */
-	struct { uint8_t n; uint32_t type, iface, rx, tx; } __attribute__((packed)) hw = { 1, 4, 1, 9, 1 };
+	struct { uint8_t n; uint32_t type, iface, rx, tx; } __attribute__((packed)) hw = { 1, 4, 1, 1, 9 };  /* consumer 1 (AP->IPA), producer 9 */
+	if (getenv("DPM_RX") != NULL) {
+		hw.rx = (uint32_t)strtoul(getenv("DPM_RX"), NULL, 0);
+	}
+	if (getenv("DPM_TX") != NULL) {
+		hw.tx = (uint32_t)strtoul(getenv("DPM_TX"), NULL, 0);
+	}
 	m_init(&q, 0, 0x0020);
 	m_tlv(&q, 0x11, &hw, sizeof(hw));
 	e = request(&dpm, &q, &r);
@@ -934,7 +940,9 @@ cmd_datacall(const char *apn)
 	m_init(&q, 0, 0x00a2);                  /* WDS Bind Mux Data Port */
 	m_tlv(&q, 0x10, ep, sizeof(ep));
 	m_u8(&q, 0x11, 1);                      /* mux id 1 */
-	m_u32(&q, 0x13, 1);                     /* client type: tethered */
+	if (getenv("MUX_TETHERED") != NULL) {
+		m_u32(&q, 0x13, 1);             /* client type: tethered */
+	}
 	e = request(&wds, &q, &r);
 	printf("mux 1          %s (%d)\n", e ? "refused" : "bound", e);
 	m_init(&q, 0, 0x004d);                  /* WDS Set IP Family */
@@ -970,11 +978,13 @@ cmd_datacall(const char *apn)
 	}
 	fflush(stdout);
 	for (;;) {                              /* keep the WDS client (and the call) alive */
-		sleep(30);
-		if (simple(&wds, 0x0022, &r) == 0) {
-			uint16_t l;
-			const uint8_t *st = tlv(&r, 0x01, &l);
-			printf("packet service %s\n", st != NULL && st[0] == 2 ? "connected" : "not connected");
+		sleep(10);
+		m_init(&q, 0, 0x0024);          /* WDS Get Packet Statistics */
+		m_u32(&q, 0x01, 0x3ff);
+		if (request(&wds, &q, &r) == 0) {
+			printf("stats: tx ok %u err %u ovf %u, rx ok %u err %u ovf %u, tx dropped %u rx dropped %u\n",
+			    tlv_u32(&r, 0x10), tlv_u32(&r, 0x12), tlv_u32(&r, 0x14), tlv_u32(&r, 0x11), tlv_u32(&r, 0x13),
+			    tlv_u32(&r, 0x15), tlv_u32(&r, 0x1b), tlv_u32(&r, 0x1c));
 			fflush(stdout);
 		}
 	}
@@ -1094,6 +1104,96 @@ cmd_ping(const char *dst_s, const char *src_s)
 	return got ? 0 : 1;
 }
 
+/* one DNS query (A record) over UDP through the call: any answer from the server shows the downlink works */
+static int
+cmd_dns(const char *server_s, const char *name)
+{
+	char srcbuf[32] = "";
+	FILE *f = fopen("/var/tmp/datacall.ip", "r");
+	if (f == NULL || fgets(srcbuf, sizeof(srcbuf), f) == NULL) {
+		fprintf(stderr, "no source address: run qmitool datacall first\n");
+		return 1;
+	}
+	fclose(f);
+	srcbuf[strcspn(srcbuf, "\n")] = 0;
+	struct in_addr src, dst;
+	if (inet_aton(srcbuf, &src) == 0 || inet_aton(server_s, &dst) == 0) {
+		return 2;
+	}
+	uint8_t pkt[1 + 512];
+	memset(pkt, 0, sizeof(pkt));
+	uint8_t *ip = pkt + 1, *udp = ip + 20, *q = udp + 8;
+	int n = 0;
+	q[0] = 0x51; q[1] = 0x57; q[2] = 0x01; q[5] = 1;       /* id, recursion desired, 1 question */
+	n = 12;
+	for (const char *l = name; *l;) {
+		const char *dot = strchr(l, '.');
+		int len = dot ? (int)(dot - l) : (int)strlen(l);
+		q[n++] = (uint8_t)len;
+		memcpy(q + n, l, (size_t)len);
+		n += len;
+		l += len + (dot ? 1 : 0);
+	}
+	q[n++] = 0;
+	q[n++] = 0; q[n++] = 1;                                 /* type A */
+	q[n++] = 0; q[n++] = 1;                                 /* class IN */
+	int ulen = 8 + n, tlen = 20 + ulen;
+	pkt[0] = 1;
+	ip[0] = 0x45; ip[2] = (uint8_t)(tlen >> 8); ip[3] = (uint8_t)tlen; ip[4] = 0x53; ip[8] = 64; ip[9] = 17;
+	memcpy(ip + 12, &src, 4);
+	memcpy(ip + 16, &dst, 4);
+	uint16_t c = ip_sum(ip, 20);
+	ip[10] = (uint8_t)(c >> 8); ip[11] = (uint8_t)c;
+	udp[0] = 0xc3; udp[1] = 0x50; udp[3] = 53; udp[4] = (uint8_t)(ulen >> 8); udp[5] = (uint8_t)ulen;  /* 50000 -> 53, no checksum */
+	struct rxrec rx[8];
+	size_t rl = sizeof(rx);
+	uint32_t last = 0;
+	if (sysctlbyname("kern.sweet_ipa_rx", rx, &rl, NULL, 0) == 0) {
+		for (unsigned i = 0; i < 8; i++) last = rx[i].seq > last ? rx[i].seq : last;
+	}
+	if (sysctlbyname("kern.sweet_ipa_tx", NULL, NULL, pkt, (size_t)(1 + tlen)) != 0) {
+		fprintf(stderr, "kern.sweet_ipa_tx: %s\n", strerror(errno));
+		return 1;
+	}
+	for (int w = 0; w < 300; w++) {
+		usleep(10000);
+		rl = sizeof(rx);
+		if (sysctlbyname("kern.sweet_ipa_rx", rx, &rl, NULL, 0) != 0) continue;
+		for (unsigned i = 0; i < 8; i++) {
+			if (rx[i].seq <= last) continue;
+			const uint8_t *r = rx[i].data;
+			printf("answer: %u bytes, proto %u, from %u.%u.%u.%u", rx[i].len, r[9], r[12], r[13], r[14], r[15]);
+			if (r[9] == 17 && rx[i].len >= 28 + 12) {
+				const uint8_t *d = r + 28;
+				printf(", DNS rcode %u, %u answers", d[3] & 15, d[7]);
+			}
+			printf("\n");
+			return 0;
+		}
+	}
+	printf("no answer in 3 s\n");
+	return 1;
+}
+
+/* the last raw frames the kernel received from the IPA (kern.sweet_ipa_raw, kernel 0228+) */
+static int
+cmd_ipa_raw(void)
+{
+	struct { uint32_t seq; uint8_t chan, pad; uint16_t len; uint8_t data[64]; } raw[8];
+	size_t rl = sizeof(raw);
+	if (sysctlbyname("kern.sweet_ipa_raw", raw, &rl, NULL, 0) != 0) {
+		fprintf(stderr, "kern.sweet_ipa_raw: %s\n", strerror(errno));
+		return 1;
+	}
+	for (unsigned i = 0; i < 8; i++) {
+		if (raw[i].seq == 0) continue;
+		printf("#%u %s %u bytes:", raw[i].seq, raw[i].chan == 3 ? "modem RX" : "LAN RX", raw[i].len);
+		for (unsigned k = 0; k < raw[i].len && k < 64; k++) printf(" %02x", raw[i].data[k]);
+		printf("\n");
+	}
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1119,6 +1219,8 @@ main(int argc, char **argv)
 	if (!strcmp(cmd, "sms-watch")) return cmd_sms_watch();
 	if (!strcmp(cmd, "raw") && argc > 3) return cmd_raw(argc - 2, argv + 2);
 	if (!strcmp(cmd, "datacall")) return cmd_datacall(argc > 2 ? argv[2] : NULL);
+	if (!strcmp(cmd, "ipa-raw")) return cmd_ipa_raw();
+	if (!strcmp(cmd, "dns") && argc > 3) return cmd_dns(argv[2], argv[3]);
 	if (!strcmp(cmd, "ping") && argc > 2) return cmd_ping(argv[2], argc > 3 ? argv[3] : NULL);
 	fprintf(stderr, "unknown command %s\n", cmd);
 	return 2;
