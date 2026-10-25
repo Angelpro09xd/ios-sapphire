@@ -1,0 +1,55 @@
+From 90ba0e4572372ee09684622b2b75f52d999261ec Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 09:24:00 +0000
+Subject: [PATCH] sapphire-0210: no backlight service by default again; the
+ battery's percent from the PMIC's own SOC
+
+0209 on the phone: with AppleARMBacklight published CoreBrightness runs its
+digital dimming (a filter over every frame) and the phone lagged badly; the
+same kernel with sweetbl=0 was smooth. Off by default again (sweetbl=1: on);
+the brightness slider needs another way. The percent: QG_SOC_MONOTONIC
+first -- it held 84 while the voltage under charge gave an estimate of 39% --
+and the voltage curve only when it reads 0.
+---
+ iokit/Kernel/arm/SweetBattery.cpp     | 6 +++++-
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 7 +++++--
+ 2 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index c107ef7..2ffc291 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -330,7 +330,11 @@ SweetBattery::poll(void)
+ 		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */
+ 		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
+ 	}
+-	unsigned percent = haveV ? estimatePercent(mv) : (msoc >= 1 && msoc <= 100) ? msoc : 50;
++	/*
++	 * 0210: QG_SOC_MONOTONIC first. On the phone it held 84 while the voltage under charge gave
++	 * an estimate of 39%: the value the PMIC keeps (the boot's charger code, the gauge) is the real one.
++	 */
++	unsigned percent = (msoc >= 1 && msoc <= 100) ? msoc : haveV ? estimatePercent(mv) : 50;
+ 	if (!regs) {
+ 		static unsigned bad;
+ 		if (bad++ % 30 == 0) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1ae2ed7..e58ef2f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -365,8 +365,11 @@ AppleCLCD::start(IOService *provider)
+ 		 * runs digital dimming, a colour filter over every frame, which the
+ 		 * CPU renderer cannot afford (the UI dropped to under 1 fps).
+ 		 */
+-		/* 0209: on by default now that the GPU draws (sweetbl=0: off) */
+-		uint32_t blOn = 1;
++		/*
++		 * 0210: off by default again (sweetbl=1: on). 0209 had it on: CoreBrightness then runs its
++		 * digital dimming, a filter over every frame, and the phone lagged; without it, smooth.
++		 */
++		uint32_t blOn = 0;
+ 		(void)PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
+ 		AppleARMBacklight *bl = blOn ? OSTypeAlloc(AppleARMBacklight) : NULL;
+ 		if (bl != NULL && bl->init()) {
+-- 
+2.43.0
+
