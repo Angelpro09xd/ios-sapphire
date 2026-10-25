@@ -703,7 +703,17 @@ br_to_cc(struct br_chan *c, uint8_t svc, uint8_t cid, const uint8_t *sdu, size_t
 	f[5] = cid;
 	memcpy(f + 6, sdu, n);
 	if (verbose_bridge) hexsay("  -> cc", f, n + 6);
-	shim_handle_read(c->shim, f, (unsigned)(n + 6));
+	/*
+	 * Delivered from our own serial queue, never under br_lock: handleRead may wait on
+	 * mav_router's queue, which may be in my_shim_tx waiting for br_lock (the reader thread and
+	 * the router deadlocked: no modem answer reached CommCenter).
+	 */
+	static dispatch_queue_t q;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{ q = dispatch_queue_create("ccbridge.deliver", DISPATCH_QUEUE_SERIAL); });
+	void *shim = c->shim;
+	unsigned len = (unsigned)(n + 6);
+	dispatch_async(q, ^{ shim_handle_read(shim, f, len); });
 }
 
 static struct br_chan *
@@ -841,7 +851,11 @@ br_from_cc(struct br_chan *c, const uint8_t *f, size_t n)
 	memcpy(&txn, sdu + 1, 2);
 	memcpy(&msg, sdu + 3, 2);
 	if (v->fd < 0) {
-		/* not on the modem: QMI_ERR_NOT_SUPPORTED (0x5e) */
+		/*
+		 * not on the modem (Apple's own services: BSP 0xe2, AUDIO 0xe1, ...): QMI_ERR_NOT_SUPPORTED
+		 * (0x5e). An empty success is worse: BSP 0xb001/0xb004 (CPMS power budget) then read an
+		 * empty vector with at() and CommCenter dies of std::out_of_range.
+		 */
 		uint8_t r[14] = { 0x02, 0, 0, 0, 0, 7, 0, 0x02, 4, 0, 1, 0, 0x5e, 0 };
 		memcpy(r + 1, &txn, 2);
 		memcpy(r + 3, &msg, 2);
@@ -965,9 +979,62 @@ my_atcs_assert(const char *a, unsigned line, const char *b, const char *c, const
 	real_atcs_assert(a, line, b, c, d, e, f);
 }
 
+/* CommCenter (main binary) 0x1006ea6d0: the function that turns "registered" into "emergency only" */
+static void (*real_cc_regstat)(void *, int);
+static void
+my_cc_regstat(void *t, int st)
+{
+	uintptr_t main_slide = (uintptr_t)_dyld_get_image_header(0) - 0x100000000UL;
+	void **gate = *(void ***)((char *)t + 0x5a8);
+	uintptr_t fn = 0;
+	if (gate != NULL) {
+		fn = (*(uintptr_t **)gate)[0x80 / 8];
+	}
+	Dl_info di = { 0 };
+	dladdr((void *)fn, &di);
+	say("CommCenter registration status %d (raw [+0x20] %d, shown [+0x648] %d); gate %p vfunc+0x80 %#lx = %s %s+%#lx (main %#lx)",
+	    st, *(int *)((char *)t + 0x20), *(uint8_t *)((char *)t + 0x648), (void *)gate, fn,
+	    di.dli_fname ? di.dli_fname : "?", di.dli_sname ? di.dli_sname : "?",
+	    di.dli_saddr ? fn - (uintptr_t)di.dli_saddr : 0, fn - main_slide);
+	real_cc_regstat(t, st);
+}
+
+/* every C++ exception CommCenter throws: its type and the throwing stack */
+static void (*real_cxa_throw)(void *, void *, void (*)(void *));
+static void
+my_cxa_throw(void *obj, void *tinfo, void (*dest)(void *))
+{
+	const char *name = tinfo ? ((const char *const *)tinfo)[1] : "?";
+	char line[600];
+	int o = snprintf(line, sizeof(line), "C++ throw %s:", name);
+	uint64_t *fp = __builtin_frame_address(0);
+	for (int k = 0; k < 16 && fp && ((uintptr_t)fp & 7) == 0 && o < (int)sizeof(line) - 20; k++) {
+		uint64_t ret = fp[1];
+		if (ret == 0) break;
+		o += snprintf(line + o, sizeof(line) - (size_t)o, " %llx", ret - slide);
+		if ((uint64_t *)fp[0] <= fp) break;
+		fp = (uint64_t *)fp[0];
+	}
+	say("%s", line);
+	real_cxa_throw(obj, tinfo, dest);
+}
+
 static void
 bm_spies_install(void)
 {
+	real_cxa_throw = hook("__cxa_throw", (void *)my_cxa_throw);
+	{
+		uintptr_t main_slide = (uintptr_t)_dyld_get_image_header(0) - 0x100000000UL;
+		real_cc_regstat = hook_at("CommCenter registration status", (uint32_t *)(0x1006ea6d0UL + main_slide), (void *)my_cc_regstat);
+		/*
+		 * The gate that turns "registered" into "emergency only" (SOS): a virtual returning
+		 * byte +0x69 of its object, set once in the constructor to !capabilities[0x166] (a
+		 * libCommCenterBase capability this device gets wrong). Returns 1: registration shown as is.
+		 */
+		static const uint32_t ret_true[] = { 0x52800020u /* mov w0, #1 */, 0xd65f03c0u /* ret */ };
+		uintptr_t gate = 0x1005aa60cUL + main_slide;
+		patch_code("CommCenter emergency-only gate", gate - slide, 0xd65f03c03941a400ULL, ret_true, 2);
+	}
 	real_atcs_assert = (void *)hook_cache("_ATCSException::triggerAssertion(..., mm)", 0x19ed00350UL, (void *)my_atcs_assert);
 	real_ctl_ctor = hook_cache("mav_router::device::controller::controller", 0x1ea5ff8d4UL, (void *)my_ctl_ctor);
 	real_ipc_change = hook_cache("RouterIPCController::changeState_sync", 0x1b7f9f770UL, (void *)my_ipc_change);
