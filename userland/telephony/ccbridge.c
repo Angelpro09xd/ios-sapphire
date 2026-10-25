@@ -667,6 +667,7 @@ struct br_svc {
 	unsigned ncids;
 	struct { uint16_t txn; uint8_t cid; uint8_t used; uint16_t orig; uint16_t as_ind; uint16_t msg; uint64_t t; } pend[64];
 	uint16_t next_txn;
+	uint8_t ind_on[256];            /* indication switches some client turned on (br_merge_ind_reg) */
 };
 struct br_chan {
 	void *shim;
@@ -728,6 +729,8 @@ br_chan_of(void *shim)
 	return NULL;
 }
 
+static int br_test_block(uint8_t svc);
+
 static struct br_svc *
 br_svc_of(struct br_chan *c, uint8_t svc, int create)
 {
@@ -746,7 +749,7 @@ br_svc_of(struct br_chan *c, uint8_t svc, int create)
 	 * never with qmitool alone. First suspects: COEX (0x22, re-configured every 30 s), QOS (0x04)
 	 * and 0x2a.
 	 */
-	if (svc == 0x22 || svc == 0x04 || svc == 0x2a) {
+	if (svc == 0x22 || svc == 0x04 || svc == 0x2a || br_test_block(svc)) {
 		say("bridge: service 0x%x kept from the modem (answered here)", svc);
 		return v;
 	}
@@ -884,7 +887,14 @@ br_nas_poll(void *arg)
 	for (unsigned i = 0; i < MAX_SHIMS; i++) {
 		if (br_chans[i].shim == NULL) continue;
 		br_nas_query(&br_chans[i], 0x0024, 0x0024);
-		/* not 0x4d -> 0x4e: this firmware's SYS INFO TLV sizes make Apple's parser throw tlv::TlvParseException */
+		/*
+		 * SYS_INFO: CommCenter never asks for it and the modem only indicates changes, so
+		 * after CommCenter starts it has none and shows "No Service". The answer as indication
+		 * 0x4e keeps only TLVs 0x10-0x1d (service status and system info of each RAT), which
+		 * the answer and the indication number alike; the later ones differ, and passing
+		 * them made Apple's parser throw tlv::TlvParseException.
+		 */
+		br_nas_query(&br_chans[i], 0x004d, 0x004e);
 	}
 	pthread_mutex_unlock(&br_lock);
 }
@@ -903,6 +913,66 @@ br_nas_poll_soon(struct br_chan *c)
 		dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC), 20 * NSEC_PER_SEC, NSEC_PER_SEC);
 		dispatch_source_set_event_handler_f(t, br_nas_poll);
 		dispatch_resume(t);
+	}
+}
+
+/*
+ * All of CommCenter's clients of a service share one client on the modem, and the modem keeps
+ * one set of indication switches per client: the last "register indications" won. NAS client 1
+ * asked for SYS_INFO (0x4e, TLV 0x18 = 1) and the next ones, with 0x18 = 0, turned it off again,
+ * so CommCenter never heard that the modem had registered. A switch any client turned on stays on
+ * (the bridge hands each indication to every client anyway).
+ */
+/* bisecting the IPA assert: services listed in /var/tmp/ccbridge.block (hex, one per line) stay here */
+static int
+br_test_block(uint8_t svc)
+{
+	FILE *f = fopen("/var/tmp/ccbridge.block", "r");
+	unsigned v;
+	int hit = 0;
+	if (f == NULL) return 0;
+	while (!hit && fscanf(f, "%x", &v) == 1) hit = v == svc;
+	fclose(f);
+	return hit;
+}
+
+/* bisecting: "SVC MSG" lines (hex) in /var/tmp/ccbridge.okmsg are answered success here */
+static int
+br_test_ok(uint8_t svc, uint16_t msg)
+{
+	FILE *f = fopen("/var/tmp/ccbridge.okmsg", "r");
+	unsigned a, b;
+	int hit = 0;
+	if (f == NULL) return 0;
+	while (!hit && fscanf(f, "%x %x", &a, &b) == 2) hit = a == svc && b == msg;
+	fclose(f);
+	return hit;
+}
+
+static void
+br_merge_ind_reg(struct br_svc *v, uint16_t msg, uint8_t *sdu, size_t sn)
+{
+	int reg = (v->svc == 0x03 && msg == 0x0003) ||     /* NAS indication register */
+	    (v->svc == 0x09 && msg == 0x0003) ||           /* VOICE indication register */
+	    (v->svc == 0x02 && msg == 0x0001) ||           /* DMS set event report */
+	    (v->svc == 0x01 && msg == 0x0001) ||           /* WDS set event report */
+	    (v->svc == 0x05 && msg == 0x0001);             /* WMS set event report */
+	if (!reg || sn < 7) return;
+	size_t end = 7 + (size_t)(sdu[5] | sdu[6] << 8);
+	if (end > sn) end = sn;
+	for (size_t o = 7; o + 3 <= end;) {
+		uint8_t type = sdu[o];
+		size_t len = sdu[o + 1] | sdu[o + 2] << 8;
+		if (o + 3 + len > end) break;
+		if (len == 1) {
+			if (sdu[o + 3]) {
+				v->ind_on[type] = 1;
+			} else if (v->ind_on[type]) {
+				sdu[o + 3] = 1;
+				say("bridge: service 0x%x msg 0x%04x: indication switch 0x%02x kept on", v->svc, msg, type);
+			}
+		}
+		o += 3 + len;
 	}
 }
 
@@ -926,7 +996,22 @@ br_from_cc(struct br_chan *c, const uint8_t *f, size_t n)
 	uint16_t txn, msg;
 	memcpy(&txn, sdu + 1, 2);
 	memcpy(&msg, sdu + 3, 2);
-	if (v->fd < 0) {
+	/*
+	 * WDS stays away from the modem: its data call task hangs as soon as the data path is set
+	 * up (no IPA on our side) and ten seconds later the modem watchdog kills it ("dog_hb.c:367:
+	 * Task starvation: dcc"), with qmitool alone as well: WDS 0x0085 alone did it, 0x00cd after
+	 * CommCenter's other WDS set-up too. With WDS let through but 0x0085 held back, the modem
+	 * died of "ipa_dl_opt_lte.c:551: IPA Assert: new_free_space > 0" instead.
+	 */
+	if (br_test_ok(svc, msg)) {
+		uint8_t r[14] = { 0x02, 0, 0, 0, 0, 7, 0, 0x02, 4, 0, 0, 0, 0, 0 };
+		memcpy(r + 1, &txn, 2);
+		memcpy(r + 3, &msg, 2);
+		say("bridge: service 0x%x msg 0x%04x answered ok here", svc, msg);
+		br_to_cc(c, svc, cid, r, sizeof(r));
+		return;
+	}
+	if (v->fd < 0 || svc == 0x01) {
 		/*
 		 * not on the modem (Apple's own services: BSP 0xe2, AUDIO 0xe1, ...): QMI_ERR_NOT_SUPPORTED
 		 * (0x5e). An empty success is worse: BSP 0xb001/0xb004 (CPMS power budget) then read an
@@ -956,6 +1041,7 @@ br_from_cc(struct br_chan *c, const uint8_t *f, size_t n)
 	memcpy(buf, &h, sizeof(h));
 	memcpy(buf + sizeof(h), sdu, sn);
 	memcpy(buf + sizeof(h) + 1, &nt, 2);
+	br_merge_ind_reg(v, msg, buf + sizeof(h), sn);
 	if (write(v->fd, buf, sizeof(h) + sn) < 0) {
 		say("bridge: write to service 0x%x: %s", svc, strerror(errno));
 	}
@@ -1044,7 +1130,9 @@ br_reader_main(void *arg)
 						uint16_t tl;
 						memcpy(&tl, sdu + o + 1, 2);
 						if (o + 3 + tl > sn) break;
-						if (sdu[o] != 0x02 && in + 3 + tl < sizeof(ind)) {
+						int keep = sdu[o] != 0x02;
+						if (v->pend[slot].as_ind == 0x004e) keep = sdu[o] >= 0x10 && sdu[o] <= 0x1d;
+						if (keep && in + 3 + tl < sizeof(ind)) {
 							memcpy(ind + in, sdu + o, 3 + tl);
 							in += 3 + tl;
 						}
@@ -1114,7 +1202,12 @@ my_atcs_assert(const char *a, unsigned line, const char *b, const char *c, const
 	real_atcs_assert(a, line, b, c, d, e, f);
 }
 
-/* CommCenter (main binary) 0x1006ea6d0: the function that turns "registered" into "emergency only" */
+/*
+ * CommCenter (main binary) 0x1006ea6d0: "Baseband service provisioned state changing from %s to
+ * %s" (byte +0x648). Anything but 2 (provisioned) reports registration as "not registered" or
+ * "emergency only" ("as report emergency only is true"). Apple's baseband says provisioned through
+ * its BSP service (0xe2), which this modem does not have: always 2.
+ */
 static void (*real_cc_regstat)(void *, int);
 static void
 my_cc_regstat(void *t, int st)
@@ -1127,11 +1220,11 @@ my_cc_regstat(void *t, int st)
 	}
 	Dl_info di = { 0 };
 	dladdr((void *)fn, &di);
-	say("CommCenter registration status %d (raw [+0x20] %d, shown [+0x648] %d); gate %p vfunc+0x80 %#lx = %s %s+%#lx (main %#lx)",
+	say("CommCenter provisioned state %d -> 2 (raw [+0x20] %d, shown [+0x648] %d); gate %p vfunc+0x80 %#lx = %s %s+%#lx (main %#lx)",
 	    st, *(int *)((char *)t + 0x20), *(uint8_t *)((char *)t + 0x648), (void *)gate, fn,
 	    di.dli_fname ? di.dli_fname : "?", di.dli_sname ? di.dli_sname : "?",
 	    di.dli_saddr ? fn - (uintptr_t)di.dli_saddr : 0, fn - main_slide);
-	real_cc_regstat(t, st);
+	real_cc_regstat(t, 2);
 }
 
 /* every C++ exception CommCenter throws: its type and the throwing stack */
