@@ -1,0 +1,114 @@
+From a3aa073d672221760c139c9cdf406e91cf6aa25c Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 19:30:54 +0000
+Subject: [PATCH] sapphire-0227: IPA diagnostics: kern.sweet_ipa_stats (each AP
+ channel's ring positions, channel and event ring states; ROUTE, AGGR_ACTIVE,
+ GSI status and error log), modem TX completions and the modem's other IPA
+ requests logged; kern.sweet_modem_stats no longer cut at 256 bytes
+
+---
+ bsd/dev/sweet_qmi_dev.c         | 17 ++++++++++++++-
+ iokit/Kernel/arm/TopazModem.cpp | 38 +++++++++++++++++++++++++++++++--
+ 2 files changed, 52 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/sweet_qmi_dev.c b/bsd/dev/sweet_qmi_dev.c
+index 120e12e..3b25c1b 100644
+--- a/bsd/dev/sweet_qmi_dev.c
++++ b/bsd/dev/sweet_qmi_dev.c
+@@ -303,7 +303,7 @@ static int
+ sysctl_sweet_modem_stats SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(oidp, arg1, arg2)
+-	char buf[256];
++	static char buf[640];
+ 	int n = topaz_modem_stats(buf, sizeof(buf));
+ 	if (n < 0) {
+ 		n = 0;
+@@ -346,6 +346,21 @@ sysctl_sweet_ipa_rx SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_rx, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_ipa_rx, "S", "the last IP packets from the modem");
+ 
++extern int topaz_ipa_stats(char *buf, size_t len);
++static int
++sysctl_sweet_ipa_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	static char buf[1024];
++	int n = topaz_ipa_stats(buf, sizeof(buf));
++	if (n < 0) {
++		buf[0] = 0;
++	}
++	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_ipa_stats, "A", "IPA channels and registers");
++
+ /* TopazModem, once the modem's IPCRTR channel is up */
+ void
+ sweet_qmi_dev_init(void)
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 345f0a3..b47afce 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -8034,7 +8034,17 @@ ipa_rx_event(struct ipa_chan *c, const uint8_t *e)
+ 	ipa_rx_post(c, b);
+ }
+ 
+-static void ipa_tx_event(struct ipa_chan *c, const uint8_t *e) { (void)e; c->cmds++; }
++static void
++ipa_tx_event(struct ipa_chan *c, const uint8_t *e)
++{
++	uint16_t len;
++	memcpy(&len, e + 8, 2);
++	c->cmds++;
++	if (c->cmds <= 8) {
++		LOG("t=%u ms: ipa: %s completion %llu: code %u, %u bytes, type %u, channel %u", g_ms, c->name, c->cmds, e[11], len,
++		    e[14], e[15]);
++	}
++}
+ 
+ /*
+  * sapphire 0226: one IP packet at a time towards the modem (kern.sweet_ipa_tx, bsd/dev/sweet_qmi_dev.c)
+@@ -8498,7 +8508,15 @@ ipa_svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_
+ 		LOG("t=%u ms: ipa: modem DRIVER_INIT_COMPLETE (the IPA microcontroller is up)", g_ms);
+ 		ipa_uc_ready = true;
+ 	} else {
+-		LOG("t=%u ms: ipa: modem request %04x answered", g_ms, msg);
++		LOG("t=%u ms: ipa: modem request %04x (%u bytes) answered", g_ms, msg, len);
++		for (uint32_t o = 7; o < len && o < 7 + 192; o += 32) {
++			char hex[100];
++			uint32_t k = 0;
++			for (uint32_t i = o; i < len && i < o + 32; i++) {
++				k += (uint32_t)snprintf(hex + k, sizeof(hex) - k, "%02x", d[i]);
++			}
++			LOG("ipa:   %04x: %s", o, hex);
++		}
+ 	}
+ 	ipa_qmi_ready();
+ 	return true;
+@@ -8537,6 +8555,22 @@ ipa_poll(unsigned ms)
+ 	}
+ }
+ 
++/* kern.sweet_ipa_stats: each AP channel's ring positions and states, the IPA's routing registers */
++extern "C" int
++topaz_ipa_stats(char *buf, size_t len)
++{
++	int n = snprintf(buf, len, "ipa %s; mem %x+%x; ROUTE %08x AGGR_ACTIVE %08x; GSI status %08x error %08x glob %08x\n", ipa_step,
++	    ipa_mo, ipa_msize, ipa_r ? ir(IPA_ROUTE) : 0, ipa_r ? ir(IPA_AGGR_ACTIVE) : 0, gsi_r ? gr(GSI_STATUS) : 0,
++	    gsi_r ? gr(GSI_ERROR_LOG) : 0, gsi_r ? gr(GSI_GLOB_IRQ_STTS) : 0);
++	for (unsigned i = 0; i < 4 && gsi_r != NULL && n > 0 && (size_t)n < len; i++) {
++		struct ipa_chan *c = &ipa_ch[i];
++		n += snprintf(buf + n, len - n, "%s: ch %u state %u ev %u state %u; filled %u read %u; hw ev write %x (ring %llx); frames %llu bytes %llu pkts %llu events %llu code %u\n",
++		    c->name, c->ch, gsi_state(GSI_CH(0, c->ch)), c->ev, gsi_state(GSI_EV(0, c->ev)), c->widx, c->eidx,
++		    gr(GSI_EV(4, c->ev)), c->evr_pa, c->frames, c->bytes, c->pkts, c->cmds, c->last_code);
++	}
++	return n;
++}
++
+ static int
+ ipa_stats(char *buf, size_t len)
+ {
+-- 
+2.43.0
+
