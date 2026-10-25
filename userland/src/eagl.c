@@ -4646,6 +4646,89 @@ display_waits(void)
 	return waits;
 }
 
+/*
+ * CoreAnimation's OpenGL ES renderer hands a function's numbers (the colour matrix of "vcm", ...)
+ * to GLContext::function_uniform(), and for the functions it has no shader for they went nowhere:
+ * redwood_gl_function_values() was never called here (HackiOS's inject.c and ios-topaz's
+ * topaz_inject.c do it from a library of their own, not loaded on sapphire), and Control Center's
+ * connectivity buttons and Focus came out as blank white discs. So the two slots of
+ * CA::OGL::GLESContext's table are taken here. Addresses: iOS 16.7.16 (20H392), iPhone10,3, from
+ * ios-topaz topaz_inject.c (after HackiOS inject.c); a slot that does not hold what it should is
+ * left alone.
+ */
+extern const void *_dyld_get_shared_cache_range(size_t *length);
+#define CA_CACHE_BASE           0x180000000UL
+#define CA_VT_GLES_CONTEXT      0x1d5b2f6e8UL   /* vtable for CA::OGL::GLESContext */
+#define CA_VSLOT(vtable, offset) ((vtable) + 0x10 + (offset))
+#define CA_FUNCTION_SUPPORTED   0x1884b2164UL   /* CA::OGL::GLContext::function_supported() const */
+#define CA_FUNCTION_UNIFORM     0x1884b21acUL   /* CA::OGL::GLContext::function_uniform(unsigned, unsigned long, unsigned long, float const*) */
+
+static uintptr_t ca_slide;
+static int (*orig_function_supported)(void *context);
+static void (*orig_function_uniform)(void *context, unsigned index, size_t components, size_t count, const float *values);
+
+static void *
+ca_replace_virtual(const char *what, uintptr_t slot, uintptr_t expected, void *replacement)
+{
+	uintptr_t *entry = (uintptr_t *)(slot + ca_slide);
+	vm_address_t page = (vm_address_t)entry & ~(vm_address_t)(vm_page_size - 1);
+	void *original;
+
+	if (*entry != expected + ca_slide) {
+		say("redwood-gl: %s: the slot holds %#lx, not %#lx: left alone\n", what, *entry - ca_slide, expected);
+		return NULL;
+	}
+	if (vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
+		say("redwood-gl: %s: the table is not writable\n", what);
+		return NULL;
+	}
+	original = (void *)*entry;
+	*entry = (uintptr_t)replacement;
+	vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ);
+	return original;
+}
+
+static unsigned
+ca_context_function(void *context)
+{
+	return *(*(uint8_t **)((char *)context + 0x10) + 0x10);
+}
+
+static int
+my_function_supported(void *context)
+{
+	int supported = orig_function_supported(context);
+	if (!supported) {
+		redwood_gl_function_refused(ca_context_function(context));
+	}
+	return supported;
+}
+
+static void
+my_function_uniform(void *context, unsigned index, size_t components, size_t count, const float *values)
+{
+	redwood_gl_function_values(context, ca_context_function(context), index, components, count, values);
+	orig_function_uniform(context, index, components, count, values);
+}
+
+static void
+ca_hooks(void)
+{
+	size_t length = 0;
+	const void *cache = _dyld_get_shared_cache_range(&length);
+
+	if (cache == NULL) {
+		return;
+	}
+	ca_slide = (uintptr_t)cache - CA_CACHE_BASE;
+	orig_function_supported = ca_replace_virtual("function_supported", CA_VSLOT(CA_VT_GLES_CONTEXT, 0x378),
+	    CA_FUNCTION_SUPPORTED, my_function_supported);
+	orig_function_uniform = ca_replace_virtual("function_uniform", CA_VSLOT(CA_VT_GLES_CONTEXT, 0x388),
+	    CA_FUNCTION_UNIFORM, my_function_uniform);
+	say("redwood-gl: GLESContext hooks: function_supported %s, function_uniform %s\n",
+	    orig_function_supported ? "on" : "OFF", orig_function_uniform ? "on" : "OFF");
+}
+
 __attribute__((constructor)) static void
 install(void)
 {
@@ -4810,6 +4893,7 @@ install(void)
 		say("redwood-gl: this program has no EAGLContext: nothing to do\n");
 		return;
 	}
+	ca_hooks();
 	for (unsigned i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
 		SEL selector = sel_registerName(methods[i].name);
 		Method method = class_getInstanceMethod(class, selector);
