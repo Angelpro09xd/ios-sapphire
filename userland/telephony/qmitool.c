@@ -30,6 +30,7 @@
 #include <sys/select.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <arpa/inet.h>
 #include <signal.h>
 #include <unistd.h>
@@ -1147,16 +1148,28 @@ cmd_datacall(const char *apn)
 		print_ip("gateway", tlv_u32(&r, 0x20));
 		print_ip("netmask", tlv_u32(&r, 0x21));
 		print_ip("dns", tlv_u32(&r, 0x15));
+		print_ip("dns 2", tlv_u32(&r, 0x16));
 		printf("%-14s %u\n", "mtu", tlv_u32(&r, 0x29));
 		uint32_t gw = tlv_u32(&r, 0x20);
 		FILE *f = fopen("/var/tmp/datacall.ip", "w");
 		if (f != NULL) {
-			fprintf(f, "%u.%u.%u.%u %u.%u.%u.%u\n", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255,
-			    gw >> 24, (gw >> 16) & 255, (gw >> 8) & 255, gw & 255);
+			uint32_t d1 = tlv_u32(&r, 0x15), d2 = tlv_u32(&r, 0x16);
+			fprintf(f, "%u.%u.%u.%u %u.%u.%u.%u %u.%u.%u.%u %u.%u.%u.%u\n", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255,
+			    ip & 255, gw >> 24, (gw >> 16) & 255, (gw >> 8) & 255, gw & 255, d1 >> 24, (d1 >> 16) & 255,
+			    (d1 >> 8) & 255, d1 & 255, d2 >> 24, (d2 >> 16) & 255, (d2 >> 8) & 255, d2 & 255);
 			fclose(f);
 		}
-		if (getenv("NO_PDP") == NULL) {
-			(void)pdp_config(ip, gw, tlv_u32(&r, 0x29));
+		if (getenv("NO_PDP") == NULL && pdp_config(ip, gw, tlv_u32(&r, 0x29)) == 0 &&
+		    access("/var/root/pdpnet", X_OK) == 0) {
+			fflush(stdout);
+			pid_t pid = fork();                 /* the call's IPv4 and DNS for configd */
+			if (pid == 0) {
+				execl("/var/root/pdpnet", "pdpnet", "up", (char *)NULL);
+				_exit(127);
+			}
+			if (pid > 0) {
+				(void)waitpid(pid, NULL, 0);
+			}
 		}
 	}
 	fflush(stdout);

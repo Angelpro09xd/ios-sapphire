@@ -16,3 +16,7 @@ echo "../obj/ccbridge.dylib"
 # ccstart: CommCenter's launchd Program (/redwood/bin/ccstart), sets DYLD_INSERT_LIBRARIES and execs it
 $L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -o ../obj/ccstart ccstart.c
 echo "../obj/ccstart"
+# pdpnet: the data call's IPv4 + DNS published to configd (/var/root/pdpnet, run by qmitool datacall)
+$L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -Wextra -Wno-unused-parameter \
+	-framework CoreFoundation -framework SystemConfiguration -o ../obj/pdpnet pdpnet.c
+echo "../obj/pdpnet"
