@@ -1,0 +1,119 @@
+From d838b184ecad60d772fb94308d12fed8f1a033cf Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 21:02:52 +0000
+Subject: [PATCH] sapphire-0229: kern.sweet_ipa_peek: IPA/GSI registers (every
+ EE) and IPA-local memory read and written from user space
+
+---
+ bsd/dev/sweet_qmi_dev.c         | 23 +++++++++++++
+ iokit/Kernel/arm/TopazModem.cpp | 60 +++++++++++++++++++++++++++++++++
+ 2 files changed, 83 insertions(+)
+
+diff --git a/bsd/dev/sweet_qmi_dev.c b/bsd/dev/sweet_qmi_dev.c
+index d6b4757..bf02e5a 100644
+--- a/bsd/dev/sweet_qmi_dev.c
++++ b/bsd/dev/sweet_qmi_dev.c
+@@ -357,6 +357,29 @@ sysctl_sweet_ipa_raw SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_raw, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_ipa_raw, "S", "the last frames received from the IPA, raw");
++extern int topaz_ipa_peek(const char *req);
++extern const char *topaz_ipa_peek_out(void);
++static int
++sysctl_sweet_ipa_peek SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (req->newptr != USER_ADDR_NULL) {
++		char in[64];
++		if (req->newlen == 0 || req->newlen >= sizeof(in)) {
++			return EINVAL;
++		}
++		int err = SYSCTL_IN(req, in, req->newlen);
++		if (err != 0) {
++			return err;
++		}
++		in[req->newlen] = 0;
++		return topaz_ipa_peek(in);
++	}
++	const char *out = topaz_ipa_peek_out();
++	return SYSCTL_OUT(req, out, strlen(out) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_peek, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_ipa_peek, "A", "IPA/GSI registers and IPA memory: write a request, read the words");
+ extern int topaz_ipa_stats(char *buf, size_t len);
+ static int
+ sysctl_sweet_ipa_stats SYSCTL_HANDLER_ARGS
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 831d46e..0ad3676 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -8625,6 +8625,66 @@ ipa_poll(unsigned ms)
+ 	}
+ }
+ 
++/*
++ * sapphire 0229: kern.sweet_ipa_peek, any IPA or GSI register (every EE: the modem's channels too)
++ * or the IPA-local memory, read and written from user space: "i OFF [N]" IPA registers, "g OFF [N]"
++ * GSI registers, "s OFF [N]" IPA memory (N words, default 16); "wi|wg|ws OFF VALUE" writes one.
++ * Reading the sysctl returns the words of the last request.
++ */
++static char ipa_peek_out[1024];
++extern "C" unsigned long strtoul(const char *nptr, char **endptr, int base);
++
++extern "C" int
++topaz_ipa_peek(const char *req)
++{
++	char sp[4] = {};
++	unsigned long off = 0, arg = 16;
++	int n = 0;
++	if (ipa_r == NULL || gsi_r == NULL) {
++		return ENXIO;
++	}
++	while (req[n] == ' ') n++;
++	int k = 0;
++	while (req[n] && req[n] != ' ' && k < 3) sp[k++] = req[n++];
++	const char *p = req + n;
++	off = strtoul(p, (char **)&p, 16);
++	if (*p) {
++		arg = strtoul(p, NULL, 0);
++	}
++	bool write = sp[0] == 'w';
++	char kind = write ? sp[1] : sp[0];
++	uint32_t limit = kind == 'i' ? IPA_REG_SIZE : kind == 'g' ? IPA_GSI_SIZE : kind == 's' ? IPA_REG_SIZE - IPA_SRAM_OFF : 0;
++	volatile uint8_t *base = kind == 'i' ? ipa_r : kind == 'g' ? gsi_r : ipa_r + IPA_SRAM_OFF;
++	if (limit == 0 || (off & 3) != 0 || off + 4 > limit) {
++		return EINVAL;
++	}
++	if (write) {
++		*(volatile uint32_t *)(base + off) = (uint32_t)arg;
++		mb();
++		snprintf(ipa_peek_out, sizeof(ipa_peek_out), "%c %lx <- %08lx, reads %08x\n", kind, off, arg,
++		    *(volatile uint32_t *)(base + off));
++		return 0;
++	}
++	if (arg == 0 || arg > 64) {
++		arg = 16;
++	}
++	int o = 0;
++	for (unsigned long i = 0; i < arg && off + 4 * i + 4 <= limit; i++) {
++		if (i % 8 == 0) {
++			o += snprintf(ipa_peek_out + o, sizeof(ipa_peek_out) - o, "%s%c %05lx:", i ? "\n" : "", kind, off + 4 * i);
++		}
++		o += snprintf(ipa_peek_out + o, sizeof(ipa_peek_out) - o, " %08x", *(volatile uint32_t *)(base + off + 4 * i));
++	}
++	snprintf(ipa_peek_out + o, sizeof(ipa_peek_out) - o, "\n");
++	return 0;
++}
++
++extern "C" const char *
++topaz_ipa_peek_out(void)
++{
++	return ipa_peek_out;
++}
++
+ /* kern.sweet_ipa_stats: each AP channel's ring positions and states, the IPA's routing registers */
+ extern "C" int
+ topaz_ipa_stats(char *buf, size_t len)
+-- 
+2.43.0
+
