@@ -1,0 +1,91 @@
+From da3136365eb3803a01e3263649213e46a7f7e193 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 10:33:45 +0000
+Subject: [PATCH] sapphire-0212: display off without blinking: black once the
+ GPU has done the last copy
+
+0211 on the phone: turned off mid-animation the screen now goes dark, but
+blinks two or three times first (black, the late copy, black again).
+SapphireGpu keeps the fence of the last copy into the panel's memory and
+tells whether it is still queued (sapphire_gpu_copy_pending()); at display
+off the black waits for it (no new copy is queued while off), up to half a
+second, and is made once, then once more a tick later.
+---
+ iokit/Kernel/arm/SapphireGpu.cpp      | 14 ++++++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 19 +++++++++++++------
+ 2 files changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index c4f3869..efbb8d3 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -2101,6 +2101,19 @@ map_window(IOMemoryDescriptor *md)
+ bool sapphire_gpu_copy(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src_pitch, uint64_t dst_pa,
+     uint32_t dst_pitch, uint32_t w, uint32_t h, uint64_t dst_base, uint64_t dst_size);
+ bool sapphire_gpu_ready(void);
++bool sapphire_gpu_copy_pending(void);
++
++/*
++ * 0212: whether the last copy into the panel's memory is still in the GPU's queue (SweetFramebuffer:
++ * the screen is made black at display off only once it is done, or the copy lands over the black).
++ */
++static uint32_t last_copy_fence;
++
++bool
++sapphire_gpu_copy_pending(void)
++{
++	return service_ready && last_copy_fence != 0 && pool != NULL && !fence_done(last_copy_fence);
++}
+ 
+ /* So a caller does not pay for cache maintenance before a copy the GPU would refuse. */
+ bool
+@@ -2134,6 +2147,7 @@ sapphire_gpu_copy(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src_pitch,
+ 			if (wi < WIN_COUNT) {
+ 				win[wi].fence = fence_seq;      /* blit_end's last event */
+ 			}
++			last_copy_fence = fence_seq;
+ 			if (!ok) {
+ 				service_ready = false;
+ 				LOG("service: a copy failed, the GPU path is off; RBBM_STATUS %08x", grd(REG_RBBM_STATUS));
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e8f48f2..73ea43a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -46,6 +46,7 @@ extern "C" unsigned int vm_page_wire_count;        /* osfmk/vm (the same kernel)
+ extern "C" void sapphire_gpu_init(void);            /* iokit/Kernel/arm/SapphireGpu.cpp (boot-arg gpu=N) */
+ extern "C" void sweet_busy_init(void);              /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */             /* iokit/Kernel/arm/TopazModem.cpp (boot-arg modem=1) */
+ extern "C" int sweet_console_copy_dirty(void *dst);
++extern bool sapphire_gpu_copy_pending(void);         /* SapphireGpu.cpp (0212): the last copy is still queued */
+ 
+ /*
+  * topaz: a surface the MDP may still be fetching counts as in use, so
+@@ -576,14 +577,20 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			 * frame is presented again (fDirty).
+ 			 */
+ 			/*
+-			 * 0211: not only twice. Turned off in the middle of an animation, the GPU is busy and the
+-			 * copy of the last frame queued before "off" lands later than two ticks, over the black:
+-			 * the screen stayed on. Black again at ticks 1, 2, 6, 15 and 30 (half a second).
++			 * 0211/0212: turned off in the middle of an animation, the GPU is busy and the copy of the
++			 * last frame queued before "off" lands later, over the black (0209 blackened twice: the
++			 * screen stayed on; 0211 again at ticks 1-30: it blinked two or three times). Now the black
++			 * waits for the GPU to have done the last copy (no new one is queued while off), up to half
++			 * a second, and is made once, then once more a tick later.
+ 			 */
+ 			uint32_t step = fb->fFadeStep;
+-			bool first = step == 0 || step == 1 || step == 5 || step == 14 || step == 29;
+-			if (step < 30) {
+-				fb->fFadeStep = step + 1;
++			bool pending = sapphire_gpu_copy_pending();
++			bool first = false;
++			if (step < 30 && pending) {
++				fb->fFadeStep = step + 1;       /* waiting for the copy (the frame stays a moment) */
++			} else if (step < 32) {
++				first = true;
++				fb->fFadeStep = step < 30 ? 30 : step + 1;
+ 			}
+ 			IOLockUnlock(fb->fLock);
+ 			if (first && fb->fPixels != 0) {
+-- 
+2.43.0
+
