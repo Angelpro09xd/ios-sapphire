@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the sapphire XNU boot image from a CI kernel:
 #
-#   tools/sapphire-boot.sh [--readonly] [--console] [--gpu-fw DIR] KERNEL [OUT.img] [extra boot-args]
+#   tools/sapphire-boot.sh [--readonly] [--console] [--amp] [--gpu-fw DIR] KERNEL [OUT.img] [extra boot-args]
 #
 # --readonly drops ufsrw=1/rootrw=1: xnu cannot write the UFS at all (no
 # root writes, no persistent log), for test boots with Android still on
@@ -9,6 +9,9 @@
 # --console keeps the kernel text drawn over the GUI (sweetfb_noconsole=1 is
 # left out); without it the log is still in the ring at the end of userdata
 # (tools/sweet-log-pull.sh from recovery).
+# --amp lists all eight cores (gold P cluster + silver E cluster) and boots with
+# cpus=8: only for a kernel built with TOPAZ_4K=1 (4 KiB pages; silver has no
+# 16K granule).
 # --gpu-fw DIR puts the Adreno firmware in DIR (a630_sqe.fw, and
 # a610_zap.mdt / a610_zap.b02 if they are there) into the device tree, so
 # patch 0145 finds it without reading a partition. Qualcomm's firmware is
@@ -25,10 +28,13 @@ cd "$(dirname "$0")/.."
 rw="ufsrw=1 rootrw=1"
 con="sweetfb_noconsole=1"
 gpufw=()
+amp=()
+cpus=4
 while [[ ${1:-} == --* ]]; do
 	case $1 in
 	--readonly) rw="" ;;
 	--console) con="" ;;
+	--amp) amp=(--amp); cpus=8 ;;
 	--gpu-fw)
 		shift
 		[[ -f $1/a630_sqe.fw ]] || { echo "$1/a630_sqe.fw not found" >&2; exit 1; }
@@ -46,9 +52,9 @@ extra=${3:-}
 
 [[ -f research/ipsw-x/d22ap.adt ]] || { echo "missing research/ipsw-x/d22ap.adt" >&2; exit 1; }
 mkdir -p shim/out
-python3 tools/mkadt.py shim/out/sapphire.adt --highmem ${gpufw[@]+"${gpufw[@]}"}
+python3 tools/mkadt.py shim/out/sapphire.adt --highmem ${gpufw[@]+"${gpufw[@]}"} ${amp[@]+"${amp[@]}"}
 python3 tools/mkpayload.py "$kernel" shim/out/sapphire.adt shim/out/payload.bin \
-	--cmdline "debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin $rw launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 $con sweetfb_hz=60 sweettouch_rx=8640 sweettouch_ry=9600 $extra"
+	--cmdline "debug=0xc serial=3 cpus=$cpus keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin $rw launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 $con sweetfb_hz=60 sweettouch_rx=8640 sweettouch_ry=9600 $extra"
 shim/build.sh ../shim/out/payload.bin
 [[ $out == shim/out/shim-boot.img ]] || cp shim/out/shim-boot.img "$out"
 sha256sum "$out"
