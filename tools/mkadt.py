@@ -166,6 +166,19 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, gpu_
             ('peripheral-frequency', u32(timebase)),
             ('fixed-frequency', u32(timebase)),
         ]))
+    # /baseband as on the iPhone X (d22ap: compatible baseband,n41): launchd loads CommCenter
+    # only with it (com.apple.CommCenter.plist _LimitLoadToDeviceTree = baseband). The GPIO
+    # "function-*" properties of Apple's board are left out; the modem is ours (QMI over
+    # /dev/redwood-qmi). iBoot writes the IMEI into device-imei: left empty here.
+    baseband = node('baseband', [
+        ph(),
+        ('device_type', cstr('baseband')),
+        ('compatible', cstr('baseband,n41')),
+        ('class', u32(3)),
+        ('device-imei', bytes(32)),
+        ('imeisv', u32(0x39)),
+        ('region-sku', cstr('syscfg/RSKU/0x40,zeroes/0x40')),
+    ])
     cpus = node('cpus', [ph(), ('#address-cells', u32(1)),
                          ('#size-cells', u32(0))], cpu_nodes)
 
@@ -261,7 +274,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, gpu_
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, baseband] + product + ([] if qemu else [ufs]))
 
 
 if __name__ == '__main__':
