@@ -352,6 +352,8 @@ cmd_sim(void)
 	static const char *card[] = { "absent", "present", "error" };
 	static const char *apptype[] = { "unknown", "SIM", "USIM", "RUIM", "CSIM", "ISIM" };
 	const uint8_t *p = v + 8, *end = v + l;
+	uint16_t gw_primary;
+	memcpy(&gw_primary, v, 2);
 	uint8_t ncards = *p++;
 	for (int i = 0; i < ncards && p + 6 <= end; i++) {
 		printf("card %d: %s, UPIN %s (%u tries), error %u\n", i, p[0] < 3 ? card[p[0]] : "?",
@@ -364,6 +366,25 @@ cmd_sim(void)
 			if (q + 7 > end) break;
 			printf("  app %d: %s, %s; PIN1 %s (%u tries, PUK %u)\n", a, type < 6 ? apptype[type] : "?",
 			    app_state(st), pin_state(q[1]), q[2], q[3]);
+			if (gw_primary == 0xffff && (type == 1 || type == 2) && st == 1) {
+				/*
+				 * Nobody chose this application for the GW primary session (Android's RIL does
+				 * at boot): UIM Change Provisioning Session, activate, slot i+1 + its AID.
+				 */
+				struct msg cq, cr;
+				m_init(&cq, 0, 0x0038);
+				uint8_t sc[2] = { 0, 1 };
+				m_tlv(&cq, 0x01, sc, 2);
+				uint8_t ai[2 + 32];
+				ai[0] = (uint8_t)(i + 1);
+				ai[1] = aidlen > 32 ? 32 : aidlen;
+				memcpy(ai + 2, p + 7, ai[1]);
+				m_tlv(&cq, 0x10, ai, (uint16_t)(2 + ai[1]));
+				int pe = request(&c, &cq, &cr);
+				printf("  -> activated as the primary session: %s (%d); run qmitool sim again\n",
+				    pe == 0 ? "ok" : "QMI error", pe);
+				gw_primary = 0;
+			}
 			p = q + 7;
 		}
 	}
@@ -431,8 +452,8 @@ cmd_net(void)
 	const uint8_t *v;
 	if (e == 0 && (v = tlv(&r, 0x01, &l)) != NULL && l >= 5) {
 		static const char *reg[] = { "not registered", "registered", "searching", "denied", "unknown" };
-		static const char *rif[] = { "none", "cdma1x", "evdo", "amps", "gsm", "umts", "lte", "?", "td-scdma",
-			"?", "?", "?", "nr5g" };
+		static const char *rif[] = { "none", "cdma1x", "evdo", "amps", "gsm", "umts", "?", "?", "lte",
+			"td-scdma", "?", "?", "nr5g" };     /* QmiNasRadioInterface */
 		printf("registration   %s (CS %s, PS %s)\n", v[0] < 5 ? reg[v[0]] : "?",
 		    v[1] == 1 ? "attached" : "detached", v[2] == 1 ? "attached" : "detached");
 		printf("radio         ");
