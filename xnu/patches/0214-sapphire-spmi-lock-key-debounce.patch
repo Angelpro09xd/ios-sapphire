@@ -1,0 +1,178 @@
+From 6dd26d970959adbd632e406b8082b3ce59ff20ae Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 10:54:37 +0000
+Subject: [PATCH] sapphire-0214: volume keys nobody pressed: one lock for the
+ SPMI observer, and keys debounced
+
+On the phone iOS now and then showed the volume HUD with no key pressed.
+The key log has the answer: presses with pon=0xc3 (the QG's "present"),
+0x95 (the charger's path) -- the battery's registers. Since 0207 the battery
+reads the PMIC every 2 s on the same observer as the key thread, and reads
+from the two at once crossed. One mutex for every observer read (sweet_spmi.c,
+also taken by sweet_keys.c), and a key's change counts once two polls in a
+row (40 ms) agree on it.
+---
+ bsd/dev/sweet_keys.c | 23 +++++++++++++++++++++--
+ bsd/dev/sweet_spmi.c | 38 +++++++++++++++++++++++++++++---------
+ 2 files changed, 50 insertions(+), 11 deletions(-)
+
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 65970f9..4d30707 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -57,12 +57,25 @@ keys_find_apid(uint16_t ppid, uint32_t count)
+ 	return found;
+ }
+ 
++void sweet_spmi_bus_lock(void);         /* sweet_spmi.c (0214): one reader of the observer at a time */
++void sweet_spmi_bus_unlock(void);
++static bool keys_read_locked(uint16_t apid, uint16_t addr, uint8_t *out);
++
+ static bool
+ keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
+ {
+ 	if (apid == KEYS_NO_APID) {
+ 		return false;
+ 	}
++	sweet_spmi_bus_lock();
++	bool ok = keys_read_locked(apid, addr, out);
++	sweet_spmi_bus_unlock();
++	return ok;
++}
++
++static bool
++keys_read_locked(uint16_t apid, uint16_t addr, uint8_t *out)
++{
+ 	uint32_t off = 0x80u * apid; /* obs + EE(0)*0x10000 */
+ 	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+@@ -94,7 +107,7 @@ keys_wait(void)
+ static void
+ keys_thread(void *arg, wait_result_t result)
+ {
+-	int state[3] = {0, 0, 0};
++	int state[3] = {0, 0, 0}, seen[3] = {0, 0, 0};
+ 	unsigned errors = 0;
+ 	(void)arg;
+ 	(void)result;
+@@ -112,7 +125,13 @@ keys_thread(void *arg, wait_result_t result)
+ 			errors = 0;
+ 		}
+ 		for (int k = 0; k < 3; ++k) {
+-			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
++			/* 0214: a change counts once two polls in a row (40 ms) agree on it */
++			bool ok = k == 1 ? gok : pok;
++			bool agreed = ok && now[k] == seen[k];
++			if (ok) {
++				seen[k] = now[k];
++			}
++			if (agreed && now[k] != state[k]) {
+ 				state[k] = now[k];
+ 				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
+ 				    k, state[k], pon, gpio);
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index ec42cd3..1425ccd 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -10,6 +10,7 @@
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
+ #include <IOKit/IOLocks.h>
++#include <kern/locks.h>
+ #include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -27,6 +28,25 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
+ static IOLock *sp_lock;
++/*
++ * 0214: one lock for every reader of the arbiter's observer, this file's and sweet_keys.c's.
++ * Reads from the two at once crossed: the key thread got the battery's registers (pon=0xc3, the
++ * QG's "present"; 0x95, the charger's path) and iOS saw volume keys nobody pressed.
++ */
++static LCK_GRP_DECLARE(sweet_spmi_grp, "sweet_spmi");
++static LCK_MTX_DECLARE(sweet_spmi_mtx, &sweet_spmi_grp);
++void sweet_spmi_bus_lock(void);
++void sweet_spmi_bus_unlock(void);
++void
++sweet_spmi_bus_lock(void)
++{
++	lck_mtx_lock(&sweet_spmi_mtx);
++}
++void
++sweet_spmi_bus_unlock(void)
++{
++	lck_mtx_unlock(&sweet_spmi_mtx);
++}
+ static unsigned sp_count;
+ static bool sp_attempted, sp_ready;
+ /* A timed-out command may complete late: never reuse that lane this boot. */
+@@ -97,10 +117,10 @@ sweet_spmi_read_any(unsigned sid, unsigned addr, uint8_t *out)
+ 	if (!sp_ready || !out || sid > 15 || addr > 0xffffu) {
+ 		return -1;
+ 	}
+-	IOLockLock(sp_lock);
++	lck_mtx_lock(&sweet_spmi_mtx);
+ 	uint16_t apid = sp_find_apid((sid << 8) | (addr >> 8));
+ 	if (apid == SP_NO_APID || sp_poisoned[apid]) {
+-		IOLockUnlock(sp_lock);
++		lck_mtx_unlock(&sweet_spmi_mtx);
+ 		return -2;
+ 	}
+ 	unsigned off = 0x80u * apid;
+@@ -113,13 +133,13 @@ sweet_spmi_read_any(unsigned sid, unsigned addr, uint8_t *out)
+ 		if (status & 1u) {
+ 			int r = (status & 0x0eu) ? -3 : 0;
+ 			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
+-			IOLockUnlock(sp_lock);
++			lck_mtx_unlock(&sweet_spmi_mtx);
+ 			return r;
+ 		}
+ 		delay(1);
+ 	}
+ 	sp_poisoned[apid] = true;
+-	IOLockUnlock(sp_lock);
++	lck_mtx_unlock(&sweet_spmi_mtx);
+ 	return -4;
+ }
+ 
+@@ -134,10 +154,10 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	    peripheral != 0x13 && peripheral != 0x48)) {
+ 		return -1;
+ 	}
+-	IOLockLock(sp_lock);
++	lck_mtx_lock(&sweet_spmi_mtx);
+ 	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
+ 	if (apid == SP_NO_APID || sp_poisoned[apid]) {
+-		IOLockUnlock(sp_lock);
++		lck_mtx_unlock(&sweet_spmi_mtx);
+ 		return -1;
+ 	}
+ 	unsigned off = 0x80u * apid;
+@@ -149,11 +169,11 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 		uint32_t status = sp_rd(sp_obs, off + 0x08u);
+ 		if (status & 1u) {
+ 			if (status & 0x0eu) {
+-				IOLockUnlock(sp_lock);
++				lck_mtx_unlock(&sweet_spmi_mtx);
+ 				return -1;
+ 			}
+ 			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
+-			IOLockUnlock(sp_lock);
++			lck_mtx_unlock(&sweet_spmi_mtx);
+ 			return 0;
+ 		}
+ 		delay(1);
+@@ -161,7 +181,7 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	sp_poisoned[apid] = true;
+ 	printf("SWEET BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n",
+ 	    sid, addr, apid);
+-	IOLockUnlock(sp_lock);
++	lck_mtx_unlock(&sweet_spmi_mtx);
+ 	return -1;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.43.0
+
