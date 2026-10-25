@@ -665,7 +665,7 @@ struct br_svc {
 	uint32_t node, port;
 	uint8_t cids[BR_CIDS];
 	unsigned ncids;
-	struct { uint16_t txn; uint8_t cid; uint8_t used; uint16_t orig; uint16_t as_ind; } pend[64];
+	struct { uint16_t txn; uint8_t cid; uint8_t used; uint16_t orig; uint16_t as_ind; uint16_t msg; uint64_t t; } pend[64];
 	uint16_t next_txn;
 };
 struct br_chan {
@@ -853,6 +853,8 @@ br_nas_query(struct br_chan *c, uint16_t msg, uint16_t as_ind)
 	v->pend[slot].orig = 0;
 	v->pend[slot].used = 1;
 	v->pend[slot].as_ind = as_ind;
+	v->pend[slot].msg = msg;
+	v->pend[slot].t = clock_gettime_nsec_np(CLOCK_MONOTONIC);
 	uint8_t buf[sizeof(struct sqhdr) + 7];
 	struct sqhdr h = { v->node, v->port };
 	memcpy(buf, &h, sizeof(h));
@@ -934,6 +936,8 @@ br_from_cc(struct br_chan *c, const uint8_t *f, size_t n)
 	v->pend[slot].orig = txn;
 	v->pend[slot].used = 1;
 	v->pend[slot].as_ind = 0;
+	v->pend[slot].msg = msg;
+	v->pend[slot].t = clock_gettime_nsec_np(CLOCK_MONOTONIC);
 	if (svc == 0x03 && msg == 0x0003) {
 		br_nas_poll_soon(c);    /* CommCenter registered for NAS indications: tell it where we are */
 	}
@@ -969,8 +973,34 @@ br_reader_main(void *arg)
 		}
 		pthread_mutex_unlock(&br_lock);
 		struct timeval tv = { 0, 200000 };
-		if (select(maxfd + 1, &fds, NULL, NULL, &tv) <= 0) continue;
+		int ready = select(maxfd + 1, &fds, NULL, NULL, &tv);
 		pthread_mutex_lock(&br_lock);
+		/*
+		 * a request the modem did not answer in 4 s gets QMI_ERR_INTERNAL from us: ATCS's own
+		 * timeout (ATCS_TIMEOUT) makes ABM hard-reset the "baseband" and CommCenter drop the
+		 * registration (seen with WDS SetEventReport)
+		 */
+		uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+		for (unsigned i = 0; i < MAX_SHIMS; i++) {
+			struct br_chan *c = &br_chans[i];
+			for (unsigned k = 0; k < c->nsvcs; k++) {
+				struct br_svc *v = &c->svcs[k];
+				for (unsigned m = 0; m < 64; m++) {
+					if (!v->pend[m].used || now - v->pend[m].t < 4000000000ULL) continue;
+					v->pend[m].used = 0;
+					say("bridge: service 0x%x msg 0x%04x: no answer from the modem in 4 s, QMI_ERR_INTERNAL", v->svc, v->pend[m].msg);
+					if (v->pend[m].as_ind) continue;
+					uint8_t r[14] = { 0x02, 0, 0, 0, 0, 7, 0, 0x02, 4, 0, 1, 0, 0x03, 0 };
+					memcpy(r + 1, &v->pend[m].orig, 2);
+					memcpy(r + 3, &v->pend[m].msg, 2);
+					br_to_cc(c, v->svc, v->pend[m].cid, r, sizeof(r));
+				}
+			}
+		}
+		if (ready <= 0) {
+			pthread_mutex_unlock(&br_lock);
+			continue;
+		}
 		for (unsigned i = 0; i < MAX_SHIMS; i++) {
 			struct br_chan *c = &br_chans[i];
 			for (unsigned k = 0; k < c->nsvcs; k++) {
