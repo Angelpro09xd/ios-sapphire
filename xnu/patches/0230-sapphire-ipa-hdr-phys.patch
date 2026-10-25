@@ -1,0 +1,71 @@
+From 0c470bf78a7603d99993603429959a269c7c8590 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 21:45:40 +0000
+Subject: [PATCH] sapphire-0230: IPA uplink header length selectable
+ (kern.sweet_ipa_peek "h4": QMAP only, "h8": QMAP + checksum header) and
+ physical memory reads ("p PA [N]")
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 32 ++++++++++++++++++++++++++++++--
+ 1 file changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 0ad3676..5070436 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -8060,6 +8060,7 @@ ipa_tx_event(struct ipa_chan *c, const uint8_t *e)
+ #define IPA_TX_SLOTS        16
+ #define IPA_RXLOG           8
+ static uint8_t ipa_txq[1600];
++static uint32_t ipa_tx_hdr = 8;                 /* 0230: 8 = QMAP + UL checksum header, 4 = QMAP only (peek "h4") */
+ static volatile uint32_t ipa_txq_len;
+ static uint8_t ipa_txq_mux;
+ static uint8_t *ipa_txbuf;
+@@ -8185,8 +8186,8 @@ ipa_tx_pump(void)
+ 	b[2] = (uint8_t)(len >> 8);
+ 	b[3] = (uint8_t)len;
+ 	bzero(b + 4, 4);                        /* uplink checksum header: nothing asked */
+-	memcpy(b + 8, ipa_txq, len);
+-	gsi_tre(c, ipa_txbuf_pa + 2048 * slot, (uint16_t)(8 + len), (2u << 16) | (1u << 9));
++	memcpy(b + ipa_tx_hdr, ipa_txq, len);
++	gsi_tre(c, ipa_txbuf_pa + 2048 * slot, (uint16_t)(ipa_tx_hdr + len), (2u << 16) | (1u << 9));
+ 	gsi_doorbell(c);
+ 	ipa_tx_sent++;
+ 	if (ipa_tx_sent <= 8) {
+@@ -8651,6 +8652,33 @@ topaz_ipa_peek(const char *req)
+ 	if (*p) {
+ 		arg = strtoul(p, NULL, 0);
+ 	}
++	if (sp[0] == 'h') {                     /* "h4" / "h8": the uplink header length */
++		ipa_tx_hdr = sp[1] == '4' ? 4 : 8;
++		snprintf(ipa_peek_out, sizeof(ipa_peek_out), "uplink header %u bytes\n", ipa_tx_hdr);
++		return 0;
++	}
++	if (sp[0] == 'p') {                     /* "p PA [N]": physical memory, one page at most */
++		uint64_t pa = strtoul(p, (char **)&p, 16);    /* unsigned long: 64 bits */
++		unsigned long words = *p ? strtoul(p, NULL, 0) : 16;
++		if ((pa & 3) || words == 0 || words > 64 || ((pa & 0xfff) + 4 * words) > 0x1000) {
++			return EINVAL;
++		}
++		IOMemoryMap *m = map_phys(pa & ~0xfffull, 0x1000, false);
++		if (m == NULL) {
++			return ENOMEM;
++		}
++		volatile uint32_t *v = (volatile uint32_t *)(m->getVirtualAddress() + (pa & 0xfff));
++		int o = 0;
++		for (unsigned long i = 0; i < words; i++) {
++			if (i % 8 == 0) {
++				o += snprintf(ipa_peek_out + o, sizeof(ipa_peek_out) - o, "%sp %llx:", i ? "\n" : "", (unsigned long long)(pa + 4 * i));
++			}
++			o += snprintf(ipa_peek_out + o, sizeof(ipa_peek_out) - o, " %08x", v[i]);
++		}
++		snprintf(ipa_peek_out + o, sizeof(ipa_peek_out) - o, "\n");
++		m->release();
++		return 0;
++	}
+ 	bool write = sp[0] == 'w';
+ 	char kind = write ? sp[1] : sp[0];
+ 	uint32_t limit = kind == 'i' ? IPA_REG_SIZE : kind == 'g' ? IPA_GSI_SIZE : kind == 's' ? IPA_REG_SIZE - IPA_SRAM_OFF : 0;
+-- 
+2.43.0
+
