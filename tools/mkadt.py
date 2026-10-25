@@ -170,15 +170,25 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, gpu_
     # only with it (com.apple.CommCenter.plist _LimitLoadToDeviceTree = baseband). The GPIO
     # "function-*" properties of Apple's board are left out; the modem is ours (QMI over
     # /dev/redwood-qmi). iBoot writes the IMEI into device-imei: left empty here.
-    baseband = node('baseband', [
-        ph(),
+    # MobileGestalt's HasBaseband stayed false with only these: it reads the node's
+    # function-* properties too (function-bb_ap_time_sync, ...). So the iPhone X's node is
+    # copied whole from d22ap.adt (phandle ours); nothing here interprets the GPIO functions.
+    bb_props = [ph(),
         ('device_type', cstr('baseband')),
         ('compatible', cstr('baseband,n41')),
         ('class', u32(3)),
         ('device-imei', bytes(32)),
         ('imeisv', u32(0x39)),
         ('region-sku', cstr('syscfg/RSKU/0x40,zeroes/0x40')),
-    ])
+    ]
+    if os.path.exists(D22AP_ADT):
+        d22, _ = adt.parse(open(D22AP_ADT, 'rb').read())
+        src = next((c for c in d22.children if c.name == 'baseband'), None)
+        have = {p[0] for p in bb_props}
+        for p in (src.props if src else []):
+            if p[0] not in have and p[0] not in ('AAPL,phandle', 'name', 'interrupt-parent', 'interrupts'):
+                bb_props.append((p[0], p[-1]))
+    baseband = node('baseband', bb_props)
     cpus = node('cpus', [ph(), ('#address-cells', u32(1)),
                          ('#size-cells', u32(0))], cpu_nodes)
 
