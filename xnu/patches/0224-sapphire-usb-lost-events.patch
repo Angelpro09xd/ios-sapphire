@@ -1,0 +1,133 @@
+From 4723fe9cf75f2fa44b9c1fd28b1ce8658ce0585d Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 17:04:03 +0000
+Subject: [PATCH] sapphire-0224: USB Ethernet: a data transfer finished without
+ its event is taken by a 500 ms watch (the link froze under CommCenter load
+ until a bus reset), kern.sweet_usb_stats
+
+---
+ bsd/dev/sweet_usb.c | 80 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 80 insertions(+)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 79295fb..19d1b23 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -35,6 +35,7 @@
+ #include <net/kpi_interface.h>
+ #include <net/kpi_protocol.h>
+ #include <netinet/in.h>
++#include <sys/sysctl.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+@@ -226,6 +227,9 @@ static struct {
+ 	bool        xfer_active[EP_INT + 1];
+ 	uint8_t     xfer_rsc[EP_INT + 1];
+ 	uint32_t    resets;
++	/* transfers the controller finished without an event reaching us (ud_watch) */
++	uint32_t    lost_rx, lost_tx, stale_rx;
++	uint64_t    watch_rx, watch_tx;
+ } ud;
+ 
+ static inline void
+@@ -520,6 +524,10 @@ ud_rx_done(void)
+ {
+ 	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+ 	ud_sync(UD_TRB_RX, 16);
++	if (t[3] & TRB_HWO) {
++		ud.stale_rx++;          /* a late event for a frame ud_watch already took */
++		return;
++	}
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+ 	ud_sync(UD_RX, UD_FRAME_MAX);
+ 	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+@@ -813,6 +821,75 @@ ud_event(uint32_t ev)
+ 	}
+ }
+ 
++/*
++ * Every 500 ms: a data transfer the controller has finished (HWO clear in its TRB) while no
++ * event came for it, twice in a row with no frame moving. The link went dead that way under
++ * load (rx and tx counters frozen for half a minute, no USB event, back at the next bus reset):
++ * take the frame as if the event had come.
++ */
++static void
++ud_watch(void)
++{
++	static bool rx_seen, tx_seen;
++	volatile uint32_t *rt = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
++	volatile uint32_t *tt = (volatile uint32_t *)(ud.dma + UD_TRB_TX);
++
++	if (!ud.configured || ud.lock == NULL) {
++		rx_seen = tx_seen = false;
++		return;
++	}
++	ud_sync(UD_TRB_RX, 16);
++	bool rx_idle = ud.xfer_active[EP_RX] && !(rt[3] & TRB_HWO) && ud.rx_frames == ud.watch_rx;
++	if (rx_idle && rx_seen) {
++		if (ud.lost_rx++ < 20) {
++			printf("SWEET USB: rx transfer done without an event (%u), taking it\n", ud.lost_rx);
++		}
++		ud.xfer_active[EP_RX] = false;
++		ud_rx_done();
++		rx_idle = false;
++	}
++	rx_seen = rx_idle;
++	ud.watch_rx = ud.rx_frames;
++
++	lck_mtx_lock(ud.lock);
++	ud_sync(UD_TRB_TX, 16);
++	bool tx_idle = ud.tx_busy && !(tt[3] & TRB_HWO) && ud.tx_frames == ud.watch_tx;
++	if (tx_idle && tx_seen) {
++		if (ud.lost_tx++ < 20) {
++			printf("SWEET USB: tx transfer done without an event (%u), going on\n", ud.lost_tx);
++		}
++		ud.xfer_active[EP_TX] = false;
++		ud.tx_busy = false;
++		ud_tx_kick_locked();
++		tx_idle = false;
++	}
++	tx_seen = tx_idle;
++	ud.watch_tx = ud.tx_frames;
++	lck_mtx_unlock(ud.lock);
++}
++
++static int
++sysctl_sweet_usb_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[256];
++	uint32_t rx3 = 0, tx3 = 0, dsts = 0;
++	if (ud.dma != 0) {
++		ud_sync(UD_TRB_RX, 16);
++		ud_sync(UD_TRB_TX, 16);
++		rx3 = ((volatile uint32_t *)(ud.dma + UD_TRB_RX))[3];
++		tx3 = ((volatile uint32_t *)(ud.dma + UD_TRB_TX))[3];
++		dsts = dwc_rd(DSTS);
++	}
++	snprintf(buf, sizeof(buf), "configured %d events %u resets %u; rx %llu frames (trb %08x, active %d) tx %llu "
++	    "frames (trb %08x, busy %d, queue %u); without event: rx %u tx %u, late rx %u; DSTS %08x",
++	    ud.configured, ud.events, ud.resets, ud.rx_frames, rx3, ud.xfer_active[EP_RX], ud.tx_frames, tx3,
++	    ud.tx_busy, ud.txq_count, ud.lost_rx, ud.lost_tx, ud.stale_rx, dsts);
++	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_usb_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_usb_stats, "A", "USB Ethernet gadget state");
++
+ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -831,6 +908,9 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 			}
+ 			dwc_wr(GEVNTCOUNT, count);
+ 		}
++		if ((ticks % 500) == 0) {
++			ud_watch();
++		}
+ 		if ((++ticks % 30000) == 0) {
+ 			printf("SWEET USB: ue0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
+ 		}
+-- 
+2.43.0
+
