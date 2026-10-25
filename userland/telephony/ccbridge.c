@@ -432,5 +432,13 @@ ccbridge_init(void)
 	static const uint32_t pdp_init[] = { A64_MOV_W0_1, A64_RET };
 	patch_code("ApplePDPHelperInterface::init", 0x1f2efe170UL, 0xa90157f6d10103ffULL, pdp_init, 2);
 
+	/*
+	 * Step 2: capabilities::bb::abm::shouldBoot() -> false. AppleBasebandManager then takes its
+	 * own "Faking bootup" path (no power-on, no sahara firmware download, no PCIe link): our modem
+	 * is already running. It waits for its transport clients instead ("Wait for Ready on Fake Boot").
+	 */
+	static const uint32_t ret_false[] = { 0x52800000u /* mov w0, #0 */, A64_RET };
+	patch_code("capabilities::bb::abm::shouldBoot", 0x1ae1df4a8UL, 0x910003fda9bf7bfdULL, ret_false, 2);
+
 	fake_iokit_install();
 }
