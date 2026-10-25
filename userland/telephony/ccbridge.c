@@ -1225,6 +1225,14 @@ my_cc_regstat(void *t, int st)
 	    di.dli_fname ? di.dli_fname : "?", di.dli_sname ? di.dli_sname : "?",
 	    di.dli_saddr ? fn - (uintptr_t)di.dli_saddr : 0, fn - main_slide);
 	real_cc_regstat(t, 2);
+	/*
+	 * "baseband activated" (byte +0x5f0) is Apple's activation too: set here. (Calling the
+	 * operator name evaluation, vfunc +0x140, from this hook trapped CommCenter.)
+	 */
+	if (!*((uint8_t *)t + 0x5f0)) {
+		*((uint8_t *)t + 0x5f0) = 1;
+		say("CommCenter: baseband marked activated");
+	}
 }
 
 /* every C++ exception CommCenter throws: its type and the throwing stack */
@@ -1262,6 +1270,14 @@ bm_spies_install(void)
 		static const uint32_t ret_true[] = { 0x52800020u /* mov w0, #1 */, 0xd65f03c0u /* ret */ };
 		uintptr_t gate = 0x1005aa60cUL + main_slide;
 		patch_code("CommCenter emergency-only gate", gate - slide, 0xd65f03c03941a400ULL, ret_true, 2);
+		/*
+		 * The operator name waits for "baseband activated" (byte +0x5f0 of the registration
+		 * model, "#N Operator name change aborted: not activated"), which Apple's activation
+		 * sets; there is none here. The cbz on it becomes a nop.
+		 */
+		static const uint32_t nop[] = { 0xd503201fu };
+		patch_code("CommCenter operator name activation check", 0x1006e7468UL + main_slide - slide,
+		    0x3959226834000228ULL, nop, 1);
 	}
 	real_atcs_assert = (void *)hook_cache("_ATCSException::triggerAssertion(..., mm)", 0x19ed00350UL, (void *)my_atcs_assert);
 	real_ctl_ctor = hook_cache("mav_router::device::controller::controller", 0x1ea5ff8d4UL, (void *)my_ctl_ctor);
