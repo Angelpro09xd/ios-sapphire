@@ -1,0 +1,34 @@
+From 8dd727324cdaa275f14271ab6ad248062ccea5e4 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 11:04:50 +0000
+Subject: [PATCH] sapphire-0215: GPU buffers zeroed again by default
+
+With 0205 (large buffers handed out unzeroed) folders opening in the dark
+appearance showed white frames, and once the whole screen went yellow;
+booted with gpu_zero=1 the frames were right. gpu_zero=1 is the default
+again; gpu_zero=0 keeps 0205's way for measuring.
+---
+ iokit/Kernel/arm/SapphireGpu.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index efbb8d3..63f7c8b 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -3575,10 +3575,12 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 		 * the kernel and zeroing it write-combined made every such GEM_NEW cost 0.5 ms and more on
+ 		 * Mesa's driver thread. Small buffers (state, queries) are still zeroed; boot-arg gpu_zero=1:
+ 		 * every buffer, as before.
++		 * 0215: gpu_zero=1 is the default again: with 0205 folders opening in the dark appearance
++		 * showed white frames (and once the whole screen went yellow), which gpu_zero=1 took away.
+ 		 */
+ 		static int zero_all = -1;
+ 		if (zero_all < 0) {
+-			int z = 0;
++			int z = 1;              /* 0215: on by default again (gpu_zero=0: 0205's way); see below */
+ 			PE_parse_boot_argn("gpu_zero", &z, sizeof(z));
+ 			zero_all = z != 0;
+ 		}
+-- 
+2.43.0
+
