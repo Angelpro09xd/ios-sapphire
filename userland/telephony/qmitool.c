@@ -1020,6 +1020,60 @@ cmd_pdp_up(void)
 	return pdp_config(ip, gw, 0) ? 1 : 0;
 }
 
+/* a plain TCP connection through pdp_ip0 (IP_BOUND_IF): the kernel's own stack over the data call */
+static int
+cmd_http(const char *ip, const char *host, const char *path)
+{
+	struct sockaddr_in a;
+	if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) {
+		return 1;
+	}
+	a.sin_len = sizeof(a);
+	a.sin_family = AF_INET;
+	a.sin_port = htons(80);
+	memset(a.sin_zero, 0, sizeof(a.sin_zero));
+	int s = socket(AF_INET, SOCK_STREAM, 0);
+	unsigned idx = if_nametoindex("pdp_ip0");
+	if (s < 0 || idx == 0) {
+		printf("no socket or no pdp_ip0 (%u)\n", idx);
+		return 1;
+	}
+	if (getenv("ANY_IF") == NULL && setsockopt(s, IPPROTO_IP, IP_BOUND_IF, &idx, sizeof(idx)) < 0) {
+		perror("IP_BOUND_IF");
+	}
+	struct timeval tv = { 15, 0 };
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	struct timeval t0, t1;
+	gettimeofday(&t0, NULL);
+	if (connect(s, (struct sockaddr *)&a, sizeof(a)) < 0) {
+		perror("connect");
+		close(s);
+		return 1;
+	}
+	gettimeofday(&t1, NULL);
+	printf("connected in %ld ms\n", (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_usec - t0.tv_usec) / 1000));
+	char req[512];
+	int n = snprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: qmitool\r\n\r\n", path, host);
+	if (write(s, req, (size_t)n) != n) {
+		perror("write");
+	}
+	char buf[4096];
+	long total = 0;
+	ssize_t r;
+	while ((r = read(s, buf, sizeof(buf))) > 0) {
+		if (total < 600) {
+			fwrite(buf, 1, (size_t)(r < 600 - total ? r : 600 - total), stdout);
+		}
+		total += r;
+	}
+	gettimeofday(&t1, NULL);
+	printf("\n-- %ld bytes in %ld ms%s\n", total, (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_usec - t0.tv_usec) / 1000),
+	    r < 0 ? " (read error)" : "");
+	close(s);
+	return 0;
+}
+
 static int
 cmd_datacall(const char *apn)
 {
@@ -1466,6 +1520,7 @@ main(int argc, char **argv)
 	if (!strcmp(cmd, "datacall")) return cmd_datacall(argc > 2 ? argv[2] : NULL);
 	if (!strcmp(cmd, "ipa-raw")) return cmd_ipa_raw();
 	if (!strcmp(cmd, "pdp-up")) return cmd_pdp_up();
+	if (!strcmp(cmd, "http") && argc > 3) return cmd_http(argv[2], argv[3], argc > 4 ? argv[4] : "/");
 	if (!strcmp(cmd, "syn") && argc > 3) return cmd_syn(argv[2], atoi(argv[3]));
 	if (!strcmp(cmd, "peek") && argc > 3) return cmd_peek(argc - 2, argv + 2);
 	if (!strcmp(cmd, "dns") && argc > 3) return cmd_dns(argv[2], argv[3]);
