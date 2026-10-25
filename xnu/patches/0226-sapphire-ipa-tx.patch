@@ -1,4 +1,4 @@
-From 2d5a655565036b046441fbf7ae00684c1e169d22 Mon Sep 17 00:00:00 2001
+From 20137a4b51a0376e04eaceff826ee6646ed02ff2 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Sun, 25 Oct 2026 19:12:53 +0000
 Subject: [PATCH] sapphire-0226: IPA: one IP packet at a time to the modem
@@ -6,9 +6,9 @@ Subject: [PATCH] sapphire-0226: IPA: one IP packet at a time to the modem
  TX) and the last eight packets from it (kern.sweet_ipa_rx), for qmitool ping
 
 ---
- bsd/dev/sweet_qmi_dev.c         | 33 +++++++++++++
- iokit/Kernel/arm/TopazModem.cpp | 88 ++++++++++++++++++++++++++++++++-
- 2 files changed, 120 insertions(+), 1 deletion(-)
+ bsd/dev/sweet_qmi_dev.c         | 33 ++++++++++++
+ iokit/Kernel/arm/TopazModem.cpp | 90 ++++++++++++++++++++++++++++++++-
+ 2 files changed, 122 insertions(+), 1 deletion(-)
 
 diff --git a/bsd/dev/sweet_qmi_dev.c b/bsd/dev/sweet_qmi_dev.c
 index f06530f..120e12e 100644
@@ -55,10 +55,19 @@ index f06530f..120e12e 100644
  void
  sweet_qmi_dev_init(void)
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
-index 67dd617..84f7241 100644
+index 67dd617..345f0a3 100644
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
-@@ -8014,6 +8014,9 @@ ipa_rx_event(struct ipa_chan *c, const uint8_t *e)
+@@ -7990,6 +7990,8 @@ ipa_rx_init(struct ipa_chan *c)
+ 	return true;
+ }
+ 
++static void ipa_rx_keep(uint8_t mux, const uint8_t *p, uint16_t len);
++
+ /* QMAP frames from the modem: [flags/pad, mux id, length (big endian)] + packet, back to back */
+ static void
+ ipa_rx_event(struct ipa_chan *c, const uint8_t *e)
+@@ -8014,6 +8016,9 @@ ipa_rx_event(struct ipa_chan *c, const uint8_t *e)
  			}
  			c->pkts++;
  			ipa_mux_seen[mux & 7]++;
@@ -68,7 +77,7 @@ index 67dd617..84f7241 100644
  			if (c->pkts <= 12) {
  				const uint8_t *ip = d + off + 4;
  				LOG("ipa: modem RX packet %llu: mux %u%s, %u bytes (pad %u), first bytes %02x %02x %02x %02x .. proto %u",
-@@ -8031,6 +8034,87 @@ ipa_rx_event(struct ipa_chan *c, const uint8_t *e)
+@@ -8031,6 +8036,87 @@ ipa_rx_event(struct ipa_chan *c, const uint8_t *e)
  
  static void ipa_tx_event(struct ipa_chan *c, const uint8_t *e) { (void)e; c->cmds++; }
  
@@ -156,7 +165,7 @@ index 67dd617..84f7241 100644
  /* ---- firmware: GSI microcode, authenticated by TrustZone (Linux ipa_firmware_load) */
  
  static bool
-@@ -8305,7 +8389,8 @@ ipa_modem_start(void)
+@@ -8305,7 +8391,8 @@ ipa_modem_start(void)
  	if (ipa_running) {
  		return;
  	}
@@ -166,7 +175,7 @@ index 67dd617..84f7241 100644
  		ipa_step = "modem endpoints did not start";
  		return;
  	}
-@@ -8430,6 +8515,7 @@ ipa_poll(unsigned ms)
+@@ -8430,6 +8517,7 @@ ipa_poll(unsigned ms)
  	}
  	if (ipa_running) {
  		gsi_events(IPA_MTX, ipa_tx_event);
