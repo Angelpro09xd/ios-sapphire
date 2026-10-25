@@ -1,0 +1,128 @@
+From c8622a1370fcc287bd50e4f90f3eddd499311f34 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 22:44:39 +0000
+Subject: [PATCH] sapphire-0233: AppleCLCD's flip buffers, console shadow and
+ DSI buffer from a fixed low-DDR pool (0xE2000000, 48 MB, write-combined):
+ with the kernel's RAM above 4 GiB the contiguous below-4G allocations failed
+ after minutes of zone_gc, the panel black after the Apple logo
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 65 +++++++++++++++++++++++----
+ 1 file changed, 56 insertions(+), 9 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 73ea43a..6cb59b9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -137,6 +137,56 @@ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ 
+ class IOMobileFramebufferUserClient;
+ 
++/*
++ * sapphire 0233: what the MDP scans (flip buffers, console shadow) and the DSI command buffer,
++ * from a fixed piece of the middle DDR bank the kernel does not manage. The MDP only reaches
++ * below 4 GiB, and with the kernel's RAM above 4 GiB (mkadt.py --highmem) a contiguous allocation
++ * below 4 GiB cannot succeed: vm_page_find_contiguous failed, ran zone_gc twice and failed again
++ * for every buffer, minutes in which the panel stayed black after the Apple logo. Next to the
++ * modem's pool (0xE0000000, 16 MB) and the GPU's (0xE1000000, 5 MB), below 0xF0000000. Mapped
++ * write-combined like the modem's pool: the MDP sees every write, the cache cleans become no-ops.
++ */
++#define SWEET_FB_LOW_PA         0xE2000000ull
++#define SWEET_FB_LOW_SIZE       0x03000000ull
++static uint64_t sweet_fb_low_used;
++
++struct SweetLowBuf {
++	IOMemoryMap *map;
++	uint8_t     *va;
++	uint64_t     pa;
++	size_t       len;
++	void        *getBytesNoCopy(void) { return va; }
++	size_t       getLength(void) { return len; }
++	uint64_t     getPhysicalSegment(uint64_t, void *, int) { return pa; }
++	void         release(void) { }      /* the pool is never given back */
++	static SweetLowBuf *alloc(size_t len);
++};
++
++SweetLowBuf *
++SweetLowBuf::alloc(size_t len)
++{
++	uint64_t size = (len + 0xffffull) & ~0xffffull;
++	if (sweet_fb_low_used + size > SWEET_FB_LOW_SIZE) {
++		return NULL;
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(SWEET_FB_LOW_PA + sweet_fb_low_used, size,
++	    kIODirectionInOut);
++	IOMemoryMap *m = md ? md->map(kIOMapWriteCombineCache) : NULL;    /* Normal NC: Device would fault on memcpy */
++	OSSafeReleaseNULL(md);
++	SweetLowBuf *b = m ? IONew(SweetLowBuf, 1) : NULL;
++	if (b == NULL) {
++		OSSafeReleaseNULL(m);
++		return NULL;
++	}
++	b->map = m;
++	b->va = (uint8_t *)m->getVirtualAddress();
++	b->pa = SWEET_FB_LOW_PA + sweet_fb_low_used;
++	b->len = len;
++	sweet_fb_low_used += size;
++	bzero(b->va, len);
++	return b;
++}
++
+ class AppleCLCD : public IOMobileFramebuffer {
+ 	OSDeclareDefaultStructors(AppleCLCD);
+ 
+@@ -180,14 +230,14 @@ public:
+ 	IOBufferMemoryDescriptor *fFadeOrig;
+ 	/* kernel-drawn frames (console, fade) are double buffered like iOS's:
+ 	 * built in the back buffer, then the MDP flips to it at vsync */
+-	IOBufferMemoryDescriptor *fFlip[2];
++	SweetLowBuf  *fFlip[2];
+ 	uint64_t      fFlipPhys[2];
+ 	uint32_t      fFlipIdx;
+ 	bool          fConsShown;     /* console frames on the panel (no iOS frame yet) */
+ 	void          flipFrom(const uint8_t *src, uint32_t srcStride);
+ 	uint8_t      *backBuffer(void) { return (uint8_t *)fFlip[fFlipIdx ^ 1]->getBytesNoCopy(); }
+ 	void          flipBack(void);
+-	IOBufferMemoryDescriptor *fCons;    /* console shadow frame (cached, contiguous) */
++	SweetLowBuf  *fCons;        /* console shadow frame (contiguous, below 4 GiB) */
+ 	uint64_t      fConsPhys;
+ 	const uint8_t *fLastVA;       /* last directly scanned frame (panel window) */
+ 	uint32_t      fLastStride;
+@@ -199,7 +249,7 @@ public:
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	/* topaz panel brightness: DCS 0x51 over DSI0 (MakrSas/topaz-woa TopazGpuW disp.c) */
+ 	volatile uint8_t *fDsi;
+-	IOBufferMemoryDescriptor *fDsiBuf;
++	SweetLowBuf  *fDsiBuf;
+ 	uint64_t      fDsiBufPhys;
+ 	IOLock       *fBlLock;
+ 	uint32_t      fBlLevel;       /* panel DBV 1..0x7ff, kept while the display is off */
+@@ -351,8 +401,7 @@ AppleCLCD::start(IOService *provider)
+ 	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
+ 	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
+ 	fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
+-	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
++	fDsiBuf = SweetLowBuf::alloc(page_size);
+ 	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+ 	fBlLock = IOLockAlloc();
+ 	fBlLevel = 0x133;                       /* panel init level (stock DT) */
+@@ -428,13 +477,11 @@ AppleCLCD::start(IOService *provider)
+ 		sweet_scanout_set_geometry(fWidth, fHeight, fLogicalW, fLogicalH);
+ 		vm_size_t fsz = (vm_size_t)fRowBytes * fHeight;
+ 		for (int i = 0; i < 2; i++) {
+-			fFlip[i] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-			    kIODirectionInOut | kIOMemoryPhysicallyContiguous, fsz, 0x00000000fffff000ull);
++			fFlip[i] = SweetLowBuf::alloc(fsz);
+ 			fFlipPhys[i] = fFlip[i] ? fFlip[i]->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+ 		}
+ 		fFadeOrig = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, fsz, page_size);
+-		fCons = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, fsz, 0x00000000fffff000ull);
++		fCons = SweetLowBuf::alloc(fsz);
+ 		if (fFlip[0] == NULL || fFlip[1] == NULL || fFadeOrig == NULL) {
+ 			OSSafeReleaseNULL(fFlip[0]);
+ 			OSSafeReleaseNULL(fFlip[1]);
+-- 
+2.43.0
+
