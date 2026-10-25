@@ -1,0 +1,41 @@
+From 923cbe30ca078d6b542e6b17e69ae3b175b8a804 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 09:48:41 +0000
+Subject: [PATCH] sapphire-0211: the screen goes dark when turned off in the
+ middle of an animation too
+
+On the phone: turned off while nothing moved, the screen went dark; turned
+off in the middle of an animation, it stayed on. The GPU is busy then, and
+the copy of the last frame queued before "off" lands later than the two
+ticks 0209 made the scanned frame black, over the black. Black again at
+ticks 1, 2, 6, 15 and 30 (half a second).
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e58ef2f..e8f48f2 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -575,9 +575,15 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			 * panel scans is also made black, once (on AMOLED black is off); at "on" the latest
+ 			 * frame is presented again (fDirty).
+ 			 */
+-			bool first = fb->fFadeStep < 2;         /* twice: a GPU copy queued before "off" may land after the first */
+-			if (first) {
+-				fb->fFadeStep++;
++			/*
++			 * 0211: not only twice. Turned off in the middle of an animation, the GPU is busy and the
++			 * copy of the last frame queued before "off" lands later than two ticks, over the black:
++			 * the screen stayed on. Black again at ticks 1, 2, 6, 15 and 30 (half a second).
++			 */
++			uint32_t step = fb->fFadeStep;
++			bool first = step == 0 || step == 1 || step == 5 || step == 14 || step == 29;
++			if (step < 30) {
++				fb->fFadeStep = step + 1;
+ 			}
+ 			IOLockUnlock(fb->fLock);
+ 			if (first && fb->fPixels != 0) {
+-- 
+2.43.0
+
