@@ -77,7 +77,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, gpu_fw=(), amp=False):
+def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, gpu_fw=(), amp=False, no_baseband=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = ((MID_PHYS_BASE, MID_MEM_SIZE) if midmem else
                            (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
@@ -274,7 +274,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, gpu_
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, baseband] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + ([] if no_baseband else [baseband]) + product + ([] if qemu else [ufs]))
 
 
 if __name__ == '__main__':
@@ -289,7 +289,7 @@ if __name__ == '__main__':
             print(f'{prop}: {len(blob)} bytes', file=sys.stderr)
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
                  native='--native' in sys.argv, midmem='--midmem' in sys.argv, gpu_fw=gpu_fw,
-                 amp='--amp' in sys.argv)
+                 amp='--amp' in sys.argv, no_baseband='--no-baseband' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
