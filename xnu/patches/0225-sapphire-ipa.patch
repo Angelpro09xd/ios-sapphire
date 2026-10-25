@@ -1,0 +1,1035 @@
+From 769c3e319749417e5f9e8f931253e380bd30b18d Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 18:56:01 +0000
+Subject: [PATCH] sapphire-0225: IPA v4.2 (boot-arg ipa=1): RPM clock, GSI
+ firmware ipa_fws by PAS 15 from the device tree, GSI channels and endpoints,
+ SRAM and tables by immediate commands, QMI handshake with the modem
+ (INIT_DRIVER, our 0x31:1 service), modem RX/TX started and polled; SMP2P
+ answers IPA power on
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 942 +++++++++++++++++++++++++++++++-
+ 1 file changed, 939 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index c2dfd2b..67dd617 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -22,6 +22,7 @@
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/crc.h>
++#include <pexpert/device_tree.h>
+ #include <sys/param.h>
+ #include <sys/errno.h>
+ 
+@@ -484,6 +485,8 @@ extern "C" void sweet_qmi_pump(void (*send)(uint32_t src_port, uint32_t node, ui
+ extern "C" void sweet_qmi_dev_init(void);
+ static void qmi_user_send(uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len, int ctrl);
+ static void wlfw_arrive(uint32_t node, uint32_t port);
++static void ipa_qmi_arrive(uint32_t node, uint32_t port);
++static int ipa_stats(char *buf, size_t len);
+ static bool wifi_enabled(void);
+ static bool ce_start(void);
+ static void radio_poll(unsigned ms);
+@@ -842,6 +845,9 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 			q_srv[q_srv_count].port = c->d;
+ 			q_srv_count++;
+ 		}
++		if (c->a == 0x31 && c->b == 0x201) {
++			ipa_qmi_arrive(c->c, c->d);     /* the modem's IPA service, instance 2 */
++		}
+ 		if (c->a == QMI_SVC_WLFW) {
+ 			LOG("t=%u ms: *** WLFW service 0x45 up: inst %x node %u port %x ***", g_ms, c->b, c->c, c->d);
+ 			wlfw_arrive(c->c, c->d);
+@@ -871,9 +877,13 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ extern "C" int
+ topaz_modem_stats(char *buf, size_t len)
+ {
+-	return snprintf(buf, len, "glink rx %u tx %u chan %s modem-intents %u txq %u drops %u; qrtr node %x hello %u services %u resume-rx %u; thread at '%s', %u loops, t=%u ms",
++	int n = snprintf(buf, len, "glink rx %u tx %u chan %s modem-intents %u txq %u drops %u; qrtr node %x hello %u services %u resume-rx %u; thread at '%s', %u loops, t=%u ms",
+ 	    g_rx_msgs, g_tx_msgs, chan_up() ? "up" : "down", g_ri_count, g_txq_tail - g_txq_head, g_txq_drops,
+ 	    q_modem_node, q_hello_rx, q_srv_count, q_resumes, g_where, g_loops, g_ms);
++	if (n > 0 && (size_t)n < len) {
++		n += ipa_stats(buf + n, len - n);
++	}
++	return n;
+ }
+ 
+ /* ---------------------------------------------------------------- GLINK RX */
+@@ -7536,6 +7546,918 @@ radio_poll(unsigned ms)
+ 	}
+ }
+ 
++/* ---------------------------------------------------------------- IPA v4.2 (ipa=1) */
++
++/*
++ * sapphire 0225: the IP accelerator. The modem hands its data (the LTE default bearer, IMS) to the
++ * AP through the IPA. With no IPA driver here the modem was told "AP IPA power off" and its data
++ * and IMS tasks hung until its watchdog killed it ("Task starvation: dcc", "... ims",
++ * "ipa_dl_opt_lte.c: IPA Assert"). A port of Linux drivers/net/ipa for IPA v4.2 (SC7180's data and
++ * registers; SM6225's downstream tables give the same endpoints and channels), polled from the
++ * modem thread, no interrupts:
++ *   RPM "ipa" clock -> registers (base 0x5800000 + 0x40000, GSI at +0x4000) -> hardware config,
++ *   SRAM canaries, resource groups -> GSI firmware ipa_fws (PAS 15, carried by the device tree:
++ *   tools/mkadt.py --ipa-mdt/--ipa-elf) -> GSI event rings and channels (AP command TX 1, LAN RX 2,
++ *   modem TX 0, modem RX 3; the modem's 0-3 allocated on its behalf, a v4.2 quirk) -> endpoints ->
++ *   SRAM regions, filter and route tables by immediate commands -> default route to LAN RX ->
++ *   QMI handshake (INIT_DRIVER to the modem's 0x31:2; our server 0x31:1 answers
++ *   DRIVER_INIT_COMPLETE and INDICATION_REGISTER, then sends INIT_COMPLETE) -> modem TX/RX started.
++ * Received QMAP frames are counted (kern.sweet_modem_stats) and their buffers given back.
++ * Rings and buffers come from the modem pool (below 4 GB, uncached: no cache maintenance).
++ */
++#define IPA_REG_PA          0x05840000ull
++#define IPA_REG_SIZE        0x10000
++#define IPA_GSI_PA          0x05804000ull
++#define IPA_GSI_SIZE        0x28000
++#define IPA_SRAM_OFF        0x7000              /* SW_AREA_RAM_DIRECT_ACCESS */
++#define IPA_PAS_ID          15
++#define IPA_FW_PA           0x55a00000ull       /* ipa_fw_region */
++#define IPA_FW_SIZE         0x10000
++#define IPA_SID             0x140               /* ipa_smmu_ap */
++#define IPA_SMEM_ITEM       497
++#define IPA_SMEM_SIZE       0x2000
++#define IPA_RX_BUF          8192
++#define IPA_RX_NBUF         32
++
++/* IPA registers (Linux reg/ipa_reg-v4.2.c), endpoint registers every 0x70 */
++#define IPA_COMP_CFG        0x003c
++#define IPA_CLKON_CFG       0x0044
++#define IPA_ROUTE           0x0048
++#define IPA_SHARED_MEM_SIZE 0x0054
++#define IPA_QSB_MAX_WRITES  0x0074
++#define IPA_QSB_MAX_READS   0x0078
++#define IPA_AGGR_ACTIVE     0x00b4
++#define IPA_HASH_EN         0x0148
++#define IPA_BCR             0x01d0
++#define IPA_PKT_PROC_CNTXT  0x01e8
++#define IPA_COUNTER_CFG     0x01f0
++#define IPA_TX_CFG          0x01fc
++#define IPA_FLAVOR_0        0x0210
++#define IPA_IDLE_CFG        0x0240
++#define IPA_SRC_RSRC(t)     (0x0400 + 0x20 * (t))
++#define IPA_DST_RSRC(t)     (0x0500 + 0x20 * (t))
++#define IPA_EP_CFG          0x0808
++#define IPA_EP_NAT          0x080c
++#define IPA_EP_HDR          0x0810
++#define IPA_EP_HDR_EXT      0x0814
++#define IPA_EP_MDMASK       0x0818
++#define IPA_EP_MODE         0x0820
++#define IPA_EP_AGGR         0x0824
++#define IPA_EP_HOL_EN       0x082c
++#define IPA_EP_DEAGGR       0x0834
++#define IPA_EP_RSRC         0x0838
++#define IPA_EP_SEQ          0x083c
++#define IPA_EP_STATUS       0x0840
++#define IPA_EP(reg, ep)     ((reg) + 0x70 * (ep))
++#define IPA_IRQ_EN          0x300c
++
++/* GSI registers, EE 0 (Linux reg/gsi_reg-v4.0.c) */
++#define GSI_INTER_EE_CH_MSK 0xc020
++#define GSI_INTER_EE_EV_MSK 0xc024
++#define GSI_CH(n, ch)       (0x1c000 + 0x80 * (ch) + 4 * (n))  /* CNTXT_0..3 */
++#define GSI_CH_QOS(ch)      (0x1c05c + 0x80 * (ch))
++#define GSI_CH_SCR(n, ch)   (0x1c060 + 0x80 * (ch) + 4 * (n))
++#define GSI_EV(n, ev)       (0x1d000 + 0x80 * (ev) + 4 * (n))  /* CNTXT_0..13 */
++#define GSI_CH_DB(ch)       (0x1e000 + 8 * (ch))
++#define GSI_EV_DB(ev)       (0x1e100 + 8 * (ev))
++#define GSI_STATUS          0x1f000
++#define GSI_CH_CMD          0x1f008
++#define GSI_EV_CMD          0x1f010
++#define GSI_GENERIC_CMD     0x1f018
++#define GSI_HW_PARAM_2      0x1f040
++#define GSI_TYPE_IRQ_MSK    0x1f088
++#define GSI_SRC_CH_IRQ_MSK  0x1f098
++#define GSI_SRC_EV_IRQ_MSK  0x1f09c
++#define GSI_IEOB_IRQ_MSK    0x1f0b8
++#define GSI_GLOB_IRQ_STTS   0x1f100
++#define GSI_GLOB_IRQ_EN     0x1f108
++#define GSI_GLOB_IRQ_CLR    0x1f110
++#define GSI_GSI_IRQ_EN      0x1f120
++#define GSI_INTSET          0x1f180
++#define GSI_ERROR_LOG       0x1f200
++#define GSI_ERROR_LOG_CLR   0x1f210
++#define GSI_SCRATCH_0       0x1f400
++
++/* IPA-local memory regions (Linux data/ipa_data-v4.2.c), offsets from the memory base */
++#define IPA_MEM_V4_FILTER   0x0290
++#define IPA_MEM_V6_FILTER   0x0318
++#define IPA_MEM_V4_ROUTE    0x03a0
++#define IPA_MEM_V6_ROUTE    0x0428
++#define IPA_MEM_TABLE_SIZE  0x0078
++#define IPA_MEM_MODEM_HDR   0x04a8              /* 0x140 */
++#define IPA_MEM_MODEM_PROC  0x05f0              /* 0x200 */
++#define IPA_MEM_AP_PROC     0x07f0              /* 0x200 */
++#define IPA_MEM_QUOTA       0x0a50              /* 0x60 */
++#define IPA_MEM_MODEM       0x0bf0              /* 0x140c */
++#define IPA_MODEM_ROUTES    8
++#define IPA_FILTERED        ((1u << 1) | (1u << 4)) /* endpoints 1 (AP->modem) and 4 (modem->AP) filter */
++
++/* immediate commands (Linux ipa_cmd.h) */
++#define IPA_CMD_V4_FILTER_INIT  0x3
++#define IPA_CMD_V6_FILTER_INIT  0x4
++#define IPA_CMD_V4_ROUTE_INIT   0x7
++#define IPA_CMD_V6_ROUTE_INIT   0x8
++#define IPA_CMD_HDR_INIT_LOCAL  0x9
++#define IPA_CMD_DMA_SHARED_MEM  0x13
++
++#define PORT_IPAC           0x4005              /* our QMI client towards the modem's IPA service */
++#define PORT_IPAS           0x4006              /* our IPA QMI service (0x31, version 1, instance 1) */
++
++struct ipa_chan {
++	const char *name;
++	uint8_t ch, ev, ep;
++	bool tx, cmd;
++	uint16_t tres, tlv;
++	uint8_t *ring, *evr, *buf;
++	uint64_t ring_pa, evr_pa, buf_pa;
++	uint32_t widx, eidx;                    /* free running: next TRE to fill, next event to read */
++	uint8_t slot_buf[512];                  /* RX: the buffer a TRE slot holds */
++	uint64_t frames, bytes, pkts, cmds;
++	uint32_t last_code;
++};
++
++static struct ipa_chan ipa_ch[4] = {
++	{ "command TX", 1, 0, 6, true,  true,  256, 20 },
++	{ "LAN RX",     2, 1, 8, false, false, 256, 6 },
++	{ "modem TX",   0, 2, 1, true,  false, 512, 8 },
++	{ "modem RX",   3, 3, 9, false, false, 256, 6 },
++};
++#define IPA_CMD             (&ipa_ch[0])
++#define IPA_LAN             (&ipa_ch[1])
++#define IPA_MTX             (&ipa_ch[2])
++#define IPA_MRX             (&ipa_ch[3])
++
++static int ipa_on;
++static bool ipa_up, ipa_running;
++static volatile uint8_t *ipa_r, *gsi_r;
++static uint32_t ipa_mo, ipa_msize;              /* IPA-local memory offset and size */
++static uint8_t *ipa_pay, *ipa_zero;             /* command payloads (32 bytes a TRE slot), zeroes */
++static uint64_t ipa_pay_pa, ipa_zero_pa, ipa_table_pa;
++static const char *ipa_step = "off";
++static uint32_t ipa_m_node, ipa_m_port, ipa_c_node, ipa_c_port;
++static bool ipa_modem_ready, ipa_uc_ready, ipa_ind_req, ipa_ind_sent;
++static uint16_t ipa_txn = 1;
++static uint32_t ipa_gsi_errors, ipa_last_error, ipa_mux_seen[8];
++
++static inline uint32_t ir(uint32_t o) { return *(volatile uint32_t *)(ipa_r + o); }
++static inline void iw(uint32_t o, uint32_t v) { *(volatile uint32_t *)(ipa_r + o) = v; mb(); }
++static inline uint32_t gr(uint32_t o) { return *(volatile uint32_t *)(gsi_r + o); }
++static inline void gw(uint32_t o, uint32_t v) { *(volatile uint32_t *)(gsi_r + o) = v; mb(); }
++
++extern "C" int topaz_rpm_vote(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++
++/* pool memory aligned to its size (GSI rings are 2^n bytes, aligned on their size) */
++static void *
++ipa_pool(uint64_t size, uint64_t align, uint64_t *pa)
++{
++	uint64_t pad = (align - ((MODEM_POOL_BASE + pool_used) & (align - 1))) & (align - 1);
++	uint64_t dummy;
++	if (pad != 0 && pool_alloc(pad, &dummy) == NULL) {
++		return NULL;
++	}
++	return pool_alloc(size, pa);
++}
++
++static bool
++ipa_chosen(const char *prop, const void **blob, unsigned *size)
++{
++	DTEntry chosen;
++	return SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++	       SecureDTGetProperty(chosen, prop, blob, size) == kSuccess;
++}
++
++/* ---- GSI */
++
++static unsigned
++gsi_state(uint32_t reg)
++{
++	return (gr(reg) >> 20) & 0xf;
++}
++
++static bool
++gsi_cmd(uint32_t cmd_reg, uint32_t val, uint32_t state_reg, unsigned want, const char *what, unsigned id)
++{
++	gw(cmd_reg, val);
++	for (unsigned i = 0; i < 500; i++) {
++		if (gsi_state(state_reg) == want) {
++			return true;
++		}
++		IODelay(100);
++	}
++	LOG("ipa: GSI %s %u: state %u, wanted %u (error log %08x)", what, id, gsi_state(state_reg), want, gr(GSI_ERROR_LOG));
++	return false;
++}
++
++/* a GENERIC command on a modem channel; the result comes in SCRATCH_0 with global interrupt GP_INT1 */
++static int
++gsi_generic(unsigned opcode, unsigned ch)
++{
++	gw(GSI_GLOB_IRQ_EN, 3);                 /* ERROR_INT | GP_INT1 */
++	gw(GSI_GLOB_IRQ_CLR, 2);
++	gw(GSI_SCRATCH_0, gr(GSI_SCRATCH_0) & ~(7u << 5));
++	gw(GSI_GENERIC_CMD, opcode | (ch << 5) | (1u << 10));  /* EE 1: the modem */
++	unsigned i;
++	for (i = 0; i < 500 && !(gr(GSI_GLOB_IRQ_STTS) & 2); i++) {
++		IODelay(100);
++	}
++	unsigned result = (gr(GSI_SCRATCH_0) >> 5) & 7;
++	gw(GSI_GLOB_IRQ_CLR, 2);
++	gw(GSI_GLOB_IRQ_EN, 1);
++	if (i == 500) {
++		LOG("ipa: GSI generic %u on modem channel %u: no answer (result %u)", opcode, ch, result);
++		return -1;
++	}
++	return (result == 1 || result == 2) ? 0 : (int)result;   /* SUCCESS, INCORRECT_CHANNEL_STATE */
++}
++
++static void
++gsi_tre(struct ipa_chan *c, uint64_t pa, uint16_t len_op, uint32_t flags)
++{
++	uint8_t *t = c->ring + (c->widx % c->tres) * 16;
++	uint16_t z = 0;
++	memcpy(t, &pa, 8);
++	memcpy(t + 8, &len_op, 2);
++	memcpy(t + 10, &z, 2);
++	memcpy(t + 12, &flags, 4);
++	c->widx++;
++}
++
++static void
++gsi_doorbell(struct ipa_chan *c)
++{
++	mb();
++	gw(GSI_CH_DB(c->ch), (uint32_t)(c->ring_pa + (c->widx % c->tres) * 16));
++}
++
++/* events filled since last time: fn for each, then the event ring doorbell */
++static unsigned
++gsi_events(struct ipa_chan *c, void (*fn)(struct ipa_chan *, const uint8_t *))
++{
++	uint32_t wp = gr(GSI_EV(4, c->ev));
++	uint32_t idx = (wp - (uint32_t)c->evr_pa) / 16;
++	unsigned n = 0;
++
++	if (idx >= c->tres) {
++		return 0;
++	}
++	while (c->eidx % c->tres != idx && n < c->tres) {
++		const uint8_t *e = c->evr + (c->eidx % c->tres) * 16;
++		c->last_code = e[11];
++		fn(c, e);
++		c->eidx++;
++		n++;
++	}
++	if (n != 0) {
++		mb();
++		gw(GSI_EV_DB(c->ev), (uint32_t)(c->evr_pa + ((c->eidx - 1) % c->tres) * 16));
++	}
++	return n;
++}
++
++static void ipa_ev_count(struct ipa_chan *c, const uint8_t *e) { (void)e; c->cmds++; }
++
++static bool
++gsi_setup_chan(struct ipa_chan *c)
++{
++	uint32_t rsize = c->tres * 16u;
++
++	c->ring = (uint8_t *)ipa_pool(rsize, rsize, &c->ring_pa);
++	c->evr = (uint8_t *)ipa_pool(rsize, rsize, &c->evr_pa);
++	if (c->ring == NULL || c->evr == NULL) {
++		LOG("ipa: no pool memory for the %s rings", c->name);
++		return false;
++	}
++	if (gsi_state(GSI_EV(0, c->ev)) != 0 || gsi_state(GSI_CH(0, c->ch)) != 0) {
++		LOG("ipa: %s: event ring %u state %u, channel %u state %u before allocation", c->name, c->ev,
++		    gsi_state(GSI_EV(0, c->ev)), c->ch, gsi_state(GSI_CH(0, c->ch)));
++	}
++	if (!gsi_cmd(GSI_EV_CMD, c->ev, GSI_EV(0, c->ev), 1, "event ring allocate", c->ev)) {
++		return false;
++	}
++	gw(GSI_EV(0, c->ev), 2u | (1u << 16) | (16u << 24));          /* GPI, interrupt type IRQ, 16-byte elements */
++	gw(GSI_EV(1, c->ev), rsize);
++	gw(GSI_EV(2, c->ev), (uint32_t)c->evr_pa);
++	gw(GSI_EV(3, c->ev), (uint32_t)(c->evr_pa >> 32));
++	gw(GSI_EV(8, c->ev), 32u | (1u << 16));                         /* moderation: 1 ms, from the channel */
++	for (unsigned n = 9; n <= 13; n++) {
++		gw(GSI_EV(n, c->ev), 0);
++	}
++	gw(GSI_EV_DB(c->ev), (uint32_t)(c->evr_pa + (c->tres - 1) * 16u));
++	if (!gsi_cmd(GSI_CH_CMD, c->ch, GSI_CH(0, c->ch), 1, "channel allocate", c->ch)) {
++		return false;
++	}
++	gw(GSI_CH(0, c->ch), 2u | (c->tx ? (1u << 3) : 0) | ((uint32_t)c->ev << 14) | (16u << 24));
++	gw(GSI_CH(1, c->ch), rsize);
++	gw(GSI_CH(2, c->ch), (uint32_t)c->ring_pa);
++	gw(GSI_CH(3, c->ch), (uint32_t)(c->ring_pa >> 32));
++	gw(GSI_CH_QOS(c->ch), c->cmd ? 0xfu : (1u << 10));             /* command: low WRR priority; others: escape buffer only */
++	gw(GSI_CH_SCR(0, c->ch), 0);
++	gw(GSI_CH_SCR(1, c->ch), 0);
++	gw(GSI_CH_SCR(2, c->ch), (uint32_t)(c->tlv * 16u) << 16);      /* max outstanding TRE bytes */
++	gw(GSI_CH_SCR(3, c->ch), (32u << 16) | (gr(GSI_CH_SCR(3, c->ch)) & 0xffff)); /* doorbell threshold: 2 TREs */
++	return true;
++}
++
++static bool
++gsi_start(struct ipa_chan *c)
++{
++	return gsi_cmd(GSI_CH_CMD, c->ch | (1u << 24), GSI_CH(0, c->ch), 2, "channel start", c->ch);
++}
++
++/* ---- endpoints (Linux ipa_endpoint_program() for each of the AP's four) */
++
++static void
++ipa_ep_program(void)
++{
++	/* command TX 6: DMA mode into LAN RX 8, sequencer DMA */
++	iw(IPA_EP(IPA_EP_CFG, 6), 0);
++	iw(IPA_EP(IPA_EP_NAT, 6), 0);
++	iw(IPA_EP(IPA_EP_HDR, 6), 0);
++	iw(IPA_EP(IPA_EP_HDR_EXT, 6), 0);
++	iw(IPA_EP(IPA_EP_MODE, 6), 3u | (8u << 4));
++	iw(IPA_EP(IPA_EP_AGGR, 6), 0);
++	iw(IPA_EP(IPA_EP_DEAGGR, 6), 0);
++	iw(IPA_EP(IPA_EP_RSRC, 6), 0);
++	iw(IPA_EP(IPA_EP_SEQ, 6), 0x00);
++	iw(IPA_EP(IPA_EP_STATUS, 6), 0);
++	/* LAN RX 8: generic aggregation (6 KB, 500 us), 4-byte pad alignment, status */
++	iw(IPA_EP(IPA_EP_CFG, 8), 0);
++	iw(IPA_EP(IPA_EP_HDR, 8), 0);
++	iw(IPA_EP(IPA_EP_HDR_EXT, 8), 2u << 10);
++	iw(IPA_EP(IPA_EP_MDMASK, 8), 0);
++	iw(IPA_EP(IPA_EP_AGGR, 8), 1u | (4u << 2) | (6u << 5) | (1u << 10));
++	iw(IPA_EP(IPA_EP_HOL_EN, 8), 0);
++	iw(IPA_EP(IPA_EP_RSRC, 8), 0);
++	iw(IPA_EP(IPA_EP_STATUS, 8), 1);
++	/* modem TX 1: UL checksum offload (header offset 1 word), QMAP + checksum header (8 bytes),
++	 * sequencer 1 pass skip uC with DMA parser replication, status to modem->AP RX 10 */
++	iw(IPA_EP(IPA_EP_CFG, 1), (1u << 1) | (1u << 3));
++	iw(IPA_EP(IPA_EP_NAT, 1), 0);
++	iw(IPA_EP(IPA_EP_HDR, 1), 8u | (1u << 6));
++	iw(IPA_EP(IPA_EP_HDR_EXT, 1), 1);
++	iw(IPA_EP(IPA_EP_MODE, 1), 0);
++	iw(IPA_EP(IPA_EP_AGGR, 1), 0);
++	iw(IPA_EP(IPA_EP_DEAGGR, 1), 0);
++	iw(IPA_EP(IPA_EP_RSRC, 1), 0);
++	iw(IPA_EP(IPA_EP_SEQ, 1), 0x06u | (0x08u << 8));
++	iw(IPA_EP(IPA_EP_STATUS, 1), 1u | (10u << 1));
++	/* modem RX 9: DL checksum offload, QMAP header filled by the IPA (mux id at 1, length at 2),
++	 * big endian, length includes padding, metadata mask 0xff (big endian), generic aggregation
++	 * closed at end of frame */
++	iw(IPA_EP(IPA_EP_CFG, 9), 2u << 1);
++	iw(IPA_EP(IPA_EP_HDR, 9), 4u | (1u << 6) | (1u << 7) | (1u << 19) | (2u << 20));
++	iw(IPA_EP(IPA_EP_HDR_EXT, 9), 1u | (1u << 1) | (1u << 3));
++	iw(IPA_EP(IPA_EP_MDMASK, 9), 0xff000000u);
++	iw(IPA_EP(IPA_EP_AGGR, 9), 1u | (4u << 2) | (6u << 5) | (1u << 10) | (1u << 21));
++	iw(IPA_EP(IPA_EP_HOL_EN, 9), 0);
++	iw(IPA_EP(IPA_EP_RSRC, 9), 0);
++	iw(IPA_EP(IPA_EP_STATUS, 9), 0);
++}
++
++/* ---- immediate commands */
++
++static uint8_t *
++ipa_cmd_add(uint16_t opcode, bool last)
++{
++	struct ipa_chan *c = IPA_CMD;
++	uint32_t slot = c->widx % c->tres;
++	uint8_t *p = ipa_pay + 32 * slot;
++	bzero(p, 32);
++	gsi_tre(c, ipa_pay_pa + 32 * slot, opcode, (3u << 16) | (last ? (1u << 9) : 1u));
++	return p;
++}
++
++static void
++ipa_cmd_dma(uint32_t off, uint16_t size, bool last)
++{
++	uint8_t *p = ipa_cmd_add(IPA_CMD_DMA_SHARED_MEM, last);
++	uint16_t local = (uint16_t)(ipa_mo + off);
++	memcpy(p + 2, &size, 2);
++	memcpy(p + 4, &local, 2);
++	memcpy(p + 8, &ipa_zero_pa, 8);         /* flags 0: toward the IPA */
++}
++
++static void
++ipa_cmd_table(uint16_t opcode, uint32_t off, uint16_t size, uint64_t addr, bool last)
++{
++	uint8_t *p = ipa_cmd_add(opcode, last);
++	uint64_t flags = ((uint64_t)(ipa_mo + off) << 40) | ((uint64_t)size << 28);
++	memcpy(p + 8, &flags, 8);
++	memcpy(p + 16, &addr, 8);
++}
++
++/* send what was added, wait for its completion event */
++static bool
++ipa_cmd_commit(const char *what)
++{
++	struct ipa_chan *c = IPA_CMD;
++	uint64_t before = c->cmds;
++	gsi_doorbell(c);
++	for (unsigned i = 0; i < 1000; i++) {
++		gsi_events(c, ipa_ev_count);
++		if (c->cmds != before) {
++			LOG("ipa: %s: done (event code %u)", what, c->last_code);
++			return true;
++		}
++		IODelay(100);
++	}
++	LOG("ipa: %s: no completion (channel state %u, error log %08x, glob %08x)", what,
++	    gsi_state(GSI_CH(0, c->ch)), gr(GSI_ERROR_LOG), gr(GSI_GLOB_IRQ_STTS));
++	return false;
++}
++
++/* ---- RX buffers */
++
++static void
++ipa_rx_post(struct ipa_chan *c, unsigned b)
++{
++	c->slot_buf[c->widx % c->tres] = (uint8_t)b;
++	gsi_tre(c, c->buf_pa + (uint64_t)b * IPA_RX_BUF, IPA_RX_BUF, (2u << 16) | (1u << 9));
++}
++
++static bool
++ipa_rx_init(struct ipa_chan *c)
++{
++	c->buf = (uint8_t *)ipa_pool((uint64_t)IPA_RX_NBUF * IPA_RX_BUF, 0x1000, &c->buf_pa);
++	if (c->buf == NULL) {
++		LOG("ipa: no pool memory for %s buffers", c->name);
++		return false;
++	}
++	for (unsigned b = 0; b < IPA_RX_NBUF; b++) {
++		ipa_rx_post(c, b);
++	}
++	gsi_doorbell(c);
++	return true;
++}
++
++/* QMAP frames from the modem: [flags/pad, mux id, length (big endian)] + packet, back to back */
++static void
++ipa_rx_event(struct ipa_chan *c, const uint8_t *e)
++{
++	uint64_t tre;
++	uint16_t len;
++	memcpy(&tre, e, 8);
++	memcpy(&len, e + 8, 2);
++	uint32_t slot = (uint32_t)((tre - c->ring_pa) / 16) % c->tres;
++	unsigned b = c->slot_buf[slot];
++	const uint8_t *d = c->buf + (uint64_t)b * IPA_RX_BUF;
++
++	c->frames++;
++	c->bytes += len;
++	if (c == IPA_MRX) {
++		for (uint32_t off = 0; off + 4 <= len;) {
++			uint8_t pad = d[off] & 0x3f, mux = d[off + 1];
++			bool cmd = (d[off] & 0x80) != 0;
++			uint16_t plen = (uint16_t)((d[off + 2] << 8) | d[off + 3]);
++			if (plen == 0 || off + 4 + plen > len) {
++				break;
++			}
++			c->pkts++;
++			ipa_mux_seen[mux & 7]++;
++			if (c->pkts <= 12) {
++				const uint8_t *ip = d + off + 4;
++				LOG("ipa: modem RX packet %llu: mux %u%s, %u bytes (pad %u), first bytes %02x %02x %02x %02x .. proto %u",
++				    c->pkts, mux, cmd ? " (QMAP command)" : "", plen, pad, ip[0], ip[1], ip[2], ip[3],
++				    plen > 9 ? ip[9] : 0);
++			}
++			off += 4 + plen;
++		}
++	} else if (c->frames <= 8) {
++		LOG("ipa: %s frame %llu: %u bytes, status opcode %02x endpoint %u", c->name, c->frames, len, d[0],
++		    len > 3 ? d[3] & 0x1f : 0);
++	}
++	ipa_rx_post(c, b);
++}
++
++static void ipa_tx_event(struct ipa_chan *c, const uint8_t *e) { (void)e; c->cmds++; }
++
++/* ---- firmware: GSI microcode, authenticated by TrustZone (Linux ipa_firmware_load) */
++
++static bool
++ipa_fw_load(void)
++{
++	const void *mdt_v, *elf_v;
++	unsigned mdt_n, elf_n;
++	uint64_t meta_pa, st, res = 0;
++
++	if (!ipa_chosen("ipa-fws-metadata", &mdt_v, &mdt_n) || !ipa_chosen("ipa-fws-image", &elf_v, &elf_n) || mdt_n < 52) {
++		LOG("ipa: no ipa_fws in the device tree (tools/mkadt.py --ipa-mdt/--ipa-elf)");
++		return false;
++	}
++	const uint8_t *mdt = (const uint8_t *)mdt_v, *elf = (const uint8_t *)elf_v;
++	uint8_t *meta = (uint8_t *)pool_alloc(mdt_n, &meta_pa);
++	if (meta == NULL) {
++		return false;
++	}
++	memcpy(meta, mdt, mdt_n);
++	uint32_t phoff, min_a = ~0u, max_a = 0;
++	uint16_t phnum;
++	memcpy(&phoff, mdt + 28, 4);
++	memcpy(&phnum, mdt + 44, 2);
++	for (unsigned i = 0; i < phnum && phoff + 32u * (i + 1) <= mdt_n; i++) {
++		uint32_t ph[8];
++		memcpy(ph, mdt + phoff + 32 * i, 32);
++		if (ph[0] == PT_LOAD && ph[5] != 0 && (ph[6] & MDT_TYPE_MASK) != MDT_TYPE_HASH) {
++			min_a = MIN(min_a, ph[3]);
++			max_a = MAX(max_a, (ph[3] + ph[5] + 0xfffu) & ~0xfffu);
++		}
++	}
++	if (min_a == ~0u || max_a - min_a > IPA_FW_SIZE) {
++		LOG("ipa: ipa_fws: unexpected layout %x..%x", min_a, max_a);
++		return false;
++	}
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, IPA_PAS_ID, 0, 0, &res);
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), IPA_PAS_ID, meta_pa, 0, &res);
++	LOG("ipa: ipa_fws init_image: ret %llx res %llx (%u bytes of metadata)", st, res, mdt_n);
++	if (st != 0 || res != 0) {
++		return false;
++	}
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_MEM_SETUP), 3, IPA_PAS_ID, IPA_FW_PA, max_a - min_a, &res);
++	LOG("ipa: ipa_fws mem_setup %llx+%x: ret %llx res %llx", IPA_FW_PA, max_a - min_a, st, res);
++	if (st != 0 || res != 0) {
++		return false;
++	}
++	IOMemoryMap *m = map_phys(IPA_FW_PA, IPA_FW_SIZE, true);
++	if (m == NULL) {
++		return false;
++	}
++	uint8_t *dst = (uint8_t *)m->getVirtualAddress();
++	bzero(dst, IPA_FW_SIZE);
++	for (unsigned i = 0; i < phnum && phoff + 32u * (i + 1) <= mdt_n; i++) {
++		uint32_t ph[8];
++		memcpy(ph, mdt + phoff + 32 * i, 32);
++		if (ph[0] != PT_LOAD || ph[5] == 0 || (ph[6] & MDT_TYPE_MASK) == MDT_TYPE_HASH) {
++			continue;
++		}
++		if (ph[1] + ph[4] > elf_n || ph[3] - min_a + ph[4] > IPA_FW_SIZE) {
++			LOG("ipa: ipa_fws segment %u out of range", i);
++			m->release();
++			return false;
++		}
++		memcpy(dst + (ph[3] - min_a), elf + ph[1], ph[4]);
++	}
++	mb();
++	m->release();
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, IPA_PAS_ID, 0, 0, &res);
++	LOG("ipa: ipa_fws auth_and_reset: ret %llx res %llx", st, res);
++	return st == 0 && res == 0;
++}
++
++/* ---- bring-up, before the modem boots (it asks for the IPA clock state early) */
++
++static bool
++ipa_hw_init(void)
++{
++	int r = topaz_rpm_vote(0, 0x00617069, 0, 0x007a484b, 100000);     /* "ipa" clock, active set, 100 MHz */
++	int r2 = topaz_rpm_vote(1, 0x00617069, 0, 0x007a484b, 100000);    /* and while the AP sleeps */
++	LOG("ipa: RPM ipa clock 100 MHz: active %d, sleep %d", r, r2);
++	if (r != 0) {
++		ipa_step = "no clock";
++		return false;
++	}
++	if (!smmu_identity(IPA_SID, 0, "IPA (AP)")) {
++		ipa_step = "no SMMU stream";
++		return false;
++	}
++	ipa_r = (volatile uint8_t *)ml_io_map(IPA_REG_PA, IPA_REG_SIZE);
++	gsi_r = (volatile uint8_t *)ml_io_map(IPA_GSI_PA, IPA_GSI_SIZE);
++	if (ipa_r == NULL || gsi_r == NULL) {
++		ipa_step = "no mapping";
++		return false;
++	}
++	uint32_t smem_v = ir(IPA_SHARED_MEM_SIZE), flavor = ir(IPA_FLAVOR_0);
++	LOG("ipa: COMP_CFG %08x CLKON %08x SHARED_MEM_SIZE %08x FLAVOR_0 %08x (tx %u, rx %u from %u); GSI status %08x",
++	    ir(IPA_COMP_CFG), ir(IPA_CLKON_CFG), smem_v, flavor, (flavor >> 8) & 0x1f, (flavor >> 16) & 0x1f,
++	    (flavor >> 24) & 0xf, gr(GSI_STATUS));
++
++	/* Linux ipa_hardware_config() */
++	iw(IPA_BCR, 0);
++	iw(IPA_TX_CFG, ir(IPA_TX_CFG) & ~(1u << 12));                     /* no PA mask: HOLB drop works */
++	iw(IPA_CLKON_CFG, (1u << 28) | (1u << 29));                        /* CLKON_GLOBAL, GLOBAL_2X_CLK */
++	iw(IPA_COMP_CFG, ir(IPA_COMP_CFG) | (1u << 15) | (1u << 7) | (1u << 8));
++	iw(IPA_QSB_MAX_WRITES, 8);
++	iw(IPA_QSB_MAX_READS, 12);
++	iw(IPA_COUNTER_CFG, 15u << 4);                                     /* aggregation granularity 500 us */
++	iw(IPA_HASH_EN, 0);                                                /* v4.2: no hashed tables */
++	iw(IPA_IDLE_CFG, 256);
++	iw(IPA_IRQ_EN, 0);
++
++	/* Linux ipa_mem_config(): where the IPA-local memory is, canaries before its regions */
++	ipa_mo = 8 * (smem_v >> 16);
++	ipa_msize = 8 * (smem_v & 0xffff);
++	if (ipa_msize < 0x2000 || ipa_mo + 0x2000 > IPA_REG_SIZE - IPA_SRAM_OFF) {
++		LOG("ipa: IPA memory %x + %x, the v4.2 layout wants 0x2000", ipa_mo, ipa_msize);
++		ipa_step = "memory too small";
++		return false;
++	}
++	static const uint16_t canary[][2] = {
++		{ 0x0288, 2 }, { 0x0290, 2 }, { 0x0310, 2 }, { 0x0318, 2 }, { 0x0398, 2 }, { 0x03a0, 2 },
++		{ 0x0420, 2 }, { 0x0428, 2 }, { 0x04a8, 2 }, { 0x05f0, 2 }, { 0x09f8, 2 }, { 0x0a50, 2 },
++		{ 0x2000, 1 },
++	};
++	for (unsigned i = 0; i < sizeof(canary) / sizeof(canary[0]); i++) {
++		volatile uint32_t *p = (volatile uint32_t *)(ipa_r + IPA_SRAM_OFF + ipa_mo + canary[i][0]);
++		for (unsigned k = 0; k < canary[i][1]; k++) {
++			*--p = 0xdeadbeef;
++		}
++	}
++	/* Linux ipa_resource_config(): one source group, one destination group */
++	static const uint32_t src[5][2] = { { 3, 63 }, { 3, 3 }, { 10, 10 }, { 1, 1 }, { 5, 5 } };
++	static const uint32_t dst[2][2] = { { 3, 3 }, { 1, 63 } };
++	for (unsigned t = 0; t < 5; t++) {
++		iw(IPA_SRC_RSRC(t), src[t][0] | (src[t][1] << 8));
++	}
++	for (unsigned t = 0; t < 2; t++) {
++		iw(IPA_DST_RSRC(t), dst[t][0] | (dst[t][1] << 8));
++	}
++	/* the modem's IPA memory in SMEM (Linux ipa_smem_init) */
++	if (smem_alloc(smem_partition(0, 1), IPA_SMEM_ITEM, IPA_SMEM_SIZE) == NULL) {
++		LOG("ipa: SMEM item %u not allocated", IPA_SMEM_ITEM);
++	}
++
++	ipa_step = "GSI firmware";
++	if (!ipa_fw_load()) {
++		return false;
++	}
++	uint32_t gs = 0;
++	for (unsigned i = 0; i < 100 && !((gs = gr(GSI_STATUS)) & 1); i++) {
++		IOSleep(1);
++	}
++	uint32_t hw2 = gr(GSI_HW_PARAM_2);
++	LOG("ipa: GSI status %08x, %u channels and %u event rings per EE", gs, (hw2 >> 3) & 0x1f, (hw2 >> 8) & 0x1f);
++	if (!(gs & 1)) {
++		ipa_step = "GSI not enabled";
++		return false;
++	}
++
++	/* Linux gsi_setup(): no interrupts (polled), error log cleared */
++	gw(GSI_INTSET, 1);
++	gw(GSI_TYPE_IRQ_MSK, 0);
++	gw(GSI_SRC_CH_IRQ_MSK, 0);
++	gw(GSI_SRC_EV_IRQ_MSK, 0);
++	gw(GSI_GLOB_IRQ_EN, 1);
++	gw(GSI_IEOB_IRQ_MSK, 0);
++	gw(GSI_INTER_EE_CH_MSK, 0);
++	gw(GSI_INTER_EE_EV_MSK, 0);
++	gw(GSI_GSI_IRQ_EN, 0);
++	gw(GSI_ERROR_LOG, 0);
++
++	ipa_pay = (uint8_t *)pool_alloc(32 * 256, &ipa_pay_pa);
++	ipa_zero = (uint8_t *)pool_alloc(0x2000, &ipa_zero_pa);
++	uint64_t *table = (uint64_t *)pool_alloc(0x1000, &ipa_table_pa);
++	if (ipa_pay == NULL || ipa_zero == NULL || table == NULL) {
++		ipa_step = "no pool memory";
++		return false;
++	}
++	/* zero rule, filter bitmap (endpoint n is bit n + 1), then 15 entries all naming the zero rule */
++	table[0] = 0;
++	table[1] = (uint64_t)IPA_FILTERED << 1;
++	for (unsigned i = 0; i < 15; i++) {
++		table[2 + i] = ipa_table_pa;
++	}
++
++	ipa_step = "GSI channels";
++	for (unsigned i = 0; i < 4; i++) {
++		if (!gsi_setup_chan(&ipa_ch[i])) {
++			return false;
++		}
++	}
++	for (unsigned ch = 0; ch < 4; ch++) {   /* modem channels 0-3: the AP allocates them on IPA v4.2 */
++		int g = gsi_generic(2, ch);
++		if (g != 0) {
++			LOG("ipa: modem channel %u allocation: %d", ch, g);
++		}
++	}
++	ipa_ep_program();
++	ipa_step = "command channel";
++	if (!gsi_start(IPA_CMD)) {
++		return false;
++	}
++
++	/* Linux ipa_mem_setup(): header table, zeroed processing contexts and modem memory */
++	ipa_step = "IPA memory setup";
++	uint8_t *p = ipa_cmd_add(IPA_CMD_HDR_INIT_LOCAL, false);
++	uint32_t hflags = 0x140u | ((ipa_mo + IPA_MEM_MODEM_HDR) << 12);
++	memcpy(p, &ipa_zero_pa, 8);
++	memcpy(p + 8, &hflags, 4);
++	ipa_cmd_dma(IPA_MEM_MODEM_PROC, 0x200, false);
++	ipa_cmd_dma(IPA_MEM_AP_PROC, 0x200, false);
++	ipa_cmd_dma(IPA_MEM_MODEM, 0x140c, true);
++	if (!ipa_cmd_commit("memory setup")) {
++		return false;
++	}
++	iw(IPA_PKT_PROC_CNTXT, (ipa_mo + IPA_MEM_MODEM_PROC) & 0x1ffff);
++
++	/* Linux ipa_table_setup(): 15 route entries, filter bitmap + 2 entries, the rest zeroed */
++	ipa_step = "tables";
++	ipa_cmd_table(IPA_CMD_V4_ROUTE_INIT, IPA_MEM_V4_ROUTE, 15 * 8, ipa_table_pa + 16, false);
++	ipa_cmd_table(IPA_CMD_V6_ROUTE_INIT, IPA_MEM_V6_ROUTE, 15 * 8, ipa_table_pa + 16, false);
++	ipa_cmd_table(IPA_CMD_V4_FILTER_INIT, IPA_MEM_V4_FILTER, 3 * 8, ipa_table_pa + 8, false);
++	ipa_cmd_dma(IPA_MEM_V4_FILTER + 3 * 8, IPA_MEM_TABLE_SIZE - 3 * 8, false);
++	ipa_cmd_table(IPA_CMD_V6_FILTER_INIT, IPA_MEM_V6_FILTER, 3 * 8, ipa_table_pa + 8, false);
++	ipa_cmd_dma(IPA_MEM_V6_FILTER + 3 * 8, IPA_MEM_TABLE_SIZE - 3 * 8, true);
++	if (!ipa_cmd_commit("tables")) {
++		return false;
++	}
++
++	ipa_step = "LAN RX";
++	if (!gsi_start(IPA_LAN) || !ipa_rx_init(IPA_LAN)) {
++		return false;
++	}
++	iw(IPA_ROUTE, (8u << 1) | (1u << 6) | (8u << 17) | (1u << 24));  /* default route: LAN RX, keep headers */
++	ipa_up = true;
++	ipa_step = "up, waiting for the modem's IPA service";
++	LOG("ipa: up (memory %x + %x, pool used %llx)", ipa_mo, ipa_msize, pool_used);
++	return true;
++}
++
++/* ---- QMI handshake (Linux ipa_qmi.c) */
++
++static uint32_t
++ipa_qmi_hdr(uint8_t *b, uint8_t type, uint16_t txn, uint16_t msg)
++{
++	b[0] = type;
++	memcpy(b + 1, &txn, 2);
++	memcpy(b + 3, &msg, 2);
++	return 7;
++}
++
++static uint32_t
++ipa_tlv(uint8_t *b, uint32_t n, uint8_t type, const void *v, uint16_t len)
++{
++	b[n] = type;
++	memcpy(b + n + 1, &len, 2);
++	memcpy(b + n + 3, v, len);
++	return n + 3 + len;
++}
++
++static void
++ipa_qmi_send(uint8_t *b, uint32_t n, uint32_t src_port, uint32_t node, uint32_t port)
++{
++	uint16_t l = (uint16_t)(n - 7);
++	memcpy(b + 5, &l, 2);
++	qrtr_send(QRTR_TYPE_DATA, src_port, node, port, b, n);
++}
++
++static void
++ipa_modem_start(void)
++{
++	if (ipa_running) {
++		return;
++	}
++	if (!gsi_start(IPA_MTX) || !gsi_start(IPA_MRX) || !ipa_rx_init(IPA_MRX)) {
++		ipa_step = "modem endpoints did not start";
++		return;
++	}
++	ipa_running = true;
++	ipa_step = "running";
++	LOG("t=%u ms: ipa: *** modem TX/RX endpoints started: the modem's data can flow ***", g_ms);
++}
++
++static void
++ipa_qmi_ready(void)
++{
++	if (!ipa_modem_ready || !ipa_uc_ready) {
++		return;
++	}
++	if (ipa_ind_req && !ipa_ind_sent) {
++		uint8_t b[32];
++		uint32_t n = ipa_qmi_hdr(b, QMI_IND, 0, 0x22);
++		uint32_t ok = 0;
++		n = ipa_tlv(b, n, 0x02, &ok, 4);
++		ipa_qmi_send(b, n, PORT_IPAS, ipa_c_node, ipa_c_port);
++		ipa_ind_sent = true;
++		LOG("t=%u ms: ipa: INIT_COMPLETE indication sent", g_ms);
++	}
++	if (ipa_ind_sent) {
++		ipa_modem_start();
++	}
++}
++
++/* the modem's IPA service 0x31 instance 2 came up: INIT_DRIVER with our memory layout */
++static void
++ipa_qmi_arrive(uint32_t node, uint32_t port)
++{
++	ipa_m_node = node;
++	ipa_m_port = port;
++	if (!ipa_up) {
++		LOG("t=%u ms: ipa: modem IPA service up, but our IPA is not (%s)", g_ms, ipa_step);
++		return;
++	}
++	struct { uint32_t a, b; } __attribute__((packed)) v;
++	uint8_t b[256];
++	uint32_t n = ipa_qmi_hdr(b, QMI_REQ, ipa_txn++, 0x21), u;
++	uint8_t skip = 0;
++
++	u = 3; n = ipa_tlv(b, n, 0x10, &u, 4);                                       /* platform: MSM Android */
++	v.a = ipa_mo + IPA_MEM_MODEM_HDR; v.b = v.a + 0x140 - 1; n = ipa_tlv(b, n, 0x11, &v, 8);
++	v.a = ipa_mo + IPA_MEM_V4_ROUTE; v.b = IPA_MODEM_ROUTES - 1; n = ipa_tlv(b, n, 0x12, &v, 8);
++	v.a = ipa_mo + IPA_MEM_V6_ROUTE; v.b = IPA_MODEM_ROUTES - 1; n = ipa_tlv(b, n, 0x13, &v, 8);
++	u = ipa_mo + IPA_MEM_V4_FILTER; n = ipa_tlv(b, n, 0x14, &u, 4);
++	u = ipa_mo + IPA_MEM_V6_FILTER; n = ipa_tlv(b, n, 0x15, &u, 4);
++	v.a = ipa_mo + IPA_MEM_MODEM; v.b = 0x140c; n = ipa_tlv(b, n, 0x16, &v, 8);
++	u = 9; n = ipa_tlv(b, n, 0x17, &u, 4);                                       /* control: AP modem RX */
++	n = ipa_tlv(b, n, 0x18, &skip, 1);                                           /* the modem loads the uC */
++	v.a = ipa_mo + IPA_MEM_MODEM_PROC; v.b = v.a + 0x200 - 1; n = ipa_tlv(b, n, 0x19, &v, 8);
++	u = ipa_mo + IPA_MEM_QUOTA; n = ipa_tlv(b, n, 0x1f, &u, 4);
++	u = ipa_mo + 0x60; n = ipa_tlv(b, n, 0x20, &u, 4);                           /* (Linux: mem_offset + size) */
++	ipa_qmi_send(b, n, PORT_IPAC, node, port);
++	ipa_step = "INIT_DRIVER sent";
++	LOG("t=%u ms: ipa: modem IPA service up (node %u port %x): INIT_DRIVER sent", g_ms, node, port);
++}
++
++/* a response to our client, or a request to our service */
++static bool
++ipa_svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d, uint32_t len)
++{
++	if (dst_port != PORT_IPAC && dst_port != PORT_IPAS) {
++		return false;
++	}
++	if (len < 7) {
++		return true;
++	}
++	uint16_t txn, msg, l = 0, res = 0xffff, err = 0xffff;
++	memcpy(&txn, d + 1, 2);
++	memcpy(&msg, d + 3, 2);
++	const uint8_t *r = qm_find(d, len, 2, &l);
++	if (r != NULL && l >= 4) {
++		memcpy(&res, r, 2);
++		memcpy(&err, r + 2, 2);
++	}
++	if (dst_port == PORT_IPAC) {
++		LOG("t=%u ms: ipa: INIT_DRIVER answer: result %u error %u", g_ms, res, err);
++		if (msg == 0x21 && res == 0) {
++			ipa_modem_ready = true;
++			ipa_step = "modem driver ready";
++			ipa_qmi_ready();
++		} else {
++			ipa_step = "INIT_DRIVER refused";
++		}
++		return true;
++	}
++	if (d[0] != QMI_REQ) {
++		return true;
++	}
++	uint8_t b[32];
++	uint32_t n = ipa_qmi_hdr(b, QMI_RESP, txn, msg), ok = 0;
++	n = ipa_tlv(b, n, 0x02, &ok, 4);
++	ipa_qmi_send(b, n, PORT_IPAS, src_node, src_port);
++	ipa_c_node = src_node;
++	ipa_c_port = src_port;
++	if (msg == 0x20) {
++		LOG("t=%u ms: ipa: modem INDICATION_REGISTER", g_ms);
++		ipa_ind_req = true;
++	} else if (msg == 0x35) {
++		LOG("t=%u ms: ipa: modem DRIVER_INIT_COMPLETE (the IPA microcontroller is up)", g_ms);
++		ipa_uc_ready = true;
++	} else {
++		LOG("t=%u ms: ipa: modem request %04x answered", g_ms, msg);
++	}
++	ipa_qmi_ready();
++	return true;
++}
++
++/* every millisecond from the modem thread */
++static void
++ipa_poll(unsigned ms)
++{
++	if (!ipa_up) {
++		return;
++	}
++	gsi_events(IPA_CMD, ipa_ev_count);
++	if (gsi_events(IPA_LAN, ipa_rx_event) != 0) {
++		gsi_doorbell(IPA_LAN);
++	}
++	if (ipa_running) {
++		gsi_events(IPA_MTX, ipa_tx_event);
++		if (gsi_events(IPA_MRX, ipa_rx_event) != 0) {
++			gsi_doorbell(IPA_MRX);
++		}
++	}
++	if (ms % 1000 == 0) {
++		uint32_t e = gr(GSI_ERROR_LOG);
++		if (e != 0) {
++			ipa_gsi_errors++;
++			ipa_last_error = e;
++			if (ipa_gsi_errors <= 10) {
++				LOG("t=%u ms: ipa: GSI error log %08x (ee %u type %u index %u code %u)", ms, e, e >> 28,
++				    (e >> 24) & 0xf, (e >> 19) & 0x1f, (e >> 12) & 0xf);
++			}
++			gw(GSI_ERROR_LOG, 0);
++			gw(GSI_ERROR_LOG_CLR, ~0u);
++		}
++	}
++}
++
++static int
++ipa_stats(char *buf, size_t len)
++{
++	return snprintf(buf, len, "; ipa %s: lan rx %llu frames, modem rx %llu frames %llu packets %llu bytes (mux 0-7: %u %u %u %u %u %u %u %u), modem tx %llu, GSI errors %u (last %08x)",
++	    ipa_step, IPA_LAN->frames, IPA_MRX->frames, IPA_MRX->pkts, IPA_MRX->bytes, ipa_mux_seen[0], ipa_mux_seen[1],
++	    ipa_mux_seen[2], ipa_mux_seen[3], ipa_mux_seen[4], ipa_mux_seen[5], ipa_mux_seen[6], ipa_mux_seen[7],
++	    IPA_MTX->cmds, ipa_gsi_errors, ipa_last_error);
++}
++
+ static void
+ svc_announce(void)
+ {
+@@ -7549,6 +8471,11 @@ svc_announce(void)
+ 		qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, q_modem_node, QRTR_PORT_CTRL, &c, sizeof(c));
+ 	}
+ 	LOG("t=%u ms: announced pd-mapper 0x40, tftp 0x1000, rmtfs 0x0e", g_ms);
++	if (ipa_up) {
++		struct qrtr_ctrl c = { QRTR_TYPE_NEW_SERVER, 0x31, 0x101, QRTR_NODE_APPS, PORT_IPAS };
++		qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, q_modem_node, QRTR_PORT_CTRL, &c, sizeof(c));
++		LOG("t=%u ms: announced the IPA service 0x31:1", g_ms);
++	}
+ }
+ 
+ static bool
+@@ -7559,6 +8486,9 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+ 		WHERE("svc rx");
+ 		return true;                            /* a userland client's port (0x3000..) */
+ 	}
++	if (ipa_svc_rx(src_node, src_port, dst_port, data, len)) {
++		return true;
++	}
+ 	WHERE("svc rx (kernel services)");
+ 	if (dst_port == PORT_TFTP) {
+ 		WHERE("tftp");
+@@ -7667,6 +8597,8 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 			glink_poll(part, ms);
+ 			WHERE("radio poll");
+ 			radio_poll(ms);
++			WHERE("ipa poll");
++			ipa_poll(ms);
+ 			WHERE("watch loop");
+ 		}
+ 		if (glink && (ms == 3000 || ms == 20000)) {
+@@ -7713,9 +8645,9 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 		if (ipa_in != NULL && ipa_out != NULL && *ipa_in != ipa_last) {
+ 			uint32_t v = *ipa_in;
+ 			if ((v & 1) && !(ipa_last != ~0u && (ipa_last & 1))) {
+-				*ipa_out = 1;                   /* answer valid, AP IPA power off */
++				*ipa_out = ipa_up ? 3 : 1;      /* valid, and the IPA clock on (ipa=1) or off */
+ 				smp2p_kick();
+-				LOG("t=%u ms: answered IPA power query (%08x)", ms, v);
++				LOG("t=%u ms: answered IPA power query (%08x): IPA power %s", ms, v, ipa_up ? "on" : "off");
+ 			}
+ 			ipa_last = v;
+ 		}
+@@ -10819,6 +11751,10 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ 		LOG("wifi: no SMMU stream for WLAN, the radio stays off");
+ 		wifi_on = 0;
+ 	}
++	(void)PE_parse_boot_argn("ipa", &ipa_on, sizeof(ipa_on));
++	if (ipa_on && !ipa_hw_init()) {
++		LOG("ipa: not up (step: %s): the modem is told \"AP IPA power off\"", ipa_step);
++	}
+ 	if (modem_boot()) {
+ 		modem_watch(smem_partition(0, 1), watch);
+ 	}
+-- 
+2.43.0
+

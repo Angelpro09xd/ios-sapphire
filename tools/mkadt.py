@@ -289,8 +289,11 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, gpu_
 
 if __name__ == '__main__':
     gpu_fw = []
+    # --ipa-mdt / --ipa-elf: the IPA's GSI firmware (vendor ipa_fws.mdt / ipa_fws.elf), loaded by
+    # TopazModem through TrustZone (PAS 15) when the kernel boots with ipa=1
     for opt, prop in (('--gpu-sqe', 'gpu-sqe-firmware'), ('--gpu-zap-mdt', 'gpu-zap-metadata'),
-                      ('--gpu-zap-seg', 'gpu-zap-segment')):
+                      ('--gpu-zap-seg', 'gpu-zap-segment'), ('--ipa-mdt', 'ipa-fws-metadata'),
+                      ('--ipa-elf', 'ipa-fws-image')):
         if opt in sys.argv:
             i = sys.argv.index(opt)
             blob = open(sys.argv[i + 1], 'rb').read()
