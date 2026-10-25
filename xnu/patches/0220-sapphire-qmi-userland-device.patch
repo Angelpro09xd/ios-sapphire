@@ -1,0 +1,415 @@
+From 144aa83ab21aac69d4e1d157bebf3dcc0f819e13 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 11:59:43 +0000
+Subject: [PATCH] sapphire-0220: /dev/redwood-qmi0..15: QMI to the modem for
+ userland (QRTR client ports 0x3000..), sent and received by the modem thread
+
+---
+ bsd/conf/files                  |   1 +
+ bsd/dev/sweet_qmi_dev.c         | 301 ++++++++++++++++++++++++++++++++
+ iokit/Kernel/arm/TopazModem.cpp |  48 +++++
+ 3 files changed, 350 insertions(+)
+ create mode 100644 bsd/dev/sweet_qmi_dev.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 35af81b..85e76c0 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -118,6 +118,7 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_audio_ctl.c		standard
+ bsd/dev/sweet_audio_dev.c		standard
++bsd/dev/sweet_qmi_dev.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+diff --git a/bsd/dev/sweet_qmi_dev.c b/bsd/dev/sweet_qmi_dev.c
+new file mode 100644
+index 0000000..b838a3d
+--- /dev/null
++++ b/bsd/dev/sweet_qmi_dev.c
+@@ -0,0 +1,301 @@
++/*
++ * /dev/redwood-qmi0 .. /dev/redwood-qmi15: QMI to the modem for userland (IMEI, SIM, network,
++ * SMS), the way Linux's AF_QIPCRTR sockets give it to libqmi / rild. The kernel only carries
++ * messages: each node is one QRTR client port (0x3000 + minor) on the apps node, opened by one
++ * process at a time.
++ *   write(): struct sweet_qmi_hdr {node, port} + one QMI message (type, txn, msg id, length,
++ *            TLVs), queued and sent by TopazModem's modem thread (it owns the GLINK FIFO).
++ *   read():  the next message for this port, with the sender's {node, port} in front; blocks
++ *            unless O_NONBLOCK; select() works.
++ *   ioctl SWEET_QMI_LOOKUP: the index-th server of a QMI service (inst ~0 = any instance), as
++ *            the modem announced it with QRTR NEW_SERVER.
++ * close() tells the modem the client is gone (QRTR DEL_CLIENT), so services drop its state.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <stdbool.h>
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/ioccom.h>
++#include <sys/proc.h>
++#include <sys/select.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++
++#define SQ_SLOTS        16
++#define SQ_PORT0        0x3000u
++#define SQ_MAX_MSG      0x4000u                 /* the modem's own intent size is 0x4400 */
++#define SQ_RXQ          64                      /* messages waiting per port */
++#define SQ_TXQ          64
++
++struct sweet_qmi_hdr { uint32_t node, port; };
++struct sweet_qmi_lookup { uint32_t svc, inst, index, node, port, found_inst; };
++#define SWEET_QMI_LOOKUP        _IOWR('q', 1, struct sweet_qmi_lookup)
++#define SWEET_QMI_PORT          _IOR('q', 2, uint32_t)
++
++struct sq_msg { uint32_t src, node, port, len, ctrl; uint8_t *data; };
++struct sq_slot {
++	bool open;
++	uint32_t head, tail;                    /* rx ring, wrapping counters */
++	struct sq_msg rx[SQ_RXQ];
++	struct selinfo sel;
++	uint64_t dropped;
++};
++
++static LCK_GRP_DECLARE(sq_grp, "sweet_qmi");
++static LCK_MTX_DECLARE(sq_mtx, &sq_grp);
++static struct sq_slot sq_slots[SQ_SLOTS];
++static struct sq_msg sq_tx[SQ_TXQ];
++static uint32_t sq_tx_head, sq_tx_tail;
++
++int sweet_qmi_deliver(uint32_t dst_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t len);
++void sweet_qmi_pump(void (*send)(uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len, int ctrl));
++void sweet_qmi_dev_init(void);
++extern int topaz_qmi_lookup(uint32_t svc, uint32_t inst, uint32_t index, uint32_t *node, uint32_t *port, uint32_t *found_inst);
++
++static void
++sq_free(struct sq_msg *m)
++{
++	if (m->data != NULL) {
++		kfree_data(m->data, m->len);
++		m->data = NULL;
++	}
++}
++
++/* modem thread: a QRTR data message arrived for dst_port; true if it is one of ours */
++int
++sweet_qmi_deliver(uint32_t dst_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t len)
++{
++	if (dst_port < SQ_PORT0 || dst_port >= SQ_PORT0 + SQ_SLOTS) {
++		return 0;
++	}
++	struct sq_slot *s = &sq_slots[dst_port - SQ_PORT0];
++	if (len == 0 || len > SQ_MAX_MSG) {
++		return 1;
++	}
++	uint8_t *copy = kalloc_data(len, Z_WAITOK);
++	if (copy == NULL) {
++		return 1;
++	}
++	memcpy(copy, data, len);
++	lck_mtx_lock(&sq_mtx);
++	if (!s->open || s->head - s->tail >= SQ_RXQ) {
++		s->dropped++;
++		lck_mtx_unlock(&sq_mtx);
++		kfree_data(copy, len);
++		return 1;
++	}
++	struct sq_msg *m = &s->rx[s->head % SQ_RXQ];
++	m->node = node;
++	m->port = port;
++	m->len = len;
++	m->data = copy;
++	s->head++;
++	wakeup(s);
++	selwakeup(&s->sel);
++	lck_mtx_unlock(&sq_mtx);
++	return 1;
++}
++
++/* modem thread, every loop: send what userland queued */
++void
++sweet_qmi_pump(void (*send)(uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len, int ctrl))
++{
++	for (;;) {
++		struct sq_msg m;
++		lck_mtx_lock(&sq_mtx);
++		if (sq_tx_tail == sq_tx_head) {
++			lck_mtx_unlock(&sq_mtx);
++			return;
++		}
++		m = sq_tx[sq_tx_tail % SQ_TXQ];
++		sq_tx[sq_tx_tail % SQ_TXQ].data = NULL;
++		sq_tx_tail++;
++		lck_mtx_unlock(&sq_mtx);
++		send(m.src, m.node, m.port, m.data, m.len, (int)m.ctrl);
++		sq_free(&m);
++	}
++}
++
++static int
++sq_queue_tx(uint32_t src_port, uint32_t node, uint32_t port, uint8_t *data, uint32_t len, int ctrl)
++{
++	lck_mtx_lock(&sq_mtx);
++	if (sq_tx_head - sq_tx_tail >= SQ_TXQ) {
++		lck_mtx_unlock(&sq_mtx);
++		return EAGAIN;
++	}
++	struct sq_msg *m = &sq_tx[sq_tx_head % SQ_TXQ];
++	m->src = src_port;
++	m->node = node;
++	m->port = port;
++	m->len = len;
++	m->ctrl = (uint32_t)ctrl;
++	m->data = data;
++	sq_tx_head++;
++	lck_mtx_unlock(&sq_mtx);
++	return 0;
++}
++
++static int
++sq_open(dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	int unit = minor(dev);
++	if (unit < 0 || unit >= SQ_SLOTS) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&sq_mtx);
++	struct sq_slot *s = &sq_slots[unit];
++	if (s->open) {
++		lck_mtx_unlock(&sq_mtx);
++		return EBUSY;
++	}
++	s->open = true;
++	s->head = s->tail = 0;
++	lck_mtx_unlock(&sq_mtx);
++	return 0;
++}
++
++static int
++sq_close(dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	int unit = minor(dev);
++	struct sq_slot *s = &sq_slots[unit];
++	lck_mtx_lock(&sq_mtx);
++	s->open = false;
++	wakeup(s);
++	while (s->tail != s->head) {
++		sq_free(&s->rx[s->tail % SQ_RXQ]);
++		s->tail++;
++	}
++	lck_mtx_unlock(&sq_mtx);
++	(void)sq_queue_tx(SQ_PORT0 + (uint32_t)unit, 0, 0, NULL, 0, 1);
++	return 0;
++}
++
++static int
++sq_read(dev_t dev, struct uio *uio, int ioflag)
++{
++	struct sq_slot *s = &sq_slots[minor(dev)];
++	lck_mtx_lock(&sq_mtx);
++	while (s->tail == s->head) {
++		if (ioflag & IO_NDELAY) {
++			lck_mtx_unlock(&sq_mtx);
++			return EWOULDBLOCK;
++		}
++		int err = msleep(s, &sq_mtx, PCATCH | PZERO, "sweetqmi", NULL);
++		if (err != 0) {
++			lck_mtx_unlock(&sq_mtx);
++			return err;
++		}
++		if (!s->open) {
++			lck_mtx_unlock(&sq_mtx);
++			return ENXIO;
++		}
++	}
++	struct sq_msg m = s->rx[s->tail % SQ_RXQ];
++	s->rx[s->tail % SQ_RXQ].data = NULL;
++	s->tail++;
++	lck_mtx_unlock(&sq_mtx);
++	struct sweet_qmi_hdr h = { m.node, m.port };
++	int err = uiomove((char *)&h, sizeof(h), uio);
++	if (err == 0) {
++		user_ssize_t n = uio_resid(uio);
++		err = uiomove((char *)m.data, (int)(n < (user_ssize_t)m.len ? n : m.len), uio);
++	}
++	sq_free(&m);
++	return err;
++}
++
++static int
++sq_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	struct sweet_qmi_hdr h;
++	user_ssize_t n = uio_resid(uio);
++	if (n < (user_ssize_t)sizeof(h) + 7 || n > (user_ssize_t)(sizeof(h) + SQ_MAX_MSG)) {
++		return EINVAL;
++	}
++	int err = uiomove((char *)&h, sizeof(h), uio);
++	if (err != 0) {
++		return err;
++	}
++	uint32_t len = (uint32_t)(n - (user_ssize_t)sizeof(h));
++	uint8_t *d = kalloc_data(len, Z_WAITOK);
++	if (d == NULL) {
++		return ENOMEM;
++	}
++	err = uiomove((char *)d, (int)len, uio);
++	if (err == 0) {
++		err = sq_queue_tx(SQ_PORT0 + (uint32_t)minor(dev), h.node, h.port, d, len, 0);
++	}
++	if (err != 0) {
++		kfree_data(d, len);
++	}
++	return err;
++}
++
++static int
++sq_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
++{
++	if (cmd == SWEET_QMI_PORT) {
++		*(uint32_t *)data = SQ_PORT0 + (uint32_t)minor(dev);
++		return 0;
++	}
++	if (cmd != SWEET_QMI_LOOKUP) {
++		return ENOTTY;
++	}
++	struct sweet_qmi_lookup *l = (struct sweet_qmi_lookup *)data;
++	return topaz_qmi_lookup(l->svc, l->inst, l->index, &l->node, &l->port, &l->found_inst) ? 0 : ENOENT;
++}
++
++static int
++sq_select(dev_t dev, int which, void *wql, struct proc *p)
++{
++	struct sq_slot *s = &sq_slots[minor(dev)];
++	if (which == FWRITE) {
++		return 1;
++	}
++	if (which != FREAD) {
++		return 0;
++	}
++	lck_mtx_lock(&sq_mtx);
++	int ready = s->tail != s->head;
++	if (!ready) {
++		selrecord(p, &s->sel, wql);
++	}
++	lck_mtx_unlock(&sq_mtx);
++	return ready;
++}
++
++static const struct cdevsw sq_cdevsw = {
++	.d_open = sq_open, .d_close = sq_close, .d_read = sq_read, .d_write = sq_write, .d_ioctl = sq_ioctl,
++	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = sq_select, .d_mmap = eno_mmap,
++	.d_strategy = eno_strat, .d_type = 0,
++};
++
++/* TopazModem, once the modem's IPCRTR channel is up */
++void
++sweet_qmi_dev_init(void)
++{
++	static int major = -1;
++	if (major >= 0) {
++		return;
++	}
++	major = cdevsw_add(-1, &sq_cdevsw);
++	if (major < 0) {
++		printf("sweet qmi: no major\n");
++		return;
++	}
++	int made = 0;
++	for (int i = 0; i < SQ_SLOTS; i++) {
++		if (devfs_make_node(makedev(major, i), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "redwood-qmi%d", i) != NULL) {
++			made++;
++		}
++	}
++	printf("sweet qmi: /dev/redwood-qmi0..%d ready (QRTR ports 0x%x..)\n", made - 1, SQ_PORT0);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 71262af..35cfa8e 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -478,6 +478,11 @@ static void svc_announce(void);
+ static bool adsp_qrtr_send(uint32_t dst_node, const uint8_t *pkt, uint32_t len);
+ static uint32_t adsp_qrtr_version(uint32_t dst_node);
+ static void svc_summary(void);
++/* sapphire 0220: /dev/redwood-qmi (bsd/dev/sweet_qmi_dev.c), QMI for userland */
++extern "C" int sweet_qmi_deliver(uint32_t dst_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t len);
++extern "C" void sweet_qmi_pump(void (*send)(uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len, int ctrl));
++extern "C" void sweet_qmi_dev_init(void);
++static void qmi_user_send(uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len, int ctrl);
+ static void wlfw_arrive(uint32_t node, uint32_t port);
+ static bool wifi_enabled(void);
+ static bool ce_start(void);
+@@ -1042,6 +1047,10 @@ glink_poll(struct smem_part_hdr *part, unsigned ms)
+ 	}
+ 	for (int i = 0; i < 64 && g_rx != NULL && rx_one(); i++) {
+ 	}
++	if (q_hello_rx) {
++		sweet_qmi_dev_init();                   /* once; nodes for userland's QMI clients */
++		sweet_qmi_pump(qmi_user_send);
++	}
+ 	txq_pump();
+ 	if (chan_up() && !g_intents_sent) {
+ 		advertise_intents(OUR_INTENTS, OUR_INTENT_SIZE);
+@@ -7519,6 +7528,9 @@ svc_announce(void)
+ static bool
+ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *data, uint32_t len)
+ {
++	if (sweet_qmi_deliver(dst_port, src_node, src_port, data, len)) {
++		return true;                            /* a userland client's port (0x3000..) */
++	}
+ 	if (dst_port == PORT_TFTP) {
+ 		if (len >= 2 && (data[1] == OP_RRQ || data[1] == OP_WRQ)) {
+ 			tftp_request(src_node, src_port, data, len);
+@@ -7549,6 +7561,42 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+ 	return false;
+ }
+ 
++/*
++ * sapphire 0220: a userland client's message (sweet_qmi_pump, modem thread), or, with ctrl,
++ * QRTR DEL_CLIENT for its port after close() (Linux's qrtr_port_remove does the same).
++ */
++static void
++qmi_user_send(uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len, int ctrl)
++{
++	if (ctrl) {
++		struct qrtr_ctrl c = { QRTR_TYPE_DEL_CLIENT, QRTR_NODE_APPS, src_port, 0, 0 };
++		qrtr_send(QRTR_TYPE_DEL_CLIENT, QRTR_PORT_CTRL, q_modem_node, QRTR_PORT_CTRL, &c, sizeof(c));
++		return;
++	}
++	if (node != q_modem_node) {
++		return;                                 /* only the modem's services (the ADSP has its own edge) */
++	}
++	qrtr_send(QRTR_TYPE_DATA, src_port, node, port, data, len);
++}
++
++/* the index-th server of a QMI service the modem announced (inst ~0: any instance) */
++extern "C" int
++topaz_qmi_lookup(uint32_t svc, uint32_t inst, uint32_t index, uint32_t *node, uint32_t *port, uint32_t *found_inst)
++{
++	for (uint32_t i = 0, seen = 0; i < q_srv_count; i++) {
++		if (q_srv[i].svc != svc || (inst != ~0u && q_srv[i].inst != inst)) {
++			continue;
++		}
++		if (seen++ == index) {
++			*node = q_srv[i].node;
++			*port = q_srv[i].port;
++			*found_inst = q_srv[i].inst;
++			return 1;
++		}
++	}
++	return 0;
++}
++
+ static void
+ svc_summary(void)
+ {
+-- 
+2.43.0
+
