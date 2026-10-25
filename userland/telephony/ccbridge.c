@@ -9,14 +9,18 @@
  * first checks the instruction bytes it expects and leaves the function alone if they differ.
  * Log: /var/tmp/ccbridge.log.
  *
- * Step 0: ApplePDPHelperInterface::init() (the cellular data "IP appender" kext, AppleIPAppender,
- *   which we do not have) returns true, so getInstance() is not NULL and the callers get
- *   "service is not open" errors instead of a NULL std::mutex (CommCenter SIGSEGV at start).
+ * The Apple drivers it opens (AppleBaseband: power, reset, GPIO; AppleIPAppender: cellular data)
+ * are answered by a fake IOKit in this library (fake_classes); Apple's AppleBasebandManager takes
+ * its fake-boot path (no firmware download). ApplePDPHelperInterface::init() patched to return
+ * true was the first try: registerHandlerInternal() then asserts (no notification port).
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <sys/mman.h>
+#include <pthread.h>
+#include <mach/thread_act.h>
 #include <libkern/OSCacheControl.h>
 #include <stdlib.h>
 #include <fcntl.h>
@@ -29,12 +33,16 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
 
 #define CACHE_BASE              0x180000000UL
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
 
 static uintptr_t slide;
+static int verbose_bridge = 1;
 static int log_fd = -1;
 
 static void
@@ -104,6 +112,8 @@ pc_relative(uint32_t i)
 static uint32_t *tramp_pool;
 static unsigned tramp_used;
 
+static void *hook_at(const char *name, uint32_t *target, void *replacement);
+
 static void *
 hook(const char *name, void *replacement)
 {
@@ -112,6 +122,19 @@ hook(const char *name, void *replacement)
 		say("hook %s: no such symbol", name);
 		return NULL;
 	}
+	return hook_at(name, target, replacement);
+}
+
+/* a cache function by its unslid address (for images not loaded yet: the whole cache is mapped) */
+static void *
+hook_cache(const char *name, uintptr_t addr, void *replacement)
+{
+	return hook_at(name, (uint32_t *)(addr + slide), replacement);
+}
+
+static void *
+hook_at(const char *name, uint32_t *target, void *replacement)
+{
 	for (int k = 0; k < 4; k++) {
 		if (pc_relative(target[k])) {
 			say("hook %s: instruction %d (%08x) depends on the PC: not hooked", name, k, target[k]);
@@ -158,7 +181,7 @@ hook(const char *name, void *replacement)
  * the calls on it are answered and logged.
  */
 #define FAKE_MAX        32
-static const char *fake_classes[] = { "AppleBaseband", NULL };
+static const char *fake_classes[] = { "AppleBaseband", "AppleIPAppender", "AppleBasebandPCIControl", NULL };
 static struct { mach_port_t port; const char *cls; int kind; } fakes[FAKE_MAX];   /* kind 1 service, 2 connection, 3 iterator */
 static unsigned nfakes;
 
@@ -371,6 +394,55 @@ my_CallAsyncMethod(mach_port_t c, uint32_t sel, mach_port_t wake, uint64_t *ref,
 	return real_CallAsyncMethod(c, sel, wake, ref, refCnt, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
 }
 
+static kern_return_t (*real_CallScalar)(mach_port_t, uint32_t, const uint64_t *, uint32_t, uint64_t *, uint32_t *);
+static kern_return_t (*real_CallStruct)(mach_port_t, uint32_t, const void *, size_t, void *, size_t *);
+static kern_return_t (*real_CallAsyncScalar)(mach_port_t, uint32_t, mach_port_t, uint64_t *, uint32_t, const uint64_t *,
+    uint32_t, uint64_t *, uint32_t *);
+static kern_return_t (*real_CallAsyncStruct)(mach_port_t, uint32_t, mach_port_t, uint64_t *, uint32_t, const void *, size_t,
+    void *, size_t *);
+
+static kern_return_t
+my_CallScalar(mach_port_t c, uint32_t sel, const uint64_t *in, uint32_t inCnt, uint64_t *out, uint32_t *outCnt)
+{
+	const char *cls;
+	if (fake_find(c, &cls) == 2) {
+		return fake_call("IOConnectCallScalarMethod", c, cls, sel, in, inCnt, 0, out, outCnt, NULL, NULL);
+	}
+	return real_CallScalar(c, sel, in, inCnt, out, outCnt);
+}
+
+static kern_return_t
+my_CallStruct(mach_port_t c, uint32_t sel, const void *inS, size_t inSCnt, void *outS, size_t *outSCnt)
+{
+	const char *cls;
+	if (fake_find(c, &cls) == 2) {
+		return fake_call("IOConnectCallStructMethod", c, cls, sel, NULL, 0, inSCnt, NULL, NULL, outS, outSCnt);
+	}
+	return real_CallStruct(c, sel, inS, inSCnt, outS, outSCnt);
+}
+
+static kern_return_t
+my_CallAsyncScalar(mach_port_t c, uint32_t sel, mach_port_t wake, uint64_t *ref, uint32_t refCnt, const uint64_t *in,
+    uint32_t inCnt, uint64_t *out, uint32_t *outCnt)
+{
+	const char *cls;
+	if (fake_find(c, &cls) == 2) {
+		return fake_call("IOConnectCallAsyncScalarMethod", c, cls, sel, in, inCnt, 0, out, outCnt, NULL, NULL);
+	}
+	return real_CallAsyncScalar(c, sel, wake, ref, refCnt, in, inCnt, out, outCnt);
+}
+
+static kern_return_t
+my_CallAsyncStruct(mach_port_t c, uint32_t sel, mach_port_t wake, uint64_t *ref, uint32_t refCnt, const void *inS,
+    size_t inSCnt, void *outS, size_t *outSCnt)
+{
+	const char *cls;
+	if (fake_find(c, &cls) == 2) {
+		return fake_call("IOConnectCallAsyncStructMethod", c, cls, sel, NULL, 0, inSCnt, NULL, NULL, outS, outSCnt);
+	}
+	return real_CallAsyncStruct(c, sel, wake, ref, refCnt, inS, inSCnt, outS, outSCnt);
+}
+
 static CFTypeRef
 my_SearchCFProperty(io_registry_entry_t e, const io_name_t plane, CFStringRef key, CFAllocatorRef a, IOOptionBits o)
 {
@@ -397,6 +469,530 @@ my_AddInterestNotification(IONotificationPortRef port, io_service_t s, const io_
 	return real_AddInterestNotification(port, s, type, cb, ref, n);
 }
 
+/*
+ * Spies on AppleBasebandManager's BootModule (libBasebandManager, exported C++ methods): which
+ * stage runs, with which state. They log and go on to the original.
+ */
+static void *bm_this;
+static void (*real_bm_initialize)(void *, void *);
+static void (*real_bm_start)(void *, void *);
+static void (*real_bm_finish)(void *);
+static void (*real_bm_change)(void *, int);
+static void (*real_bm_boot)(void *);
+
+static void my_bm_initialize(void *t, void *g) { bm_this = t; say("BootModule::initialize(%p)", t); real_bm_initialize(t, g); }
+static void my_bm_start(void *t, void *g) { bm_this = t; say("BootModule::start(%p)", t); real_bm_start(t, g); }
+static void my_bm_finish(void *t) { say("BootModule::finishInitialization_sync(%p)", t); real_bm_finish(t); }
+static void *mav_controller;
+#define MAX_SHIMS 4
+static void *qmi_shims[MAX_SHIMS];
+static unsigned qmi_iface[MAX_SHIMS], nshims;
+static void *pci_shims_seen[4];
+static unsigned npci_seen;
+static int (*real_shim_init)(void *);
+static int (*real_shim_engage)(void *, void *);
+static int my_shim_init(void *t) { int r = real_shim_init(t); if (npci_seen < 4) pci_shims_seen[npci_seen++] = t; say("pci_shim::init(%p) -> %d", t, r); return r; }
+static int (*real_ctl_engage)(void *);
+static void *ipc_controller;
+static void (*real_ipc_change)(void *, int);
+static void my_ipc_change(void *t, int st) { ipc_controller = t; say("RouterIPCController::changeState_sync(%p, %d)", t, st); real_ipc_change(t, st); }
+static void (*real_ipc_ctor)(void *, void *);
+static void (*real_ipc_activate)(void *);
+static void my_ipc_ctor(void *t, void *w) { ipc_controller = t; say("RouterIPCController %p", t); real_ipc_ctor(t, w); }
+static int ipc_activated, bm_booting, engaged_once;
+static void engage_later(void *arg);
+/* engage once both have happened: the IPC controller activated (kDisengaged) and the fake boot began */
+static void
+maybe_engage(void)
+{
+	if (ipc_activated && bm_booting && !__sync_lock_test_and_set(&engaged_once, 1)) {
+		dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2),
+		    dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), NULL, engage_later);
+	}
+}
+static void my_ipc_activate(void *t) { ipc_controller = t; say("RouterIPCController::activate(%p)", t); real_ipc_activate(t); ipc_activated = 1; maybe_engage(); }
+
+static void
+engage_later(void *arg)
+{
+	(void)arg;
+	if (ipc_controller != NULL) {
+		/* RouterIPCController::engage_sync(): what ABM does once the baseband is up (setup, router engage, kEngaged, workers) */
+		int (*engage_sync)(void *) = (int (*)(void *))(0x1b7fa05a0UL + slide);
+		say("RouterIPCController::engage_sync(%p) ourselves", ipc_controller);
+		int r = engage_sync(ipc_controller);
+		say("  engage_sync -> %d", r);
+	} else if (mav_controller != NULL && real_ctl_engage != NULL) {
+		say("engaging mav_router controller %p ourselves", mav_controller);
+		real_ctl_engage(mav_controller);
+		say("  engage returned");
+		/* the controller engages only the first PCI device: the second QMI channel too */
+		for (unsigned i = 0; i < npci_seen; i++) {
+			int done = 0;
+			for (unsigned k = 0; k < nshims; k++) done |= qmi_shims[k] == pci_shims_seen[i];
+			if (!done && real_shim_engage != NULL) {
+				dispatch_group_t g = dispatch_group_create();
+				say("engaging pci_shim %p ourselves", pci_shims_seen[i]);
+				real_shim_engage(pci_shims_seen[i], g);
+			}
+		}
+	}
+}
+
+static void
+my_bm_change(void *t, int st)
+{
+	say("BootModule::changeState_sync(%p, %d)", t, st);
+	real_bm_change(t, st);
+	if (st == 2) {      /* Booting (fake boot): nothing engages the PCI devices, we do, before QMux starts */
+		bm_booting = 1;
+		maybe_engage();
+	}
+}
+static void my_bm_boot(void *t) { say("BootModule::boot_sync(%p)", t); real_bm_boot(t); }
+
+static void *(*real_abm_init)(void *, void *, void *, void *);
+static void *(*real_abm_start)(void *, void *, void *, void *);
+static void *(*real_srv_start)(void *, void *);
+static void *my_abm_init(void *a, void *b, void *c, void *d) { say("AppleBasebandManagerInitServer(%p, %p)", a, b); void *r = real_abm_init(a, b, c, d); say("  InitServer -> %p", r); return r; }
+static void *my_abm_start(void *a, void *b, void *c, void *d) { say("AppleBasebandManagerStartServer(%p, %p)", a, b); void *r = real_abm_start(a, b, c, d); say("  StartServer -> %p", r); return r; }
+static void *my_srv_start(void *t, void *g) { say("ABMServer::start(%p)", t); return real_srv_start(t, g); }
+
+/* every thread's stack (frame pointer walk), into the log: who waits on what */
+static void
+dump_stacks(const char *why)
+{
+	thread_act_array_t th;
+	mach_msg_type_number_t n;
+	if (task_threads(mach_task_self(), &th, &n) != KERN_SUCCESS) {
+		return;
+	}
+	say("--- stacks (%s): %u threads", why, n);
+	for (mach_msg_type_number_t i = 0; i < n; i++) {
+		if (th[i] == mach_thread_self()) {
+			continue;
+		}
+		arm_thread_state64_t st;
+		mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+		if (thread_get_state(th[i], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) != KERN_SUCCESS) {
+			continue;
+		}
+		char line[400];
+		int o = snprintf(line, sizeof(line), "T%u pc %llx lr %llx:", i, st.__pc - slide, st.__lr - slide);
+		uint64_t fp = st.__fp;
+		for (int k = 0; k < 14 && fp && (fp & 7) == 0 && o < (int)sizeof(line) - 20; k++) {
+			uint64_t *f = (uint64_t *)fp;
+			uint64_t ret = f[1];
+			if (ret == 0) break;
+			o += snprintf(line + o, sizeof(line) - (size_t)o, " %llx", ret - slide);
+			if (f[0] <= fp) break;
+			fp = f[0];
+		}
+		say("%s", line);
+	}
+}
+
+static void *
+watchdog(void *arg)
+{
+	(void)arg;
+	sleep(20);
+	dump_stacks("20 s");
+	return NULL;
+}
+
+/*
+ * libPCITransport replaced for the QMI channels: TelephonyBasebandPCITransportCreate fills its
+ * 0x58-byte object (+0x00 Write, +0x08 Read, +0x10 UnblockRead, +0x18 FlushRead, +0x20 SendImage,
+ * +0x28 ReadRegister, +0x30 Free, +0x38 IsValid, +0x50 internal) with ours. mav_router's pci_shim
+ * keeps it at shim+0x38; what the shim transmits is taken in handle_transmit (below), what the
+ * modem answers goes in through pci_shim::handleRead.
+ */
+
+static int tp_ok(void) { return 1; }
+static int tp_no(void) { return 0; }
+
+static int (*real_tp_create)(void *, void *);
+static int
+my_tp_create(void *out, void *params)
+{
+	const uint8_t *p = params;
+	uint32_t iface;
+	memcpy(&iface, p, 4);
+	char hex[0x58 * 3 + 1];
+	for (int i = 0; i < 0x58; i++) snprintf(hex + 3 * i, 4, "%02x ", p[i]);
+	say("TelephonyBasebandPCITransportCreate(%p, interface %u, params: %s)", out, iface, hex);
+	void **o = out;
+	memset(out, 0, 0x58);
+	o[0] = (void *)tp_ok;           /* Write: never reached, handle_transmit is ours */
+	o[1] = (void *)tp_no;           /* Read */
+	o[2] = (void *)tp_ok;           /* UnblockRead */
+	o[3] = (void *)tp_ok;           /* FlushRead */
+	o[4] = (void *)tp_no;           /* SendImage */
+	o[5] = (void *)tp_no;           /* ReadRegister */
+	o[6] = (void *)tp_ok;           /* Free */
+	o[7] = (void *)tp_ok;           /* IsValid */
+	o[10] = (void *)out;            /* internal: anything not NULL */
+	if (nshims < MAX_SHIMS) {
+		qmi_shims[nshims] = (char *)out - 0x38;
+		qmi_iface[nshims] = iface;
+		say("  QMI transport %u: shim %p", nshims, qmi_shims[nshims]);
+		nshims++;
+	}
+	return 1;
+}
+
+/*
+ * The QMUX <-> QRTR bridge. mav_router's PCI control channels carry standard Qualcomm QMUX frames
+ * (I/F type 1, u16 length, control flags, service, client id, then the QMI SDU), as libqmi
+ * speaks to a USB modem. Our modem speaks QMI over QRTR (/dev/redwood-qmiN, kernel 0220):
+ *   - QMI_CTL (service 0) is answered here: SYNC, client ids, version info.
+ *   - every other service gets one QRTR client port (one /dev/redwood-qmi node) shared by all of
+ *     CommCenter's QMUX clients of that service on that channel; requests get a fresh txn,
+ *     answers go back to the client that asked with its own txn, indications to every client.
+ *   - services the modem does not have (Apple's own 0xe1..) answer "not supported".
+ * Frames to CommCenter go in through pci_shim::handleRead (0x1ea5fe404).
+ */
+struct sqhdr { uint32_t node, port; };
+struct sqlookup { uint32_t svc, inst, index, node, port, found_inst; };
+#define SQ_LOOKUP       _IOWR('q', 1, struct sqlookup)
+
+#define BR_SVCS         24
+#define BR_CIDS         16
+struct br_svc {
+	uint8_t svc;
+	int fd;                         /* -1: not on the modem, answered here */
+	uint32_t node, port;
+	uint8_t cids[BR_CIDS];
+	unsigned ncids;
+	struct { uint16_t txn; uint8_t cid; uint8_t used; uint16_t orig; } pend[64];
+	uint16_t next_txn;
+};
+struct br_chan {
+	void *shim;
+	struct br_svc svcs[BR_SVCS];
+	unsigned nsvcs;
+	uint8_t next_cid[256];
+};
+static struct br_chan br_chans[MAX_SHIMS];
+static pthread_mutex_t br_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+static void (*shim_handle_read)(void *, const void *, unsigned);
+static pthread_t br_reader;
+static int br_reader_started;
+
+static void
+hexsay(const char *what, const uint8_t *b, size_t n)
+{
+	char hex[3 * 48 + 1] = "";
+	for (size_t i = 0; i < n && i < 48; i++) snprintf(hex + 3 * i, 4, "%02x ", b[i]);
+	say("%s (%zu): %s", what, n, hex);
+}
+
+/* one QMUX frame to CommCenter */
+static void
+br_to_cc(struct br_chan *c, uint8_t svc, uint8_t cid, const uint8_t *sdu, size_t n)
+{
+	/* handleRead's dispatch_data takes the buffer and frees it (DISPATCH_DATA_DESTRUCTOR_FREE) */
+	uint8_t *f = malloc(n + 6);
+	if (f == NULL) return;
+	f[0] = 0x01;
+	uint16_t l = (uint16_t)(n + 5);
+	memcpy(f + 1, &l, 2);
+	f[3] = 0x80;                    /* from the service */
+	f[4] = svc;
+	f[5] = cid;
+	memcpy(f + 6, sdu, n);
+	if (verbose_bridge) hexsay("  -> cc", f, n + 6);
+	shim_handle_read(c->shim, f, (unsigned)(n + 6));
+}
+
+static struct br_chan *
+br_chan_of(void *shim)
+{
+	for (unsigned i = 0; i < MAX_SHIMS; i++) {
+		if (br_chans[i].shim == shim) return &br_chans[i];
+	}
+	for (unsigned i = 0; i < MAX_SHIMS; i++) {
+		if (br_chans[i].shim == NULL) { br_chans[i].shim = shim; return &br_chans[i]; }
+	}
+	return NULL;
+}
+
+static struct br_svc *
+br_svc_of(struct br_chan *c, uint8_t svc, int create)
+{
+	for (unsigned i = 0; i < c->nsvcs; i++) {
+		if (c->svcs[i].svc == svc) return &c->svcs[i];
+	}
+	if (!create || c->nsvcs >= BR_SVCS) return NULL;
+	struct br_svc *v = &c->svcs[c->nsvcs++];
+	memset(v, 0, sizeof(*v));
+	v->svc = svc;
+	v->fd = -1;
+	v->next_txn = 1;
+	char path[32];
+	for (int i = 0; i < 32; i++) {
+		snprintf(path, sizeof(path), "/dev/redwood-qmi%d", i);
+		int fd = open(path, O_RDWR);
+		if (fd < 0) continue;
+		struct sqlookup lk = { svc, ~0u, 0, 0, 0, 0 };
+		if (ioctl(fd, SQ_LOOKUP, &lk) != 0) {
+			close(fd);
+			say("bridge: service 0x%x is not on the modem (answered here)", svc);
+			break;
+		}
+		v->fd = fd;
+		v->node = lk.node;
+		v->port = lk.port;
+		say("bridge: service 0x%x -> %s (modem %u:%x)", svc, path, lk.node, lk.port);
+		break;
+	}
+	return v;
+}
+
+/* a QMI_CTL answer: flags 1, txn, msg, TLVs (result first) */
+static void
+br_ctl_reply(struct br_chan *c, uint8_t txn, uint16_t msg, const uint8_t *tlvs, size_t tn, uint16_t err)
+{
+	uint8_t sdu[512];
+	sdu[0] = 0x01;
+	sdu[1] = txn;
+	memcpy(sdu + 2, &msg, 2);
+	uint8_t res[7] = { 0x02, 4, 0, (uint8_t)(err ? 1 : 0), 0, (uint8_t)err, (uint8_t)(err >> 8) };
+	uint16_t len = (uint16_t)(7 + tn);
+	memcpy(sdu + 4, &len, 2);
+	memcpy(sdu + 6, res, 7);
+	if (tn) memcpy(sdu + 13, tlvs, tn);
+	br_to_cc(c, 0, 0, sdu, 13 + tn);
+}
+
+static void
+br_ctl(struct br_chan *c, const uint8_t *sdu, size_t n)
+{
+	if (n < 6) return;
+	uint8_t txn = sdu[1];
+	uint16_t msg, len;
+	memcpy(&msg, sdu + 2, 2);
+	memcpy(&len, sdu + 4, 2);
+	const uint8_t *t = sdu + 6;
+	switch (msg) {
+	case 0x0022: {                  /* GET_CLIENT_ID: TLV 1 service */
+		uint8_t svc = (len >= 4 && t[0] == 0x01) ? t[3] : 0;
+		struct br_svc *v = br_svc_of(c, svc, 1);
+		uint8_t cid = ++c->next_cid[svc];
+		if (cid == 0 || cid == 0xff) cid = c->next_cid[svc] = 1;
+		if (v && v->ncids < BR_CIDS) v->cids[v->ncids++] = cid;
+		uint8_t r[5] = { 0x01, 2, 0, svc, cid };
+		say("bridge: CTL client id for service 0x%x: %u", svc, cid);
+		br_ctl_reply(c, txn, msg, r, 5, 0);
+		break;
+	}
+	case 0x0023: {                  /* RELEASE_CLIENT_ID: TLV 1 {service, cid} */
+		uint8_t svc = len >= 5 ? t[3] : 0, cid = len >= 5 ? t[4] : 0;
+		struct br_svc *v = br_svc_of(c, svc, 0);
+		for (unsigned i = 0; v && i < v->ncids; i++) {
+			if (v->cids[i] == cid) { v->cids[i] = v->cids[--v->ncids]; break; }
+		}
+		uint8_t r[5] = { 0x01, 2, 0, svc, cid };
+		br_ctl_reply(c, txn, msg, r, 5, 0);
+		break;
+	}
+	case 0x0021: {                  /* GET_VERSION_INFO: TLV 1 {count, {svc, major u16, minor u16}...} */
+		static const uint8_t svcs[] = { 0, 1, 2, 3, 4, 5, 6, 9, 0x0a, 0x0b, 0x0c, 0x10, 0x1a, 0x24, 0x2f, 0xe1, 0xe2, 0xe4, 0xe8 };
+		uint8_t r[3 + 1 + sizeof(svcs) * 5];
+		uint16_t l = (uint16_t)(1 + sizeof(svcs) * 5);
+		r[0] = 0x01;
+		memcpy(r + 1, &l, 2);
+		r[3] = sizeof(svcs);
+		for (unsigned i = 0; i < sizeof(svcs); i++) {
+			uint8_t *e = r + 4 + i * 5;
+			e[0] = svcs[i]; e[1] = 1; e[2] = 0; e[3] = 50; e[4] = 0;
+		}
+		br_ctl_reply(c, txn, msg, r, sizeof(r), 0);
+		break;
+	}
+	default:                        /* SYNC (0x27), SET_INSTANCE_ID (0x20), data format...: fine */
+		say("bridge: CTL msg 0x%04x answered ok", msg);
+		br_ctl_reply(c, txn, msg, NULL, 0, 0);
+		break;
+	}
+}
+
+static void *br_reader_main(void *arg);
+
+static void
+br_from_cc(struct br_chan *c, const uint8_t *f, size_t n)
+{
+	if (n < 6 || f[0] != 0x01) {
+		hexsay("bridge: not a QMUX frame", f, n);
+		return;
+	}
+	uint8_t svc = f[4], cid = f[5];
+	const uint8_t *sdu = f + 6;
+	size_t sn = n - 6;
+	if (svc == 0) {
+		br_ctl(c, sdu, sn);
+		return;
+	}
+	if (sn < 7) return;
+	struct br_svc *v = br_svc_of(c, svc, 1);
+	if (v == NULL) return;
+	uint16_t txn, msg;
+	memcpy(&txn, sdu + 1, 2);
+	memcpy(&msg, sdu + 3, 2);
+	if (v->fd < 0) {
+		/* not on the modem: QMI_ERR_NOT_SUPPORTED (0x5e) */
+		uint8_t r[14] = { 0x02, 0, 0, 0, 0, 7, 0, 0x02, 4, 0, 1, 0, 0x5e, 0 };
+		memcpy(r + 1, &txn, 2);
+		memcpy(r + 3, &msg, 2);
+		br_to_cc(c, svc, cid, r, sizeof(r));
+		return;
+	}
+	unsigned slot = v->next_txn % 64;
+	uint16_t nt = v->next_txn++;
+	if (v->next_txn == 0) v->next_txn = 1;
+	v->pend[slot].txn = nt;
+	v->pend[slot].cid = cid;
+	v->pend[slot].orig = txn;
+	v->pend[slot].used = 1;
+	uint8_t buf[sizeof(struct sqhdr) + 0x4000];
+	struct sqhdr h = { v->node, v->port };
+	memcpy(buf, &h, sizeof(h));
+	memcpy(buf + sizeof(h), sdu, sn);
+	memcpy(buf + sizeof(h) + 1, &nt, 2);
+	if (write(v->fd, buf, sizeof(h) + sn) < 0) {
+		say("bridge: write to service 0x%x: %s", svc, strerror(errno));
+	}
+	if (!br_reader_started) {
+		br_reader_started = 1;
+		pthread_create(&br_reader, NULL, br_reader_main, NULL);
+	}
+}
+
+/* everything the modem says, back into CommCenter as QMUX */
+static void *
+br_reader_main(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		fd_set fds;
+		FD_ZERO(&fds);
+		int maxfd = -1;
+		pthread_mutex_lock(&br_lock);
+		for (unsigned i = 0; i < MAX_SHIMS; i++) {
+			for (unsigned k = 0; k < br_chans[i].nsvcs; k++) {
+				int fd = br_chans[i].svcs[k].fd;
+				if (fd >= 0) { FD_SET(fd, &fds); if (fd > maxfd) maxfd = fd; }
+			}
+		}
+		pthread_mutex_unlock(&br_lock);
+		struct timeval tv = { 0, 200000 };
+		if (select(maxfd + 1, &fds, NULL, NULL, &tv) <= 0) continue;
+		pthread_mutex_lock(&br_lock);
+		for (unsigned i = 0; i < MAX_SHIMS; i++) {
+			struct br_chan *c = &br_chans[i];
+			for (unsigned k = 0; k < c->nsvcs; k++) {
+				struct br_svc *v = &c->svcs[k];
+				if (v->fd < 0 || !FD_ISSET(v->fd, &fds)) continue;
+				uint8_t buf[sizeof(struct sqhdr) + 0x4000];
+				ssize_t r = read(v->fd, buf, sizeof(buf));
+				if (r < (ssize_t)sizeof(struct sqhdr) + 7) continue;
+				uint8_t *sdu = buf + sizeof(struct sqhdr);
+				size_t sn = (size_t)r - sizeof(struct sqhdr);
+				uint16_t txn;
+				memcpy(&txn, sdu + 1, 2);
+				if (sdu[0] == 0x04) {           /* indication: every client of the service */
+					for (unsigned m = 0; m < v->ncids; m++) br_to_cc(c, v->svc, v->cids[m], sdu, sn);
+					continue;
+				}
+				unsigned slot = txn % 64;
+				if (v->pend[slot].used && v->pend[slot].txn == txn) {
+					v->pend[slot].used = 0;
+					memcpy(sdu + 1, &v->pend[slot].orig, 2);
+					br_to_cc(c, v->svc, v->pend[slot].cid, sdu, sn);
+				} else {
+					say("bridge: service 0x%x answer with unknown txn %u dropped", v->svc, txn);
+				}
+			}
+		}
+		pthread_mutex_unlock(&br_lock);
+	}
+	return NULL;
+}
+
+/* mav_router's PCI shim transmit: the QMUX frames CommCenter sends towards the baseband */
+static int (*real_shim_tx)(void *, void *);
+static int
+my_shim_tx(void *shim, void *msg)
+{
+	const void *buf = NULL;
+	size_t len = 0;
+	dispatch_data_t map = dispatch_data_create_map((dispatch_data_t)msg, &buf, &len);
+	if (verbose_bridge) hexsay("cc ->", buf, len);
+	pthread_mutex_lock(&br_lock);
+	struct br_chan *c = br_chan_of(shim);
+	/* a mav_router message may carry several frames back to back */
+	const uint8_t *p = buf;
+	size_t off = 0;
+	while (c && off + 3 <= len) {
+		uint16_t l;
+		memcpy(&l, p + off + 1, 2);
+		size_t fl = (size_t)l + 1;
+		if (p[off] != 0x01 || off + fl > len) { hexsay("bridge: bad frame", p + off, len - off); break; }
+		br_from_cc(c, p + off, fl);
+		off += fl;
+	}
+	pthread_mutex_unlock(&br_lock);
+	if (map) dispatch_release(map);
+	return 0;                       /* MAV_ROUTER_SUCCESS */
+}
+
+static int (*real_ctl_engage_blk)(void *, void *);
+static void (*real_shim_error)(void *, int);
+static void (*real_ctl_ctor)(void *, void *);
+static void my_ctl_ctor(void *t, void *w) { mav_controller = t; say("mav_router controller %p", t); real_ctl_ctor(t, w); }
+static int my_shim_engage(void *t, void *g) { say("pci_shim::engage(%p)", t); int r = real_shim_engage(t, g); say("  pci_shim::engage -> %d", r); return r; }
+static int my_ctl_engage_blk(void *t, void *b) { say("controller::engage(%p, block)", t); int r = real_ctl_engage_blk(t, b); say("  controller::engage(block) -> %d", r); return r; }
+static int my_ctl_engage(void *t) { say("controller::engage(%p)", t); int r = real_ctl_engage(t); say("  controller::engage -> %d", r); return r; }
+static void my_shim_error(void *t, int e) { say("pci_shim::handleError(%p, %d)", t, e); real_shim_error(t, e); }
+
+static void (*real_atcs_assert)(const char *, unsigned, const char *, const char *, const char *, unsigned long, unsigned long);
+static void
+my_atcs_assert(const char *a, unsigned line, const char *b, const char *c, const char *d, unsigned long e, unsigned long f)
+{
+	say("ATCS assertion: '%s' line %u '%s' '%s' '%s' %#lx %#lx", a ? a : "", line, b ? b : "", c ? c : "", d ? d : "", e, f);
+	dump_stacks("ATCS assertion");
+	real_atcs_assert(a, line, b, c, d, e, f);
+}
+
+static void
+bm_spies_install(void)
+{
+	real_atcs_assert = (void *)hook_cache("_ATCSException::triggerAssertion(..., mm)", 0x19ed00350UL, (void *)my_atcs_assert);
+	real_ctl_ctor = hook_cache("mav_router::device::controller::controller", 0x1ea5ff8d4UL, (void *)my_ctl_ctor);
+	real_ipc_change = hook_cache("RouterIPCController::changeState_sync", 0x1b7f9f770UL, (void *)my_ipc_change);
+	real_ipc_ctor = hook_cache("RouterIPCController::RouterIPCController", 0x1b7f9eed8UL, (void *)my_ipc_ctor);
+	real_ipc_activate = hook_cache("RouterIPCController::activate", 0x1b7f9f5e0UL, (void *)my_ipc_activate);
+	real_shim_init = hook_cache("pci_shim::init", 0x1ea604318UL, (void *)my_shim_init);
+	real_shim_engage = hook_cache("pci_shim::engage", 0x1ea60445cUL, (void *)my_shim_engage);
+	real_ctl_engage_blk = hook_cache("controller::engage(block)", 0x1ea5ffbf0UL, (void *)my_ctl_engage_blk);
+	real_ctl_engage = hook_cache("controller::engage", 0x1ea5ffffcUL, (void *)my_ctl_engage);
+	real_shim_error = hook_cache("pci_shim::handleError", 0x1ea604c04UL, (void *)my_shim_error);
+	shim_handle_read = (void (*)(void *, const void *, unsigned))(0x1ea5fe404UL + slide);
+	real_shim_tx = hook_cache("pci_shim::handle_transmit", 0x1ea5fe5a4UL, (void *)my_shim_tx);
+	real_tp_create = hook_cache("TelephonyBasebandPCITransportCreate", 0x1e9f6df80UL, (void *)my_tp_create);
+	pthread_t wt;
+	pthread_create(&wt, NULL, watchdog, NULL);
+	real_abm_init = hook_cache("AppleBasebandManagerInitServer", 0x1b80500e4UL, (void *)my_abm_init);
+	real_abm_start = hook_cache("AppleBasebandManagerStartServer", 0x1b80504c8UL, (void *)my_abm_start);
+	real_srv_start = hook_cache("ABMServer::start", 0x1b7eef454UL, (void *)my_srv_start);
+	real_bm_initialize = hook_cache("BootModule::initialize", 0x1b7f45480UL, (void *)my_bm_initialize);
+	real_bm_start = hook_cache("BootModule::start", 0x1b7f47e04UL, (void *)my_bm_start);
+	real_bm_finish = hook_cache("BootModule::finishInitialization_sync", 0x1b7f47f6cUL, (void *)my_bm_finish);
+	real_bm_change = hook_cache("BootModule::changeState_sync", 0x1b7f40150UL, (void *)my_bm_change);
+	real_bm_boot = hook_cache("BootModule::boot_sync", 0x1b7f4ba2cUL, (void *)my_bm_boot);
+}
+
 static void
 fake_iokit_install(void)
 {
@@ -408,9 +1004,14 @@ fake_iokit_install(void)
 	real_ServiceClose = hook("IOServiceClose", (void *)my_ServiceClose);
 	real_CallMethod = hook("IOConnectCallMethod", (void *)my_CallMethod);
 	real_CallAsyncMethod = hook("IOConnectCallAsyncMethod", (void *)my_CallAsyncMethod);
+	real_CallScalar = hook("IOConnectCallScalarMethod", (void *)my_CallScalar);
+	real_CallStruct = hook("IOConnectCallStructMethod", (void *)my_CallStruct);
+	real_CallAsyncScalar = hook("IOConnectCallAsyncScalarMethod", (void *)my_CallAsyncScalar);
+	real_CallAsyncStruct = hook("IOConnectCallAsyncStructMethod", (void *)my_CallAsyncStruct);
 	real_SearchCFProperty = hook("IORegistryEntrySearchCFProperty", (void *)my_SearchCFProperty);
 	real_AddInterestNotification = hook("IOServiceAddInterestNotification", (void *)my_AddInterestNotification);
 	say("fake IOKit: %s", real_CallMethod && real_GetMatchingService && real_IteratorNext ? "on" : "INCOMPLETE");
+	bm_spies_install();
 }
 
 #define A64_MOV_W0_1    0x52800020u     /* mov w0, #1 */
@@ -426,11 +1027,12 @@ ccbridge_init(void)
 		return;
 	}
 	slide = (uintptr_t)cache - CACHE_BASE;
+	/* installed as /usr/appleinternal/lib/liblinkguard.dylib, which other daemons weak-link too */
+	if (strcmp(getprogname(), "CommCenter") != 0) {
+		return;
+	}
 	say("ccbridge in %s, cache slide %#lx", getprogname(), slide);
 
-	/* ApplePDPHelperInterface::init(): return true without AppleIPAppender */
-	static const uint32_t pdp_init[] = { A64_MOV_W0_1, A64_RET };
-	patch_code("ApplePDPHelperInterface::init", 0x1f2efe170UL, 0xa90157f6d10103ffULL, pdp_init, 2);
 
 	/*
 	 * Step 2: capabilities::bb::abm::shouldBoot() -> false. AppleBasebandManager then takes its
