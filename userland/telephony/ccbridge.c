@@ -834,8 +834,8 @@ static void *br_reader_main(void *arg);
  * NAS: CommCenter asks its registration through Apple's own NAS messages (0x556a, 0x555b, not
  * on this modem) and otherwise waits for indications, which the modem sends only on a change:
  * a modem that registered before CommCenter started never tells it. The bridge asks GET SERVING
- * SYSTEM (0x24) and GET SYS INFO (0x4d) itself and hands the answers in as the 0x24 and 0x4e
- * indications; now (after an indication register) and every 20 s.
+ * SYSTEM (0x24) itself and hands the answer in as the 0x24 indication; now (after an indication
+ * register) and every 20 s.
  */
 static void
 br_nas_query(struct br_chan *c, uint16_t msg, uint16_t as_ind)
@@ -872,7 +872,7 @@ br_nas_poll(void *arg)
 	for (unsigned i = 0; i < MAX_SHIMS; i++) {
 		if (br_chans[i].shim == NULL) continue;
 		br_nas_query(&br_chans[i], 0x0024, 0x0024);
-		br_nas_query(&br_chans[i], 0x004d, 0x004e);
+		/* not 0x4d -> 0x4e: this firmware's SYS INFO TLV sizes make Apple's parser throw tlv::TlvParseException */
 	}
 	pthread_mutex_unlock(&br_lock);
 }
