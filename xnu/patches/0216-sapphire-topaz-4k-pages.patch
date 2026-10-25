@@ -1,0 +1,358 @@
+From 6706fe4670456f302b70a49554699b4910a19b92 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 01:29:27 +0300
+Subject: [PATCH 1/4] topaz-0140: TOPAZ_4K=1 builds SWEET with 4 KiB pages
+ (silver A53 cluster has no 16 KiB granule): compact kernel VA, iOS user VA
+ limit, 16 KiB-signed shared cache accepted, no early splash console
+
+---
+ bsd/kern/ubc_subr.c               | 15 ++++++++++++++-
+ iokit/Kernel/arm/SweetSurface.cpp | 29 +++++++++++++++++++++--------
+ makedefs/MakeInc.def              | 12 +++++++++++-
+ osfmk/arm/pmap/pmap.c             |  4 ++++
+ osfmk/arm/pmap/pmap.h             |  6 ++++++
+ osfmk/arm64/arm_vm_init.c         |  6 +++---
+ osfmk/arm64/start.s               |  6 +++++-
+ osfmk/arm64/sweet_early.c         |  9 ++++++++-
+ osfmk/kern/zalloc.c               |  3 ++-
+ osfmk/mach/arm/vm_param.h         |  2 +-
+ osfmk/vm/vm_compressor.c          |  3 ++-
+ osfmk/vm/vm_shared_region.c       |  5 +++++
+ pexpert/pexpert/arm64/SWEET.h     |  2 ++
+ 13 files changed, 84 insertions(+), 18 deletions(-)
+
+diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+index 9b553be..4f4c77d 100644
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -371,7 +371,12 @@ cs_validate_codedirectory(const CS_CodeDirectory *cd, size_t length)
+ 	if (ntohl(cd->magic) != CSMAGIC_CODEDIRECTORY) {
+ 		return EBADEXEC;
+ 	}
+-	if ((cd->pageSize != PAGE_SHIFT_4K) && (cd->pageSize != PAGE_SHIFT)) {
++	if ((cd->pageSize != PAGE_SHIFT_4K) && (cd->pageSize != PAGE_SHIFT)
++#if defined(TOPAZ_4K)
++	    /* the iOS 16 shared cache is signed in 16 KiB units */
++	    && (cd->pageSize != 14)
++#endif
++	    ) {
+ 		printf("disallowing unsupported code signature page shift: %u\n", cd->pageSize);
+ 		return EBADEXEC;
+ 	}
+@@ -5920,6 +5925,14 @@ cs_validate_page(
+ 	*tainted_p = VMP_CS_ALL_FALSE;
+ 	*nx_p = VMP_CS_ALL_FALSE;
+ 
++#if defined(TOPAZ_4K)
++	/*
++	 * 16 KiB hash units (shared cache) cannot be checked against one 4 KiB
++	 * VM page; code signing is not enforced on this port (as on a5xelte).
++	 */
++	return;
++#endif
++
+ 	for (offset_in_page = 0;
+ 	    offset_in_page < PAGE_SIZE;
+ 	    /* offset_in_page updated based on bytes processed */) {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 390ea48..0bf1777 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -75,6 +75,19 @@ enum {
+ #define SWEET_SURFACE_RESULT_SIZE       0xa68
+ #define SWEET_SURFACE_MAX_ID            4096
+ #define SWEET_SURFACE_MAX_DIM           16384
++
++/*
++ * The page size user tasks see. A 4 KiB-page kernel (TOPAZ_4K) still gives
++ * 64-bit tasks 16 KiB VM pages: surface memory, the state page and wrapped
++ * client ranges are 16 KiB aligned and sized, or a task's mapping of one
++ * shows neighbouring memory (garbage in text textures).
++ */
++#if defined(TOPAZ_4K)
++#define SWEET_UPAGE                     16384ULL
++#else
++#define SWEET_UPAGE                     ((uint64_t)PAGE_SIZE)
++#endif
++#define sweet_round_upage(x)            (((uint64_t)(x) + SWEET_UPAGE - 1) & ~(SWEET_UPAGE - 1))
+ #define SWEET_SURFACE_MAX_ALLOC         (256u << 20)
+ #define SWEET_SURFACE_MAX_PROPS         (64u << 10)
+ #define SWEET_SURFACE_ROW_ALIGN         64
+@@ -310,12 +323,12 @@ sweet_surface_alloc(void)
+ 		return NULL;
+ 	}
+ 	s->state = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-	    kIODirectionInOut | kIOMemoryKernelUserShared, page_size, page_size);
++	    kIODirectionInOut | kIOMemoryKernelUserShared, SWEET_UPAGE, SWEET_UPAGE);
+ 	if (s->state == NULL) {
+ 		s->release();
+ 		return NULL;
+ 	}
+-	bzero(s->state->getBytesNoCopy(), page_size);
++	bzero(s->state->getBytesNoCopy(), SWEET_UPAGE);
+ 	return s;
+ }
+ 
+@@ -343,7 +356,7 @@ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+ 	s->bytesPerElement = 4;
+ 	s->elementWidth = s->elementHeight = 1;
+ 	s->pixelFormat = pixelFormat;
+-	s->allocSize = (uint32_t)round_page(bytesPerRow * height);
++	s->allocSize = (uint32_t)sweet_round_upage(bytesPerRow * height);
+ 	s->memory = IOMemoryDescriptor::withPhysicalAddress(phys, s->allocSize, kIODirectionInOut);
+ 	s->mapCache = kIOMapWriteCombineCache;
+ 	if (s->memory == NULL || !sweet_surface_publish(s)) {
+@@ -435,7 +448,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 			p->offset = sweet_dict_u32(pd, "IOSurfacePlaneOffset", (uint32_t)next);
+ 			p->size = sweet_dict_u32(pd, "IOSurfacePlaneSize",
+ 			    p->bytesPerRow * sweet_div_up(p->height, p->elementHeight));
+-			next = round_page((uint64_t)p->offset + p->size);
++			next = sweet_round_upage((uint64_t)p->offset + p->size);
+ 			if ((uint64_t)p->offset + p->size > end) {
+ 				end = (uint64_t)p->offset + p->size;
+ 			}
+@@ -447,7 +460,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	if (alloc < end) {
+ 		alloc = end;
+ 	}
+-	alloc = round_page(alloc);
++	alloc = sweet_round_upage(alloc);
+ 	if (alloc == 0 || alloc > SWEET_SURFACE_MAX_ALLOC) {
+ 		return kIOReturnNoMemory;
+ 	}
+@@ -889,7 +902,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			 */
+ 			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+ 			    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPageable | kIOMemoryPurgeable,
+-			    s->allocSize, page_size);
++			    s->allocSize, SWEET_UPAGE);
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+@@ -932,8 +945,8 @@ sweet_surface_use_task_memory(SweetSurface *s, task_t task, uint64_t address, ui
+ 	if (address == 0 || size == 0 || size > SWEET_SURFACE_MAX_ALLOC) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	uint64_t first = trunc_page_64(address);
+-	uint64_t length = round_page_64(address + size) - first;
++	uint64_t first = address & ~(SWEET_UPAGE - 1);
++	uint64_t length = sweet_round_upage(address + size) - first;
+ 	IOMemoryDescriptor *md = NULL;
+ 	IOReturn held = kIOReturnNoMemory;
+ 	/* writable if it can be; a picture that is only shown may be read-only memory */
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 7a7cf4d..943a1a5 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -63,7 +63,7 @@ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+ # topaz: Cortex-A53/A73 are ARMv8.0 (no LSE atomics, RCpc, PAN or FP16). An explicit
+ # -mcpu: -arch arm64 otherwise keeps clang's apple-m1 default and its LSE/RCpc features
+-MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -mcpu=cortex-a53
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -mcpu=cortex-a53 $(if $(filter 1,$(TOPAZ_4K)),-DTOPAZ_4K=1)
+ 
+ 
+ #
+@@ -339,6 +339,16 @@ ARM64_PLKSEG_ADDR  =0xfffffe0004004000
+ ARM64_LINK_ADDR    =0xfffffe0007004000
+ endif
+ 
++# topaz: TOPAZ_4K=1 in the environment builds SWEET with 4 KiB pages (the
++# Cortex-A53 silver cluster has no 16 KiB granule). TTBR1 then spans 39 bits:
++# the ARM_LARGE_MEMORY link address at -2 TiB is outside it, so use the
++# compact iOS kernel VA layout.
++ifeq ($(CURRENT_MACHINE_CONFIG)$(TOPAZ_4K),SWEET1)
++LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY
++ARM64_PLKSEG_ADDR  =0xfffffff004004000
++ARM64_LINK_ADDR    =0xfffffff007004000
++endif
++
+ 
+ CFLAGS_ARM64	= -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=$(ARM64_LINK_ADDR) \
+ 			$(LARGE_MEMORY_DEFINE) -momit-leaf-frame-pointer -fno-strict-aliasing -D__API__=v4 -mkernel
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 00568d3..c240258 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -10892,6 +10892,10 @@ pmap_create_commpages(vm_map_address_t *kernel_data_addr, vm_map_address_t *kern
+ 
+ 	do {
+ 		int text_leaf_index = random() % num_ptes;
++#if defined(TOPAZ_4K)
++		/* 4 KiB leaves under 16 KiB VM pages: the page must start on a VM page (write_pte_fast panics otherwise) */
++		text_leaf_index &= ~(PAGE_RATIO - 1);
++#endif
+ 
+ 		// Generate a VA for the commpage text with the same root and twig index as data
+ 		// comm page, but with new leaf index we've just generated.
+diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
+index 75f3db0..a2cd571 100644
+--- a/osfmk/arm/pmap/pmap.h
++++ b/osfmk/arm/pmap/pmap.h
+@@ -111,6 +111,12 @@
+  * Upper limit on how many pages can be consumed by bootstrap page tables
+  */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 34)
++#elif defined(TOPAZ_4K)
++/*
++ * topaz, 4 KiB pages: one L2 table maps 1 GB, so 4 GB of DRAM needs up to
++ * 5 L2 tables for V=P and 5 for the KVA (unaligned start), plus 2 L1.
++ */
++#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 16)
+ #else /* defined(ARM_LARGE_MEMORY) */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 8)
+ #endif /* defined(ARM_LARGE_MEMORY) */
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 06bb568..34537cf 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1825,7 +1825,7 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+ #define ARM64_PHYSMAP_ALIGNMENT_PADDING (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE)
+ #endif
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && !defined(TOPAZ_4K)
+ /*
+  * The reserved low-globals/kernel region is excluded from VM allocation.
+  * Use the otherwise empty 32MB block above low globals and below gVirtBase
+@@ -2179,7 +2179,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 
+ 	arm_set_user_tbi();
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && !defined(TOPAZ_4K)
+ 	/* phystokv() must still refer to the bootstrap aperture here. */
+ 	sweet_early_map_final();
+ #endif
+@@ -2188,7 +2188,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 
+ 	ml_enable_monitor();
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && !defined(TOPAZ_4K)
+ 	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
+ 	sweet_early_relocate(SWEET_EARLY_FB_VA);
+ #endif
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f..0ab2cad 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -515,7 +515,11 @@ LEXT(start_first_cpu)
+ 
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
++#if defined(TOPAZ_4K)
++	MOV64	x0, (0x5c000000 + 2368 * 4320)	/* topaz splash framebuffer */
++#else
+ 	MOV64	x0, (0x9c000000 + 2368 * 4320)
++#endif
+ 	mov		w1, #-1
+ 	mov		x2, #32
+ 	mov		x4, #4320
+@@ -678,7 +682,7 @@ Lkernelcache_base_found:
+ 	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
+ 	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && !defined(TOPAZ_4K)
+ 	/*
+ 	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+ 	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 6928957..2adaa7f 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -7,7 +7,14 @@
+  */
+ #include <arm64/sweet_early.h>
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && defined(TOPAZ_4K)
++/* 4 KiB pages: start.s does not map the splash framebuffer (16K block layout) */
++void sweet_early_putc(char c) { (void)c; }
++void sweet_early_mark(unsigned int stage, const char *label) { (void)stage; (void)label; }
++void sweet_early_panic(const char *fmt, va_list *args) { (void)fmt; (void)args; }
++void sweet_early_relocate(uint64_t base) { (void)base; }
++void sweet_early_disable(void) {}
++#elif defined(SWEET)
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index 182b44a..398a89c 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -160,7 +160,8 @@ ZONE_DEFINE_TYPE(percpu_u64_zone, "percpu.64", uint64_t,
+ #define ZONE_GUARD_SPARSE       (64  * 1024)
+ #endif /* ZSECURITY_CONFIG(SAD_FENG_SHUI) */
+ 
+-#if XNU_PLATFORM_MacOSX
++/* TOPAZ_4K: compact 4 KiB kernel VA layout (no ARM_LARGE_MEMORY) on a MacOSX build */
++#if XNU_PLATFORM_MacOSX && !defined(TOPAZ_4K)
+ #define ZONE_MAP_MAX            (32ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (128ULL << 30)
+ #else /* XNU_PLATFORM_MacOSX */
+diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
+index c013288..4567298 100644
+--- a/osfmk/mach/arm/vm_param.h
++++ b/osfmk/mach/arm/vm_param.h
+@@ -133,7 +133,7 @@ extern int PAGE_SHIFT_CONST;
+ 
+ /* system-wide values */
+ #define MACH_VM_MIN_ADDRESS_RAW 0x0ULL
+-#if defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)
++#if (defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)) && !defined(TOPAZ_4K)
+ #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
+ #else
+ #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
+diff --git a/osfmk/vm/vm_compressor.c b/osfmk/vm/vm_compressor.c
+index 1e7ca07..9d82d7d 100644
+--- a/osfmk/vm/vm_compressor.c
++++ b/osfmk/vm/vm_compressor.c
+@@ -811,7 +811,8 @@ vm_compressor_set_size(void)
+ 	compressor_pool_max_size = C_SEG_MAX_LIMIT;
+ 	compressor_pool_max_size *= c_seg_bufsize;
+ 
+-#if XNU_TARGET_OS_OSX
++/* TOPAZ_4K: the compact kernel VA layout has no room for macOS's 16x pool */
++#if XNU_TARGET_OS_OSX && !defined(TOPAZ_4K)
+ 
+ 	if (vm_compression_limit == 0) {
+ 		if (max_mem <= (4ULL * 1024ULL * 1024ULL * 1024ULL)) {
+diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
+index db1d613..c562417 100644
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -810,10 +810,15 @@ vm_shared_region_create(
+ 		goto done;
+ 	}
+ 
++#if defined(TOPAZ_4K)
++	/* the 16 KiB-signed iOS shared cache runs on 4 KiB VM pages */
++	vm_map_cs_enforcement_set(sub_map, false);
++#else
+ 	/* shared regions should always enforce code-signing */
+ 	vm_map_cs_enforcement_set(sub_map, true);
+ 	assert(vm_map_cs_enforcement(sub_map));
+ 	assert(pmap_get_vm_map_cs_enforced(vm_map_pmap(sub_map)));
++#endif
+ 
+ 	assert(!sub_map->disable_vmentry_reuse);
+ 	sub_map->is_nested_map = TRUE;
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index 424e1c0..ef561e5 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -35,7 +35,9 @@
+ #define __ARM_ENABLE_SWAP__       1
+ #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+ /* topaz: Cortex-A53/A73 have no PAN (ARMv8.1); MSR PAN is undefined there */
++#if !defined(TOPAZ_4K)
+ #define __ARM_16K_PG__            1
++#endif
+ 
+ #define HAS_GIC_V3                1
+ 
+-- 
+2.43.0
+

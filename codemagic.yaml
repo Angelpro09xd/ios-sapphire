@@ -4,7 +4,7 @@
 # Start it from the Codemagic UI (workflow "xnu", branch sapphire); the
 # kernel is in the build's artifacts as xnu-kernel.zip.
 workflows:
-  xnu:
+  xnu: &xnu
     name: xnu
     instance_type: mac_mini_m2
     max_build_duration: 120
@@ -12,7 +12,7 @@ workflows:
       # oldest Xcode Codemagic offers; patch 0128 adds IORPC.kernelContent,
       # which Xcode 16+ iig stubs need (Xcode 15 is no longer offered)
       xcode: 16.0
-      vars:
+      vars: &xnu_vars
         DXB_REPO: https://github.com/blacktop/darwin-xnu-build
         DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
         MACOS_VERSION: "13.5"
@@ -53,10 +53,13 @@ workflows:
           xcrun --find iig
           wrap="$CM_BUILD_DIR/ccache-bin"
           mkdir -p "$wrap"
-          # ccache when the image has it, plain clang otherwise
+          # ccache when the image has it, plain clang otherwise. Never for
+          # assembly (.s): it includes the generated assym.s, which ccache does
+          # not hash, so a cached object keeps stale structure offsets (a
+          # TOPAZ_4K build moves machine.CpuDatap; upstream topaz build-local.sh)
           cc=$(command -v ccache || true)
           for t in clang clang++; do
-            printf '#!/bin/sh\nexec %s %s "$@"\n' "$cc" "$(xcrun -find $t)" > "$wrap/$t"
+            printf '#!/bin/sh\nfor a; do case "$a" in *.s) exec %s "$@";; esac; done\nexec %s %s "$@"\n' "$(xcrun -find $t)" "$cc" "$(xcrun -find $t)" > "$wrap/$t"
             chmod +x "$wrap/$t"
           done
           cat "$wrap/clang"
@@ -74,6 +77,19 @@ workflows:
           cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
           ls -la out
-          (cd out && zip -qr ../xnu-kernel.zip .)
+          (cd out && zip -qr ../xnu-kernel${ZIP_SUFFIX:-}.zip .)
     artifacts:
-      - xnu-kernel.zip
+      - xnu-kernel*.zip
+  # The same kernel with 4 KiB pages (TOPAZ_4K=1, patches 0216-0219): the
+  # silver A53 cluster has no 16K granule, so only this one can run all eight
+  # cores (boot image with tools/sapphire-boot.sh --amp). Artifact
+  # xnu-kernel-4k.zip.
+  xnu-4k:
+    <<: *xnu
+    name: xnu-4k
+    environment:
+      xcode: 16.0
+      vars:
+        <<: *xnu_vars
+        TOPAZ_4K: "1"
+        ZIP_SUFFIX: "-4k"

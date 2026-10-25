@@ -172,21 +172,25 @@ static uintptr_t find_gicr(void);
 /*
  * topaz: xnu needs the 16K translation granule. ABL starts us on a Kryo 260
  * Silver core (Cortex-A53 class, TGran16 = 0); the Gold A73 cluster has it.
- * The boot core wakes gold CPU 0x100 with this DTB and parks itself; gold
- * runs the loader and xnu never sees the silver cluster.
+ * The boot core wakes gold CPU 0x100 with this DTB and turns itself off
+ * (PSCI CPU_OFF), so a 4 KiB-page xnu (TOPAZ_4K) can start it again with
+ * CPU_ON as one of its E cores; a 16K xnu only lists gold and never does.
  */
 static volatile uint64_t gold_dtb;
 static void test_gic(void);
 
 /*
- * xnu starts the other gold CPUs itself (PSCI CPU_ON), without the shim, so
+ * xnu starts the other CPUs itself (PSCI CPU_ON), without the shim, so
  * give their redistributors the same setup test_gic() gives the boot CPU:
  * awake, SGIs/PPIs in Group 1, default priority. The frames are MMIO, so the
- * boot CPU can do it for all of them.
+ * boot CPU can do it for all of them: gold 0x101-0x103 and, for a 4 KiB xnu
+ * with the E cluster, silver 0x0-0x3.
  */
 static void gold_gicr_prepare(void)
 {
-	for (uint32_t aff = 0x101; aff <= 0x103; aff++) {
+	static const uint32_t affs[] = { 0x101, 0x102, 0x103, 0x0, 0x1, 0x2, 0x3 };
+	for (unsigned int k = 0; k < sizeof(affs) / sizeof(affs[0]); k++) {
+		uint32_t aff = affs[k];
 		uintptr_t r = 0;
 		for (uintptr_t off = 0; off < GICR_SIZE; off += GICR_PE_SIZE) {
 			uint64_t typer = rd64(GICR_BASE + off + GICR_TYPER);
@@ -242,12 +246,12 @@ static uint64_t speed_ticks(void)
 }
 
 /*
- * Gold cluster to its top cpufreq-hw level before xnu (which has no cpufreq
- * driver): freq-domain1 0xf523000, LUT +0x110 (32-byte rows), PERF_STATE +0x920.
+ * A cluster to its top cpufreq-hw level before xnu (which has no cpufreq
+ * driver): freq-domain0 0xf521000 silver, freq-domain1 0xf523000 gold,
+ * LUT +0x110 (32-byte rows), PERF_STATE +0x920.
  */
-static void gold_cpufreq_max(void)
+static void cpufreq_max(uintptr_t b)
 {
-	uintptr_t b = 0x0f523000;
 	uint32_t best = 0, best_khz = 0, prev = 0;
 	for (uint32_t i = 0; i < 12; i++) {
 		uint32_t v = rd32(b + 0x110 + i * 0x20);
@@ -263,7 +267,7 @@ static void gold_cpufreq_max(void)
 	uint32_t old = rd32(b + 0x920);
 	wr32(b + 0x920, best);
 	__asm__ volatile("dsb sy" ::: "memory");
-	con_hex2("CPUFREQ", "old=", old, "mhz=", best_khz / 1000);
+	con_hex2(b == 0x0f521000 ? "CPUFREQ S" : "CPUFREQ G", "old=", old, "mhz=", best_khz / 1000);
 }
 
 static void __attribute__((noreturn)) gold_main(uint64_t dtb)
@@ -284,7 +288,8 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		 */
 		test_gic();
 		gold_gicr_prepare();
-		gold_cpufreq_max();
+		cpufreq_max(0x0f523000);
+		cpufreq_max(0x0f521000);
 		uint64_t gt = speed_ticks();
 		con_hex2("SPEED", "silver=", (uint32_t)silver_ticks, "gold=", (uint32_t)gt);
 		if (!con_quiet)
@@ -530,7 +535,10 @@ void shim_main(uint64_t dtb)
 		__asm__ volatile("dsb sy" ::: "memory");
 		int64_t r = smc(PSCI_CPU_ON, 0x100, (uintptr_t)secondary_entry, 4);
 		if (r == 0) {
-			for (;;)	/* parked with DAIF masked (start.S) */
+			/* off, for xnu's CPU_ON; if PSCI refuses, parked with DAIF masked (start.S) */
+			__asm__ volatile("dsb sy" ::: "memory");
+			smc(PSCI_CPU_OFF, 0, 0, 0);
+			for (;;)
 				__asm__ volatile("wfi");
 		}
 		gold_dtb = 0;

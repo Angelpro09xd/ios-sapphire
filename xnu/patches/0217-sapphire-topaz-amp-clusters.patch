@@ -1,0 +1,48 @@
+From 7fba2286fdf050e0b5aaec58290704ce06c7aac6 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 02:09:31 +0300
+Subject: [PATCH 2/4] topaz-0141: TOPAZ_4K runs gold as the P cluster and
+ silver as the E cluster (Edge scheduler)
+
+---
+ pexpert/pexpert/arm64/SWEET.h        | 7 +++++++
+ pexpert/pexpert/arm64/board_config.h | 4 ++++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index ef561e5..cfeb976 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -37,6 +37,13 @@
+ /* topaz: Cortex-A53/A73 have no PAN (ARMv8.1); MSR PAN is undefined there */
+ #if !defined(TOPAZ_4K)
+ #define __ARM_16K_PG__            1
++#else
++/*
++ * 4 KiB pages run all eight topaz cores: gold A73 = P cluster (boot, pset0),
++ * silver A53 = E cluster (ADT cluster-type). The Edge scheduler then keeps
++ * threads on P and spills to E only when P is busy (no CLPC recommends).
++ */
++#define __ARM_AMP__               1
+ #endif
+ 
+ #define HAS_GIC_V3                1
+diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+index 88e524a..0d5f7cc 100644
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -102,7 +102,11 @@
+ 
+ #define MAX_L2_CLINE                   6
+ #define MAX_CPUS                       8
++#if defined(TOPAZ_4K)
++#define MAX_CPU_CLUSTERS               2
++#else
+ #define MAX_CPU_CLUSTERS               1
++#endif
+ 
+ #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+ 
+-- 
+2.43.0
+
