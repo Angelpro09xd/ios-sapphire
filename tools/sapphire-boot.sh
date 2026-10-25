@@ -34,7 +34,8 @@ while [[ ${1:-} == --* ]]; do
 	case $1 in
 	--readonly) rw="" ;;
 	--console) con="" ;;
-	--amp) amp=(--amp); cpus=8 ;;
+	--amp) amp+=(--amp); cpus=8 ;;
+	--no-baseband) amp+=(--no-baseband) ;;   # no /baseband node: launchd leaves CommCenter alone
 	--gpu-fw)
 		shift
 		[[ -f $1/a630_sqe.fw ]] || { echo "$1/a630_sqe.fw not found" >&2; exit 1; }
