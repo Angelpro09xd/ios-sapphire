@@ -34,6 +34,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
+#include <spawn.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
 
@@ -1328,6 +1329,35 @@ fake_iokit_install(void)
 #define A64_MOV_W0_1    0x52800020u     /* mov w0, #1 */
 #define A64_RET         0xd65f03c0u
 
+/*
+ * the mobile data call (qmitool autodata, setuid root: address, route, configd), started with
+ * CommCenter; one instance (its own lock), so a CommCenter restart leaves the running one alone.
+ * /var/tmp/autodata.off keeps it from starting.
+ */
+extern char **environ;
+static void
+start_autodata(void)
+{
+	static const char *tool = "/redwood/bin/qmitool";
+	if (access(tool, X_OK) != 0 || access("/var/tmp/autodata.off", F_OK) == 0) {
+		return;
+	}
+	posix_spawn_file_actions_t fa;
+	posix_spawnattr_t at;
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+	posix_spawn_file_actions_addopen(&fa, 1, "/var/tmp/autodata.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+	posix_spawn_file_actions_adddup2(&fa, 1, 2);
+	posix_spawnattr_init(&at);
+	posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSID);
+	char *argv[] = { (char *)"qmitool", (char *)"autodata", NULL };
+	pid_t pid = 0;
+	int e = posix_spawn(&pid, tool, &fa, &at, argv, environ);
+	say("autodata: %s (pid %d)", e == 0 ? "started" : strerror(e), (int)pid);
+	posix_spawn_file_actions_destroy(&fa);
+	posix_spawnattr_destroy(&at);
+}
+
 __attribute__((constructor)) static void
 ccbridge_init(void)
 {
@@ -1342,6 +1372,7 @@ ccbridge_init(void)
 	if (strcmp(getprogname(), "CommCenter") != 0) {
 		return;
 	}
+	start_autodata();
 	say("ccbridge in %s, cache slide %#lx", getprogname(), slide);
 
 
