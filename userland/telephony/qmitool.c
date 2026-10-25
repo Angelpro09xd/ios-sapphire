@@ -1162,13 +1162,17 @@ cmd_datacall(const char *apn)
 		if (getenv("NO_PDP") == NULL && pdp_config(ip, gw, tlv_u32(&r, 0x29)) == 0 &&
 		    access("/var/root/pdpnet", X_OK) == 0) {
 			fflush(stdout);
-			pid_t pid = fork();                 /* the call's IPv4 and DNS for configd */
+			/* pdpnet watch: the call's IPv4 and DNS for configd while the cellular data switch is on */
+			pid_t pid = fork();
 			if (pid == 0) {
-				execl("/var/root/pdpnet", "pdpnet", "up", (char *)NULL);
+				setsid();
+				int fd = open("/var/tmp/pdpnet.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+				if (fd >= 0) {
+					dup2(fd, 1);
+					dup2(fd, 2);
+				}
+				execl("/var/root/pdpnet", "pdpnet", "watch", (char *)NULL);
 				_exit(127);
-			}
-			if (pid > 0) {
-				(void)waitpid(pid, NULL, 0);
 			}
 		}
 	}
