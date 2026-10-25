@@ -665,7 +665,7 @@ struct br_svc {
 	uint32_t node, port;
 	uint8_t cids[BR_CIDS];
 	unsigned ncids;
-	struct { uint16_t txn; uint8_t cid; uint8_t used; uint16_t orig; } pend[64];
+	struct { uint16_t txn; uint8_t cid; uint8_t used; uint16_t orig; uint16_t as_ind; } pend[64];
 	uint16_t next_txn;
 };
 struct br_chan {
@@ -830,6 +830,70 @@ br_ctl(struct br_chan *c, const uint8_t *sdu, size_t n)
 
 static void *br_reader_main(void *arg);
 
+/*
+ * NAS: CommCenter asks its registration through Apple's own NAS messages (0x556a, 0x555b, not
+ * on this modem) and otherwise waits for indications, which the modem sends only on a change:
+ * a modem that registered before CommCenter started never tells it. The bridge asks GET SERVING
+ * SYSTEM (0x24) and GET SYS INFO (0x4d) itself and hands the answers in as the 0x24 and 0x4e
+ * indications; now (after an indication register) and every 20 s.
+ */
+static void
+br_nas_query(struct br_chan *c, uint16_t msg, uint16_t as_ind)
+{
+	struct br_svc *v = br_svc_of(c, 0x03, 0);
+	if (v == NULL || v->fd < 0 || v->ncids == 0) {
+		say("bridge: NAS poll 0x%04x on channel %p: no NAS client (%p)", msg, c->shim, (void *)v);
+		return;
+	}
+	unsigned slot = v->next_txn % 64;
+	uint16_t nt = v->next_txn++;
+	if (v->next_txn == 0) v->next_txn = 1;
+	v->pend[slot].txn = nt;
+	v->pend[slot].cid = 0;
+	v->pend[slot].orig = 0;
+	v->pend[slot].used = 1;
+	v->pend[slot].as_ind = as_ind;
+	uint8_t buf[sizeof(struct sqhdr) + 7];
+	struct sqhdr h = { v->node, v->port };
+	memcpy(buf, &h, sizeof(h));
+	uint8_t q[7] = { 0x00, 0, 0, 0, 0, 0, 0 };
+	memcpy(q + 1, &nt, 2);
+	memcpy(q + 3, &msg, 2);
+	memcpy(buf + sizeof(h), q, 7);
+	ssize_t w = write(v->fd, buf, sizeof(buf));
+	say("bridge: NAS poll 0x%04x txn %u -> %zd", msg, nt, w);
+}
+
+static void
+br_nas_poll(void *arg)
+{
+	(void)arg;
+	pthread_mutex_lock(&br_lock);
+	for (unsigned i = 0; i < MAX_SHIMS; i++) {
+		if (br_chans[i].shim == NULL) continue;
+		br_nas_query(&br_chans[i], 0x0024, 0x0024);
+		br_nas_query(&br_chans[i], 0x004d, 0x004e);
+	}
+	pthread_mutex_unlock(&br_lock);
+}
+
+static void
+br_nas_poll_soon(struct br_chan *c)
+{
+	(void)c;
+	static int timer_on;
+	dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0),
+	    NULL, br_nas_poll);
+	if (!timer_on) {
+		timer_on = 1;
+		dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+		    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+		dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC), 20 * NSEC_PER_SEC, NSEC_PER_SEC);
+		dispatch_source_set_event_handler_f(t, br_nas_poll);
+		dispatch_resume(t);
+	}
+}
+
 static void
 br_from_cc(struct br_chan *c, const uint8_t *f, size_t n)
 {
@@ -869,6 +933,10 @@ br_from_cc(struct br_chan *c, const uint8_t *f, size_t n)
 	v->pend[slot].cid = cid;
 	v->pend[slot].orig = txn;
 	v->pend[slot].used = 1;
+	v->pend[slot].as_ind = 0;
+	if (svc == 0x03 && msg == 0x0003) {
+		br_nas_poll_soon(c);    /* CommCenter registered for NAS indications: tell it where we are */
+	}
 	uint8_t buf[sizeof(struct sqhdr) + 0x4000];
 	struct sqhdr h = { v->node, v->port };
 	memcpy(buf, &h, sizeof(h));
@@ -920,6 +988,33 @@ br_reader_main(void *arg)
 					continue;
 				}
 				unsigned slot = txn % 64;
+				if (v->pend[slot].used && v->pend[slot].txn == txn && v->pend[slot].as_ind) {
+					/*
+					 * our own query (br_nas_poll): its answer goes to every NAS client as the
+					 * indication carrying the same TLVs, without the result TLV 0x02
+					 */
+					v->pend[slot].used = 0;
+					say("bridge: NAS poll answer 0x%04x (%zu bytes) -> indication to %u clients", v->pend[slot].as_ind, sn, v->ncids);
+					uint8_t ind[0x4000];
+					size_t in = 7;
+					ind[0] = 0x04;
+					memset(ind + 1, 0, 2);
+					memcpy(ind + 3, &v->pend[slot].as_ind, 2);
+					for (size_t o = 7; o + 3 <= sn;) {
+						uint16_t tl;
+						memcpy(&tl, sdu + o + 1, 2);
+						if (o + 3 + tl > sn) break;
+						if (sdu[o] != 0x02 && in + 3 + tl < sizeof(ind)) {
+							memcpy(ind + in, sdu + o, 3 + tl);
+							in += 3 + tl;
+						}
+						o += 3 + tl;
+					}
+					uint16_t tlen = (uint16_t)(in - 7);
+					memcpy(ind + 5, &tlen, 2);
+					for (unsigned m = 0; m < v->ncids; m++) br_to_cc(c, v->svc, v->cids[m], ind, in);
+					continue;
+				}
 				if (v->pend[slot].used && v->pend[slot].txn == txn) {
 					v->pend[slot].used = 0;
 					memcpy(sdu + 1, &v->pend[slot].orig, 2);

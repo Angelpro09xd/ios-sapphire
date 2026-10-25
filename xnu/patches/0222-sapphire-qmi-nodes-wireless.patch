@@ -1,16 +1,18 @@
-From 6dc664ae1b317a7728517779ca8e95854bd6a8cf Mon Sep 17 00:00:00 2001
+From 7b6448f237a1ce27ffa4853506c139ac633aaaa7 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Sun, 25 Oct 2026 15:14:05 +0000
-Subject: [PATCH] sapphire-0222: /dev/redwood-qmi0..31 (group _wireless 0660,
- CommCenter is the client), a fresh QRTR port at every open (a reused port,
- after QRTR DEL_CLIENT, got no more answers from the modem)
+Subject: [PATCH] sapphire-0222: QMI for Apple's CommCenter:
+ /dev/redwood-qmi0..31 (group _wireless 0660), a fresh QRTR port at every
+ open, GLINK TX queue 64 -> 1024 (an overflow dropped RESUME_TX and the modem
+ stopped answering), kern.sweet_modem_stats
 
 ---
- bsd/dev/sweet_qmi_dev.c | 40 +++++++++++++++++++++++++++++-----------
- 1 file changed, 29 insertions(+), 11 deletions(-)
+ bsd/dev/sweet_qmi_dev.c         | 57 ++++++++++++++++++++++++++-------
+ iokit/Kernel/arm/TopazModem.cpp | 21 ++++++++++--
+ 2 files changed, 64 insertions(+), 14 deletions(-)
 
 diff --git a/bsd/dev/sweet_qmi_dev.c b/bsd/dev/sweet_qmi_dev.c
-index 2fb1635..0c716d3 100644
+index 2fb1635..f06530f 100644
 --- a/bsd/dev/sweet_qmi_dev.c
 +++ b/bsd/dev/sweet_qmi_dev.c
 @@ -1,8 +1,8 @@
@@ -25,7 +27,13 @@ index 2fb1635..0c716d3 100644
   *   write(): struct sweet_qmi_hdr {node, port} + one QMI message (type, txn, msg id, length,
   *            TLVs), queued and sent by TopazModem's modem thread (it owns the GLINK FIFO).
   *   read():  the next message for this port, with the sender's {node, port} in front; blocks
-@@ -27,7 +27,7 @@
+@@ -22,12 +22,13 @@
+ #include <sys/ioccom.h>
+ #include <sys/proc.h>
+ #include <sys/select.h>
++#include <sys/sysctl.h>
+ #include <sys/vnode.h>
+ #include <miscfs/devfs/devfs.h>
  #include <kern/locks.h>
  #include <kern/kalloc.h>
  
@@ -34,7 +42,7 @@ index 2fb1635..0c716d3 100644
  #define SQ_PORT0        0x3000u
  #define SQ_MAX_MSG      0x4000u                 /* the modem's own intent size is 0x4400 */
  #define SQ_RXQ          64                      /* messages waiting per port */
-@@ -41,6 +41,7 @@ struct sweet_qmi_lookup { uint32_t svc, inst, index, node, port, found_inst; };
+@@ -41,6 +42,7 @@ struct sweet_qmi_lookup { uint32_t svc, inst, index, node, port, found_inst; };
  struct sq_msg { uint32_t src, node, port, len, ctrl; uint8_t *data; };
  struct sq_slot {
  	bool open;
@@ -42,7 +50,7 @@ index 2fb1635..0c716d3 100644
  	uint32_t head, tail;                    /* rx ring, wrapping counters */
  	struct sq_msg rx[SQ_RXQ];
  	struct selinfo sel;
-@@ -52,6 +53,7 @@ static LCK_MTX_DECLARE(sq_mtx, &sq_grp);
+@@ -52,6 +54,7 @@ static LCK_MTX_DECLARE(sq_mtx, &sq_grp);
  static struct sq_slot sq_slots[SQ_SLOTS];
  static struct sq_msg sq_tx[SQ_TXQ];
  static uint32_t sq_tx_head, sq_tx_tail;
@@ -50,7 +58,7 @@ index 2fb1635..0c716d3 100644
  
  int sweet_qmi_deliver(uint32_t dst_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t len);
  void sweet_qmi_pump(void (*send)(uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len, int ctrl));
-@@ -71,10 +73,9 @@ sq_free(struct sq_msg *m)
+@@ -71,10 +74,9 @@ sq_free(struct sq_msg *m)
  int
  sweet_qmi_deliver(uint32_t dst_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t len)
  {
@@ -62,7 +70,7 @@ index 2fb1635..0c716d3 100644
  	if (len == 0 || len > SQ_MAX_MSG) {
  		return 1;
  	}
-@@ -84,7 +85,18 @@ sweet_qmi_deliver(uint32_t dst_port, uint32_t node, uint32_t port, const uint8_t
+@@ -84,7 +86,18 @@ sweet_qmi_deliver(uint32_t dst_port, uint32_t node, uint32_t port, const uint8_t
  	}
  	memcpy(copy, data, len);
  	lck_mtx_lock(&sq_mtx);
@@ -82,7 +90,7 @@ index 2fb1635..0c716d3 100644
  		s->dropped++;
  		lck_mtx_unlock(&sq_mtx);
  		kfree_data(copy, len);
-@@ -157,6 +169,12 @@ sq_open(dev_t dev, __unused int flags, __unused int devtype, __unused struct pro
+@@ -157,6 +170,12 @@ sq_open(dev_t dev, __unused int flags, __unused int devtype, __unused struct pro
  	}
  	s->open = true;
  	s->head = s->tail = 0;
@@ -95,7 +103,7 @@ index 2fb1635..0c716d3 100644
  	lck_mtx_unlock(&sq_mtx);
  	return 0;
  }
-@@ -174,7 +192,7 @@ sq_close(dev_t dev, __unused int flags, __unused int devtype, __unused struct pr
+@@ -174,7 +193,7 @@ sq_close(dev_t dev, __unused int flags, __unused int devtype, __unused struct pr
  		s->tail++;
  	}
  	lck_mtx_unlock(&sq_mtx);
@@ -104,7 +112,7 @@ index 2fb1635..0c716d3 100644
  	return 0;
  }
  
-@@ -231,7 +249,7 @@ sq_write(dev_t dev, struct uio *uio, __unused int ioflag)
+@@ -231,7 +250,7 @@ sq_write(dev_t dev, struct uio *uio, __unused int ioflag)
  	}
  	err = uiomove((char *)d, (int)len, uio);
  	if (err == 0) {
@@ -113,7 +121,7 @@ index 2fb1635..0c716d3 100644
  	}
  	if (err != 0) {
  		kfree_data(d, len);
-@@ -243,7 +261,7 @@ static int
+@@ -243,7 +262,7 @@ static int
  sq_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
  {
  	if (cmd == SWEET_QMI_PORT) {
@@ -122,7 +130,30 @@ index 2fb1635..0c716d3 100644
  		return 0;
  	}
  	if (cmd != SWEET_QMI_LOOKUP) {
-@@ -293,7 +311,7 @@ sweet_qmi_dev_init(void)
+@@ -278,6 +297,22 @@ static const struct cdevsw sq_cdevsw = {
+ 	.d_strategy = eno_strat, .d_type = 0,
+ };
+ 
++/* 0222: the modem link's counters, to see a stall instead of guessing */
++extern int topaz_modem_stats(char *buf, size_t len);
++static int
++sysctl_sweet_modem_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[256];
++	int n = topaz_modem_stats(buf, sizeof(buf));
++	if (n < 0) {
++		n = 0;
++	}
++	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_modem_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_modem_stats, "A", "modem GLINK/QRTR counters");
++
+ /* TopazModem, once the modem's IPCRTR channel is up */
+ void
+ sweet_qmi_dev_init(void)
+@@ -293,7 +328,7 @@ sweet_qmi_dev_init(void)
  	}
  	int made = 0;
  	for (int i = 0; i < SQ_SLOTS; i++) {
@@ -131,6 +162,52 @@ index 2fb1635..0c716d3 100644
  			made++;
  		}
  	}
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 35cfa8e..1b52b0b 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -701,8 +701,12 @@ glink_try_send(const void *data, uint32_t len)
+ 	return tx_write(&h, sizeof(h), data, len);
+ }
+ 
+-/* packets wait here until the modem has a free RX intent for them */
+-#define TXQ_LEN 64
++/*
++ * packets wait here until the modem has a free RX intent for them. 0222: 64 was too few for
++ * Apple's CommCenter (hundreds of requests and RESUME_TX at once): the queue overflowed, a dropped
++ * RESUME_TX left the modem's QRTR waiting forever and no QMI answer came any more.
++ */
++#define TXQ_LEN 1024
+ static struct { void *p; uint32_t len; } g_txq[TXQ_LEN];
+ static unsigned g_txq_head, g_txq_tail, g_txq_drops;
+ 
+@@ -721,7 +725,9 @@ glink_send(const void *data, uint32_t len)
+ {
+ 	void *p;
+ 	if (g_txq_tail - g_txq_head >= TXQ_LEN || (p = IOMalloc(len)) == NULL) {
+-		g_txq_drops++;
++		if (g_txq_drops++ < 8) {
++			LOG("t=%u ms: glink: TX queue full (%u), packet of %u bytes dropped", g_ms, g_txq_tail - g_txq_head, len);
++		}
+ 		return;
+ 	}
+ 	memcpy(p, data, len);
+@@ -857,6 +863,15 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 	}
+ }
+ 
++/* sapphire 0222: kern.sweet_modem_stats (bsd/dev/sweet_qmi_dev.c) */
++extern "C" int
++topaz_modem_stats(char *buf, size_t len)
++{
++	return snprintf(buf, len, "glink rx %u tx %u chan %s modem-intents %u txq %u drops %u; qrtr node %x hello %u services %u resume-rx %u",
++	    g_rx_msgs, g_tx_msgs, chan_up() ? "up" : "down", g_ri_count, g_txq_tail - g_txq_head, g_txq_drops,
++	    q_modem_node, q_hello_rx, q_srv_count, q_resumes);
++}
++
+ /* ---------------------------------------------------------------- GLINK RX */
+ 
+ static bool
 -- 
 2.43.0
 
