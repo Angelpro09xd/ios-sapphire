@@ -1,0 +1,47 @@
+From 2c500176a0f19faafd8d81f5607de49acf6f48ae Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 21:58:11 +0000
+Subject: [PATCH] sapphire-0231: IPA uplink with the QMAP header alone and no
+ checksum offload on endpoint 1: with the 8-byte QMAP + checksum header the
+ modem got our header in front of every packet; now 8.8.8.8 answers pings and
+ SYNs
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 5070436..d1e29f5 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -7889,11 +7889,14 @@ ipa_ep_program(void)
+ 	iw(IPA_EP(IPA_EP_HOL_EN, 8), 0);
+ 	iw(IPA_EP(IPA_EP_RSRC, 8), 0);
+ 	iw(IPA_EP(IPA_EP_STATUS, 8), 1);
+-	/* modem TX 1: UL checksum offload (header offset 1 word), QMAP + checksum header (8 bytes),
+-	 * sequencer 1 pass skip uC with DMA parser replication, status to modem->AP RX 10 */
+-	iw(IPA_EP(IPA_EP_CFG, 1), (1u << 1) | (1u << 3));
++	/* modem TX 1: QMAP header only (4 bytes), no uplink checksum offload, sequencer 1 pass skip uC
++	 * with DMA parser replication, status to modem->AP RX 10. (sapphire 0231: with Linux's UL
++	 * checksum offload and its 8-byte header the IPA left our header on the packet, the modem
++	 * counted it sent and nothing ever came back; QMAP alone, as rmnet without the checksum
++	 * flag, and the network answers.) */
++	iw(IPA_EP(IPA_EP_CFG, 1), 0);
+ 	iw(IPA_EP(IPA_EP_NAT, 1), 0);
+-	iw(IPA_EP(IPA_EP_HDR, 1), 8u | (1u << 6));
++	iw(IPA_EP(IPA_EP_HDR, 1), 4u | (1u << 6));
+ 	iw(IPA_EP(IPA_EP_HDR_EXT, 1), 1);
+ 	iw(IPA_EP(IPA_EP_MODE, 1), 0);
+ 	iw(IPA_EP(IPA_EP_AGGR, 1), 0);
+@@ -8060,7 +8063,7 @@ ipa_tx_event(struct ipa_chan *c, const uint8_t *e)
+ #define IPA_TX_SLOTS        16
+ #define IPA_RXLOG           8
+ static uint8_t ipa_txq[1600];
+-static uint32_t ipa_tx_hdr = 8;                 /* 0230: 8 = QMAP + UL checksum header, 4 = QMAP only (peek "h4") */
++static uint32_t ipa_tx_hdr = 4;                 /* 4 = QMAP only (0231 default), 8 = QMAP + UL checksum header (peek "h8") */
+ static volatile uint32_t ipa_txq_len;
+ static uint8_t ipa_txq_mux;
+ static uint8_t *ipa_txbuf;
+-- 
+2.43.0
+
