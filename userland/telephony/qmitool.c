@@ -12,6 +12,10 @@
  *   qmitool sms-list             the messages stored on the SIM and in the modem
  *   qmitool sms-watch            print SMS as they arrive
  *   qmitool raw SVC MSG [HEX]    any request, TLVs given as hex bytes; prints the answer
+ *   qmitool datacall [APN]       IPv4 data call over the IPA (kernel 0225+ with ipa=1): WDA data
+ *                                format QMAP on the embedded endpoint, WDS mux 1, start network;
+ *                                prints the address and stays (the call ends with this client)
+ *   qmitool ping DST [SRC]       ICMP echo through the call (kern.sweet_ipa_tx / sweet_ipa_rx)
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -21,6 +25,10 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
+#include <arpa/inet.h>
+#include <signal.h>
 #include <unistd.h>
 
 struct sweet_qmi_hdr { uint32_t node, port; };
@@ -866,6 +874,226 @@ cmd_raw(int argc, char **argv)
 	return 0;
 }
 
+/* ---- data call (libqmi qmi-service-wda.json / qmi-service-wds.json) */
+
+static void m_u32(struct msg *m, uint8_t t, uint32_t v) { m_tlv(m, t, &v, 4); }
+
+static uint32_t
+tlv_u32(const struct msg *m, uint8_t type)
+{
+	uint16_t l;
+	const uint8_t *v = tlv(m, type, &l);
+	uint32_t x = 0;
+	if (v != NULL && l >= 4) {
+		memcpy(&x, v, 4);
+	}
+	return x;
+}
+
+static void
+print_ip(const char *label, uint32_t a)
+{
+	printf("%-14s %u.%u.%u.%u\n", label, a >> 24, (a >> 16) & 255, (a >> 8) & 255, a & 255);
+}
+
+static int
+cmd_datacall(const char *apn)
+{
+	struct cli wda, wds;
+	struct msg q, r;
+	uint32_t ep[2] = { 4, 1 };              /* embedded endpoint (the IPA), interface 1 */
+	int e;
+
+	struct cli dpm;
+	if (cli_open(&dpm, 0x2f) != 0 || cli_open(&wda, 0x1a) != 0 || cli_open(&wds, 0x01) != 0) {
+		return 1;
+	}
+	/*
+	 * DPM Open Port first (netmgr's qmi_dpm_enabled on IPA SoCs): the embedded hardware data port,
+	 * IPA endpoints 9 (modem -> AP) and 1 (AP -> modem). Without it WDA and WDS answer
+	 * INVALID_OPERATION. The client stays open with the call.
+	 */
+	struct { uint8_t n; uint32_t type, iface, rx, tx; } __attribute__((packed)) hw = { 1, 4, 1, 9, 1 };
+	m_init(&q, 0, 0x0020);
+	m_tlv(&q, 0x11, &hw, sizeof(hw));
+	e = request(&dpm, &q, &r);
+	printf("dpm port       %s (%d)\n", e ? "refused" : "open", e);
+	m_init(&q, 0, 0x0020);                  /* WDA Set Data Format */
+	m_u32(&q, 0x11, 2);                     /* link layer: raw IP */
+	m_u32(&q, 0x12, 5);                     /* uplink aggregation: QMAP */
+	m_u32(&q, 0x13, 5);                     /* downlink aggregation: QMAP */
+	m_u32(&q, 0x15, 32);
+	m_u32(&q, 0x16, 32768);
+	m_tlv(&q, 0x17, ep, sizeof(ep));
+	e = request(&wda, &q, &r);
+	printf("data format    %s (link %u, ul %u, dl %u)\n", e ? "refused" : "set", tlv_u32(&r, 0x11), tlv_u32(&r, 0x12),
+	    tlv_u32(&r, 0x13));
+	if (e) {
+		hexdump("answer", r.b, r.n);
+	}
+	m_init(&q, 0, 0x00a2);                  /* WDS Bind Mux Data Port */
+	m_tlv(&q, 0x10, ep, sizeof(ep));
+	m_u8(&q, 0x11, 1);                      /* mux id 1 */
+	m_u32(&q, 0x13, 1);                     /* client type: tethered */
+	e = request(&wds, &q, &r);
+	printf("mux 1          %s (%d)\n", e ? "refused" : "bound", e);
+	m_init(&q, 0, 0x004d);                  /* WDS Set IP Family */
+	m_u8(&q, 0x01, 4);
+	(void)request(&wds, &q, &r);
+	m_init(&q, 0, 0x0020);                  /* WDS Start Network */
+	if (apn != NULL) {
+		m_tlv(&q, 0x14, apn, (uint16_t)strlen(apn));
+	}
+	m_u8(&q, 0x19, 4);
+	e = request(&wds, &q, &r);
+	if (e) {
+		printf("start network  failed: QMI error %d, call end reason %u, verbose %u/%u\n", e,
+		    tlv_u32(&r, 0x10) & 0xffff, tlv_u32(&r, 0x11) & 0xffff, tlv_u32(&r, 0x11) >> 16);
+		hexdump("answer", r.b, r.n);
+		return 1;
+	}
+	printf("start network  ok, handle %08x\n", tlv_u32(&r, 0x01));
+	m_init(&q, 0, 0x002d);                  /* WDS Get Runtime Settings */
+	m_u32(&q, 0x10, (1u << 4) | (1u << 8) | (1u << 9) | (1u << 13));
+	if (request(&wds, &q, &r) == 0) {
+		uint32_t ip = tlv_u32(&r, 0x1e);
+		print_ip("address", ip);
+		print_ip("gateway", tlv_u32(&r, 0x20));
+		print_ip("netmask", tlv_u32(&r, 0x21));
+		print_ip("dns", tlv_u32(&r, 0x15));
+		printf("%-14s %u\n", "mtu", tlv_u32(&r, 0x29));
+		FILE *f = fopen("/var/tmp/datacall.ip", "w");
+		if (f != NULL) {
+			fprintf(f, "%u.%u.%u.%u\n", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255);
+			fclose(f);
+		}
+	}
+	fflush(stdout);
+	for (;;) {                              /* keep the WDS client (and the call) alive */
+		sleep(30);
+		if (simple(&wds, 0x0022, &r) == 0) {
+			uint16_t l;
+			const uint8_t *st = tlv(&r, 0x01, &l);
+			printf("packet service %s\n", st != NULL && st[0] == 2 ? "connected" : "not connected");
+			fflush(stdout);
+		}
+	}
+}
+
+static uint16_t
+ip_sum(const uint8_t *p, int n)
+{
+	uint32_t s = 0;
+	for (int i = 0; i + 1 < n; i += 2) {
+		s += (uint32_t)(p[i] << 8 | p[i + 1]);
+	}
+	if (n & 1) {
+		s += (uint32_t)p[n - 1] << 8;
+	}
+	while (s >> 16) {
+		s = (s & 0xffff) + (s >> 16);
+	}
+	return (uint16_t)~s;
+}
+
+struct rxrec { uint32_t seq; uint8_t mux, pad; uint16_t len; uint8_t data[248]; };
+
+static int
+cmd_ping(const char *dst_s, const char *src_s)
+{
+	char srcbuf[32] = "";
+	if (src_s == NULL) {
+		FILE *f = fopen("/var/tmp/datacall.ip", "r");
+		if (f == NULL || fgets(srcbuf, sizeof(srcbuf), f) == NULL) {
+			fprintf(stderr, "no source address: run qmitool datacall first, or give one\n");
+			return 1;
+		}
+		fclose(f);
+		srcbuf[strcspn(srcbuf, "\n")] = 0;
+		src_s = srcbuf;
+	}
+	struct in_addr src, dst;
+	if (inet_aton(src_s, &src) == 0 || inet_aton(dst_s, &dst) == 0) {
+		fprintf(stderr, "bad address\n");
+		return 2;
+	}
+	uint32_t last = 0;
+	struct rxrec rx[8];
+	size_t rl = sizeof(rx);
+	if (sysctlbyname("kern.sweet_ipa_rx", rx, &rl, NULL, 0) == 0) {
+		for (unsigned i = 0; i < 8; i++) {
+			last = rx[i].seq > last ? rx[i].seq : last;
+		}
+	}
+	int got = 0;
+	for (uint16_t seq = 1; seq <= 4; seq++) {
+		uint8_t pkt[1 + 84];
+		uint8_t *ip = pkt + 1, *ic = ip + 20;
+		memset(pkt, 0, sizeof(pkt));
+		pkt[0] = 1;                     /* mux id */
+		ip[0] = 0x45;
+		ip[2] = 0;
+		ip[3] = 84;
+		ip[4] = 0x12;
+		ip[5] = (uint8_t)seq;
+		ip[8] = 64;
+		ip[9] = 1;
+		memcpy(ip + 12, &src, 4);
+		memcpy(ip + 16, &dst, 4);
+		uint16_t c = ip_sum(ip, 20);
+		ip[10] = (uint8_t)(c >> 8);
+		ip[11] = (uint8_t)c;
+		ic[0] = 8;
+		ic[4] = 0x53;
+		ic[5] = 0x57;
+		ic[6] = 0;
+		ic[7] = (uint8_t)seq;
+		for (int i = 8; i < 64; i++) {
+			ic[i] = (uint8_t)i;
+		}
+		c = ip_sum(ic, 64);
+		ic[2] = (uint8_t)(c >> 8);
+		ic[3] = (uint8_t)c;
+		struct timeval t0, t1;
+		gettimeofday(&t0, NULL);
+		if (sysctlbyname("kern.sweet_ipa_tx", NULL, NULL, pkt, sizeof(pkt)) != 0) {
+			fprintf(stderr, "kern.sweet_ipa_tx: %s\n", strerror(errno));
+			return 1;
+		}
+		int ok = 0;
+		for (int w = 0; w < 300 && !ok; w++) {
+			usleep(10000);
+			rl = sizeof(rx);
+			if (sysctlbyname("kern.sweet_ipa_rx", rx, &rl, NULL, 0) != 0) {
+				continue;
+			}
+			for (unsigned i = 0; i < 8; i++) {
+				if (rx[i].seq <= last) {
+					continue;
+				}
+				const uint8_t *r = rx[i].data;
+				if (rx[i].len >= 28 && r[9] == 1 && r[20] == 0 && memcmp(r + 12, &dst, 4) == 0 && r[27] == seq) {
+					gettimeofday(&t1, NULL);
+					printf("%u bytes from %s: icmp_seq=%u ttl=%u time=%.1f ms\n", rx[i].len - 20, dst_s, seq, r[8],
+					    (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_usec - t0.tv_usec) / 1000.0);
+					ok = 1;
+				} else if (rx[i].seq > last) {
+					printf("(packet from the modem: %u bytes, proto %u, from %u.%u.%u.%u)\n", rx[i].len, r[9], r[12], r[13],
+					    r[14], r[15]);
+				}
+				last = rx[i].seq > last ? rx[i].seq : last;
+			}
+		}
+		if (!ok) {
+			printf("icmp_seq=%u: no answer in 3 s\n", seq);
+		}
+		got += ok;
+		sleep(1);
+	}
+	printf("%d of 4 answered\n", got);
+	return got ? 0 : 1;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -890,6 +1118,8 @@ main(int argc, char **argv)
 	if (!strcmp(cmd, "sms-list")) return cmd_sms_list();
 	if (!strcmp(cmd, "sms-watch")) return cmd_sms_watch();
 	if (!strcmp(cmd, "raw") && argc > 3) return cmd_raw(argc - 2, argv + 2);
+	if (!strcmp(cmd, "datacall")) return cmd_datacall(argc > 2 ? argv[2] : NULL);
+	if (!strcmp(cmd, "ping") && argc > 2) return cmd_ping(argv[2], argc > 3 ? argv[3] : NULL);
 	fprintf(stderr, "unknown command %s\n", cmd);
 	return 2;
 }
