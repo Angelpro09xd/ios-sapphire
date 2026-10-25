@@ -1,0 +1,142 @@
+From c9a00e59187a0d6814ead27f314eae61d52ac754 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 20:12:04 +0000
+Subject: [PATCH] sapphire-0228: IPA: the last raw frames received
+ (kern.sweet_ipa_raw); QMAP commands from the modem logged and requests
+ answered with an ACK (Linux rmnet_map_send_ack)
+
+---
+ bsd/dev/sweet_qmi_dev.c         | 11 ++++++
+ iokit/Kernel/arm/TopazModem.cpp | 70 +++++++++++++++++++++++++++++++++
+ 2 files changed, 81 insertions(+)
+
+diff --git a/bsd/dev/sweet_qmi_dev.c b/bsd/dev/sweet_qmi_dev.c
+index 3b25c1b..d6b4757 100644
+--- a/bsd/dev/sweet_qmi_dev.c
++++ b/bsd/dev/sweet_qmi_dev.c
+@@ -346,6 +346,17 @@ sysctl_sweet_ipa_rx SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_rx, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_ipa_rx, "S", "the last IP packets from the modem");
+ 
++extern int topaz_ipa_raw(uint8_t *out, uint32_t max);
++static int
++sysctl_sweet_ipa_raw SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	static uint8_t buf[1024];
++	int n = topaz_ipa_raw(buf, sizeof(buf));
++	return SYSCTL_OUT(req, buf, n > 0 ? (size_t)n : 0);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_raw, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_ipa_raw, "S", "the last frames received from the IPA, raw");
+ extern int topaz_ipa_stats(char *buf, size_t len);
+ static int
+ sysctl_sweet_ipa_stats SYSCTL_HANDLER_ARGS
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index b47afce..831d46e 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -7991,6 +7991,8 @@ ipa_rx_init(struct ipa_chan *c)
+ }
+ 
+ static void ipa_rx_keep(uint8_t mux, const uint8_t *p, uint16_t len);
++static void ipa_raw_keep(uint8_t chan, const uint8_t *p, uint16_t len);
++static void ipa_qmap_cmd(const uint8_t *frame, uint16_t len);
+ 
+ /* QMAP frames from the modem: [flags/pad, mux id, length (big endian)] + packet, back to back */
+ static void
+@@ -8006,6 +8008,7 @@ ipa_rx_event(struct ipa_chan *c, const uint8_t *e)
+ 
+ 	c->frames++;
+ 	c->bytes += len;
++	ipa_raw_keep(c == IPA_MRX ? 3 : 2, d, len);
+ 	if (c == IPA_MRX) {
+ 		for (uint32_t off = 0; off + 4 <= len;) {
+ 			uint8_t pad = d[off] & 0x3f, mux = d[off + 1];
+@@ -8018,6 +8021,8 @@ ipa_rx_event(struct ipa_chan *c, const uint8_t *e)
+ 			ipa_mux_seen[mux & 7]++;
+ 			if (!cmd) {
+ 				ipa_rx_keep(mux, d + off + 4, (uint16_t)(plen - pad));
++			} else {
++				ipa_qmap_cmd(d + off, (uint16_t)(4 + plen));
+ 			}
+ 			if (c->pkts <= 12) {
+ 				const uint8_t *ip = d + off + 4;
+@@ -8100,9 +8105,74 @@ ipa_rx_keep(uint8_t mux, const uint8_t *p, uint16_t len)
+ 	ipa_rxlog[i].seq = ++ipa_rxlog_seq;
+ }
+ 
++/* kern.sweet_ipa_raw: the first 64 bytes of the last 8 frames received, as they came */
++static struct { uint32_t seq; uint8_t chan, pad; uint16_t len; uint8_t data[64]; } ipa_raw[8];
++static uint32_t ipa_raw_seq;
++
++static void
++ipa_raw_keep(uint8_t chan, const uint8_t *p, uint16_t len)
++{
++	unsigned i = ipa_raw_seq % 8;
++	ipa_raw[i].chan = chan;
++	ipa_raw[i].len = len;
++	memcpy(ipa_raw[i].data, p, MIN((uint32_t)len, (uint32_t)sizeof(ipa_raw[i].data)));
++	mb();
++	ipa_raw[i].seq = ++ipa_raw_seq;
++}
++
++extern "C" int
++topaz_ipa_raw(uint8_t *out, uint32_t max)
++{
++	uint32_t n = MIN(max, (uint32_t)sizeof(ipa_raw));
++	memcpy(out, ipa_raw, n);
++	return (int)n;
++}
++
++/*
++ * A QMAP command from the modem ([cd=1, mux, length] + name, type, reserved, transaction id):
++ * a request (type 0) is answered with the same command as an ACK (type 1), as Linux rmnet's
++ * rmnet_map_send_ack() does for flow control.
++ */
++static uint8_t ipa_ackq[64];
++static volatile uint32_t ipa_ackq_len;
++static uint32_t ipa_qmap_cmds;
++
++static void
++ipa_qmap_cmd(const uint8_t *frame, uint16_t len)
++{
++	if (len < 12) {
++		return;
++	}
++	uint8_t name = frame[4], type = frame[5] & 3;
++	uint32_t txn = (uint32_t)frame[8] << 24 | (uint32_t)frame[9] << 16 | (uint32_t)frame[10] << 8 | frame[11];
++	if (++ipa_qmap_cmds <= 16) {
++		LOG("t=%u ms: ipa: QMAP command %u type %u mux %u transaction %u (%u bytes)%s", g_ms, name, type, frame[1], txn, len,
++		    type == 0 ? ": ACK sent" : "");
++	}
++	if (type == 0 && ipa_ackq_len == 0 && len <= sizeof(ipa_ackq)) {
++		memcpy(ipa_ackq, frame, len);
++		ipa_ackq[5] = (uint8_t)((ipa_ackq[5] & ~3u) | 1);
++		mb();
++		ipa_ackq_len = len;
++	}
++}
++
+ static void
+ ipa_tx_pump(void)
+ {
++	if (ipa_ackq_len != 0) {                /* a QMAP command ACK goes out as it is (its own header) */
++		struct ipa_chan *c = IPA_MTX;
++		uint32_t slot = c->widx % IPA_TX_SLOTS;
++		uint8_t *b = ipa_txbuf + 2048 * slot;
++		uint32_t l = ipa_ackq_len;
++		memcpy(b, ipa_ackq, 4);
++		bzero(b + 4, 4);                /* the endpoint's 8-byte header: QMAP + checksum */
++		memcpy(b + 8, ipa_ackq + 4, l - 4);
++		gsi_tre(c, ipa_txbuf_pa + 2048 * slot, (uint16_t)(l + 4), (2u << 16) | (1u << 9));
++		gsi_doorbell(c);
++		mb();
++		ipa_ackq_len = 0;
++	}
+ 	uint32_t len = ipa_txq_len;
+ 	if (len == 0) {
+ 		return;
+-- 
+2.43.0
+
