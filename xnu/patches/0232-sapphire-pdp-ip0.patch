@@ -1,0 +1,454 @@
+From 0ca047ec0ae97239a4982603b389c46946c0910e Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 22:04:58 +0000
+Subject: [PATCH] sapphire-0232: pdp_ip0, the cellular data interface: raw IP
+ over the IPA's modem endpoints (mux 1), a 64-packet TX queue drained by the
+ modem thread into 64 DMA buffers, kern.sweet_pdp_stats
+
+---
+ bsd/conf/files                  |   1 +
+ bsd/dev/sweet_pdp.c             | 219 ++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_qmi_dev.c         |   2 +-
+ iokit/Kernel/arm/TopazModem.cpp | 102 ++++++++++-----
+ 4 files changed, 290 insertions(+), 34 deletions(-)
+ create mode 100644 bsd/dev/sweet_pdp.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 5b58196..ddb8c21 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -121,6 +121,7 @@ bsd/dev/sweet_audio_dev.c		standard
+ bsd/dev/sweet_qmi_dev.c			standard
+ bsd/dev/sweet_reboot.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_pdp.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_pdp.c b/bsd/dev/sweet_pdp.c
+new file mode 100644
+index 0000000..2b23757
+--- /dev/null
++++ b/bsd/dev/sweet_pdp.c
+@@ -0,0 +1,219 @@
++/*
++ * sapphire 0232: pdp_ip0, the cellular data interface.
++ *
++ * A raw IP point-to-point interface (no link layer, like utun without its 4-byte family header)
++ * over the modem's data call: packets leaving through it go to the IPA's modem TX endpoint behind a
++ * QMAP header for mux 1 (topaz_ipa_send, TopazModem.cpp); IPv4/IPv6 packets the IPA delivers for
++ * mux 1 come in through sweet_pdp_input(). The address, the peer and the default route are set from
++ * user space (qmitool datacall: SIOCAIFADDR and a routing socket RTM_ADD), as for any interface.
++ * Apple names its cellular interfaces pdp_ipN, and parts of iOS look for that name.
++ */
++#include <stdbool.h>
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sockio.h>
++#include <sys/sysctl.h>
++#include <sys/kpi_mbuf.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <netinet/in.h>
++
++#define PDP_MUX         1
++#define PDP_MTU         1500
++
++extern int topaz_ipa_send(const uint8_t *pkt, uint32_t len, uint8_t mux);
++
++void sweet_pdp_create(void);
++void sweet_pdp_input(const uint8_t *pkt, uint32_t len);
++
++static ifnet_t pdp_ifp;
++static uint64_t pdp_in, pdp_out, pdp_drops;
++
++static errno_t
++pdp_output(ifnet_t ifp, mbuf_t m)
++{
++	uint8_t buf[PDP_MTU + 64];
++	size_t len = mbuf_pkthdr_len(m);
++
++	if (len == 0 || len > sizeof(buf) || mbuf_copydata(m, 0, len, buf) != 0) {
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	mbuf_freem(m);
++	if (topaz_ipa_send(buf, (uint32_t)len, PDP_MUX) != 0) {
++		pdp_drops++;
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	pdp_out++;
++	ifnet_stat_increment_out(ifp, 1, (uint32_t)len, 0);
++	return 0;
++}
++
++static errno_t
++pdp_demux(ifnet_t ifp __unused, mbuf_t m, char *frame_header __unused, protocol_family_t *protocol)
++{
++	while (m != NULL && mbuf_len(m) < 1) {
++		m = mbuf_next(m);
++	}
++	if (m == NULL) {
++		return ENOENT;
++	}
++	uint8_t v = *(uint8_t *)mbuf_data(m) >> 4;
++	if (v == 4) {
++		*protocol = PF_INET;
++	} else if (v == 6) {
++		*protocol = PF_INET6;
++	} else {
++		return ENOENT;
++	}
++	return 0;
++}
++
++static errno_t
++pdp_add_proto(ifnet_t ifp __unused, protocol_family_t protocol, const struct ifnet_demux_desc *d __unused,
++    u_int32_t n __unused)
++{
++	return (protocol == PF_INET || protocol == PF_INET6) ? 0 : ENOPROTOOPT;
++}
++
++static errno_t
++pdp_del_proto(ifnet_t ifp __unused, protocol_family_t protocol __unused)
++{
++	return 0;
++}
++
++static errno_t
++pdp_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
++{
++	switch (cmd) {
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++	case SIOCSIFDSTADDR:
++		ifnet_set_flags(ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++		return 0;
++	case SIOCSIFMTU:
++		ifnet_set_mtu(ifp, ((struct ifreq *)data)->ifr_mtu);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++pdp_detach(ifnet_t ifp __unused)
++{
++}
++
++static errno_t
++pdp_proto_input(ifnet_t ifp __unused, protocol_family_t protocol, mbuf_t m, char *frame_header __unused)
++{
++	if (proto_input(protocol, m) != 0) {
++		mbuf_freem(m);
++	}
++	return 0;
++}
++
++static errno_t
++pdp_pre_output(ifnet_t ifp __unused, protocol_family_t protocol __unused, mbuf_t *m __unused,
++    const struct sockaddr *dest __unused, void *route __unused, char *frame_type __unused, char *link_dest __unused)
++{
++	return 0;
++}
++
++/* TopazModem, once the IPA's modem endpoints run */
++void
++sweet_pdp_create(void)
++{
++	struct ifnet_init_eparams init;
++	struct ifnet_attach_proto_param proto;
++
++	if (pdp_ifp != NULL) {
++		return;
++	}
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "sweet-pdp-ip0";
++	init.uniqueid_len = sizeof("sweet-pdp-ip0") - 1;
++	init.name = "pdp_ip";
++	init.unit = 0;
++	init.family = IFNET_FAMILY_CELLULAR;
++	init.type = IFT_CELLULAR;
++	init.output = pdp_output;
++	init.demux = pdp_demux;
++	init.add_proto = pdp_add_proto;
++	init.del_proto = pdp_del_proto;
++	init.ioctl = pdp_ioctl;
++	init.detach = pdp_detach;
++	if (ifnet_allocate_extended(&init, &pdp_ifp) != 0) {
++		printf("SWEET PDP: ifnet_allocate failed\n");
++		pdp_ifp = NULL;
++		return;
++	}
++	ifnet_set_mtu(pdp_ifp, PDP_MTU);
++	ifnet_set_flags(pdp_ifp, IFF_POINTOPOINT | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(pdp_ifp, NULL) != 0) {
++		printf("SWEET PDP: ifnet_attach failed\n");
++		ifnet_release(pdp_ifp);
++		pdp_ifp = NULL;
++		return;
++	}
++	bzero(&proto, sizeof(proto));
++	proto.input = pdp_proto_input;
++	proto.pre_output = pdp_pre_output;
++	errno_t e4 = ifnet_attach_protocol(pdp_ifp, PF_INET, &proto);
++	errno_t e6 = ifnet_attach_protocol(pdp_ifp, PF_INET6, &proto);
++	printf("SWEET PDP: pdp_ip0 attached (inet %d, inet6 %d)\n", e4, e6);
++}
++
++/* the modem thread: one IP packet the IPA delivered for our mux */
++void
++sweet_pdp_input(const uint8_t *pkt, uint32_t len)
++{
++	mbuf_t m = NULL;
++
++	if (pdp_ifp == NULL || len == 0 || len > PDP_MTU + 64) {
++		return;
++	}
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
++	    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
++	    !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < len) {
++		if (m != NULL) {
++			mbuf_freem(m);
++		}
++		pdp_drops++;
++		return;
++	}
++	struct ifnet_stat_increment_param stats = {};
++	memcpy(mbuf_data(m), pkt, len);
++	mbuf_setlen(m, len);
++	mbuf_pkthdr_setlen(m, len);
++	mbuf_pkthdr_setrcvif(m, pdp_ifp);
++	mbuf_pkthdr_setheader(m, mbuf_data(m));
++	stats.packets_in = 1;
++	stats.bytes_in = len;
++	pdp_in++;
++	ifnet_input(pdp_ifp, m, &stats);
++}
++
++static int
++sysctl_sweet_pdp_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[128];
++	snprintf(buf, sizeof(buf), "pdp_ip0 %s: in %llu, out %llu, drops %llu", pdp_ifp != NULL ? "attached" : "absent",
++	    pdp_in, pdp_out, pdp_drops);
++	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_pdp_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_pdp_stats, "A", "pdp_ip0 packet counts");
+diff --git a/bsd/dev/sweet_qmi_dev.c b/bsd/dev/sweet_qmi_dev.c
+index bf02e5a..59aa36a 100644
+--- a/bsd/dev/sweet_qmi_dev.c
++++ b/bsd/dev/sweet_qmi_dev.c
+@@ -385,7 +385,7 @@ static int
+ sysctl_sweet_ipa_stats SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(oidp, arg1, arg2)
+-	static char buf[1024];
++	static char buf[2048];
+ 	int n = topaz_ipa_stats(buf, sizeof(buf));
+ 	if (n < 0) {
+ 		buf[0] = 0;
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index d1e29f5..6608445 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -7996,6 +7996,8 @@ ipa_rx_init(struct ipa_chan *c)
+ static void ipa_rx_keep(uint8_t mux, const uint8_t *p, uint16_t len);
+ static void ipa_raw_keep(uint8_t chan, const uint8_t *p, uint16_t len);
+ static void ipa_qmap_cmd(const uint8_t *frame, uint16_t len);
++extern "C" void sweet_pdp_create(void);
++extern "C" void sweet_pdp_input(const uint8_t *pkt, uint32_t len);
+ 
+ /* QMAP frames from the modem: [flags/pad, mux id, length (big endian)] + packet, back to back */
+ static void
+@@ -8024,6 +8026,9 @@ ipa_rx_event(struct ipa_chan *c, const uint8_t *e)
+ 			ipa_mux_seen[mux & 7]++;
+ 			if (!cmd) {
+ 				ipa_rx_keep(mux, d + off + 4, (uint16_t)(plen - pad));
++				if (mux == 1) {
++					sweet_pdp_input(d + off + 4, (uint32_t)(plen - pad));
++				}
+ 			} else {
+ 				ipa_qmap_cmd(d + off, (uint16_t)(4 + plen));
+ 			}
+@@ -8060,36 +8065,50 @@ ipa_tx_event(struct ipa_chan *c, const uint8_t *e)
+  * started with qmitool datacall. The packet goes out on modem TX behind a QMAP header (mux id) and
+  * an empty uplink checksum header (endpoint 1's 8-byte header, no checksum offload asked).
+  */
+-#define IPA_TX_SLOTS        16
++#define IPA_TX_SLOTS        64              /* DMA buffers on modem TX, one a TRE in flight */
++#define IPA_TXQ             64              /* packets waiting for the modem thread (0232: pdp_ip0's output) */
+ #define IPA_RXLOG           8
+-static uint8_t ipa_txq[1600];
++static struct { uint16_t len; uint8_t mux; uint8_t data[1600]; } ipa_txq[IPA_TXQ];
+ static uint32_t ipa_tx_hdr = 4;                 /* 4 = QMAP only (0231 default), 8 = QMAP + UL checksum header (peek "h8") */
+-static volatile uint32_t ipa_txq_len;
+-static uint8_t ipa_txq_mux;
++static volatile uint32_t ipa_txq_head, ipa_txq_tail;    /* written by the senders (under the lock) / the modem thread */
++static IOSimpleLock *ipa_txq_lock;
+ static uint8_t *ipa_txbuf;
+-static uint64_t ipa_txbuf_pa, ipa_tx_sent;
++static uint64_t ipa_txbuf_pa, ipa_tx_sent, ipa_tx_posted, ipa_tx_full;
+ static struct { uint32_t seq; uint8_t mux, pad; uint16_t len; uint8_t data[248]; } ipa_rxlog[IPA_RXLOG];
+ static uint32_t ipa_rxlog_seq;
+ 
+ extern "C" int
+ topaz_ipa_tx(const uint8_t *pkt, uint32_t len, uint8_t mux)
+ {
+-	if (!ipa_running || ipa_txbuf == NULL) {
++	if (!ipa_running || ipa_txbuf == NULL || ipa_txq_lock == NULL) {
+ 		return ENXIO;
+ 	}
+-	if (len < 20 || len > sizeof(ipa_txq)) {
++	if (len < 20 || len > sizeof(ipa_txq[0].data)) {
+ 		return EINVAL;
+ 	}
+-	if (ipa_txq_len != 0) {
++	IOSimpleLockLock(ipa_txq_lock);
++	uint32_t h = ipa_txq_head;
++	if (h - ipa_txq_tail >= IPA_TXQ) {
++		IOSimpleLockUnlock(ipa_txq_lock);
++		ipa_tx_full++;
+ 		return EBUSY;
+ 	}
+-	memcpy(ipa_txq, pkt, len);
+-	ipa_txq_mux = mux;
++	memcpy(ipa_txq[h % IPA_TXQ].data, pkt, len);
++	ipa_txq[h % IPA_TXQ].len = (uint16_t)len;
++	ipa_txq[h % IPA_TXQ].mux = mux;
+ 	mb();
+-	ipa_txq_len = len;
++	ipa_txq_head = h + 1;
++	IOSimpleLockUnlock(ipa_txq_lock);
+ 	return 0;
+ }
+ 
++/* sapphire 0232: pdp_ip0's output (bsd/dev/sweet_pdp.c) */
++extern "C" int
++topaz_ipa_send(const uint8_t *pkt, uint32_t len, uint8_t mux)
++{
++	return topaz_ipa_tx(pkt, len, mux);
++}
++
+ extern "C" int
+ topaz_ipa_rx(uint8_t *out, uint32_t max)
+ {
+@@ -8164,8 +8183,9 @@ ipa_qmap_cmd(const uint8_t *frame, uint16_t len)
+ static void
+ ipa_tx_pump(void)
+ {
+-	if (ipa_ackq_len != 0) {                /* a QMAP command ACK goes out as it is (its own header) */
+-		struct ipa_chan *c = IPA_MTX;
++	struct ipa_chan *c = IPA_MTX;
++
++	if (ipa_ackq_len != 0 && ipa_tx_posted - c->cmds < IPA_TX_SLOTS) {     /* a QMAP command ACK goes out as it is */
+ 		uint32_t slot = c->widx % IPA_TX_SLOTS;
+ 		uint8_t *b = ipa_txbuf + 2048 * slot;
+ 		uint32_t l = ipa_ackq_len;
+@@ -8174,31 +8194,39 @@ ipa_tx_pump(void)
+ 		memcpy(b + 8, ipa_ackq + 4, l - 4);
+ 		gsi_tre(c, ipa_txbuf_pa + 2048 * slot, (uint16_t)(l + 4), (2u << 16) | (1u << 9));
+ 		gsi_doorbell(c);
++		ipa_tx_posted++;
+ 		mb();
+ 		ipa_ackq_len = 0;
+ 	}
+-	uint32_t len = ipa_txq_len;
+-	if (len == 0) {
+-		return;
++	/* the queued packets, as many as there are free buffers (a buffer is free once its TRE completed) */
++	bool rang = false;
++	while (ipa_txq_tail != ipa_txq_head && ipa_tx_posted - c->cmds < IPA_TX_SLOTS) {
++		uint32_t t = ipa_txq_tail;
++		mb();
++		uint32_t len = ipa_txq[t % IPA_TXQ].len;
++		uint8_t mux = ipa_txq[t % IPA_TXQ].mux;
++		const uint8_t *pkt = ipa_txq[t % IPA_TXQ].data;
++		uint32_t slot = c->widx % IPA_TX_SLOTS;
++		uint8_t *b = ipa_txbuf + 2048 * slot;
++		b[0] = 0;                               /* pad 0, data */
++		b[1] = mux;
++		b[2] = (uint8_t)(len >> 8);
++		b[3] = (uint8_t)len;
++		bzero(b + 4, 4);                        /* uplink checksum header: nothing asked */
++		memcpy(b + ipa_tx_hdr, pkt, len);
++		gsi_tre(c, ipa_txbuf_pa + 2048 * slot, (uint16_t)(ipa_tx_hdr + len), (2u << 16) | (1u << 9));
++		rang = true;
++		ipa_tx_posted++;
++		ipa_tx_sent++;
++		if (ipa_tx_sent <= 8) {
++			LOG("t=%u ms: ipa: packet %llu to the modem: mux %u, %u bytes, proto %u", g_ms, ipa_tx_sent, mux, len, pkt[9]);
++		}
++		mb();
++		ipa_txq_tail = t + 1;
+ 	}
+-	struct ipa_chan *c = IPA_MTX;
+-	uint32_t slot = c->widx % IPA_TX_SLOTS;
+-	uint8_t *b = ipa_txbuf + 2048 * slot;
+-	b[0] = 0;                               /* pad 0, data */
+-	b[1] = ipa_txq_mux;
+-	b[2] = (uint8_t)(len >> 8);
+-	b[3] = (uint8_t)len;
+-	bzero(b + 4, 4);                        /* uplink checksum header: nothing asked */
+-	memcpy(b + ipa_tx_hdr, ipa_txq, len);
+-	gsi_tre(c, ipa_txbuf_pa + 2048 * slot, (uint16_t)(ipa_tx_hdr + len), (2u << 16) | (1u << 9));
+-	gsi_doorbell(c);
+-	ipa_tx_sent++;
+-	if (ipa_tx_sent <= 8) {
+-		LOG("t=%u ms: ipa: packet %llu to the modem: mux %u, %u bytes, proto %u", g_ms, ipa_tx_sent, ipa_txq_mux, len,
+-		    ipa_txq[9]);
++	if (rang) {
++		gsi_doorbell(c);
+ 	}
+-	mb();
+-	ipa_txq_len = 0;
+ }
+ 
+ /* ---- firmware: GSI microcode, authenticated by TrustZone (Linux ipa_firmware_load) */
+@@ -8475,6 +8503,9 @@ ipa_modem_start(void)
+ 	if (ipa_running) {
+ 		return;
+ 	}
++	if (ipa_txq_lock == NULL) {
++		ipa_txq_lock = IOSimpleLockAlloc();
++	}
+ 	ipa_txbuf = (uint8_t *)pool_alloc(2048 * IPA_TX_SLOTS, &ipa_txbuf_pa);
+ 	if (ipa_txbuf == NULL || !gsi_start(IPA_MTX) || !gsi_start(IPA_MRX) || !ipa_rx_init(IPA_MRX)) {
+ 		ipa_step = "modem endpoints did not start";
+@@ -8483,6 +8514,7 @@ ipa_modem_start(void)
+ 	ipa_running = true;
+ 	ipa_step = "running";
+ 	LOG("t=%u ms: ipa: *** modem TX/RX endpoints started: the modem's data can flow ***", g_ms);
++	sweet_pdp_create();
+ }
+ 
+ static void
+@@ -8729,6 +8761,10 @@ topaz_ipa_stats(char *buf, size_t len)
+ 		    c->name, c->ch, gsi_state(GSI_CH(0, c->ch)), c->ev, gsi_state(GSI_EV(0, c->ev)), c->widx, c->eidx,
+ 		    gr(GSI_EV(4, c->ev)), c->evr_pa, c->frames, c->bytes, c->pkts, c->cmds, c->last_code);
+ 	}
++	if (n > 0 && (size_t)n < len) {
++		n += snprintf(buf + n, len - n, "tx queue: head %u tail %u, posted %llu sent %llu, full %llu\n", ipa_txq_head,
++		    ipa_txq_tail, ipa_tx_posted, ipa_tx_sent, ipa_tx_full);
++	}
+ 	return n;
+ }
+ 
+-- 
+2.43.0
+
