@@ -7,4 +7,4 @@ case "${1:-bootloader}" in
 bootloader) m=2 ;; recovery) m=1 ;; system) m=0 ;;
 *) echo "usage: $0 [bootloader|recovery|system]" >&2; exit 2 ;;
 esac
-ssh -i ~/.ssh/sapphire_phone root@192.168.7.2 "/var/jb/usr/sbin/sysctl kern.sweet_reboot_mode=$m && /sbin/reboot"
+ssh -i ~/.ssh/sapphire_phone root@192.168.7.2 "/var/jb/usr/sbin/sysctl kern.sweet_reboot_mode=$m && /var/jb/sbin/reboot"
