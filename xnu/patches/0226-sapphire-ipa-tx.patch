@@ -1,0 +1,179 @@
+From 2d5a655565036b046441fbf7ae00684c1e169d22 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 19:12:53 +0000
+Subject: [PATCH] sapphire-0226: IPA: one IP packet at a time to the modem
+ (kern.sweet_ipa_tx: mux id + packet, QMAP + empty UL checksum header on modem
+ TX) and the last eight packets from it (kern.sweet_ipa_rx), for qmitool ping
+
+---
+ bsd/dev/sweet_qmi_dev.c         | 33 +++++++++++++
+ iokit/Kernel/arm/TopazModem.cpp | 88 ++++++++++++++++++++++++++++++++-
+ 2 files changed, 120 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_qmi_dev.c b/bsd/dev/sweet_qmi_dev.c
+index f06530f..120e12e 100644
+--- a/bsd/dev/sweet_qmi_dev.c
++++ b/bsd/dev/sweet_qmi_dev.c
+@@ -313,6 +313,39 @@ sysctl_sweet_modem_stats SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_modem_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_modem_stats, "A", "modem GLINK/QRTR counters");
+ 
++/* 0226: IP packets to and from the modem through the IPA (qmitool ping) */
++extern int topaz_ipa_tx(const uint8_t *pkt, uint32_t len, uint8_t mux);
++extern int topaz_ipa_rx(uint8_t *out, uint32_t max);
++static int
++sysctl_sweet_ipa_tx SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint8_t buf[1601];
++	if (req->newptr == USER_ADDR_NULL) {
++		return 0;
++	}
++	if (req->newlen < 21 || req->newlen > sizeof(buf)) {
++		return EINVAL;
++	}
++	int err = SYSCTL_IN(req, buf, req->newlen);
++	if (err != 0) {
++		return err;
++	}
++	return topaz_ipa_tx(buf + 1, (uint32_t)req->newlen - 1, buf[0]);   /* mux id, then the packet */
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_tx, CTLTYPE_OPAQUE | CTLFLAG_WR | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_ipa_tx, "S", "one IP packet to the modem (mux id byte, then the packet)");
++static int
++sysctl_sweet_ipa_rx SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint8_t buf[2048];
++	int n = topaz_ipa_rx(buf, sizeof(buf));
++	return SYSCTL_OUT(req, buf, n > 0 ? (size_t)n : 0);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_rx, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_ipa_rx, "S", "the last IP packets from the modem");
++
+ /* TopazModem, once the modem's IPCRTR channel is up */
+ void
+ sweet_qmi_dev_init(void)
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 67dd617..84f7241 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -8014,6 +8014,9 @@ ipa_rx_event(struct ipa_chan *c, const uint8_t *e)
+ 			}
+ 			c->pkts++;
+ 			ipa_mux_seen[mux & 7]++;
++			if (!cmd) {
++				ipa_rx_keep(mux, d + off + 4, (uint16_t)(plen - pad));
++			}
+ 			if (c->pkts <= 12) {
+ 				const uint8_t *ip = d + off + 4;
+ 				LOG("ipa: modem RX packet %llu: mux %u%s, %u bytes (pad %u), first bytes %02x %02x %02x %02x .. proto %u",
+@@ -8031,6 +8034,87 @@ ipa_rx_event(struct ipa_chan *c, const uint8_t *e)
+ 
+ static void ipa_tx_event(struct ipa_chan *c, const uint8_t *e) { (void)e; c->cmds++; }
+ 
++/*
++ * sapphire 0226: one IP packet at a time towards the modem (kern.sweet_ipa_tx, bsd/dev/sweet_qmi_dev.c)
++ * and the last packets from it (kern.sweet_ipa_rx): enough for qmitool's ping over a data call
++ * started with qmitool datacall. The packet goes out on modem TX behind a QMAP header (mux id) and
++ * an empty uplink checksum header (endpoint 1's 8-byte header, no checksum offload asked).
++ */
++#define IPA_TX_SLOTS        16
++#define IPA_RXLOG           8
++static uint8_t ipa_txq[1600];
++static volatile uint32_t ipa_txq_len;
++static uint8_t ipa_txq_mux;
++static uint8_t *ipa_txbuf;
++static uint64_t ipa_txbuf_pa, ipa_tx_sent;
++static struct { uint32_t seq; uint8_t mux, pad; uint16_t len; uint8_t data[248]; } ipa_rxlog[IPA_RXLOG];
++static uint32_t ipa_rxlog_seq;
++
++extern "C" int
++topaz_ipa_tx(const uint8_t *pkt, uint32_t len, uint8_t mux)
++{
++	if (!ipa_running || ipa_txbuf == NULL) {
++		return ENXIO;
++	}
++	if (len < 20 || len > sizeof(ipa_txq)) {
++		return EINVAL;
++	}
++	if (ipa_txq_len != 0) {
++		return EBUSY;
++	}
++	memcpy(ipa_txq, pkt, len);
++	ipa_txq_mux = mux;
++	mb();
++	ipa_txq_len = len;
++	return 0;
++}
++
++extern "C" int
++topaz_ipa_rx(uint8_t *out, uint32_t max)
++{
++	uint32_t n = MIN(max, (uint32_t)sizeof(ipa_rxlog));
++	memcpy(out, ipa_rxlog, n);
++	return (int)n;
++}
++
++static void
++ipa_rx_keep(uint8_t mux, const uint8_t *p, uint16_t len)
++{
++	unsigned i = ipa_rxlog_seq % IPA_RXLOG;
++	ipa_rxlog[i].len = len;
++	ipa_rxlog[i].mux = mux;
++	memcpy(ipa_rxlog[i].data, p, MIN((uint32_t)len, (uint32_t)sizeof(ipa_rxlog[i].data)));
++	mb();
++	ipa_rxlog[i].seq = ++ipa_rxlog_seq;
++}
++
++static void
++ipa_tx_pump(void)
++{
++	uint32_t len = ipa_txq_len;
++	if (len == 0) {
++		return;
++	}
++	struct ipa_chan *c = IPA_MTX;
++	uint32_t slot = c->widx % IPA_TX_SLOTS;
++	uint8_t *b = ipa_txbuf + 2048 * slot;
++	b[0] = 0;                               /* pad 0, data */
++	b[1] = ipa_txq_mux;
++	b[2] = (uint8_t)(len >> 8);
++	b[3] = (uint8_t)len;
++	bzero(b + 4, 4);                        /* uplink checksum header: nothing asked */
++	memcpy(b + 8, ipa_txq, len);
++	gsi_tre(c, ipa_txbuf_pa + 2048 * slot, (uint16_t)(8 + len), (2u << 16) | (1u << 9));
++	gsi_doorbell(c);
++	ipa_tx_sent++;
++	if (ipa_tx_sent <= 8) {
++		LOG("t=%u ms: ipa: packet %llu to the modem: mux %u, %u bytes, proto %u", g_ms, ipa_tx_sent, ipa_txq_mux, len,
++		    ipa_txq[9]);
++	}
++	mb();
++	ipa_txq_len = 0;
++}
++
+ /* ---- firmware: GSI microcode, authenticated by TrustZone (Linux ipa_firmware_load) */
+ 
+ static bool
+@@ -8305,7 +8389,8 @@ ipa_modem_start(void)
+ 	if (ipa_running) {
+ 		return;
+ 	}
+-	if (!gsi_start(IPA_MTX) || !gsi_start(IPA_MRX) || !ipa_rx_init(IPA_MRX)) {
++	ipa_txbuf = (uint8_t *)pool_alloc(2048 * IPA_TX_SLOTS, &ipa_txbuf_pa);
++	if (ipa_txbuf == NULL || !gsi_start(IPA_MTX) || !gsi_start(IPA_MRX) || !ipa_rx_init(IPA_MRX)) {
+ 		ipa_step = "modem endpoints did not start";
+ 		return;
+ 	}
+@@ -8430,6 +8515,7 @@ ipa_poll(unsigned ms)
+ 	}
+ 	if (ipa_running) {
+ 		gsi_events(IPA_MTX, ipa_tx_event);
++		ipa_tx_pump();
+ 		if (gsi_events(IPA_MRX, ipa_rx_event) != 0) {
+ 			gsi_doorbell(IPA_MRX);
+ 		}
+-- 
+2.43.0
+
