@@ -11,5 +11,5 @@ $L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -Wext
 echo "../obj/qmitool"
 # ccbridge.dylib: loaded into CommCenter (DYLD_INSERT_LIBRARIES), installed as /redwood/lib/ccbridge.dylib
 $L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -Wextra -Wno-unused-parameter \
-	-dynamiclib -install_name /redwood/lib/ccbridge.dylib -o ../obj/ccbridge.dylib ccbridge.c
+	-dynamiclib -install_name /redwood/lib/ccbridge.dylib -framework CoreFoundation -framework IOKit -o ../obj/ccbridge.dylib ccbridge.c
 echo "../obj/ccbridge.dylib"
