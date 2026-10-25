@@ -24,6 +24,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <netinet/in.h>
 #include <sys/select.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
@@ -896,6 +899,127 @@ print_ip(const char *label, uint32_t a)
 	printf("%-14s %u.%u.%u.%u\n", label, a >> 24, (a >> 16) & 255, (a >> 8) & 255, a & 255);
 }
 
+/*
+ * pdp_ip0 (kernel 0232): the call's address on the interface (point to point to the gateway) and,
+ * when there is none yet, the default route through it, as configd would do for a cellular service.
+ */
+static void
+sin_set(struct sockaddr_in *a, uint32_t ip)
+{
+	memset(a, 0, sizeof(*a));
+	a->sin_len = sizeof(*a);
+	a->sin_family = AF_INET;
+	a->sin_addr.s_addr = htonl(ip);
+}
+
+/* <net/route.h> is not in the iOS SDK: the routing socket's message, as xnu has it */
+struct rt_metrics {
+	uint32_t rmx_locks, rmx_mtu, rmx_hopcount;
+	int32_t rmx_expire;
+	uint32_t rmx_recvpipe, rmx_sendpipe, rmx_ssthresh, rmx_rtt, rmx_rttvar, rmx_pksent, rmx_state, rmx_filler[3];
+};
+struct rt_msghdr {
+	u_short rtm_msglen;
+	u_char rtm_version, rtm_type;
+	u_short rtm_index;
+	int rtm_flags, rtm_addrs;
+	pid_t rtm_pid;
+	int rtm_seq, rtm_errno, rtm_use;
+	uint32_t rtm_inits;
+	struct rt_metrics rtm_rmx;
+};
+#define RTM_VERSION     5
+#define RTM_ADD         0x1
+#define RTF_UP          0x1
+#define RTF_GATEWAY     0x2
+#define RTF_STATIC      0x800
+#define RTA_DST         0x1
+#define RTA_GATEWAY     0x2
+#define RTA_NETMASK     0x4
+
+struct ifaliasreq4 {
+	char ifra_name[IFNAMSIZ];
+	struct sockaddr_in ifra_addr, ifra_broadaddr, ifra_mask;
+};
+
+static int
+pdp_config(uint32_t ip, uint32_t gw, uint32_t mtu)
+{
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+	if (s < 0) {
+		perror("pdp_ip0: socket");
+		return -1;
+	}
+	struct ifaliasreq4 ifra;
+	memset(&ifra, 0, sizeof(ifra));
+	strlcpy(ifra.ifra_name, "pdp_ip0", sizeof(ifra.ifra_name));
+	sin_set(&ifra.ifra_addr, ip);
+	sin_set(&ifra.ifra_broadaddr, gw != 0 ? gw : ip);
+	sin_set(&ifra.ifra_mask, 0xffffffffu);
+	if (ioctl(s, SIOCAIFADDR, &ifra) < 0) {
+		perror("pdp_ip0: SIOCAIFADDR");
+		close(s);
+		return -1;
+	}
+	if (mtu >= 576 && mtu <= 1500) {
+		struct ifreq ifr;
+		memset(&ifr, 0, sizeof(ifr));
+		strlcpy(ifr.ifr_name, "pdp_ip0", sizeof(ifr.ifr_name));
+		ifr.ifr_mtu = (int)mtu;
+		(void)ioctl(s, SIOCSIFMTU, &ifr);
+	}
+	close(s);
+	printf("pdp_ip0        %u.%u.%u.%u -> %u.%u.%u.%u\n", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255,
+	    gw >> 24, (gw >> 16) & 255, (gw >> 8) & 255, gw & 255);
+
+	int r = socket(PF_ROUTE, SOCK_RAW, 0);
+	if (r < 0) {
+		perror("route socket");
+		return -1;
+	}
+	struct {
+		struct rt_msghdr h;
+		struct sockaddr_in dst, gw, mask;
+	} m;
+	memset(&m, 0, sizeof(m));
+	m.h.rtm_msglen = sizeof(m);
+	m.h.rtm_version = RTM_VERSION;
+	m.h.rtm_type = RTM_ADD;
+	m.h.rtm_flags = RTF_UP | RTF_GATEWAY | RTF_STATIC;
+	m.h.rtm_addrs = RTA_DST | RTA_GATEWAY | RTA_NETMASK;
+	m.h.rtm_pid = getpid();
+	m.h.rtm_seq = 1;
+	sin_set(&m.dst, 0);
+	sin_set(&m.gw, gw != 0 ? gw : ip);
+	sin_set(&m.mask, 0);
+	if (write(r, &m, sizeof(m)) < 0) {
+		printf("default route  %s\n", errno == EEXIST ? "already there (left alone)" : strerror(errno));
+	} else {
+		printf("default route  via pdp_ip0\n");
+	}
+	close(r);
+	return 0;
+}
+
+static int
+cmd_pdp_up(void)
+{
+	unsigned a[4], g[4];
+	FILE *f = fopen("/var/tmp/datacall.ip", "r");
+	if (f == NULL) {
+		printf("no data call (/var/tmp/datacall.ip)\n");
+		return 1;
+	}
+	int n = fscanf(f, "%u.%u.%u.%u %u.%u.%u.%u", &a[0], &a[1], &a[2], &a[3], &g[0], &g[1], &g[2], &g[3]);
+	fclose(f);
+	if (n < 4) {
+		return 1;
+	}
+	uint32_t ip = a[0] << 24 | a[1] << 16 | a[2] << 8 | a[3];
+	uint32_t gw = n == 8 ? (g[0] << 24 | g[1] << 16 | g[2] << 8 | g[3]) : 0;
+	return pdp_config(ip, gw, 0) ? 1 : 0;
+}
+
 static int
 cmd_datacall(const char *apn)
 {
@@ -970,10 +1094,15 @@ cmd_datacall(const char *apn)
 		print_ip("netmask", tlv_u32(&r, 0x21));
 		print_ip("dns", tlv_u32(&r, 0x15));
 		printf("%-14s %u\n", "mtu", tlv_u32(&r, 0x29));
+		uint32_t gw = tlv_u32(&r, 0x20);
 		FILE *f = fopen("/var/tmp/datacall.ip", "w");
 		if (f != NULL) {
-			fprintf(f, "%u.%u.%u.%u\n", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255);
+			fprintf(f, "%u.%u.%u.%u %u.%u.%u.%u\n", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255,
+			    gw >> 24, (gw >> 16) & 255, (gw >> 8) & 255, gw & 255);
 			fclose(f);
+		}
+		if (getenv("NO_PDP") == NULL) {
+			(void)pdp_config(ip, gw, tlv_u32(&r, 0x29));
 		}
 	}
 	fflush(stdout);
@@ -1336,6 +1465,7 @@ main(int argc, char **argv)
 	if (!strcmp(cmd, "raw") && argc > 3) return cmd_raw(argc - 2, argv + 2);
 	if (!strcmp(cmd, "datacall")) return cmd_datacall(argc > 2 ? argv[2] : NULL);
 	if (!strcmp(cmd, "ipa-raw")) return cmd_ipa_raw();
+	if (!strcmp(cmd, "pdp-up")) return cmd_pdp_up();
 	if (!strcmp(cmd, "syn") && argc > 3) return cmd_syn(argv[2], atoi(argv[3]));
 	if (!strcmp(cmd, "peek") && argc > 3) return cmd_peek(argc - 2, argv + 2);
 	if (!strcmp(cmd, "dns") && argc > 3) return cmd_dns(argv[2], argv[3]);
