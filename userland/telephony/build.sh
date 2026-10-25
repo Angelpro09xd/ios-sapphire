@@ -13,3 +13,6 @@ echo "../obj/qmitool"
 $L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -Wextra -Wno-unused-parameter \
 	-dynamiclib -install_name /redwood/lib/ccbridge.dylib -framework CoreFoundation -framework IOKit -o ../obj/ccbridge.dylib ccbridge.c
 echo "../obj/ccbridge.dylib"
+# ccstart: CommCenter's launchd Program (/redwood/bin/ccstart), sets DYLD_INSERT_LIBRARIES and execs it
+$L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -o ../obj/ccstart ccstart.c
+echo "../obj/ccstart"
