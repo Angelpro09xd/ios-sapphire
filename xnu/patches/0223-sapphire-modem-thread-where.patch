@@ -1,0 +1,106 @@
+From c5e30ebbc6f6c9818b5c5c931520e406cb6a5929 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 16:30:06 +0000
+Subject: [PATCH] sapphire-0223: the modem thread says where it is
+ (kern.sweet_modem_stats): it stopped under Apple's CommCenter
+
+---
+ iokit/Kernel/arm/TopazModem.cpp | 23 +++++++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 1b52b0b..c2dfd2b 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -559,6 +559,10 @@ static bool q_hello_sent, q_hello_rx, q_announced;
+ static struct { uint32_t svc, inst, node, port; } q_srv[64];
+ static unsigned q_srv_count, g_rx_msgs, g_tx_msgs, q_resumes;
+ static unsigned g_ms;                           /* watch time, for the log */
++/* 0223: where the modem thread is, for kern.sweet_modem_stats when it stops (it did, under CommCenter) */
++static const char *volatile g_where = "start";
++static volatile unsigned g_loops;
++#define WHERE(s) (g_where = (s))
+ 
+ static uint32_t
+ rx_avail(void)
+@@ -867,9 +871,9 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ extern "C" int
+ topaz_modem_stats(char *buf, size_t len)
+ {
+-	return snprintf(buf, len, "glink rx %u tx %u chan %s modem-intents %u txq %u drops %u; qrtr node %x hello %u services %u resume-rx %u",
++	return snprintf(buf, len, "glink rx %u tx %u chan %s modem-intents %u txq %u drops %u; qrtr node %x hello %u services %u resume-rx %u; thread at '%s', %u loops, t=%u ms",
+ 	    g_rx_msgs, g_tx_msgs, chan_up() ? "up" : "down", g_ri_count, g_txq_tail - g_txq_head, g_txq_drops,
+-	    q_modem_node, q_hello_rx, q_srv_count, q_resumes);
++	    q_modem_node, q_hello_rx, q_srv_count, q_resumes, g_where, g_loops, g_ms);
+ }
+ 
+ /* ---------------------------------------------------------------- GLINK RX */
+@@ -1060,13 +1064,17 @@ glink_poll(struct smem_part_hdr *part, unsigned ms)
+ 			LOG("t=%u ms: modem RX FIFO, %u bytes", ms, sz);
+ 		}
+ 	}
++	WHERE("glink rx");
+ 	for (int i = 0; i < 64 && g_rx != NULL && rx_one(); i++) {
+ 	}
+ 	if (q_hello_rx) {
++		WHERE("qmi pump");
+ 		sweet_qmi_dev_init();                   /* once; nodes for userland's QMI clients */
+ 		sweet_qmi_pump(qmi_user_send);
+ 	}
++	WHERE("txq pump");
+ 	txq_pump();
++	WHERE("glink poll end");
+ 	if (chan_up() && !g_intents_sent) {
+ 		advertise_intents(OUR_INTENTS, OUR_INTENT_SIZE);
+ 		g_intents_sent = true;
+@@ -7493,8 +7501,11 @@ radio_poll(unsigned ms)
+ 	if (!ce_up) {
+ 		return;
+ 	}
++	WHERE("wlan ce poll");
+ 	(void)ce_poll();
++	WHERE("wlan htt poll");
+ 	htt_poll();
++	WHERE("wlan join/tx");
+ 	if (scan_started && !api_ready) {
+ 		if (etxq_lock == NULL) {
+ 			etxq_lock = IOSimpleLockAlloc();
+@@ -7543,10 +7554,14 @@ svc_announce(void)
+ static bool
+ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *data, uint32_t len)
+ {
++	WHERE("qmi deliver");
+ 	if (sweet_qmi_deliver(dst_port, src_node, src_port, data, len)) {
++		WHERE("svc rx");
+ 		return true;                            /* a userland client's port (0x3000..) */
+ 	}
++	WHERE("svc rx (kernel services)");
+ 	if (dst_port == PORT_TFTP) {
++		WHERE("tftp");
+ 		if (len >= 2 && (data[1] == OP_RRQ || data[1] == OP_WRQ)) {
+ 			tftp_request(src_node, src_port, data, len);
+ 		}
+@@ -7570,6 +7585,7 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+ 		return true;
+ 	}
+ 	if (dst_port == PORT_RMTFS) {
++		WHERE("rmtfs");
+ 		rmtfs_rx(src_node, src_port, txn, msg, data, len);
+ 		return true;
+ 	}
+@@ -7646,9 +7662,12 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 				ready = false;  /* no retry */
+ 			}
+ 		}
++		g_loops++;
+ 		if (glink) {
+ 			glink_poll(part, ms);
++			WHERE("radio poll");
+ 			radio_poll(ms);
++			WHERE("watch loop");
+ 		}
+ 		if (glink && (ms == 3000 || ms == 20000)) {
+ 			glink_summary();                /* early, before the iOS UI covers the console */
+-- 
+2.43.0
+
