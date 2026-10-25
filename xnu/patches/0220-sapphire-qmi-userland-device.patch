@@ -1,4 +1,4 @@
-From 144aa83ab21aac69d4e1d157bebf3dcc0f819e13 Mon Sep 17 00:00:00 2001
+From 48bc9938ad3faccf5a441edfa9f6f90b874f777e Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Sun, 25 Oct 2026 11:59:43 +0000
 Subject: [PATCH] sapphire-0220: /dev/redwood-qmi0..15: QMI to the modem for
@@ -6,9 +6,9 @@ Subject: [PATCH] sapphire-0220: /dev/redwood-qmi0..15: QMI to the modem for
 
 ---
  bsd/conf/files                  |   1 +
- bsd/dev/sweet_qmi_dev.c         | 301 ++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_qmi_dev.c         | 302 ++++++++++++++++++++++++++++++++
  iokit/Kernel/arm/TopazModem.cpp |  48 +++++
- 3 files changed, 350 insertions(+)
+ 3 files changed, 351 insertions(+)
  create mode 100644 bsd/dev/sweet_qmi_dev.c
 
 diff --git a/bsd/conf/files b/bsd/conf/files
@@ -25,10 +25,10 @@ index 35af81b..85e76c0 100644
  bsd/dev/munge.c 			optional config_requires_u32_munging
 diff --git a/bsd/dev/sweet_qmi_dev.c b/bsd/dev/sweet_qmi_dev.c
 new file mode 100644
-index 0000000..b838a3d
+index 0000000..2fb1635
 --- /dev/null
 +++ b/bsd/dev/sweet_qmi_dev.c
-@@ -0,0 +1,301 @@
+@@ -0,0 +1,302 @@
 +/*
 + * /dev/redwood-qmi0 .. /dev/redwood-qmi15: QMI to the modem for userland (IMEI, SIM, network,
 + * SMS), the way Linux's AF_QIPCRTR sockets give it to libqmi / rild. The kernel only carries
@@ -53,6 +53,7 @@ index 0000000..b838a3d
 +#include <sys/ioccom.h>
 +#include <sys/proc.h>
 +#include <sys/select.h>
++#include <sys/vnode.h>
 +#include <miscfs/devfs/devfs.h>
 +#include <kern/locks.h>
 +#include <kern/kalloc.h>
