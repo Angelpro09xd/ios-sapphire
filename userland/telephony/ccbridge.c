@@ -740,6 +740,16 @@ br_svc_of(struct br_chan *c, uint8_t svc, int create)
 	v->svc = svc;
 	v->fd = -1;
 	v->next_txn = 1;
+	/*
+	 * kept away from the modem, answered here (QMI_ERR_NOT_SUPPORTED): with CommCenter talking
+	 * to it the modem died minutes after registering ("dog_hb.c: Task starvation: dcc"),
+	 * never with qmitool alone. First suspects: COEX (0x22, re-configured every 30 s), QOS (0x04)
+	 * and 0x2a.
+	 */
+	if (svc == 0x22 || svc == 0x04 || svc == 0x2a) {
+		say("bridge: service 0x%x kept from the modem (answered here)", svc);
+		return v;
+	}
 	char path[32];
 	for (int i = 0; i < 32; i++) {
 		snprintf(path, sizeof(path), "/dev/redwood-qmi%d", i);
