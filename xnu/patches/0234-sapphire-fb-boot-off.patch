@@ -1,0 +1,58 @@
+From 10e4b6908eae696ff212e19a630e529949a6cd1f Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 22:57:48 +0000
+Subject: [PATCH] sapphire-0234: AppleCLCD ignores only the display-off request
+ backboardd sends at boot (before the first on, first 2 minutes); later ones
+ (auto-lock, power button) turn the panel off, without sweetfb_stayon
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6cb59b9..4d53e8c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -225,6 +225,8 @@ public:
+ 	void          scanFrom(uint64_t pa, uint32_t stride);
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
++	bool          fPowerOnSeen;   /* 0234: a display-on request came (the UI is up) */
++	uint64_t      fStartAbs;      /* mach_absolute_time() at start */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 	/* topaz fade: cached copy of the last frame and a contiguous output frame */
+ 	IOBufferMemoryDescriptor *fFadeOrig;
+@@ -513,6 +515,7 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
++	fStartAbs = mach_absolute_time();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;
+@@ -1633,6 +1636,22 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				IOLog("SWEET FB: display off ignored (sweetfb_stayon)\n");
+ 				break;
+ 			}
++			/*
++			 * sapphire 0234: backboardd asks for display off right after the Apple logo, long
++			 * before the UI can ask for it on again, and the panel stayed black (sweetfb_stayon=1
++			 * worked around it, but then the panel never went off). An off before the first on,
++			 * in the first 2 minutes, is that one: ignored. Later ones (auto-lock, the power
++			 * button) turn the panel off as asked.
++			 */
++			uint64_t since_ns;
++			absolutetime_to_nanoseconds(mach_absolute_time() - fFB->fStartAbs, &since_ns);
++			if (off && !fFB->fPowerOnSeen && since_ns < 120ull * NSEC_PER_SEC) {
++				IOLog("SWEET FB: display off ignored (boot, %llu s)\n", since_ns / NSEC_PER_SEC);
++				break;
++			}
++			if (!off) {
++				fFB->fPowerOnSeen = true;
++			}
+ 			IOLockLock(fFB->fLock);
+ 			bool changed = off != fFB->fPowerOff;
+ 			if (changed) {
+-- 
+2.43.0
+

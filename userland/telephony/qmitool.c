@@ -31,9 +31,14 @@
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <sys/file.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <signal.h>
 #include <unistd.h>
+
+/* installed next to qmitool (/redwood/bin) or, by hand, in /var/root */
+#define PDPNET (access("/redwood/bin/pdpnet", X_OK) == 0 ? "/redwood/bin/pdpnet" : "/var/root/pdpnet")
 
 struct sweet_qmi_hdr { uint32_t node, port; };
 struct sweet_qmi_lookup { uint32_t svc, inst, index, node, port, found_inst; };
@@ -1160,7 +1165,7 @@ cmd_datacall(const char *apn)
 			fclose(f);
 		}
 		if (getenv("NO_PDP") == NULL && pdp_config(ip, gw, tlv_u32(&r, 0x29)) == 0 &&
-		    access("/var/root/pdpnet", X_OK) == 0) {
+		    access(PDPNET, X_OK) == 0) {
 			fflush(stdout);
 			/* pdpnet watch: the call's IPv4 and DNS for configd while the cellular data switch is on */
 			pid_t pid = fork();
@@ -1171,7 +1176,7 @@ cmd_datacall(const char *apn)
 					dup2(fd, 1);
 					dup2(fd, 2);
 				}
-				execl("/var/root/pdpnet", "pdpnet", "watch", (char *)NULL);
+				execl(PDPNET, "pdpnet", "watch", (char *)NULL);
 				_exit(127);
 			}
 		}
@@ -1187,6 +1192,85 @@ cmd_datacall(const char *apn)
 			    tlv_u32(&r, 0x15), tlv_u32(&r, 0x1b), tlv_u32(&r, 0x1c));
 			fflush(stdout);
 		}
+	}
+}
+
+/* 1 when NAS says registered with PS attached, 0 otherwise, -1 when NAS does not answer */
+static int
+ps_attached(void)
+{
+	struct cli c;
+	struct msg r;
+	if (cli_open(&c, SVC_NAS) != 0) {
+		return -1;
+	}
+	int e = simple(&c, 0x0024, &r);
+	uint16_t l;
+	const uint8_t *v;
+	int ok = e != 0 ? -1 : ((v = tlv(&r, 0x01, &l)) != NULL && l >= 5 && v[0] == 1 && v[2] == 1);
+	close(c.fd);
+	return ok;
+}
+
+/*
+ * qmitool autodata [APN]: the data call at boot, without anyone at the console (started by
+ * ccstart next to CommCenter). Waits for the modem's registration with packet service (the PIN is
+ * entered on the lock screen), takes the modem online when it sits in low power after boot, then
+ * runs datacall; when the call fails or ends, starts over. One instance (flock).
+ */
+static int
+cmd_autodata(const char *apn)
+{
+	if (geteuid() == 0) {
+		/* setuid root from ccstart (CommCenter's user): root for the address, the route, pdpnet */
+		(void)setgid(0);
+		(void)setuid(0);
+	}
+	int lk = open("/var/tmp/autodata.lock", O_RDWR | O_CREAT, 0644);
+	if (lk < 0 || flock(lk, LOCK_EX | LOCK_NB) < 0) {
+		printf("autodata: already running\n");
+		return 0;
+	}
+	if (apn == NULL) {
+		FILE *f = fopen("/var/root/apn", "r");
+		static char b[64];
+		if (f != NULL && fscanf(f, "%63s", b) == 1) {
+			apn = b;
+		}
+		if (f != NULL) {
+			fclose(f);
+		}
+	}
+	if (apn == NULL) {
+		apn = "internet";
+	}
+	time_t last_online = 0;
+	for (;;) {
+		int a = ps_attached();
+		if (a != 1) {
+			time_t now = time(NULL);
+			if (a == 0 && now - last_online >= 30) {
+				printf("autodata: not attached, modem online\n");
+				fflush(stdout);
+				(void)cmd_mode(0);
+				last_online = now;
+			}
+			sleep(3);
+			continue;
+		}
+		printf("autodata: attached, data call on APN %s\n", apn);
+		fflush(stdout);
+		pid_t pid = fork();
+		if (pid == 0) {
+			_exit(cmd_datacall(apn));
+		}
+		int st = 0;
+		if (pid > 0) {
+			(void)waitpid(pid, &st, 0);
+		}
+		printf("autodata: data call ended (status %d), again in 10 s\n", st);
+		fflush(stdout);
+		sleep(10);
 	}
 }
 
@@ -1537,6 +1621,7 @@ main(int argc, char **argv)
 	if (!strcmp(cmd, "datacall")) return cmd_datacall(argc > 2 ? argv[2] : NULL);
 	if (!strcmp(cmd, "ipa-raw")) return cmd_ipa_raw();
 	if (!strcmp(cmd, "pdp-up")) return cmd_pdp_up();
+	if (!strcmp(cmd, "autodata")) return cmd_autodata(argc > 2 ? argv[2] : NULL);
 	if (!strcmp(cmd, "http") && argc > 3) return cmd_http(argv[2], argv[3], argc > 4 ? argv[4] : "/");
 	if (!strcmp(cmd, "syn") && argc > 3) return cmd_syn(argv[2], atoi(argv[3]));
 	if (!strcmp(cmd, "peek") && argc > 3) return cmd_peek(argc - 2, argv + 2);
