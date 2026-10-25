@@ -1194,6 +1194,28 @@ cmd_ipa_raw(void)
 	return 0;
 }
 
+/* qmitool peek "g 1c000 32" / "i 810" / "s 290 32" / "wi 810 VALUE": kern.sweet_ipa_peek (kernel 0229+) */
+static int
+cmd_peek(int argc, char **argv)
+{
+	char req[64] = "";
+	for (int i = 0; i < argc; i++) {
+		strlcat(req, argv[i], sizeof(req));
+		if (i + 1 < argc) strlcat(req, " ", sizeof(req));
+	}
+	if (sysctlbyname("kern.sweet_ipa_peek", NULL, NULL, req, strlen(req)) != 0) {
+		fprintf(stderr, "kern.sweet_ipa_peek: %s\n", strerror(errno));
+		return 1;
+	}
+	char out[1100];
+	size_t ol = sizeof(out);
+	if (sysctlbyname("kern.sweet_ipa_peek", out, &ol, NULL, 0) != 0) {
+		return 1;
+	}
+	fputs(out, stdout);
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1220,6 +1242,7 @@ main(int argc, char **argv)
 	if (!strcmp(cmd, "raw") && argc > 3) return cmd_raw(argc - 2, argv + 2);
 	if (!strcmp(cmd, "datacall")) return cmd_datacall(argc > 2 ? argv[2] : NULL);
 	if (!strcmp(cmd, "ipa-raw")) return cmd_ipa_raw();
+	if (!strcmp(cmd, "peek") && argc > 3) return cmd_peek(argc - 2, argv + 2);
 	if (!strcmp(cmd, "dns") && argc > 3) return cmd_dns(argv[2], argv[3]);
 	if (!strcmp(cmd, "ping") && argc > 2) return cmd_ping(argv[2], argc > 3 ? argv[3] : NULL);
 	fprintf(stderr, "unknown command %s\n", cmd);
