@@ -1,0 +1,67 @@
+From 45a34feff42e51df8d2e7e35cf089ab7e5002394 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 25 Oct 2026 10:48:23 +0000
+Subject: [PATCH] sapphire-0213: a battery percent that moves slowly and one
+ way
+
+0212 on the phone: the percent jumped every 2 s (18, 16, 19, 17) and now and
+then to 100. QG_SOC_MONOTONIC is not kept up here (84, 0, other values from
+one boot to the next): no longer used. The voltage moves with the load:
+the current's drop is taken out (an open-circuit estimate, 0.15 ohm), the
+result averaged (1/8 of each new reading), and its percent shown at most
+one point every 30 s, never down while charging nor up while discharging.
+"Full" only after 3 polls in a row.
+---
+ iokit/Kernel/arm/SweetBattery.cpp | 35 ++++++++++++++++++++++++++++---
+ 1 file changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 2ffc291..7fdd803 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -331,10 +331,39 @@ SweetBattery::poll(void)
+ 		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
+ 	}
+ 	/*
+-	 * 0210: QG_SOC_MONOTONIC first. On the phone it held 84 while the voltage under charge gave
+-	 * an estimate of 39%: the value the PMIC keeps (the boot's charger code, the gauge) is the real one.
++	 * 0213: what is shown moves slowly and one way. On the phone the percent jumped every 2 s (18,
++	 * 16, 19, 17) and now and then to 100: QG_SOC_MONOTONIC is not kept up here (84, 0, other values
++	 * from one boot to the next) and is no longer used, and the voltage moves with the load. So:
++	 * the voltage with the current's drop taken out (an open-circuit estimate, 0.15 ohm), averaged
++	 * (1/8 of each new reading), its percent shown at most 1 point every 30 s, never down while
++	 * charging nor up while discharging; "full" only after 3 polls in a row.
+ 	 */
+-	unsigned percent = (msoc >= 1 && msoc <= 100) ? msoc : haveV ? estimatePercent(mv) : 50;
++	static int64_t avgMv16;                 /* the averaged estimate, mV * 16 */
++	static unsigned shown, sinceChange, fullPolls;
++	unsigned percent = shown != 0 ? shown : 50;
++	if (haveV) {
++		int ocv = (int)mv - (int)((int64_t)ma * 15 / 100);     /* ma > 0 charging: the voltage stands above the OCV */
++		if (ocv < 3000) {
++			ocv = 3000;
++		}
++		avgMv16 = avgMv16 == 0 ? (int64_t)ocv * 16 : avgMv16 + ((int64_t)ocv * 16 - avgMv16) / 8;
++		unsigned target = estimatePercent((unsigned)(avgMv16 / 16));
++		if (shown == 0) {
++			shown = target;
++			sinceChange = 0;
++		} else if (++sinceChange >= 15 && target != shown) {
++			bool up = target > shown;
++			if ((up && !(charging && (ma >= 0))) || (!up && charging)) {
++				/* not the way the current goes: stay */
++			} else {
++				shown += up ? 1 : -1;
++				sinceChange = 0;
++			}
++		}
++		percent = shown;
++	}
++	fullPolls = (external && state == 5 && !(error & 2u)) ? fullPolls + 1 : 0;
++	full = fullPolls >= 3;
+ 	if (!regs) {
+ 		static unsigned bad;
+ 		if (bad++ % 30 == 0) {
+-- 
+2.43.0
+
