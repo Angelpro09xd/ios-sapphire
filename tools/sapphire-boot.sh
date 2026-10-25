@@ -36,6 +36,11 @@ while [[ ${1:-} == --* ]]; do
 	--console) con="" ;;
 	--amp) amp+=(--amp); cpus=8 ;;
 	--no-baseband) amp+=(--no-baseband) ;;   # no /baseband node: launchd leaves CommCenter alone
+	--ipa-fw)                                # DIR with the vendor's ipa_fws.mdt and ipa_fws.elf (boot-arg ipa=1)
+		shift
+		[[ -f $1/ipa_fws.mdt && -f $1/ipa_fws.elf ]] || { echo "$1/ipa_fws.{mdt,elf} not found" >&2; exit 1; }
+		gpufw+=(--ipa-mdt "$1/ipa_fws.mdt" --ipa-elf "$1/ipa_fws.elf")
+		;;
 	--gpu-fw)
 		shift
 		[[ -f $1/a630_sqe.fw ]] || { echo "$1/a630_sqe.fw not found" >&2; exit 1; }
