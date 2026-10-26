@@ -7,17 +7,16 @@ entry first; this file is the short version plus what lives outside git.
 
 ## What works on the phone today
 
-- Boots to the iOS home screen; touch calibrated for this phone (patch 0140); Settings opens.
-- USB networking (patch 0142, `sweetusb=2`): the phone is `192.168.7.2`, the PC `192.168.7.1`,
-  and the kernel console streams to UDP 5140. This is the fastest way to watch a boot.
-- Modem and Wi-Fi firmware boot from the stock `modem_a` (patch 0143), and the phone **joins a
-  WPA2 network** with upstream's station code plus `wifi_ssid=` / `wifi_pass=` boot args (0144).
-  iOS itself has no network interface on it yet.
-- GPU (Adreno 610, patch 0145): **powered and answering** (`gpu=2`): RBBM_STATUS 0x1, and the
-  always-on counter grows at 19.2 MHz. But three of the four boots that got that far killed the
-  phone about a second later, with every clock reading correct and nothing else in the log, so
-  the open question is why (`NOTES.md`, newest entries; `gpu_div` and `gpu_smmu_early` exist to
-  bisect it one variable per boot).
+Updated 2026-10-26 (kernel 0234; details in `NOTES.md`, entry "SAPPHIRE 2026-10-25/26").
+
+- Boots to the iOS home screen on 8 cores (4K-page kernel, Codemagic workflow `xnu-4k`),
+  through our UEFI (`uefi/`), with touch, GPU (Adreno 610, Mesa/turnip + EAGL bridge), sound,
+  battery, Wi-Fi firmware, USB networking (`192.168.7.2`).
+- Telephony: SIM, signal bars, operator name (ccbridge inside CommCenter).
+- **Mobile data (LTE) for every app**, through the IPA driver (`ipa=1`) and `pdp_ip0`; the data
+  call starts by itself after the PIN; the Control Center data switch works.
+- The panel turns off/on with the power button and auto-lock (no `sweetfb_stayon` any more).
+- Open: the panel goes black after the Apple logo until the boot ends; USB link stalls.
 
 ## The pieces outside this repository
 
@@ -93,21 +92,8 @@ tools/sapphire-boot.sh --gpu-fw ../gpu-fw xnu/out-cm6/kernel.development.sweet o
 
 ## The next step
 
-Find out why a powered GPU kills the phone a second later. It needs a kernel built from the
-current `sapphire` (Codemagic, ~4 minutes) and then boots that change **one** thing at a time:
-
-```sh
-tools/sapphire-boot.sh --gpu-fw ../gpu-fw <kernel> out.img \
-    "sweetusb=2 gpu=2 gpu_delay=20 gpu_slow=1200"            # how often does it die at all?
-#   ... the same + gpu_smmu_early=1    identity SMMU bank before the GX domain
-#   ... the same + gpu_div=8           core at 75 MHz instead of 300
-```
-
-Attach the USB to WSL during the `gpu_delay` and watch UDP 5140; after a death, read the ring
-from recovery with `tools/sweet-log-pull.sh` (it survives, and it held the same lines as the live
-console last time). A death leaves the HFS+ journal dirty: repair it before the next boot, the
-way "Working on the phone without copying 16 GB" above says.
-
-Once a boot survives, `gpu=4` runs a command on the GPU with only the open microcode, and every
-step of it now reports before it runs. `gpu=3` needs this phone's signed zap shader, which still
-has to be found in its vendor filesystem.
+1. The black panel after the Apple logo (0233 removed the minutes-long contiguous allocation
+   stall, the symptom stayed): read a full boot log (`dmesg`, UDP 5140) for what the
+   framebuffer does between the logo and SpringBoard.
+2. SMS and calls in the apps, the USB stall, then CommCenter's own data contexts (4G icon,
+   per-app cellular policy).

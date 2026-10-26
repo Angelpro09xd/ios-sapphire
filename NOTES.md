@@ -1,5 +1,86 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-10-25/26: mobile data in iOS, display off, boot logo (kernels 0224-0234)
+
+**Works now (user confirmed on 0234):** LTE mobile data for every app (Safari loads pages), the
+Control Center cellular data switch cuts it and restores it, the data call comes up by itself
+after the SIM PIN, the panel turns off and on with the power button / auto-lock.
+**Still open:** the panel goes black right after the Apple logo and comes back when the boot ends
+(0233 removed one cause, below, but not the symptom).
+
+### IPA driver (kernel 0225-0231, `iokit/Kernel/arm/TopazModem.cpp`, boot-arg `ipa=1`)
+Without an IPA on the AP the modem dies as soon as data or IMS comes up ("Task starvation:
+dcc/ims", "ipa_dl_opt_lte IPA Assert"). Port of Linux `drivers/net/ipa` for IPA v4.2 (SC7180
+data; QCM2290 is the same IPA at the same addresses): registers 0x5840000, GSI 0x5804000, SRAM
+reg+0x7000 (0x20a8 bytes), GSI firmware `ipa_fws` via PAS 15 at 0x55a00000 (`--ipa-fw DIR`
+-> mkadt `--ipa-mdt/--ipa-elf` -> /chosen), RPM clock "ipa" 100 MHz, SMMU stream 0x140 bypass,
+SMEM item 497, SMP2P "ipa" answered 3. GSI channels: AP cmd ch1/ev0/ep6, LAN RX ch2/ev1/ep8,
+modem TX ch0/ev2/ep1, modem RX ch3/ev3/ep9; the modem's EE1 channels 0-3 are allocated by the
+AP with GENERIC_CMD (v4.2 quirk). IPA QMI: INIT_DRIVER to the modem's 0x31:0x201, our server
+0x31:0x101 (INDICATION_REGISTER, DRIVER_INIT_COMPLETE, then IND INIT_COMPLETE); 0x23/0x27 from
+the modem are answered ok (the DT's modem-cfg-emb-pipe-flt: the modem installs the UL filters).
+**Uplink header (0231): QMAP only, 4 bytes, endpoint 1 CFG 0 (no checksum offload).** With the
+8-byte QMAP + checksum header the IPA did not strip ours and the network dropped everything.
+Never write IPA SRAM 0x504: it is the modem's own UL header (`EX:kernel:0x0:ipa_ul:0x17a`).
+Diagnostics: `kern.sweet_ipa_stats`, `_rx`, `_raw`, `_peek` (`qmitool peek`).
+
+### pdp_ip0 (kernel 0232, `bsd/dev/sweet_pdp.c`)
+Raw IP point-to-point interface (IFT_CELLULAR, the name iOS expects) over mux 1: output -> a
+64-packet queue in TopazModem -> 64 DMA buffers on modem TX (a buffer is reused once its TRE
+completed); mux 1 packets from modem RX -> `ifnet_input`. `kern.sweet_pdp_stats`.
+First real traffic: `qmitool http 142.250.184.14 www.google.com /` = 200 OK, 88 KB in 0.6 s.
+
+### Userland (`userland/telephony`, `build.sh`)
+- `qmitool datacall [APN]`: DPM open port (embedded ep {4,1}, consumer 1 then producer 9),
+  WDA raw IP + QMAP aggregation, WDS bind mux 1, start network, runtime settings; writes
+  `/var/tmp/datacall.ip` ("ip gw dns1 dns2"), puts the address on pdp_ip0 (SIOCAIFADDR, peer =
+  gateway) and adds the default route, then starts `pdpnet watch`. Keeps the WDS client open.
+- `qmitool autodata [APN]`: waits for NAS registered + PS attached (the PIN is typed on the lock
+  screen), sends `online` when the modem sits in low power, runs datacall, starts over when the
+  call ends. APN from `/var/root/apn`, default `internet`. One instance (flock). Started by
+  **ccbridge** (`start_autodata`, posix_spawn of `/redwood/bin/qmitool`, setuid root) when it
+  loads into CommCenter; `/var/tmp/autodata.off` disables it. Log `/var/tmp/autodata.log`.
+  CommCenter's launchd job does not go through `ccstart` (its ProgramArguments are CommCenter
+  itself; ccbridge is installed as `/usr/appleinternal/lib/liblinkguard.dylib`).
+- `pdpnet`: publishes `State:/Network/Service/sapphire-pdp_ip0/{IPv4,DNS}` to configd, which
+  makes it the primary service and gives mDNSResponder the DNS servers. The iOS SDK marks
+  SCDynamicStore unavailable: `#undef API_UNAVAILABLE` before the SystemConfiguration header.
+  `pdpnet watch` polls CoreTelephony's private `_CTServerConnectionGetCellularDataIsEnabled`
+  (works from an unsigned binary) every 0.5 s: off removes the address and the service, on puts
+  them back; the call itself stays up on the modem. `pdpnet show|keys REGEX|resolve NAME`.
+- On the phone: `/redwood/bin/{qmitool (4755),pdpnet}`, ccbridge in liblinkguard.dylib
+  (old copy in `/var/root/liblinkguard.dylib.bak`).
+
+### Display (kernel 0233, 0234, `SweetFramebuffer.cpp`)
+- 0233: with the kernel's RAM above 4 GiB (`mkadt.py --highmem`) every contiguous below-4G
+  allocation fails (`vm_page_find_contiguous(num=633,low=262143) ... scanned 1 pages`, then
+  zone_gc twice, again per buffer: minutes). The flip buffers, console shadow and DSI buffer now
+  come from a fixed unmanaged low-DDR pool, 0xE2000000 + 48 MB (after the modem pool 0xE0000000
+  and the GPU's 0xE1000000-0xE1500000), mapped write-combined (Device would fault on memcpy).
+  The logo still disappears: the cause is something else; next session starts from the boot log.
+- 0234: `sweetfb_stayon=1` is no longer needed (and no longer in the boot args): only the
+  display-off that backboardd sends at boot (before the first on, first 2 minutes) is ignored.
+
+### Boot image (current)
+```sh
+tools/sapphire-boot.sh --amp --gpu-fw ../gpu-fw/vendor --ipa-fw ../vendor-extract/firmware \
+  ../xnu/out-0234/kernel.development.sweet ../sapphire-4k-0234.img \
+  "sweetusb=2 gpu=3 gpu_delay=20 gpu_mmu=1 gpu_service=1 sweetfb_gpucopy=1 sweetmetal=1 sweetgl=1 modem=1 wifi=1 audio=2 gpu_div=1 sweetfb_direct=0 gpu_mhz=1260 glwait=0 vblur=2 ipa=1 glenv=FD_MESA_DEBUG=sysmem"
+python3 uefi/mkuefi-v4.py Mu-sapphire.img sapphire-uefi-4k-0234.img shim/out/Image sapphire.dtb
+fastboot boot sapphire-uefi-4k-0234.img
+```
+Kernels build on Codemagic workflow `xnu-4k` (REST API: POST /builds with appId, workflowId,
+branch; poll /builds/ID; artefact `xnu-kernel-4k.zip`).
+
+### Known problems
+- The USB link to the PC stalls now and then (not a lost event: `kern.sweet_usb_stats` shows
+  none); recover with `usbipd detach --busid 3-2`, attach again. Run long phone tests with
+  nohup into a file so a stall does not kill them.
+- After a new datacall with a different address, an already running `pdpnet watch` only syncs
+  once; the old address can stay on pdp_ip0 as an alias.
+- No 4G icon logic of our own: CommCenter shows 4G/none from its own state; SMS/calls in the
+  apps, locationd crash loop, below-4G GPU allocations elsewhere: not done.
+
 ## SAPPHIRE port (Redmi Note 13 4G, sapphire/sapphiren) - handoff 2026-10-19
 
 Branch `sapphire`, forked from ios-topaz `topaz` at 5b208e0.
