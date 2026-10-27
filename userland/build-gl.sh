@@ -11,4 +11,6 @@ python3 mkeagl.py src/eagl_slots.txt $M/gl.xml $M/exported-gl.txt src/eagl.c > o
 clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -Wno-unused-function -Wno-frame-address \
 	-dynamiclib -install_name /redwood/lib/libredwood-gl.dylib -Iobj -framework CoreFoundation -framework IOKit \
 	-framework IOSurface -lobjc $M/libOSMesa.8.dylib -o obj/libredwood-gl.dylib src/eagl.c src/gl_osmesa.c
-echo "obj/libredwood-gl.dylib"
+clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -dynamiclib \
+	-install_name /redwood/lib/libredwood-glload.dylib -o obj/libredwood-glload.dylib src/glload.c
+echo "obj/libredwood-gl.dylib obj/libredwood-glload.dylib"
