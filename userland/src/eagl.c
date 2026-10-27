@@ -272,6 +272,11 @@ struct eagl {
 	id object;                      /* the EAGLContext */
 	struct redwood_gl *gl;
 	unsigned long api;
+	struct drawable *drawable;      /* an app's CAEAGLLayer (renderbufferStorage:fromDrawable:), or NULL */
+	uint32_t *texture_frame;        /* texture name (below IMAGE_NAMES) -> the frame that last drew with or into it */
+	GLsync frame_fence[8];          /* a fence after each of the last frames (glFinishObjectAPPLE) */
+	uint32_t frame_fence_of[8];     /* ... and the frame it follows */
+	unsigned frame_fence_next;
 	struct image *images;           /* sapphire: IMAGES_MAX of them (256 ran out: text came out as boxes) */
 	uint32_t *image_index;          /* ... and texture name -> 1 + its place there, for names below IMAGE_NAMES */
 	unsigned image_count;
@@ -1802,6 +1807,13 @@ frame_end(struct eagl *e, bool finished)
 		summary(e);
 	}
 	gpu_query_collect();
+	/* a fence after the frame, kept for the last eight: glFinishObjectAPPLE waits for the one it needs */
+	unsigned slot = e->frame_fence_next++ % 8;
+	if (e->frame_fence[slot] != NULL) {
+		glDeleteSync(e->frame_fence[slot]);
+	}
+	e->frame_fence[slot] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+	e->frame_fence_of[slot] = e->frames;
 	if (profile_calls && e->frames % 200 == 0) {
 		profile_report(e);
 	}
@@ -1891,6 +1903,17 @@ drawing(struct eagl *e)
 	struct image *image;
 
 	frame_begin(e);
+	if (e->texture_frame != NULL) {
+		/* what this frame draws with and into (glFinishObjectAPPLE) */
+		for (unsigned u = 0; u < 8; u++) {
+			if (e->bound[u] != 0 && e->bound[u] < IMAGE_NAMES) {
+				e->texture_frame[e->bound[u]] = e->frames + 1;
+			}
+		}
+		if (e->colour != 0 && e->colour < IMAGE_NAMES) {
+			e->texture_frame[e->colour] = e->frames + 1;
+		}
+	}
 	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && image->target) {
 		image->drawn = image->painted = true;
 		damage(image, false);
@@ -3935,15 +3958,40 @@ my_glFlush(void *context)
 	EAGL_LEAVE(e, 0x2d8);
 }
 
-/* APPLE_fence: wait for one object to be done with. Everything is done with after glFinish. */
+/*
+ * APPLE_fence: wait for one object to be done with. CoreAnimation asks it of a texture before it
+ * lets go of it -- every frame of an app that shows a new IOSurface each frame (a game) -- and a
+ * glFinish there waited for all the GPU had queued, the app's frames included: 13.8 ms of a
+ * window-server frame of 20 (GLSpin). A texture is done with when the frame that last used it is:
+ * that frame's fence (frame_end) is waited for, usually long signalled. Only a texture of the frame
+ * still being drawn, or of one too old to have its fence kept, or another kind of object, takes
+ * the glFinish as before.
+ */
 static void
 my_glFinishObjectAPPLE(void *context, GLenum object, GLint name)
 {
 	struct eagl *e = context;
 
-	(void)object;
-	(void)name;
 	EAGL_ENTER(e, 0xeb8);
+	if (object == 0x1702 /* GL_TEXTURE */ && name > 0 && name < IMAGE_NAMES && e->texture_frame != NULL) {
+		uint32_t used = e->texture_frame[name];
+		GLsync fence = NULL;
+		uint32_t best = 0;
+		for (unsigned i = 0; i < 8; i++) {
+			/* the earliest kept fence at or after that frame: fences signal in order */
+			if (e->frame_fence[i] != NULL && e->frame_fence_of[i] >= used && (best == 0 || e->frame_fence_of[i] < best)) {
+				best = e->frame_fence_of[i];
+				fence = e->frame_fence[i];
+			}
+		}
+		if (used == 0 || (fence != NULL && !(e->in_frame && used > e->frames))) {
+			if (fence != NULL) {
+				(void)glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+			}
+			EAGL_LEAVE(e, 0xeb8);
+			return;
+		}
+	}
 	clear_now(e);
 	gpu_query_end();
 	glFinish();
@@ -4561,6 +4609,7 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 	}
 	e->images = calloc(IMAGES_MAX, sizeof(struct image));
 	e->image_index = calloc(IMAGE_NAMES, sizeof(uint32_t));
+	e->texture_frame = calloc(IMAGE_NAMES, sizeof(uint32_t));
 	current = e;
 	e->object = self;
 	e->api = api;
@@ -4867,6 +4916,292 @@ ca_hooks(void)
 	    orig_function_supported ? "on" : "OFF", orig_function_uniform ? "on" : "OFF");
 }
 
+/* ---- an app's own OpenGL ES (a game): what CoreAnimation's render server never asks for ------- */
+
+/*
+ * In backboardd only CoreAnimation draws, through the table it gets from -getMacroContextPrivate.
+ * An app draws through OpenGLES.framework's gl* functions, which find the current context through
+ * the thread's pointer (tpidrro_el0, slot 30: see the top), and shows its frames through a
+ * CAEAGLLayer: -renderbufferStorage:fromDrawable: gives the bound renderbuffer the layer's size
+ * and -presentRenderbuffer: puts what was drawn on the screen. Here the renderbuffer is ordinary
+ * GPU memory (tiled: a linear target costs the GPU 2.4 times as much, userland/tests/glbench),
+ * and each present copies it, turned the right way up, into one of three IOSurfaces that becomes
+ * the layer's contents; the window server shows that surface without a copy of its own.
+ */
+#define DRAWABLE_SURFACES       3
+#define GL_RENDERBUFFER         0x8d41
+#define GL_RENDERBUFFER_BINDING 0x8ca7
+#define GL_READ_FRAMEBUFFER     0x8ca8
+#define GL_DRAW_FRAMEBUFFER     0x8ca9
+#define GL_READ_FRAMEBUFFER_BINDING 0x8caa
+#define GL_DRAW_FRAMEBUFFER_BINDING 0x8ca6
+#define GL_FRAMEBUFFER_BINDING  0x8ca6
+#define GL_RGBA8                0x8058
+#define GL_NEAREST              0x2600
+#define GL_SYNC_GPU_COMMANDS_COMPLETE_ 0x9117
+#define GL_SYNC_FLUSH_COMMANDS_BIT_    0x00000001
+
+struct drawable {
+	id layer;                               /* the CAEAGLLayer (retained) */
+	GLuint renderbuffer;                    /* the app's, given storage here */
+	GLint width, height;
+	GLuint source;                          /* a framebuffer of ours with that renderbuffer */
+	IOSurfaceRef surface[DRAWABLE_SURFACES];
+	GLuint texture[DRAWABLE_SURFACES], target[DRAWABLE_SURFACES];
+	GLsync done[DRAWABLE_SURFACES];         /* after the last copy into each */
+	unsigned next, presents;
+	uint64_t waited_us;
+	uint64_t since_us, present_us;
+};
+
+struct cg_rect { double x, y, width, height; };
+
+static bool app_mode;                   /* not the window server: an app with an OpenGL ES of its own */
+static __thread id thread_context;      /* +[EAGLContext currentContext] */
+
+static void
+thread_gl_set(void *value)
+{
+	uintptr_t tsd;
+	__asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tsd));
+	((void **)(tsd & ~(uintptr_t)7))[30] = value;
+}
+
+static BOOL
+my_setCurrentContext(Class cls, SEL selector, id object)
+{
+	struct eagl *e = object != nil ? context_of(object) : NULL;
+
+	(void)cls;
+	(void)selector;
+	if (object != nil && e == NULL) {
+		return NO;
+	}
+	if (e == NULL) {
+		redwood_gl_make_current(NULL);
+		current = NULL;
+		thread_context = nil;
+		thread_gl_set(NULL);
+		return YES;
+	}
+	if (!redwood_gl_make_current(e->gl)) {
+		say("redwood-gl: +setCurrentContext: the context cannot be made this thread's\n");
+		return NO;
+	}
+	current = e;
+	thread_context = object;
+	thread_gl_set(e->head16_7);             /* OpenGLES's gl* read the context at +0x20, the table after it */
+	return YES;
+}
+
+static id
+my_currentContext(Class cls, SEL selector)
+{
+	(void)cls;
+	(void)selector;
+	return thread_context;
+}
+
+static id
+my_initWithAPI_plain(id self, SEL selector, unsigned long api)
+{
+	return my_initWithAPI(self, selector, api, nil);
+}
+
+static id
+my_initWithAPI_sharegroup(id self, SEL selector, unsigned long api, id sharegroup)
+{
+	if (sharegroup != nil) {
+		say("redwood-gl: a context sharing with another was asked for; it shares nothing\n");
+	}
+	return my_initWithAPI(self, selector, api, nil);
+}
+
+static void
+drawable_free(struct drawable *d)
+{
+	if (d == NULL) {
+		return;
+	}
+	for (unsigned i = 0; i < DRAWABLE_SURFACES; i++) {
+		if (d->done[i] != NULL) {
+			glDeleteSync(d->done[i]);
+		}
+		if (d->target[i] != 0) {
+			glDeleteFramebuffers(1, &d->target[i]);
+		}
+		if (d->texture[i] != 0) {
+			glDeleteTextures(1, &d->texture[i]);
+		}
+		if (d->surface[i] != NULL) {
+			CFRelease(d->surface[i]);
+		}
+	}
+	if (d->source != 0) {
+		glDeleteFramebuffers(1, &d->source);
+	}
+	if (d->layer != nil) {
+		CFRelease((CFTypeRef)d->layer);
+	}
+	free(d);
+}
+
+static IOSurfaceRef
+drawable_surface(GLint width, GLint height)
+{
+	int w = width, h = height, bpe = 4, format = 'BGRA';
+	CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	CFNumberRef nw = CFNumberCreate(NULL, kCFNumberIntType, &w), nh = CFNumberCreate(NULL, kCFNumberIntType, &h);
+	CFNumberRef nb = CFNumberCreate(NULL, kCFNumberIntType, &bpe), nf = CFNumberCreate(NULL, kCFNumberIntType, &format);
+	IOSurfaceRef surface;
+
+	CFDictionarySetValue(d, kIOSurfaceWidth, nw);
+	CFDictionarySetValue(d, kIOSurfaceHeight, nh);
+	CFDictionarySetValue(d, kIOSurfaceBytesPerElement, nb);
+	CFDictionarySetValue(d, kIOSurfacePixelFormat, nf);
+	surface = IOSurfaceCreate(d);
+	CFRelease(nw);
+	CFRelease(nh);
+	CFRelease(nb);
+	CFRelease(nf);
+	CFRelease(d);
+	return surface;
+}
+
+static BOOL
+my_renderbufferStorage(id self, SEL selector, unsigned long target, id drawable)
+{
+	struct eagl *e = context_of(self);
+	struct drawable *d;
+	GLint bound = 0, texture = 0, framebuffer = 0;
+
+	(void)selector;
+	if (e == NULL || target != GL_RENDERBUFFER || drawable == nil) {
+		return NO;
+	}
+	if (current != e) {
+		redwood_gl_make_current(e->gl);
+		current = e;
+	}
+	struct cg_rect bounds = ((struct cg_rect (*)(id, SEL))objc_msgSend)(drawable, sel_registerName("bounds"));
+	double scale = ((double (*)(id, SEL))objc_msgSend)(drawable, sel_registerName("contentsScale"));
+	GLint width = (GLint)(bounds.width * scale + 0.5), height = (GLint)(bounds.height * scale + 0.5);
+	glGetIntegerv(GL_RENDERBUFFER_BINDING, &bound);
+	if (bound == 0 || width <= 0 || height <= 0) {
+		say("redwood-gl: -renderbufferStorage:fromDrawable: renderbuffer %d, %d x %d: refused\n", bound, width, height);
+		return NO;
+	}
+	drawable_free(e->drawable);
+	e->drawable = d = calloc(1, sizeof(*d));
+	if (d == NULL) {
+		return NO;
+	}
+	d->layer = (id)CFRetain((CFTypeRef)drawable);
+	d->renderbuffer = (GLuint)bound;
+	d->width = width;
+	d->height = height;
+	glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, width, height);
+
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+	glGenFramebuffers(1, &d->source);
+	glBindFramebuffer(GL_FRAMEBUFFER, d->source);
+	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, d->renderbuffer);
+	unsigned made = 0;
+	for (unsigned i = 0; i < DRAWABLE_SURFACES; i++) {
+		d->surface[i] = drawable_surface(width, height);
+		glGenTextures(1, &d->texture[i]);
+		glBindTexture(GL_TEXTURE_2D, d->texture[i]);
+		if (d->surface[i] == NULL || !redwood_gl_surface_texture(e->gl, IOSurfaceGetID(d->surface[i]))) {
+			continue;
+		}
+		glGenFramebuffers(1, &d->target[i]);
+		glBindFramebuffer(GL_FRAMEBUFFER, d->target[i]);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, d->texture[i], 0);
+		made++;
+	}
+	glBindTexture(GL_TEXTURE_2D, (GLuint)texture);
+	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)framebuffer);
+	say("redwood-gl: -renderbufferStorage:fromDrawable: renderbuffer %u, %d x %d (scale %.1f), %u of %u surfaces on the GPU\n",
+	    d->renderbuffer, width, height, scale, made, DRAWABLE_SURFACES);
+	return made == DRAWABLE_SURFACES;
+}
+
+static BOOL
+my_presentRenderbuffer(id self, SEL selector, unsigned long target)
+{
+	struct eagl *e = context_of(self);
+	struct drawable *d = e != NULL ? e->drawable : NULL;
+	GLint reading = 0, drawing = 0;
+
+	(void)selector;
+	if (d == NULL || target != GL_RENDERBUFFER) {
+		return NO;
+	}
+	if (current != e) {
+		redwood_gl_make_current(e->gl);
+		current = e;
+	}
+	uint64_t began = now_us();
+	unsigned i = d->next;
+	d->next = (i + 1) % DRAWABLE_SURFACES;
+	/*
+	 * A surface is drawn into again only when the GPU is done with the copy into it of three
+	 * frames ago: an app that draws faster than the GPU waits here, as with a real driver's
+	 * swap chain, instead of queueing ever more work ahead of the window server's.
+	 */
+	if (d->done[i] != NULL) {
+		uint64_t w0 = now_us();
+		(void)glClientWaitSync(d->done[i], GL_SYNC_FLUSH_COMMANDS_BIT_, 1000000000ull);
+		glDeleteSync(d->done[i]);
+		d->done[i] = NULL;
+		d->waited_us += now_us() - w0;
+	}
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &reading);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawing);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, d->source);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, d->target[i]);
+	/* GL's rows go up, a surface's down: turned over on the way */
+	glBlitFramebuffer(0, 0, d->width, d->height, 0, d->height, d->width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)reading);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)drawing);
+	/* to the kernel now (not held back to be merged): the window server's draw of it comes after on the GPU */
+	d->done[i] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE_, 0);
+	glFlush();
+	if (d->done[i] != NULL) {
+		(void)glClientWaitSync(d->done[i], GL_SYNC_FLUSH_COMMANDS_BIT_, 0);
+	}
+
+	Class transaction = objc_getClass("CATransaction");
+	((void (*)(Class, SEL))objc_msgSend)(transaction, sel_registerName("begin"));
+	((void (*)(Class, SEL, BOOL))objc_msgSend)(transaction, sel_registerName("setDisableActions:"), YES);
+	((void (*)(id, SEL, id))objc_msgSend)(d->layer, sel_registerName("setContents:"), (id)d->surface[i]);
+	((void (*)(Class, SEL))objc_msgSend)(transaction, sel_registerName("commit"));
+	if (!pthread_main_np()) {
+		((void (*)(Class, SEL))objc_msgSend)(transaction, sel_registerName("flush"));
+	}
+
+	uint64_t now = now_us();
+	d->present_us += now - began;
+	if (d->since_us == 0) {
+		d->since_us = now;
+	}
+	if (++d->presents % 120 == 0) {
+		say("redwood-gl: app frames: %.1f a second, %llu us a present (%llu waiting for the GPU)\n",
+		    120e6 / (double)(now - d->since_us), d->present_us / 120, d->waited_us / 120);
+		d->since_us = now;
+		d->present_us = d->waited_us = 0;
+	}
+	return YES;
+}
+
+static BOOL
+my_presentRenderbuffer_atTime(id self, SEL selector, unsigned long target, double when)
+{
+	(void)when;
+	return my_presentRenderbuffer(self, selector, target);
+}
+
 __attribute__((constructor)) static void
 install(void)
 {
@@ -5053,6 +5388,41 @@ install(void)
 	}
 	say("redwood-gl: %u of %zu methods of EAGLContext are ours; OpenGL ES by %s\n", replaced,
 	    sizeof(methods) / sizeof(methods[0]), redwood_gl_library());
+
+	/* an app (not the window server): what it draws with and shows with, too */
+	const char *program = getprogname();
+	app_mode = program == NULL || strcmp(program, "backboardd") != 0;
+	if (!app_mode) {
+		return;
+	}
+	static const struct {
+		const char *name;
+		IMP ours;
+		bool of_class;
+	} app_methods[] = {
+		{ "initWithAPI:", (IMP)my_initWithAPI_plain, false },
+		{ "initWithAPI:sharegroup:", (IMP)my_initWithAPI_sharegroup, false },
+		{ "renderbufferStorage:fromDrawable:", (IMP)my_renderbufferStorage, false },
+		{ "presentRenderbuffer:", (IMP)my_presentRenderbuffer, false },
+		{ "presentRenderbuffer:atTime:", (IMP)my_presentRenderbuffer_atTime, false },
+		{ "presentRenderbuffer:afterMinimumDuration:", (IMP)my_presentRenderbuffer_atTime, false },
+		{ "setCurrentContext:", (IMP)my_setCurrentContext, true },
+		{ "currentContext", (IMP)my_currentContext, true },
+	};
+	for (unsigned i = 0; i < sizeof(app_methods) / sizeof(app_methods[0]); i++) {
+		Class owner = app_methods[i].of_class ? object_getClass((id)class) : class;
+		SEL selector = sel_registerName(app_methods[i].name);
+		Method method = app_methods[i].of_class ? class_getClassMethod(class, selector) : class_getInstanceMethod(class, selector);
+
+		if (method == NULL) {
+			say("redwood-gl: EAGLContext has no %c%s\n", app_methods[i].of_class ? '+' : '-', app_methods[i].name);
+			continue;
+		}
+		if (!class_addMethod(owner, selector, app_methods[i].ours, method_getTypeEncoding(method))) {
+			method_setImplementation(method, app_methods[i].ours);
+		}
+	}
+	say("redwood-gl: %s: an app's OpenGL ES (CAEAGLLayer) too\n", program ? program : "?");
 }
 
 _Static_assert(__builtin_offsetof(struct eagl, table) == __builtin_offsetof(struct eagl, head16_7) + 0x20,
