@@ -206,13 +206,17 @@ int
 main(int argc, char *argv[])
 {
 	/*
-	 * Until apps get the EAGL bridge by themselves: it is loaded here, before the first
-	 * EAGLContext (file /var/tmp/glspin.nobridge: not, to see what iOS's own OpenGL ES does).
+	 * The EAGL bridge, loaded here before the first EAGLContext (file /var/tmp/glspin.nobridge:
+	 * not -- to see whether libredwood-glload brought it, or what iOS's own OpenGL ES does).
+	 * Its log lines go to the same file.
 	 */
+	freopen("/var/tmp/glspin.log", "a", stderr);
 	if (access("/var/tmp/glspin.nobridge", F_OK) != 0) {
-		freopen("/var/tmp/glspin.log", "a", stderr);
 		void *bridge = dlopen("/redwood/lib/libredwood-gl.dylib", RTLD_NOW);
 		say("bridge: %s\n", bridge != NULL ? "loaded" : dlerror());
+	} else {
+		say("bridge: %s\n", dlopen("/redwood/lib/libredwood-gl.dylib", RTLD_NOLOAD | RTLD_LAZY) != NULL ?
+		    "already here (libredwood-glload)" : "not loaded");
 	}
 	@autoreleasepool {
 		return UIApplicationMain(argc, argv, nil, NSStringFromClass([SpinDelegate class]));

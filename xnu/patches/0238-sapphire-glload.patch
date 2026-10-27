@@ -1,0 +1,62 @@
+From f293583a1661d7ae76acc4d56d22fbce1977add0 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 27 Oct 2026 21:43:20 +0100
+Subject: [PATCH] sapphire-0238: kern.sweet_glload=1 gives every app
+ DYLD_INSERT_LIBRARIES of the EAGL bridge's loader (OpenGL ES for apps, games)
+
+---
+ bsd/kern/kern_exec.c | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..1136b6b 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -247,6 +247,21 @@ SYSCTL_INT(_vm, OID_AUTO, vm_shared_region_reslide_restrict,
+ SYSCTL_INT(_vm, OID_AUTO, vm_shared_region_reslide_aslr,
+     CTLFLAG_RW, &vm_shared_region_reslide_aslr, 0, "");
+ #endif
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * sapphire 0238: kern.sweet_glload=1 puts DYLD_INSERT_LIBRARIES=/redwood/lib/libredwood-glload.dylib
++ * into the environment of every app (an executable inside an .app bundle) that is started. That
++ * small library brings the EAGL bridge into apps that draw with OpenGL ES -- games -- whose
++ * EAGLContext iOS's own OpenGL ES (AppleMetalGLRenderer, on a Metal device there is none of) cannot
++ * make; launchd keeps no environment of its own for apps. 0 by default: dyld stops a process whose
++ * inserted library is missing, so this is turned on once the library is known to be there.
++ */
++static int sweet_glload = 0;
++SYSCTL_INT(_kern, OID_AUTO, sweet_glload, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_glload, 0,
++    "DYLD_INSERT_LIBRARIES of the EAGL bridge's loader for apps");
++#define SWEET_GLLOAD_ENV "DYLD_INSERT_LIBRARIES=/redwood/lib/libredwood-glload.dylib"
++#endif
+ #endif /* __has_feature(ptrauth_calls) */
+ 
+ #if DEVELOPMENT || DEBUG
+@@ -5741,6 +5756,22 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* sapphire 0238 (kern.sweet_glload): the bridge's loader for an app; one set by the caller comes first and wins */
++	if (sweet_glload && strnstr(imgp->ip_strings, ".app/", strlen(EXECUTABLE_KEY) + MAXPATHLEN) != NULL) {
++		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(SWEET_GLLOAD_ENV), UIO_SYSSPACE, TRUE);
++		if (error) {
++			goto bad;
++		}
++		if (imgp->ip_argspace < new_ptr_size) {
++			error = E2BIG;
++			goto bad;
++		}
++		imgp->ip_argspace -= new_ptr_size;
++		imgp->ip_envc++;
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+-- 
+2.53.0
+
