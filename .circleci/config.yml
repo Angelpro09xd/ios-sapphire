@@ -1,0 +1,95 @@
+# The kernel the phone runs (4 KiB pages, all eight cores) on CircleCI's macOS machines: the same
+# steps as codemagic.yaml's xnu-4k workflow. The free plan gives open-source projects a monthly
+# allotment of macOS credits (about 20 minutes a kernel). It builds only when asked: a pipeline
+# triggered with the parameter build_kernel=true (API: POST /api/v2/project/gh/<owner>/<repo>/pipeline
+# {"branch":"sapphire","parameters":{"build_kernel":true}}, or "Trigger pipeline" in the web UI).
+# The kernel is the job's artifact out/kernel.development.sweet (and SHA256SUMS).
+version: 2.1
+
+parameters:
+  build_kernel:
+    type: boolean
+    default: false
+
+jobs:
+  xnu-4k:
+    macos:
+      xcode: 16.0.0
+    resource_class: m4pro.medium
+    environment:
+      DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+      DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+      MACOS_VERSION: "13.5"
+      KERNEL_CONFIG: DEVELOPMENT
+      MACHINE_CONFIG: SWEET
+      MAKEFLAGS: -k
+      TOPAZ_4K: "1"
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,file_macro,pch_defines
+      CCACHE_MAXSIZE: 3G
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - ccache-xnu-4k-
+      - run:
+          name: Fetch build script
+          command: |
+            set -e
+            git init -q dxb
+            git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+            git -C dxb checkout -q FETCH_HEAD
+            cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+            sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53"/' dxb/build.sh
+            grep -c 'OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53"' dxb/build.sh
+            sed -i '' 's|export CC="$(xcrun -find clang)"|export CC="$CCACHE_WRAP/clang"|; s|export CXX="$(xcrun -find clang++)"|export CXX="$CCACHE_WRAP/clang++"|' dxb/build.sh
+            grep -c 'export CC="$CCACHE_WRAP/clang"' dxb/build.sh
+      - run:
+          name: Deps
+          command: |
+            set -e
+            pip3 install --break-system-packages cmake ninja || pip3 install cmake ninja
+            for t in gum xcodes; do
+              command -v $t || { sudo mkdir -p /usr/local/bin; printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/$t >/dev/null; sudo chmod +x /usr/local/bin/$t; }
+            done
+            for t in jq gum cmake ninja xcodes; do command -v $t; done
+            xcodebuild -version
+            xcrun --find iig
+            wrap="$PWD/ccache-bin"
+            mkdir -p "$wrap"
+            # never ccache for assembly: it includes the generated assym.s, which ccache does not hash
+            cc=$(command -v ccache || true)
+            for t in clang clang++; do
+              printf '#!/bin/sh\nfor a; do case "$a" in *.s) exec %s "$@";; esac; done\nexec %s %s "$@"\n' "$(xcrun -find $t)" "$cc" "$(xcrun -find $t)" > "$wrap/$t"
+              chmod +x "$wrap/$t"
+            done
+            cat "$wrap/clang"
+      - run:
+          name: Build
+          no_output_timeout: 60m
+          command: |
+            set -e
+            export CCACHE_DIR="$PWD/.ccache" CCACHE_BASEDIR="$PWD" CCACHE_WRAP="$PWD/ccache-bin"
+            cd dxb
+            command -v ccache >/dev/null && ccache -z
+            bash build.sh
+            command -v ccache >/dev/null && ccache -s || true
+      - save_cache:
+          key: ccache-xnu-4k-{{ .BuildNum }}
+          paths:
+            - .ccache
+      - run:
+          name: Collect
+          command: |
+            mkdir -p out
+            cp -R dxb/fakeroot/System/Library/Kernels/. out/
+            (cd out && shasum -a 256 kernel.* > SHA256SUMS)
+            ls -la out
+      - store_artifacts:
+          path: out
+
+workflows:
+  kernel:
+    when: << pipeline.parameters.build_kernel >>
+    jobs:
+      - xnu-4k
