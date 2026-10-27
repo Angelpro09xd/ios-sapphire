@@ -1,5 +1,44 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-10-27 (night): OpenGL ES for apps, where the GPU's time goes (kernel 0238)
+
+**Apps can draw with OpenGL ES now** (games that use it, not Metal ones): `userland/tests/glspin`, a
+full-screen CAEAGLLayer app (300 textured quads a frame, 3 of them screen-sized), runs at **60 fps**
+with the bridge brought in by the kernel, from the home screen. Before, `-[EAGLContext initWithAPI:]`
+answered nil in every app: iOS 16's OpenGL ES is `AppleMetalGLRenderer` over Metal, and there is no
+Metal device. **Metal games still cannot draw**: `metal/SapphireMetal` only logs (GPU-ROADMAP layer 2).
+
+- **eagl.c, app mode** (any process but backboardd): `initWithAPI:`/`initWithAPI:sharegroup:`,
+  `+setCurrentContext:` (also writes tpidrro_el0 slot 30 = the context's head, where OpenGLES's gl*
+  look), `+currentContext`, `renderbufferStorage:fromDrawable:` (ordinary, tiled GPU storage of the
+  layer's size x contentsScale) and `presentRenderbuffer:` (a flipped glBlitFramebuffer into one of
+  three IOSurfaces, flushed to the kernel, set as the layer's contents; waits for the GPU's copy of
+  three frames before, like a swap chain).
+- **Loading it into apps:** xnu 0238 `kern.sweet_glload=1` adds
+  `DYLD_INSERT_LIBRARIES=/redwood/lib/libredwood-glload.dylib` to every `.app/` executable's
+  environment (launchd's `setenv` does not reach apps: user domain, ENOTSUP); `src/glload.c` dlopens
+  the bridge only in apps that linked OpenGLES (`GLLOAD_DEBUG=1`: what it decided). The sysctl is 0
+  at boot; `userland/com.sapphire.glload.plist` (for /var/jb/Library/LaunchDaemons) sets it,
+  not installed yet.
+- **glFinishObjectAPPLE** waited for everything (glFinish): with an app showing a new surface each
+  frame, 13.8 ms of a window-server frame of 20. Now it waits for the fence after the frame that last
+  used the texture (eight kept). With GLSpin's load the GPU is still saturated, so it still waits.
+- **Where the GPU's time goes** (`userland/tests/glbench`, `/redwood/glgputime`): Mesa costs ~1.5 us
+  of CPU a draw (the window server's ~150 us a draw is CoreAnimation and the bridge); one blended
+  full-screen layer costs the GPU 2.4 ms into a tiled target and **6 ms into a linear one** (an
+  IOSurface, or Mesa's own with `notile`): the layout, not physical contiguity. GMEM: 1.3 ms, but
+  for CoreAnimation it did not help (more CPU at flush, waits up to 700 ms). The window server's
+  frames cost the GPU 7-30 ms during swipes. Memory bandwidth is the limit: every full-screen pass
+  (app copy, composition, mirror copy, the kernel's copy to the panel) moves ~22 MB.
+- **Kernel bug found, not fixed:** killing backboardd while a GL app runs deadlocks its exit
+  (stackshot, `tools/lldbmacros/kcdata.py`): kernel_task frees backboardd's GPU client and, holding
+  IOKit's gIOMemoryLock (IOMemoryMap::taggedRelease), waits in vm_object_destroy for paging of a
+  device-pager object that never ends; backboardd's IOSurfaceRootUserClient::clientClose waits for
+  that lock. Only a forced restart helps. Killing the app alone is fine.
+- Measured, not kept: `TC_EARLY_SLOTS` (threaded-context batches handed over early), `cpus=4`,
+  `FD_MESA_DEBUG=` (autotune) and `=gmem` for the window server, `sweetfb_direct=1` (the 11 MB
+  contiguous allocations fail even right after boot).
+
 ## SAPPHIRE 2026-10-27: smoother animations, automatic swipe tests (kernels 0235-0237)
 
 **User-visible:** animations no longer jump back and forth (0235), the Apple logo stays until the
