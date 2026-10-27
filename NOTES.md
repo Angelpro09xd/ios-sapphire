@@ -1,5 +1,41 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-10-27 (late): iOS at 2x, tweaks, at most 3 frames on the GPU (kernels 0239-0241)
+
+**User-visible (confirmed):** animations "go tremendously well" at 2x; tweaks (Cylinder, Atria,
+SnowBoard, ...) work; the status bar is the X's again. Boot image in use:
+`C:\adb\sapphire-uefi-4k-0240-2x750.img` (0240 + `sweetfb_scale=2 sweetfb_w=750`, ADT display-scale 2,
+canvas 750x1624). Swipe test: **34-35 fps** (3x: 26-29), GPU waits 0.01-0.3 ms a frame.
+
+- **iOS at 2x (0239, 0240):** the GPU is bound by memory bandwidth (~2.5 ms a full-screen pass at
+  3x; a memcpy from one core is 1.5 GB/s and a DDR vote of 1804.8 MHz, `kern.sweet_audio` op 6 RPM
+  clk2 bimc, changes nothing: the DDR is already fast). With `sweetfb_scale=2` iOS draws the same 375
+  x 812 points at 2x and the panel copy scales them by 1.5 (`blit_scale`: the 2D blitter's source
+  coordinates have 8 fraction bits, FILTER bit 16; a panel pitch of 4320 is done in two passes of
+  every other row). `sapphire-repack.py --adt display-scale=2 --adt canvas-width=750 --adt
+  canvas-height=1624`. MobileGestalt's cache must be deleted once (it computes the screen) and its
+  class fixed (`tools/sapphire-mg-scale2.py`, 15 = the X's; else -1).
+- **The status bar:** UIKit chooses it by pixel width, scale and corner radius
+  (`_UIStatusBarVisualProvider_Split1125` etc.); 375 pt at 2x has none: the red rdar://45025538
+  bar. 0240's XR geometry (828x1792, `sweetfb_w=828`) does not help: the corner radius (39, the X's)
+  comes from the model, not from the MG cache; and iOS 16's default wallpaper has no 414x896
+  variant. Fixed by `userland/tweaks/statusbar` (SapphireStatusBar: the Split1125 provider where
+  UIKit would use the fallback).
+- **Tweaks:** nothing inserted ElleKit's TweakLoader (no jailbreak launch hook). `glload.c` (in every
+  app by xnu 0238) now dlopens it, MobileSafety first in SpringBoard; `/var/jb/var/sapphire-notweaks`
+  turns it off. kern.sweet_glload is set at boot by a job in launchd's cache
+  (`tools/sapphire-launchd-glload.py`; launchd runs no RunAtLoad job from /var/jb; original kept as
+  launchd.plist.pre-glload). 0241 (boot-arg `sweet_glload=1`) is written but not built: the
+  Codemagic account is out of build minutes (BILLING_NOT_ENABLED).
+- **redwood-gl:** at most 3 frames on the GPU (`/redwood/glahead`): with none waited for, the GPU
+  fell several frames behind and a glFinishObjectAPPLE then waited 90-700 ms; the frame's display
+  copies go in the frame's submission.
+- **Wallpaper (open):** the active poster is iOS 16's 7400 "WWDC 2022", whose layers are HEIC (HEVC):
+  the blue is its gradient alone. The layers converted to PNG (originals in /var/root/wp-orig-*.tar)
+  and the poster's snapshots moved away (/var/root/wp-snapshots): not confirmed visible yet.
+- **Broken system binaries:** /bin/cp, /bin/mkdir, /bin/chmod fail with "Exec format error"; use
+  /var/jb's (chown and chmod are in /var/jb/usr/bin).
+
 ## SAPPHIRE 2026-10-27 (night): OpenGL ES for apps, where the GPU's time goes (kernel 0238)
 
 **Apps can draw with OpenGL ES now** (games that use it, not Metal ones): `userland/tests/glspin`, a
