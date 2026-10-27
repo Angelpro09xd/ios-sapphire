@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  /var/jb/Library/LaunchDaemons/com.sapphire.glload.plist: at boot, kern.sweet_glload=1 (xnu 0238), so
+  that apps that draw with OpenGL ES get the EAGL bridge (/redwood/lib/libredwood-glload.dylib), but
+  only if that library is there (dyld stops a process whose inserted library is missing).
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.sapphire.glload</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/var/jb/bin/sh</string>
+		<string>-c</string>
+		<string>[ -f /redwood/lib/libredwood-glload.dylib ] &amp;&amp; /var/jb/usr/sbin/sysctl -w kern.sweet_glload=1</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>LaunchOnlyOnce</key>
+	<true/>
+</dict>
+</plist>
