@@ -277,6 +277,8 @@ struct eagl {
 	GLsync frame_fence[8];          /* a fence after each of the last frames (glFinishObjectAPPLE) */
 	uint32_t frame_fence_of[8];     /* ... and the frame it follows */
 	unsigned frame_fence_next;
+	unsigned premirrored;           /* copies into display surfaces made before the frame's glFlush (my_glFlush) */
+	uint64_t ahead_wait_us;         /* waiting for the GPU at frame_end (frames_ahead), for the frame lines */
 	struct image *images;           /* sapphire: IMAGES_MAX of them (256 ran out: text came out as boxes) */
 	uint32_t *image_index;          /* ... and texture name -> 1 + its place there, for names below IMAGE_NAMES */
 	unsigned image_count;
@@ -399,6 +401,7 @@ static int full_mirror;                 /* boot-arg glmirror=full (a test): all 
  * here in any case; glwait=0: nowhere, to see what the waiting costs (and frames half drawn).
  */
 static int wait_for_frames = 1;
+static unsigned frames_ahead = 3;       /* frames on the GPU at most (frame_end; file /redwood/glahead: N, 0 off) */
 static int sync_frames = 1;             /* boot-arg glsync=0 (a test): a frame's end does not push what Mesa holds back (frame_end()) */
 /*
  * EXT_shader_framebuffer_fetch -- a fragment shader reads the pixel it is about to write -- is
@@ -1702,8 +1705,9 @@ frame_end(struct eagl *e, bool finished)
 {
 	static unsigned unfollowed;
 	uint64_t before, mirrored, waited, after;
-	unsigned copied = 0, in_place = 0;
+	unsigned copied = 0, in_place = e->premirrored;
 
+	e->premirrored = 0;
 	clear_now(e);
 	before = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
@@ -1805,6 +1809,9 @@ frame_end(struct eagl *e, bool finished)
 	}
 	if (e->frames == 30 || e->frames % 200 == 0) {
 		summary(e);
+		say("redwood-gl: %llu us a frame waited for the GPU to be at most %u frames behind\n",
+		    e->ahead_wait_us / (e->frames == 30 ? 30 : 200), frames_ahead);
+		e->ahead_wait_us = 0;
 	}
 	gpu_query_collect();
 	/* a fence after the frame, kept for the last eight: glFinishObjectAPPLE waits for the one it needs */
@@ -1814,6 +1821,21 @@ frame_end(struct eagl *e, bool finished)
 	}
 	e->frame_fence[slot] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 	e->frame_fence_of[slot] = e->frames;
+	/*
+	 * At most frames_ahead frames on the GPU (/redwood/glahead: N, 0 = no limit): with no frame
+	 * waited for (glwait=0) the GPU fell several frames behind in heavy animations, and whatever
+	 * then waited for it (glFinishObjectAPPLE, a texture's memory) waited for all of them: waits of
+	 * 90-500 ms, the worst stutters. The frame frames_ahead back is waited for here instead,
+	 * usually long done.
+	 */
+	if (frames_ahead != 0 && e->frame_fence_next > frames_ahead) {
+		unsigned back = (e->frame_fence_next - 1 - frames_ahead) % 8;
+		if (e->frame_fence[back] != NULL) {
+			uint64_t w0 = now_us();
+			(void)glClientWaitSync(e->frame_fence[back], GL_SYNC_FLUSH_COMMANDS_BIT, 200000000ull);
+			e->ahead_wait_us += now_us() - w0;
+		}
+	}
 	if (profile_calls && e->frames % 200 == 0) {
 		profile_report(e);
 	}
@@ -3951,6 +3973,17 @@ my_glFlush(void *context)
 	}
 	clear_now(e);
 	gpu_query_end();
+	/*
+	 * The frame's copies into the display's surfaces (blit_targets) go with the frame, in the same
+	 * submission: frame_end() made them after this flush and flushed again, two submissions to
+	 * the kernel a frame (~200 us each on this thread) where one does.
+	 */
+	for (unsigned i = 0; i < e->image_count; i++) {
+		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
+			target_to_surface(e, &e->images[i]);
+			e->premirrored++;
+		}
+	}
 	began = now_us();
 	glFlush();
 	e->flushing += now_us() - began;
@@ -5286,6 +5319,14 @@ install(void)
 		/* likewise /redwood/glframes: a line for every frame */
 		frame_lines |= access("/redwood/glframes", F_OK) == 0;
 		gpu_time_on = access("/redwood/glgputime", F_OK) == 0;
+		FILE *ahead = fopen("/redwood/glahead", "r");
+		if (ahead != NULL) {
+			unsigned n = 0;
+			if (fscanf(ahead, "%u", &n) == 1 && n < 8) {
+				frames_ahead = n;
+			}
+			fclose(ahead);
+		}
 		full_precision = strstr(arguments, "glprecision=0") == NULL;
 		vblur_on = strstr(arguments, "vblur=0") != NULL ? 0 : strstr(arguments, "vblur=2") != NULL ? 2 : 1;
 		if ((argument = strstr(arguments, "glplain=")) != NULL) {
