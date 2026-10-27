@@ -1,0 +1,52 @@
+From 989906ab0ec305234a0d75bb18e8ee820e52020b Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 27 Oct 2026 17:49:01 +0100
+Subject: [PATCH] sapphire-0236: every display-off before the second display-on
+ (first 3 minutes) is the boot's and ignored: backboardd turned the panel off
+ after its first on, the Apple logo went black until SpringBoard turned it on
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 67c718f..98f8d11 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -225,7 +225,7 @@ public:
+ 	void          scanFrom(uint64_t pa, uint32_t stride);
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+-	bool          fPowerOnSeen;   /* 0234: a display-on request came (the UI is up) */
++	uint32_t      fPowerOns;      /* 0236: display-on requests so far, up to 2 (the second: the UI is up) */
+ 	uint64_t      fStartAbs;      /* mach_absolute_time() at start */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 	/* topaz fade: cached copy of the last frame and a contiguous output frame */
+@@ -1697,14 +1697,20 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			 * in the first 2 minutes, is that one: ignored. Later ones (auto-lock, the power
+ 			 * button) turn the panel off as asked.
+ 			 */
++			/*
++			 * sapphire 0236: the boot log of 0235 shows the order: backboardd asks for on, draws a
++			 * few frames, asks for off (the panel went black there, logo gone), and SpringBoard asks
++			 * for on again once the lock screen is ready. So every off before the second on, in the
++			 * first 3 minutes, belongs to the boot: ignored.
++			 */
+ 			uint64_t since_ns;
+ 			absolutetime_to_nanoseconds(mach_absolute_time() - fFB->fStartAbs, &since_ns);
+-			if (off && !fFB->fPowerOnSeen && since_ns < 120ull * NSEC_PER_SEC) {
+-				IOLog("SWEET FB: display off ignored (boot, %llu s)\n", since_ns / NSEC_PER_SEC);
++			if (off && fFB->fPowerOns < 2 && since_ns < 180ull * NSEC_PER_SEC) {
++				IOLog("SWEET FB: display off ignored (boot, %llu s, %u on)\n", since_ns / NSEC_PER_SEC, fFB->fPowerOns);
+ 				break;
+ 			}
+-			if (!off) {
+-				fFB->fPowerOnSeen = true;
++			if (!off && fFB->fPowerOns < 2) {
++				fFB->fPowerOns++;
+ 			}
+ 			IOLockLock(fFB->fLock);
+ 			bool changed = off != fFB->fPowerOff;
+-- 
+2.53.0
+
