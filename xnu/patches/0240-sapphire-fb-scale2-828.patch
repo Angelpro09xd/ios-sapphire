@@ -1,0 +1,55 @@
+From d2abbd4cc1909ae87967a35666513f2379706a79 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 27 Oct 2026 23:04:20 +0100
+Subject: [PATCH] sapphire-0240: the 2x picture is the iPhone XR's 828x1792
+ (UIKit has a status bar for it; sweetfb_w=750 for 0239's)
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4526140..d84bcd0 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -389,12 +389,20 @@ AppleCLCD::start(IOService *provider)
+ 	 * pass at 3x). fOffX/fOffY stay those of the 3x picture (the panel's window, and the touch
+ 	 * mapping, are unchanged).
+ 	 */
+-	int scale = 3;
++	/*
++	 * 0240: the 2x picture is that of a real 2x iPhone, the XR's 828 x 1792 (414 x 896 points,
++	 * the X's proportions): UIKit has a status bar only for screens it knows by their pixel width
++	 * (_UIStatusBarVisualProvider_Split828, Split1125, ...), and 750 x 1624 got the red
++	 * "rdar://45025538" bar. Boot-arg sweetfb_w (750 or 828, the default) chooses.
++	 */
++	int scale = 3, width2x = 828;
+ 	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
+-	fScale2 = scale == 2 && fLogicalW == SWEET_FB_LOGICAL_W && fLogicalH == SWEET_FB_LOGICAL_H;
++	PE_parse_boot_argn("sweetfb_w", &width2x, sizeof(width2x));
++	fScale2 = scale == 2 && fLogicalW == SWEET_FB_LOGICAL_W && fLogicalH == SWEET_FB_LOGICAL_H &&
++	    (width2x == 750 || width2x == 828);
+ 	if (fScale2) {
+-		fLogicalW = SWEET_FB_LOGICAL_W * 2 / 3;
+-		fLogicalH = SWEET_FB_LOGICAL_H * 2 / 3;
++		fLogicalW = (uint32_t)width2x;
++		fLogicalH = width2x == 828 ? 1792 : SWEET_FB_LOGICAL_H * 2 / 3;
+ 		IOLog("SWEET FB: iOS draws at 2x, %ux%u, scaled onto the panel by the GPU\n", fLogicalW, fLogicalH);
+ 	}
+ 	fLock = IOLockAlloc();
+@@ -1459,8 +1467,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 				if (!(s->gpuDrawn && seed_now == s->gpuSeed)) {
+ 					sweet_dcache_clean((vm_offset_t)(src + s->offset), (unsigned)((uint64_t)s->height * s->bytesPerRow));
+ 				}
++				/* the panel's window of the 3x picture, in the 2x one's pixels << 8 */
++				uint64_t kx = ((uint64_t)fLogicalW << 8), ky = ((uint64_t)fLogicalH << 8);
+ 				shown = sapphire_gpu_copy_scaled(s->memory, s->offset, s->bytesPerRow,
+-				    (uint32_t)fOffX * 512 / 3, (uint32_t)fOffY * 512 / 3, fWidth * 512 / 3, fHeight * 512 / 3,
++				    (uint32_t)((uint64_t)fOffX * kx / SWEET_FB_LOGICAL_W), (uint32_t)((uint64_t)fOffY * ky / SWEET_FB_LOGICAL_H),
++				    (uint32_t)((uint64_t)fWidth * kx / SWEET_FB_LOGICAL_W), (uint32_t)((uint64_t)fHeight * ky / SWEET_FB_LOGICAL_H),
+ 				    dbase, fRowBytes, fWidth, fHeight, dbase, (uint64_t)fRowBytes * fHeight);
+ 				if (shown) {
+ 					if (fFlip[0] != NULL) {
+-- 
+2.53.0
+
