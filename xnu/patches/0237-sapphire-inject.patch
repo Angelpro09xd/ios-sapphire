@@ -1,0 +1,100 @@
+From 38b083bc34a88926cf75ae3fcf25b75f67f1d878 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 27 Oct 2026 19:16:50 +0100
+Subject: [PATCH] sapphire-0237: kern.sweet_inject, synthetic touches and
+ buttons into the panel's and keys' own HID path (animation tests with no hand
+ on the phone)
+
+---
+ bsd/conf/files         |  1 +
+ bsd/dev/sweet_inject.c | 66 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 67 insertions(+)
+ create mode 100644 bsd/dev/sweet_inject.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index ddb8c21..e5ef693 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -120,6 +120,7 @@ bsd/dev/sweet_audio_ctl.c		standard
+ bsd/dev/sweet_audio_dev.c		standard
+ bsd/dev/sweet_qmi_dev.c			standard
+ bsd/dev/sweet_reboot.c			standard
++bsd/dev/sweet_inject.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_pdp.c			standard
+ bsd/dev/mem.c				standard
+diff --git a/bsd/dev/sweet_inject.c b/bsd/dev/sweet_inject.c
+new file mode 100644
+index 0000000..9d07edc
+--- /dev/null
++++ b/bsd/dev/sweet_inject.c
+@@ -0,0 +1,66 @@
++/*
++ * sapphire 0237: touches and buttons written to a sysctl, into the same path as the panel's and
++ * the keys' own (SweetHID.cpp), for testing animations with no hand on the phone
++ * (userland/tests/hidtouch.c). kern.sweet_inject takes a string:
++ *   "t FINGER DOWN X Y"   a contact, in panel pixels (1080 x 2400), DOWN 1 or 0
++ *   "k KEY DOWN"          0 power, 1 volume up, 2 volume down, 3 home
++ * Root only (CTLFLAG_ANYBODY not set).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/errno.h>
++
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_hid_key(int key, int down);
++
++static int
++sweet_inject_int(const char **p, int *out)
++{
++	const char *s = *p;
++	int sign = 1, v = 0, digits = 0;
++
++	while (*s == ' ') {
++		s++;
++	}
++	if (*s == '-') {
++		sign = -1;
++		s++;
++	}
++	while (*s >= '0' && *s <= '9' && digits < 9) {
++		v = v * 10 + (*s++ - '0');
++		digits++;
++	}
++	*p = s;
++	*out = sign * v;
++	return digits > 0;
++}
++
++static int
++sysctl_sweet_inject SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[64] = "";
++	int changed = 0;
++	int error = sysctl_io_string(req, buf, sizeof(buf), 0, &changed);
++	if (error != 0 || !changed) {
++		return error;
++	}
++	const char *p = buf + 1;
++	int a, b, c, d;
++	if (buf[0] == 't' && sweet_inject_int(&p, &a) && sweet_inject_int(&p, &b) &&
++	    sweet_inject_int(&p, &c) && sweet_inject_int(&p, &d)) {
++		sweet_hid_touch(a, b, c, d);
++		return 0;
++	}
++	if (buf[0] == 'k' && sweet_inject_int(&p, &a) && sweet_inject_int(&p, &b)) {
++		sweet_hid_key(a, b);
++		return 0;
++	}
++	return EINVAL;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_inject, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_inject, "A", "a synthetic touch (t FINGER DOWN X Y) or button (k KEY DOWN)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.53.0
+
