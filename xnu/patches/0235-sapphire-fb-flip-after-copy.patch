@@ -1,0 +1,176 @@
+From ee3af5ab8397ab73ced658164cbf24760a396a27 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 27 Oct 2026 17:25:23 +0100
+Subject: [PATCH] sapphire-0235: AppleCLCD flips to the back buffer only once
+ the GPU's copy into it has landed (the flip right after queueing it showed
+ the frame of two swaps ago: animations jumped back and forth)
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 94 +++++++++++++++++++++------
+ 1 file changed, 74 insertions(+), 20 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4d53e8c..67c718f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -239,6 +239,8 @@ public:
+ 	void          flipFrom(const uint8_t *src, uint32_t srcStride);
+ 	uint8_t      *backBuffer(void) { return (uint8_t *)fFlip[fFlipIdx ^ 1]->getBytesNoCopy(); }
+ 	void          flipBack(void);
++	bool          fFlipWait;      /* 0235: the back buffer waits for the GPU's copy before the MDP is pointed at it */
++	bool          flipWhenCopied(bool wait);
+ 	SweetLowBuf  *fCons;        /* console shadow frame (contiguous, below 4 GiB) */
+ 	uint64_t      fConsPhys;
+ 	const uint8_t *fLastVA;       /* last directly scanned frame (panel window) */
+@@ -714,7 +716,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	bzero(fb->fRetireHold, sizeof(fb->fRetireHold));
+ 	IOLockUnlock(fb->fLock);
+ 	sweet_hold_set(retire, false);
+-	if (fb->fConsShown && sweet_console_copy_dirty(fb->backBuffer())) {
++	if (fb->fPresentLock != NULL) {
++		/* 0235: a back buffer whose GPU copy has landed since the last swap goes on the panel now */
++		IOLockLock(fb->fPresentLock);
++		(void)fb->flipWhenCopied(false);
++		IOLockUnlock(fb->fPresentLock);
++	}
++	if (fb->fConsShown && fb->fFlip[0] != NULL && fb->flipWhenCopied(true) &&
++	    sweet_console_copy_dirty(fb->backBuffer())) {
+ 		fb->flipBack();
+ 	}
+ 	if (rec != NULL) {
+@@ -1093,6 +1102,36 @@ AppleCLCD::fadeStep(const uint8_t *src, uint32_t srcStride, uint32_t step)
+ 	flipBack();
+ }
+ 
++/*
++ * sapphire 0235: the GPU's copy of a frame into the back buffer is only queued when present()
++ * returns; pointing the MDP at that buffer right away showed what it held before, the frame of two
++ * swaps ago, until the copy landed: animations jumped back and forth by a frame (0233 gave this
++ * phone flip buffers for the first time). The flip now waits for the copy's fence: at the next
++ * swap or vsync tick (wait false), or, up to 20 ms, before the CPU writes the back buffer (wait
++ * true: flipFrom, present's CPU path, the console). With fPresentLock held, but for the console.
++ */
++bool
++AppleCLCD::flipWhenCopied(bool wait)
++{
++	if (!fFlipWait) {
++		return true;
++	}
++	for (unsigned i = 0; sapphire_gpu_copy_pending(); i++) {
++		if (!wait) {
++			return false;
++		}
++		if (i >= 200) {
++			break;                  /* the GPU is stuck: flip anyway, as before 0235 */
++		}
++		IODelay(100);
++	}
++	uint32_t idx = fFlipIdx ^ 1;
++	scanFrom(fFlipPhys[idx], fRowBytes);
++	fFlipIdx = idx;
++	fFlipWait = false;
++	return true;
++}
++
+ /* Clean the back buffer and point the MDP at it (latched at its vsync). */
+ void
+ AppleCLCD::flipBack(void)
+@@ -1193,6 +1232,7 @@ sweet_fb_gpucopy_on(void)
+ void
+ AppleCLCD::flipFrom(const uint8_t *src, uint32_t srcStride)
+ {
++	(void)flipWhenCopied(true);
+ 	uint8_t *dst = backBuffer();
+ 	uint64_t t0 = mach_absolute_time();
+ 	if (srcStride == fRowBytes) {
+@@ -1320,6 +1360,29 @@ AppleCLCD::present(const uint8_t *rec)
+ 	 * flip, like the direct path. Composing into the scanned, uncached boot
+ 	 * framebuffer showed every multi-layer frame (dims, apps) drawn top-down.
+ 	 */
++	uint32_t nlayers = 0;
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		if ((mask & (1u << layer)) && get32(rec, 0x54 + 4 * layer) != 0) {
++			nlayers++;
++		}
++	}
++	/*
++	 * Without flip buffers (they need 2 x 10 MB of contiguous memory, which is not there at
++	 * boot on this phone) the frame goes straight into the boot framebuffer the panel scans:
++	 * contiguous, already mapped in the GPU, and write-combined for the CPU, so the GPU's
++	 * writes need no invalidate.
++	 */
++	bool gpu_frame = nlayers == 1 && sweet_fb_gpucopy_on() && sapphire_gpu_ready();
++	bool gpu_used = false;
++
++	/*
++	 * 0235: the last GPU copy, landed, goes on the panel first. A frame the CPU composes waits for
++	 * it (it writes the same back buffer); one the GPU copies is queued behind it, in order, and the
++	 * flip of both waits for the newer copy.
++	 */
++	if (fFlip[0] != NULL) {
++		(void)flipWhenCopied(!gpu_frame);
++	}
+ 	uint8_t *dst = fFlip[0] != NULL ? backBuffer() : (uint8_t *)fPixels;
+ 	if (fFlip[0] == NULL && fVig0 != NULL && fScanPhys != fBootSrc) {
+ 		scanFrom(fBootSrc, fBootStride);
+@@ -1336,21 +1399,6 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 	}
+ 
+-	uint32_t nlayers = 0;
+-	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+-		if ((mask & (1u << layer)) && get32(rec, 0x54 + 4 * layer) != 0) {
+-			nlayers++;
+-		}
+-	}
+-	/*
+-	 * Without flip buffers (they need 2 x 10 MB of contiguous memory, which is not there at
+-	 * boot on this phone) the frame goes straight into the boot framebuffer the panel scans:
+-	 * contiguous, already mapped in the GPU, and write-combined for the CPU, so the GPU's
+-	 * writes need no invalidate.
+-	 */
+-	bool gpu_frame = nlayers == 1 && sweet_fb_gpucopy_on() && sapphire_gpu_ready();
+-	bool gpu_used = false;
+-
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -1447,6 +1495,10 @@ AppleCLCD::present(const uint8_t *rec)
+ 			}
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			/* 0235: a GPU frame whose copy was refused: the earlier copy into this buffer lands first */
++			for (unsigned i = 0; fFlipWait && i < 200 && sapphire_gpu_copy_pending(); i++) {
++				IODelay(100);
++			}
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(dst + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+@@ -1456,11 +1508,12 @@ AppleCLCD::present(const uint8_t *rec)
+ 		s->release();
+ 	}
+ 	if (gpu_used) {
+-		/* the GPU wrote RAM (and the rows were invalidated): point the MDP at it, no clean */
++		/*
++		 * the GPU writes RAM: the MDP is pointed at the back buffer once the copy has landed
++		 * (0235: flipWhenCopied(), at the next swap or vsync tick), no clean
++		 */
+ 		if (fFlip[0] != NULL) {
+-			uint32_t idx = fFlipIdx ^ 1;
+-			scanFrom(fFlipPhys[idx], fRowBytes);
+-			fFlipIdx = idx;
++			fFlipWait = true;
+ 		}
+ 		if (sweet_fb_stats_on()) {
+ 			sweet_fb_stats.gpu++;
+@@ -1470,6 +1523,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	}
+ 	if (fFlip[0] != NULL) {
+ 		flipBack();
++		fFlipWait = false;      /* (this frame, the CPU's, replaces one still waiting for its copy) */
+ 	}
+ 	if (sweet_fb_stats_on()) {
+ 		sweet_fb_stats.comp += sweet_fb_us(comp_t0, mach_absolute_time());
+-- 
+2.53.0
+
