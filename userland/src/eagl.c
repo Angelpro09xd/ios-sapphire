@@ -259,6 +259,8 @@ struct image {
 	unsigned looked;                /* ... the frame in which that memory was last looked at, */
 	uint64_t sum;                   /* ... what a word in every SUM_STRIDE bytes of it added up to, */
 	uint64_t slice_sum[SUM_SLICES]; /* ... and what each slice of it added up to, word by word */
+	unsigned slice_next;            /* ... the slice to add up next, */
+	unsigned quiet, look_again;     /* ... looks in a row that found no change, and the frame of the next one */
 	GLenum to, internal, format, type;
 	uint32_t plane, seed;
 	GLsizei width, height;
@@ -919,16 +921,35 @@ surface_shared(struct eagl *e, struct image *image)
  * of the memory in full, a different one each frame: a change smaller than that is seen within
  * SUM_SLICES frames. Everything is added up when the texture is made (all, below).
  */
+/*
+ * Four sums side by side, each of every fourth word: one chain of multiplies kept the processor
+ * waiting on the last one, and on one load at a time where the words are SUM_STRIDE apart.
+ */
+#define ADD_UP_STEP(s, w) do { (s) = ((s) ^ (w)) * 0x9e3779b97f4a7c15ull; (s) ^= (s) >> 29; } while (0)
 static uint64_t
 add_up(const uint8_t *base, size_t from, size_t to, size_t stride, uint64_t sum)
 {
-	uint64_t word;
+	uint64_t word, w[4], s[4] = { sum, sum + 1, sum + 2, sum + 3 };
+	size_t at = from;
 
-	for (size_t at = from; at + 8 <= to; at += stride) {
-		memcpy(&word, base + at, 8);
-		sum = (sum ^ word) * 0x9e3779b97f4a7c15ull;
-		sum ^= sum >> 29;
+	for (; at + 3 * stride + 8 <= to; at += 4 * stride) {
+		memcpy(&w[0], base + at, 8);
+		memcpy(&w[1], base + at + stride, 8);
+		memcpy(&w[2], base + at + 2 * stride, 8);
+		memcpy(&w[3], base + at + 3 * stride, 8);
+		ADD_UP_STEP(s[0], w[0]);
+		ADD_UP_STEP(s[1], w[1]);
+		ADD_UP_STEP(s[2], w[2]);
+		ADD_UP_STEP(s[3], w[3]);
 	}
+	for (; at + 8 <= to; at += stride) {
+		memcpy(&word, base + at, 8);
+		ADD_UP_STEP(s[0], word);
+	}
+	sum = s[0];
+	ADD_UP_STEP(sum, s[1]);
+	ADD_UP_STEP(sum, s[2]);
+	ADD_UP_STEP(sum, s[3]);
 	return sum;
 }
 
@@ -943,7 +964,8 @@ surface_changed_all(struct eagl *e, struct image *image, bool all)
 	bool changed = false;
 	uint64_t sum;
 
-	if (image->looked == e->frames + 1 || base == NULL || IOSurfaceGetPlaneCount(surface) > 0) {
+	if (image->looked == e->frames + 1 || base == NULL || IOSurfaceGetPlaneCount(surface) > 0 ||
+	    (!all && e->frames + 1 < image->look_again)) {
 		return false;
 	}
 	image->looked = e->frames + 1;
@@ -952,8 +974,9 @@ surface_changed_all(struct eagl *e, struct image *image, bool all)
 		image->sum = sum;
 		changed = true;
 	}
+	image->slice_next++;
 	for (unsigned n = 0; n < SUM_SLICES; n++) {
-		if (!all && n != (e->frames + (unsigned)(uintptr_t)image / 64) % SUM_SLICES) {
+		if (!all && n != (image->slice_next + (unsigned)(uintptr_t)image / 64) % SUM_SLICES) {
 			continue;
 		}
 		sum = add_up(base, n * slice, (n + 1) * slice < size ? (n + 1) * slice : size, 8, n);
@@ -962,6 +985,14 @@ surface_changed_all(struct eagl *e, struct image *image, bool all)
 			changed = true;
 		}
 	}
+	/*
+	 * Looking cost a seventh of a home-screen swipe's frames (glsample), nearly all of it at
+	 * pictures that did not change. One that has not changed for a few looks is looked at every
+	 * second frame, then every fourth; a change brings it back to every frame. (A seed that
+	 * moves is seen at once all the same: my_glBindTexture.)
+	 */
+	image->quiet = changed || all ? 0 : image->quiet + 1;
+	image->look_again = e->frames + 1 + (image->quiet < 4 ? 1 : image->quiet < 8 ? 2 : 4);
 	return changed;
 }
 
