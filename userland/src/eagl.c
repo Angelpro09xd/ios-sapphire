@@ -1306,6 +1306,77 @@ show_texture(struct eagl *e, struct image *image)
 	free(pixels);
 }
 
+/*
+ * File /redwood/glgputime: what each frame costs the GPU, from a GL_TIME_ELAPSED query around it
+ * (begun at the frame's first drawing, ended before the glFlush that sends it), read back frames
+ * later without waiting; a line every 60 frames measured.
+ */
+#define GPU_QUERIES     8
+static int gpu_time_on;
+static GLuint gpu_query[GPU_QUERIES];
+static bool gpu_query_busy[GPU_QUERIES];
+static unsigned gpu_query_next, gpu_query_open = ~0u;
+static uint64_t gpu_ns_sum, gpu_ns_max, gpu_measured;
+
+static void
+gpu_query_begin(void)
+{
+	if (!gpu_time_on || gpu_query_open != ~0u) {
+		return;
+	}
+	if (gpu_query[0] == 0) {
+		glGenQueries(GPU_QUERIES, gpu_query);
+	}
+	unsigned slot = gpu_query_next % GPU_QUERIES;
+	if (gpu_query_busy[slot]) {
+		return;                         /* (not read back yet: this frame goes unmeasured) */
+	}
+	while (glGetError() != 0) {
+	}
+	glBeginQuery(0x88bf /* GL_TIME_ELAPSED */, gpu_query[slot]);
+	if (glGetError() != 0) {
+		say("redwood-gl: no GL_TIME_ELAPSED queries here; /redwood/glgputime ignored\n");
+		gpu_time_on = 0;
+		return;
+	}
+	gpu_query_busy[slot] = true;
+	gpu_query_open = slot;
+	gpu_query_next++;
+}
+
+static void
+gpu_query_end(void)
+{
+	if (gpu_query_open != ~0u) {
+		glEndQuery(0x88bf);
+		gpu_query_open = ~0u;
+	}
+}
+
+static void
+gpu_query_collect(void)
+{
+	for (unsigned i = 0; i < GPU_QUERIES && gpu_time_on; i++) {
+		GLuint available = 0, ns = 0;
+		if (!gpu_query_busy[i] || i == gpu_query_open) {
+			continue;
+		}
+		glGetQueryObjectuiv(gpu_query[i], 0x8867 /* GL_QUERY_RESULT_AVAILABLE */, &available);
+		if (!available) {
+			continue;
+		}
+		glGetQueryObjectuiv(gpu_query[i], 0x8866 /* GL_QUERY_RESULT */, &ns);
+		gpu_query_busy[i] = false;
+		gpu_ns_sum += ns;
+		gpu_ns_max = ns > gpu_ns_max ? ns : gpu_ns_max;
+		if (++gpu_measured % 60 == 0) {
+			say("redwood-gl: gpu: %llu us a frame on average over 60 frames, the longest %llu us\n", gpu_ns_sum / 60000,
+			    gpu_ns_max / 1000);
+			gpu_ns_sum = gpu_ns_max = 0;
+		}
+	}
+}
+
 /* Before the first drawing of a frame: the textures whose IOSurfaces somebody has written to since. */
 static void
 frame_begin(struct eagl *e)
@@ -1318,6 +1389,7 @@ frame_begin(struct eagl *e)
 	}
 	e->in_frame = true;
 	e->began = now_us();
+	gpu_query_begin();
 	eagl_tracing = e->frames + 1 >= trace_first && e->frames + 1 <= trace_last;
 	if ((trace_at != 0 && e->began >= trace_at) || (trace_draws != 0 && e->last_draws == trace_draws) || trace_function_met) {
 		trace_left = trace_frames;      /* (once) */
@@ -1411,6 +1483,8 @@ smp_cmp_total(const void *a, const void *b)
 	return (int)((const struct smp_slot *)b)->total - (int)((const struct smp_slot *)a)->total;
 }
 
+static bool smp_waiting(uint64_t pc);
+
 static void
 smp_report(const char *who, uint64_t (*pcs)[SMP_DEPTH], unsigned n, unsigned idle)
 {
@@ -1440,8 +1514,37 @@ smp_report(const char *who, uint64_t (*pcs)[SMP_DEPTH], unsigned n, unsigned idl
 		}
 	}
 	say("redwood-gl: thread %s: %u samples, %u%% of them waiting\n", who, n, idle * 100 / n);
+	/*
+	 * Where the time went by library: each sample that is not waiting goes to the innermost frame
+	 * of Mesa, of this library or of QuartzCore (what they call in libsystem counts as theirs).
+	 */
+	static const char *const libs[] = { "libOSMesa", "libredwood-gl", "QuartzCore" };
+	unsigned in_lib[4] = {}, busy = 0;
+	for (unsigned k = 0; k < n; k++) {
+		if (pcs[k][0] == 0 || smp_waiting(pcs[k][0])) {
+			continue;
+		}
+		busy++;
+		unsigned which = 3;
+		for (int i = 0; i < SMP_DEPTH && pcs[k][i] != 0 && which == 3; i++) {
+			Dl_info info;
+			if (dladdr((const void *)(pcs[k][i] - (i > 0 ? 4 : 0)), &info) && info.dli_fname != NULL) {
+				for (unsigned l = 0; l < 3; l++) {
+					if (strstr(info.dli_fname, libs[l]) != NULL) {
+						which = l;
+						break;
+					}
+				}
+			}
+		}
+		in_lib[which]++;
+	}
+	if (busy != 0) {
+		say("redwood-gl:  %s busy %u%%: Mesa %u%%, redwood-gl %u%%, QuartzCore %u%%, other %u%% (of the busy samples)\n", who,
+		    busy * 100 / n, in_lib[0] * 100 / busy, in_lib[1] * 100 / busy, in_lib[2] * 100 / busy, in_lib[3] * 100 / busy);
+	}
 	qsort(slot, SMP_SLOTS, sizeof(*slot), smp_cmp_self);
-	for (int i = 0; i < 25 && slot[i].self != 0; i++) {
+	for (int i = 0; i < 40 && slot[i].self != 0; i++) {
 		smp_name(slot[i].key, name, sizeof(name));
 		say("redwood-gl:  %s self  %5.1f%%  %s\n", who, 100.0 * slot[i].self / n, name);
 	}
@@ -1698,6 +1801,7 @@ frame_end(struct eagl *e, bool finished)
 	if (e->frames == 30 || e->frames % 200 == 0) {
 		summary(e);
 	}
+	gpu_query_collect();
 	if (profile_calls && e->frames % 200 == 0) {
 		profile_report(e);
 	}
@@ -3806,6 +3910,7 @@ my_glFinish(void *context)
 		eagl_trace("glFinish()\n");
 	}
 	clear_now(e);
+	gpu_query_end();
 	glFinish();
 	frame_end(e, true);
 	EAGL_LEAVE(e, 0x2d0);
@@ -3822,6 +3927,7 @@ my_glFlush(void *context)
 		eagl_trace("glFlush()\n");
 	}
 	clear_now(e);
+	gpu_query_end();
 	began = now_us();
 	glFlush();
 	e->flushing += now_us() - began;
@@ -3839,6 +3945,7 @@ my_glFinishObjectAPPLE(void *context, GLenum object, GLint name)
 	(void)name;
 	EAGL_ENTER(e, 0xeb8);
 	clear_now(e);
+	gpu_query_end();
 	glFinish();
 	frame_end(e, true);
 	EAGL_LEAVE(e, 0xeb8);
@@ -4843,6 +4950,7 @@ install(void)
 		}
 		/* likewise /redwood/glframes: a line for every frame */
 		frame_lines |= access("/redwood/glframes", F_OK) == 0;
+		gpu_time_on = access("/redwood/glgputime", F_OK) == 0;
 		full_precision = strstr(arguments, "glprecision=0") == NULL;
 		vblur_on = strstr(arguments, "vblur=0") != NULL ? 0 : strstr(arguments, "vblur=2") != NULL ? 2 : 1;
 		if ((argument = strstr(arguments, "glplain=")) != NULL) {
