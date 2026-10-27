@@ -1,4 +1,4 @@
-From f293583a1661d7ae76acc4d56d22fbce1977add0 Mon Sep 17 00:00:00 2001
+From 0e98ec92eba369c0eac4d30e5d686e58674c488d Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Tue, 27 Oct 2026 21:43:20 +0100
 Subject: [PATCH] sapphire-0238: kern.sweet_glload=1 gives every app
@@ -9,14 +9,13 @@ Subject: [PATCH] sapphire-0238: kern.sweet_glload=1 gives every app
  1 file changed, 31 insertions(+)
 
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 68612db..1136b6b 100644
+index 68612db..84cc1da 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -247,6 +247,21 @@ SYSCTL_INT(_vm, OID_AUTO, vm_shared_region_reslide_restrict,
- SYSCTL_INT(_vm, OID_AUTO, vm_shared_region_reslide_aslr,
-     CTLFLAG_RW, &vm_shared_region_reslide_aslr, 0, "");
+@@ -249,6 +249,21 @@ SYSCTL_INT(_vm, OID_AUTO, vm_shared_region_reslide_aslr,
  #endif
-+
+ #endif /* __has_feature(ptrauth_calls) */
+ 
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +/*
 + * sapphire 0238: kern.sweet_glload=1 puts DYLD_INSERT_LIBRARIES=/redwood/lib/libredwood-glload.dylib
@@ -31,9 +30,10 @@ index 68612db..1136b6b 100644
 +    "DYLD_INSERT_LIBRARIES of the EAGL bridge's loader for apps");
 +#define SWEET_GLLOAD_ENV "DYLD_INSERT_LIBRARIES=/redwood/lib/libredwood-glload.dylib"
 +#endif
- #endif /* __has_feature(ptrauth_calls) */
- 
++
  #if DEVELOPMENT || DEBUG
+ static TUNABLE(bool, enable_dext_coredumps_on_panic, "dext_panic_coredump", true);
+ #else
 @@ -5741,6 +5756,22 @@ exec_extract_strings(struct image_params *imgp)
  		imgp->ip_envc++;
  	}
