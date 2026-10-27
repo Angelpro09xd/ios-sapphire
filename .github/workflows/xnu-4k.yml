@@ -1,0 +1,97 @@
+# The kernel the phone runs (4 KiB pages, all eight cores): the same steps as codemagic.yaml's
+# xnu-4k workflow, on GitHub's macOS runners (free for a public repository), for when the Codemagic
+# account has no build minutes left. Start it with `gh workflow run xnu-4k -R <fork> --ref sapphire`;
+# the kernel is the run's artifact xnu-kernel-4k (kernel.development.sweet, SHA256SUMS).
+name: xnu-4k
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: xnu-4k-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  MACOS_VERSION: "13.5"
+  KERNEL_CONFIG: DEVELOPMENT
+  MACHINE_CONFIG: SWEET
+  MAKEFLAGS: -k
+  TOPAZ_4K: "1"
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_COMPILERCHECK: content
+  CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,file_macro,pch_defines
+  CCACHE_MAXSIZE: 3G
+  CCACHE_WRAP: ${{ github.workspace }}/ccache-bin
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode 16.0 (as on Codemagic: patch 0128 gives iig's IORPC.kernelContent)
+        run: |
+          ls -d /Applications/Xcode*.app
+          sudo xcode-select -s /Applications/Xcode_16.0.app
+          xcodebuild -version
+
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-xnu-4k-${{ github.run_id }}
+          restore-keys: ccache-xnu-4k-
+
+      - name: Fetch build script
+        run: |
+          set -e
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53"/' dxb/build.sh
+          grep -c 'OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53"' dxb/build.sh
+          sed -i '' 's|export CC="$(xcrun -find clang)"|export CC="$CCACHE_WRAP/clang"|; s|export CXX="$(xcrun -find clang++)"|export CXX="$CCACHE_WRAP/clang++"|' dxb/build.sh
+          grep -c 'export CC="$CCACHE_WRAP/clang"' dxb/build.sh
+
+      - name: Deps
+        run: |
+          set -e
+          brew install ccache || true
+          pip3 install --break-system-packages cmake ninja || pip3 install cmake ninja
+          for t in gum xcodes; do
+            command -v $t || { sudo mkdir -p /usr/local/bin; printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/$t >/dev/null; sudo chmod +x /usr/local/bin/$t; }
+          done
+          for t in jq gum cmake ninja xcodes; do command -v $t; done
+          xcrun --find iig
+          mkdir -p "$CCACHE_WRAP"
+          # never ccache for assembly: it includes the generated assym.s, which ccache does not hash
+          cc=$(command -v ccache || true)
+          for t in clang clang++; do
+            printf '#!/bin/sh\nfor a; do case "$a" in *.s) exec %s "$@";; esac; done\nexec %s %s "$@"\n' "$(xcrun -find $t)" "$cc" "$(xcrun -find $t)" > "$CCACHE_WRAP/$t"
+            chmod +x "$CCACHE_WRAP/$t"
+          done
+          cat "$CCACHE_WRAP/clang"
+
+      - name: Build
+        run: |
+          set -e
+          cd dxb
+          command -v ccache >/dev/null && ccache -z
+          bash build.sh
+          command -v ccache >/dev/null && ccache -s || true
+
+      - name: Collect
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS)
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xnu-kernel-4k
+          path: out/
