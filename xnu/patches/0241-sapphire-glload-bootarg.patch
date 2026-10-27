@@ -1,0 +1,38 @@
+From 794f1380f464db093806cf3d85cb9b310ef33b25 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 27 Oct 2026 23:46:09 +0100
+Subject: [PATCH] sapphire-0241: boot-arg sweet_glload=1 (the app loader, now
+ with ElleKit's tweaks, from boot)
+
+---
+ bsd/kern/kern_exec.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 84cc1da..462a500 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5757,7 +5757,19 @@ exec_extract_strings(struct image_params *imgp)
+ 	}
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-	/* sapphire 0238 (kern.sweet_glload): the bridge's loader for an app; one set by the caller comes first and wins */
++	/*
++	 * sapphire 0238 (kern.sweet_glload): the bridge's loader for an app; one set by the caller comes first and wins.
++	 * 0241: boot-arg sweet_glload=1 turns it on from the start (launchd runs no RunAtLoad job from /var/jb, so
++	 * nothing in user space could set the sysctl early enough); the loader also brings ElleKit's tweaks.
++	 */
++	static int glload_args = -1;
++	if (glload_args < 0) {
++		int on = 0;
++		glload_args = PE_parse_boot_argn("sweet_glload", &on, sizeof(on)) && on != 0;
++		if (glload_args) {
++			sweet_glload = 1;
++		}
++	}
+ 	if (sweet_glload && strnstr(imgp->ip_strings, ".app/", strlen(EXECUTABLE_KEY) + MAXPATHLEN) != NULL) {
+ 		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(SWEET_GLLOAD_ENV), UIO_SYSSPACE, TRUE);
+ 		if (error) {
+-- 
+2.53.0
+
