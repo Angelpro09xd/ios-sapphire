@@ -1,5 +1,42 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-10-27: smoother animations, automatic swipe tests (kernels 0235-0237)
+
+**User-visible:** animations no longer jump back and forth (0235), the Apple logo stays until the
+UI comes up (0236), swipes are "a bit smoother" (redwood-gl 2df3a2d). Measured on the home screen
+(pages left/right, Control Center open/close): **18.6 -> ~29 fps** while animating.
+
+- **0235 flip after the copy:** with `sweetfb_gpucopy`, present() queued the GPU copy of a frame
+  into the back buffer and pointed the MDP at it at once: the panel scanned out the frame of two
+  swaps ago. Now the flip waits for the copy's fence (at the next swap or vsync tick; up to 20 ms
+  before a CPU write of the back buffer).
+- **0236 boot logo:** backboardd turns the display on, off, then SpringBoard on. Every off before
+  the second on, in the first 3 minutes, is ignored (`SWEET FB: display off ignored (boot, ...)`).
+- **redwood-gl 2df3a2d:** the in-process sampler (`/redwood/glsample`) put 15% of the render
+  thread in `surface_changed_all`: every copied (not shared) texture was added up every frame to
+  notice unannounced writes. Unchanged surfaces are now looked at every 2nd, then every 4th frame
+  (a seed change is still seen at once), and the sum runs four words at a time: 15% -> 2%.
+- **0237 `kern.sweet_inject` + `userland/tests/hidtouch`:** touches ("t FINGER DOWN X Y", panel
+  pixels) and buttons ("k KEY DOWN") go into SweetHID.cpp's own path, edge bit included.
+  `hidtouch swipe X0 Y0 X1 Y1 [MS]` / `tap X Y` / `press KEY` (fractions of the panel; KEY 0 power,
+  3 home). Dispatching IOHIDEvents to backboardd from a process with the HID entitlements did
+  nothing. `userland/tests/swipetest.sh N` wakes/unlocks and runs N rounds of the gesture test.
+- **Where a frame's time goes now** (`/redwood/gllat`: a `tl: g N began ended draws` line a frame;
+  `/redwood/glprofile`; `/redwood/glsample`; each read when backboardd starts): pacing is not
+  capped -- frames start on 60 Hz ticks and those under 16.7 ms run at 60 fps -- but 35-45% of
+  frames cost more and take two ticks. Cost is ~150 us per draw (120 draws ~18 ms, Control
+  Center's 250 ~37 ms); 80% of it inside GL entries: glFlush 4.5-7 ms (waiting for Mesa's driver
+  thread to build the commands), glDrawElements ~37 us a call, glBindTexture ~25 us a call.
+  Texture uploads during swipes are near zero. The next win is Mesa/freedreno's per-draw cost.
+- **Tried, no gain:** only the 4 gold cores (`cpus=4`: 30.6 fps vs 28.5-29.5 with 8; the Edge
+  scheduler without CLPC prefers pset0 for every thread group anyway); handing threaded-context
+  batches to the driver thread early (a `TC_EARLY_SLOTS` knob in u_threaded_context.c: glFlush's
+  wait halved but the frame cost did not move -- the render thread's own work is the limit). Not
+  kept.
+- **Seen:** `parsecd` traps now and then (Swift, sig 5) and ReportCrash spends seconds of CPU on
+  each, sometimes during animations. A big scp over the USB link stalls it (reattach); send big
+  files in pieces.
+
 ## SAPPHIRE 2026-10-25/26: mobile data in iOS, display off, boot logo (kernels 0224-0234)
 
 **Works now (user confirmed on 0234):** LTE mobile data for every app (Safari loads pages), the

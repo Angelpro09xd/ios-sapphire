@@ -4827,7 +4827,8 @@ install(void)
 		frame_lines = strstr(arguments, "glframes=1") != NULL;
 		/* (or the file /redwood/glprofile: no reboot, a restart of backboardd is enough) */
 		profile_calls = strstr(arguments, "glprofile=1") != NULL || access("/redwood/glprofile", F_OK) == 0;
-		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
+		/* (or the file /redwood/gllat: no reboot) */
+		latency_lines = strstr(arguments, "touch_lat=1") != NULL || access("/redwood/gllat", F_OK) == 0;
 		if ((argument = strstr(arguments, "glslow=")) != NULL) {
 			slow_calls_us = strtoull(argument + 7, NULL, 10);
 		}
