@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Rebuild a UEFI boot image (uefi/mkuefi-v4.py output) around another kernel, keeping the rest.
 
-  sapphire-repack.py OLD.img KERNEL OUT.img [--set ARG=VALUE ...] [--drop ARG ...] [--print]
+  sapphire-repack.py OLD.img KERNEL OUT.img [--set ARG=VALUE ...] [--drop ARG ...] [--adt NAME=U32 ...] [--print]
+
+(iOS drawing at 2x, xnu 0239: --set sweetfb_scale=2 --adt display-scale=2 --adt canvas-width=750
+--adt canvas-height=1624.)
 
 OLD.img's BootShim + FD, shim, device tree and ADT (with the GPU/IPA firmware mkadt.py put in it)
 are reused; only the kernel is replaced (tools/mkpayload.py) and the boot-args edited. For working
@@ -17,6 +20,7 @@ ap.add_argument('kernel', nargs='?')
 ap.add_argument('out', nargs='?')
 ap.add_argument('--set', action='append', default=[])
 ap.add_argument('--drop', action='append', default=[])
+ap.add_argument('--adt', action='append', default=[], help='NAME=U32: every 4-byte ADT property NAME set to U32')
 ap.add_argument('--print', action='store_true')
 a = ap.parse_args()
 
@@ -52,8 +56,22 @@ for kv in a.set:
     args = [x for x in args if x.split('=')[0] != k] + [kv]
 cmd = ' '.join(args)
 
+adt = bytearray(pl[adt_off:adt_off + adt_size])
+for kv in a.adt:
+    # an ADT property: name in 32 bytes (NUL-padded), u32 length (top bit: placeholder), value
+    k, v = kv.split('=')
+    name = k.encode().ljust(32, b'\0')
+    n, at = 0, adt.find(name)
+    while at >= 0:
+        if struct.unpack_from('<I', adt, at + 32)[0] & 0x7fffffff == 4:
+            struct.pack_into('<I', adt, at + 36, int(v, 0))
+            n += 1
+        at = adt.find(name, at + 1)
+    assert n > 0, 'no 4-byte ADT property ' + k
+    print('ADT: %s = %s (%d)' % (k, v, n))
+
 t = tempfile.mkdtemp()
-open(os.path.join(t, 'adt'), 'wb').write(pl[adt_off:adt_off + adt_size])
+open(os.path.join(t, 'adt'), 'wb').write(adt)
 subprocess.check_call([sys.executable, os.path.join(here, 'mkpayload.py'), a.kernel, os.path.join(t, 'adt'),
                        os.path.join(t, 'payload'), '--cmdline', cmd])
 shim = bytearray(shim[:po] + open(os.path.join(t, 'payload'), 'rb').read())

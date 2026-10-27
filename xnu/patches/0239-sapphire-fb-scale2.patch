@@ -1,0 +1,211 @@
+From be094056db713556fb194ae9de01bcc5c620093f Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 27 Oct 2026 22:43:12 +0100
+Subject: [PATCH] sapphire-0239: sweetfb_scale=2, iOS draws at 2x (750x1624)
+ and the GPU's copy scales it onto the panel (blit_scale, bilinear 2D blit)
+
+---
+ iokit/Kernel/arm/SapphireGpu.cpp      | 95 +++++++++++++++++++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 52 +++++++++++++++
+ 2 files changed, 147 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index 63f7c8b..7f0cdd8 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -1628,6 +1628,54 @@ blit_copy(uint64_t src, uint32_t spitch, uint64_t dst, uint32_t dpitch, uint32_t
+ 	return blit_end("copy");
+ }
+ 
++/*
++ * sapphire 0239: the source rectangle [sx, sx + sw) x [sy, sy + sh) (pixels << 8: the blitter's
++ * source coordinates have 8 fraction bits) scaled, bilinear, onto dw x dh pixels at dst. For iOS
++ * drawing at 2x (SweetFramebuffer, sweetfb_scale=2): 720 x 1600 of a 750 x 1624 surface onto the
++ * 1080 x 2400 panel. The source pitch must be a multiple of 64 bytes; a destination pitch that is
++ * not (the panel's 4320) is done as blit_copy does it, in k passes of every k-th row, each pass's
++ * source rows k times as far apart and started where its first row's centre falls.
++ */
++static bool
++blit_scale(uint64_t src, uint32_t spitch, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
++    uint64_t dst, uint32_t dpitch, uint32_t dw, uint32_t dh)
++{
++	uint32_t k = (dpitch & 63) == 0 ? 1 : 2;
++
++	if ((spitch & 63) != 0 || ((k * dpitch) & 63) != 0 || (src & 3) != 0 || (dst & 3) != 0 || dw == 0 || dh == 0 ||
++	    sw == 0 || sh == 0 || dw + 16 > 0x4000 || ((sx + sw) >> 8) + 16 > 0x4000 || ((sy + sh) >> 8) + 2 > 0x7fff) {
++		LOG("  blit_scale: pitches %u/%u or sizes do not fit the blitter", spitch, dpitch);
++		return false;
++	}
++	uint64_t sb = src & ~63ull;
++	uint32_t sadd = (uint32_t)(src & 63) / 4;               /* the base's misalignment, as pixels */
++	uint32_t swidth = sadd + ((sx + sw) >> 8) + 1, sheight = ((sy + sh) >> 8) + 2;
++	blit_setup(false, 0);
++	for (uint32_t j = 0; j < k && j < dh; j++) {
++		uint64_t d0 = dst + (uint64_t)j * dpitch;
++		uint32_t dx = (uint32_t)(d0 & 63) / 4, n = (dh - j + k - 1) / k;
++		/* the pass's n rows sample k * n * (sh / dh) source rows, the first centred on row j's */
++		int64_t span = (int64_t)sh * k * n / dh;
++		int64_t y0 = (int64_t)sy + ((2 * (int64_t)j + 1 - (int64_t)k) * (int64_t)sh) / (2 * (int64_t)dh);
++		if (y0 < 0) {
++			y0 = 0;
++		}
++		emit(pkt4(REG_TPL1_A2D_SRC_TEXTURE_INFO, 5));        /* INFO, SIZE, BASE lo/hi, PITCH */
++		emit(FMT6_8_8_8_8_UNORM | (1u << 16) | (1u << 20) | (1u << 22));  /* LINEAR, WZYX, FILTER, UNK20, UNK22 */
++		emit(swidth | (sheight << 15));
++		emit((uint32_t)sb);
++		emit((uint32_t)(sb >> 32));
++		emit((spitch >> 6) << 9);
++		emit(pkt4(REG_GRAS_A2D_SRC_XMIN, 4));
++		emit((sadd << 8) + sx);
++		emit((sadd << 8) + sx + sw - 256);
++		emit((uint32_t)y0);
++		emit((uint32_t)(y0 + span - 256));
++		blit_rect(d0 & ~63ull, k * dpitch, dx, 0, dx + dw - 1, n - 1);
++	}
++	return blit_end("scale");
++}
++
+ /*
+  * boot-arg gpu_bench=1: is the GPU worth handing AppleCLCD's per-frame copy? That copy is a
+  * full 1080 x 2400 frame (10 MB) from CoreAnimation's surface into the flip buffer, memcpy then a
+@@ -2162,6 +2210,53 @@ sapphire_gpu_copy(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src_pitch,
+ 	return ok;
+ }
+ 
++/* 0239: sapphire_gpu_copy() scaled: blit_scale() of the source at src_off (coordinates << 8) */
++bool sapphire_gpu_copy_scaled(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src_pitch, uint32_t sx, uint32_t sy,
++    uint32_t sw, uint32_t sh, uint64_t dst_pa, uint32_t dst_pitch, uint32_t dw, uint32_t dh, uint64_t dst_base,
++    uint64_t dst_size);
++
++bool
++sapphire_gpu_copy_scaled(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src_pitch, uint32_t sx, uint32_t sy,
++    uint32_t sw, uint32_t sh, uint64_t dst_pa, uint32_t dst_pitch, uint32_t dw, uint32_t dh, uint64_t dst_base,
++    uint64_t dst_size)
++{
++	static uint32_t told;
++	bool ok = false;
++	uint64_t last = src_off + (uint64_t)(((sy + sh) >> 8) + 1) * src_pitch;
++
++	if (!service_ready || src == NULL || dw == 0 || dh == 0) {
++		return false;
++	}
++	IOLockLock(service_lock);
++	if (service_ready) {
++		uint64_t va = map_window(src);
++		bool dst_ok = map_identity(dst_base, dst_size);
++		if (!ring_room(1024, 200)) {
++			LOG("service: the ring stays full (the GPU stopped?): copy refused");
++			IOLockUnlock(service_lock);
++			return false;
++		}
++		if (va != 0 && dst_ok && last <= src->getLength()) {
++			ok = blit_scale(va + src_off, src_pitch, sx, sy, sw, sh, dst_pa, dst_pitch, dw, dh);
++			uint32_t wi = (uint32_t)((va - WIN_BASE) / WIN_SIZE);
++			if (wi < WIN_COUNT) {
++				win[wi].fence = fence_seq;
++			}
++			last_copy_fence = fence_seq;
++			if (!ok) {
++				service_ready = false;
++				LOG("service: a scaled copy failed, the GPU path is off; RBBM_STATUS %08x", grd(REG_RBBM_STATUS));
++				smmu_fault("service");
++			}
++		} else if (told++ < 4) {
++			LOG("service: cannot map this scaled copy (window %llx, destination %s, to %ux%u at +%llx of %llu bytes)", va,
++			    dst_ok ? "ok" : "NOT mapped", dw, dh, src_off, src->getLength());
++		}
++	}
++	IOLockUnlock(service_lock);
++	return ok;
++}
++
+ /*
+  * boot-arg gpu_cs=1: the first shader on the Adreno — a compute kernel of 64 invocations, each
+  * storing 0xc0de0000 + its local invocation id at buf[id], the buffer's GPU address in c0.xy.
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 98f8d11..4526140 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -204,6 +204,7 @@ public:
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	bool          fScale2;                  /* 0239: iOS draws at 2x (750 x 1624), the GPU scales it to the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -380,6 +381,22 @@ AppleCLCD::start(IOService *provider)
+ 	/* x rounded down to 4 pixels: the panel window must start 16-byte aligned (MDP fetch) */
+ 	fOffX = ((int32_t)(fLogicalW - fWidth) / 2) & ~3;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	/*
++	 * 0239, boot-arg sweetfb_scale=2 (with the ADT's display-scale 2 and canvas 750 x 1624): iOS
++	 * draws the same 375 x 812 points at 2x, 750 x 1624, and every frame's copy to the panel (the
++	 * GPU's) scales the part of it the panel shows by 1.5. 2.25 times fewer pixels for the GPU to
++	 * draw, blend and copy: this phone's GPU is bound by memory bandwidth (~2.5 ms a full-screen
++	 * pass at 3x). fOffX/fOffY stay those of the 3x picture (the panel's window, and the touch
++	 * mapping, are unchanged).
++	 */
++	int scale = 3;
++	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
++	fScale2 = scale == 2 && fLogicalW == SWEET_FB_LOGICAL_W && fLogicalH == SWEET_FB_LOGICAL_H;
++	if (fScale2) {
++		fLogicalW = SWEET_FB_LOGICAL_W * 2 / 3;
++		fLogicalH = SWEET_FB_LOGICAL_H * 2 / 3;
++		IOLog("SWEET FB: iOS draws at 2x, %ux%u, scaled onto the panel by the GPU\n", fLogicalW, fLogicalH);
++	}
+ 	fLock = IOLockAlloc();
+ 	fPresentLock = IOLockAlloc();
+ 	{
+@@ -1214,6 +1231,9 @@ sweet_fb_stats_on(void)
+  */
+ extern bool sapphire_gpu_copy(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src_pitch, uint64_t dst_pa,
+     uint32_t dst_pitch, uint32_t w, uint32_t h, uint64_t dst_base, uint64_t dst_size);
++extern bool sapphire_gpu_copy_scaled(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src_pitch, uint32_t sx,
++    uint32_t sy, uint32_t sw, uint32_t sh, uint64_t dst_pa, uint32_t dst_pitch, uint32_t dw, uint32_t dh,
++    uint64_t dst_base, uint64_t dst_size);
+ extern bool sapphire_gpu_ready(void);
+ extern "C" void sweet_dcache_flush(vm_offset_t addr, unsigned length);  /* osfmk/arm/caches.c */
+ 
+@@ -1424,6 +1444,38 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		if (fScale2) {
++			/*
++			 * 0239: a 2x frame (one full-screen layer, as CoreAnimation sends them) goes onto the
++			 * panel scaled by the GPU: the panel's window of the 3x picture, at 2/3 of its place
++			 * and size. Anything else is not shown (the CPU copies 1:1 and would put it small).
++			 */
++			static uint32_t scale_told;
++			bool shown = false;
++			if (gpu_frame && bpe == 4 && src != 0 && s->width >= fLogicalW && s->height >= fLogicalH &&
++			    s->elementWidth == 1 && s->elementHeight == 1 && s->memory != NULL) {
++				uint64_t dbase = fFlip[0] != NULL ? fFlipPhys[fFlipIdx ^ 1] : fPhys;
++				uint32_t seed_now = s->state != NULL ? *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
++				if (!(s->gpuDrawn && seed_now == s->gpuSeed)) {
++					sweet_dcache_clean((vm_offset_t)(src + s->offset), (unsigned)((uint64_t)s->height * s->bytesPerRow));
++				}
++				shown = sapphire_gpu_copy_scaled(s->memory, s->offset, s->bytesPerRow,
++				    (uint32_t)fOffX * 512 / 3, (uint32_t)fOffY * 512 / 3, fWidth * 512 / 3, fHeight * 512 / 3,
++				    dbase, fRowBytes, fWidth, fHeight, dbase, (uint64_t)fRowBytes * fHeight);
++				if (shown) {
++					if (fFlip[0] != NULL) {
++						sweet_dcache_flush((vm_offset_t)dst, (unsigned)((uint64_t)fHeight * fRowBytes));
++					}
++					gpu_used = true;
++				}
++			}
++			if (!shown && scale_told++ < 8) {
++				IOLog("SWEET FB: 2x frame not shown (layers %u, gpu %d, surface %ux%u bpe %u)\n", nlayers, gpu_frame,
++				    s->width, s->height, bpe);
++			}
++			s->release();
++			continue;
++		}
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+ 			h = (int32_t)s->height;
+-- 
+2.53.0
+
