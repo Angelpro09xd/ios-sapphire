@@ -1,5 +1,12 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-10-28: the iOS root grown to its whole partition (107 GiB)
+
+The root (HFS+ on userdata, sda18, 115 GB) was the 16 GiB image it was flashed as: iOS showed 17 GB and
+had 0.8 GB free (96%). `userland/tools/hfsgrow` grows the mounted volume with fsctl HFSIOC_RESIZE_VOLUME
+(hfs_extendfs) to the partition less the kernel's console ring at its end (1025 x 4 KiB) and 64 MiB:
+115160719360 bytes, 92 GiB free. Done once, live, in seconds; nothing reflashed.
+
 ## SAPPHIRE 2026-10-28: SMS from and into Messages (kernel 0244)
 
 Messages sends and receives SMS (before, only qmitool did). CommCenter already spoke WMS through ccbridge;
