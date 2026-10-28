@@ -1,0 +1,24 @@
+#!/usr/bin/python3 -I
+# plutil for the xnu build on Linux: -convert binary1|xml1 [-s] [-o OUT] FILE..., and -lint FILE...
+import plistlib, sys
+a = sys.argv[1:]
+fmt = out = None
+files = []
+lint = False
+i = 0
+while i < len(a):
+    x = a[i]
+    if x == '-convert': fmt = a[i + 1]; i += 1
+    elif x == '-o': out = a[i + 1]; i += 1
+    elif x in ('-s', '-r'): pass
+    elif x == '-lint': lint = True
+    else: files.append(x)
+    i += 1
+for f in files:
+    with open(f, 'rb') as h:
+        d = plistlib.load(h)
+    if lint:
+        continue
+    kind = {'binary1': plistlib.FMT_BINARY, 'xml1': plistlib.FMT_XML}[fmt]
+    with open(out or f, 'wb') as h:
+        plistlib.dump(d, h, fmt=kind, sort_keys=False)

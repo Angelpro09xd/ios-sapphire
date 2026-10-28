@@ -1,0 +1,33 @@
+#!/bin/bash
+# xcrun for building xnu on Linux: answers the questions xnu's makedefs and the patch scripts ask
+# (-show-sdk-path/-version/-platform-path, -find TOOL) with the tools in this directory.
+# The "macosx" SDK is XNU_SDK (default: our iPhoneOS 16.5 SDK; the kernel only needs its headers).
+B=$(cd "$(dirname "$0")" && pwd)
+SDK=${XNU_SDK:-$HOME/xnu-tools/MacOSX.sdk}
+find_tool() {
+	case "$1" in
+	clang) echo "$B/xclang" ;;
+	clang++) echo "$B/xclang++" ;;
+	cc) echo "$B/xclang" ;;
+	ld|strip|lipo|libtool|nm|nmedit|mig|migcom|iig|codesign_allocate|ctf_insert) echo "$B/$1" ;;
+	otool) command -v llvm-otool-18 ;;
+	dsymutil) command -v dsymutil-18 || command -v llvm-dsymutil-18 || echo /bin/true ;;
+	unifdef|git|flex|bison) command -v "$1" ;;
+	gm4|m4) command -v m4 ;;
+	*) return 1 ;;
+	esac
+}
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-sdk|--sdk|-toolchain|--toolchain) shift ;;
+	-verbose|--verbose|-v|-log|--log|-n|--no-cache|-k|--kill-cache) ;;
+	-show-sdk-path|--show-sdk-path) echo "$SDK"; exit 0 ;;
+	-show-sdk-version|--show-sdk-version) echo 13.5; exit 0 ;;
+	-show-sdk-platform-path|--show-sdk-platform-path) echo /opt/fake/Platforms/MacOSX.platform; exit 0 ;;
+	-show-sdk-build-version|--show-sdk-build-version) echo 22G74; exit 0 ;;
+	-find|--find|-f) find_tool "$2"; exit $? ;;
+	-*) echo "xcrun: unsupported $1" >&2; exit 1 ;;
+	*) t=$(find_tool "$1") || { echo "xcrun: no $1" >&2; exit 1; }; shift; exec "$t" "$@" ;;
+	esac
+	shift
+done

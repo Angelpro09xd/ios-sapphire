@@ -1,0 +1,6 @@
+#!/bin/sh
+# BSD install for the xnu build: -S (safe copy) is a suffix option in GNU install; drop it
+n=$#; i=0
+for a; do i=$((i+1)); [ "$a" = -S ] || set -- "$@" "$a"; done
+shift $n
+exec /usr/bin/install "$@"
