@@ -1,5 +1,19 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-10-28: kernels built on this PC (WSL), no CI (kernel 0241)
+
+Codemagic is out of build minutes and GitHub Actions is blocked by billing, so the kernel now builds on Linux:
+`tools/xnu-linux/kernel.sh OUT.img` (~8 min at -j12 after a one-time setup, see tools/xnu-linux/README.md).
+It is PureDarwin's Linux xnu toolchain (cctools ld64, mig, iig-lite, SETUP tools) plus an LLVM clang 18.1.8
+patched with Apple's xnu builtins (`clang-xnu-builtins.py`), the iOS 16.5 SDK as a stand-in macOS SDK and
+the tree prepared exactly as CI does (darwin-xnu-build at DXB_SHA, its patches and ours, 243 applied).
+
+- **0241 built this way boots** (`sapphire-uefi-4k-0241-local.img`, 0240's boot-args, `fastboot boot`):
+  SpringBoard, backboardd, CommCenter and wifid up, kern.sweet_glload=1. Against CI's 0240: same segments
+  (no `__CTF`), 24449 vs 24471 global symbols, the missing ones DriverKit glue iig-lite generates differently.
+- `make install` fails at the DriverKit exports check after the kernel is linked; `kernel.sh` repacks the
+  linked kernel from the obj dir.
+
 ## SAPPHIRE 2026-10-27 (late): iOS at 2x, tweaks, at most 3 frames on the GPU (kernels 0239-0241)
 
 **User-visible (confirmed):** animations "go tremendously well" at 2x; tweaks (Cylinder, Atria,

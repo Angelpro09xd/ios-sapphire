@@ -1,0 +1,6 @@
+#!/bin/sh
+# The Darwin cross compiler for xnu: LLVM clang aimed at arm64 macOS, linking with Apple's ld64 (cctools,
+# in this directory). xnu's flags carry -arch and -isysroot themselves.
+B=$(dirname "$0")
+case "$0" in *++) C=$HOME/xnu-tools/llvm-build/bin/clang++ ;; *) C=$HOME/xnu-tools/llvm-build/bin/clang ;; esac
+exec $C -target arm64-apple-macos13.5 -fuse-ld="$B/ld" -Wno-unused-command-line-argument -D__apple_build_version__=16000026 -mllvm -disable-atexit-based-global-dtor-lowering "$@"
