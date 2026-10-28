@@ -1,0 +1,938 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0243: /dev/redwood-gpr (AudioReach packets to the audio DSP from user space: a voice call's graphs replayed from what Android's GSL sends, 192 KB mapped to the DSP), /dev/redwood-mic (the record graph), the codec's handset microphones (WCD937x ADC1/ADC2, TX macro DEC0/DEC1, VA SoundWire TX ports)
+
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index e5ef693..8453865 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -119,6 +119,7 @@ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_audio_ctl.c		standard
+ bsd/dev/sweet_audio_dev.c		standard
+ bsd/dev/sweet_qmi_dev.c			standard
++bsd/dev/sweet_gpr_dev.c			standard
+ bsd/dev/sweet_reboot.c			standard
+ bsd/dev/sweet_inject.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_gpr_dev.c b/bsd/dev/sweet_gpr_dev.c
+new file mode 100644
+index 0000000..a4fdee8
+--- /dev/null
++++ b/bsd/dev/sweet_gpr_dev.c
+@@ -0,0 +1,220 @@
++/*
++ * /dev/redwood-gpr: AudioReach packets to the audio DSP from user space, carried by TopazModem's
++ * ADSP thread (which owns the GLINK edge). What Android's GSL sends for a voice call (graph opens,
++ * calibration, VCPM's voice session) is too much and too varied to write out here; a tool replays
++ * it instead (userland/audio/arplay). With it comes 192 KB of memory the DSP reads (mapped to it
++ * once, by SWEET_GPR_SETUP): out-of-band payloads and calibration tables the DSP keeps using while
++ * a graph is open are written there (SWEET_GPR_WRITE) and named by their offset.
++ *
++ *   SWEET_GPR_CALL op 1 setup: the memory mapped to the DSP (info in got[]: handle, size)
++ *                  op 2 one packet: payload[len] in band; with flags & 1 its first 16 bytes are an
++ *                       apm_cmd_header the kernel fills in (address of oob_offset, the map's
++ *                       handle, oob_len). Waits up to wait_ms for GPR_IBASIC_RSP_RESULT naming the
++ *                       opcode (status: its result) or for rsp_opcode (status 0, its words in got[]);
++ *                       status -1: no answer, -3: the DSP crashed
++ *                  op 3 iOS's playback graph: arg 0 closed (it shares the codec DMA interface), 1 open again
++ *                  op 4 the RX macro's digital gains while iOS does not play: arg = EAR dB | AUX dB << 8 (signed)
++ *                  op 5 the record graph (open and prepared) that /dev/redwood-mic starts: dst_port its
++ *                       RD_SHARED_MEM_EP, src_port its client port, payload[len] the in-band
++ *                       GRAPH_START / STOP payload (its subgraph list), arg the buffers' offset
++ *                       (4 of 3840 bytes: 20 ms of 48 kHz 16-bit stereo); 0 bytes: none (stopped first)
++ *                  op 6 the codec's capture path (the handset microphones): arg 1 on, 0 off
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/errno.h>
++#include <sys/ioccom.h>
++#include <sys/proc.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++
++extern void IOSleep(unsigned int milliseconds);
++
++struct sweet_gpr_cmd {
++	uint32_t op, arg;
++	uint32_t src_port, dst_port, opcode, token, rsp_opcode, wait_ms;
++	uint32_t flags, oob_offset, oob_len, len;
++	int32_t status;
++	uint32_t got_opcode, got_n, got[8];
++	uint8_t payload[512];
++};
++struct sweet_gpr_mem { uint32_t offset, len; uint64_t ptr; };
++
++#define SWEET_GPR_CALL  _IOWR('g', 1, struct sweet_gpr_cmd)
++#define SWEET_GPR_WRITE _IOW('g', 2, struct sweet_gpr_mem)
++#define SWEET_GPR_READ  _IOW('g', 3, struct sweet_gpr_mem)
++
++/* the request on its way to the ADSP thread (TopazModem.cpp gpr_request()) and the memory it mapped */
++struct sweet_gpr_cmd sweet_gpr_req;
++volatile uint32_t sweet_gpr_seq, sweet_gpr_done;
++uint8_t *volatile sweet_gpr_va;
++volatile uint32_t sweet_gpr_size;
++
++void sweet_gpr_dev_init(void);
++
++static LCK_GRP_DECLARE(sg_grp, "sweet_gpr");
++static LCK_MTX_DECLARE(sg_lock, &sg_grp);
++
++static int
++sg_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++sg_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++sg_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
++{
++	int err = 0;
++
++	if (cmd == SWEET_GPR_WRITE || cmd == SWEET_GPR_READ) {
++		const struct sweet_gpr_mem *m = (const struct sweet_gpr_mem *)data;
++		uint8_t *va = sweet_gpr_va;
++		if (va == NULL) {
++			return ENXIO;
++		}
++		if (m->offset > sweet_gpr_size || m->len > sweet_gpr_size - m->offset) {
++			return EINVAL;
++		}
++		if (cmd == SWEET_GPR_WRITE) {
++			err = copyin((user_addr_t)m->ptr, va + m->offset, m->len);
++			__asm__ volatile("dsb sy" ::: "memory");
++		} else {
++			err = copyout(va + m->offset, (user_addr_t)m->ptr, m->len);
++		}
++		return err;
++	}
++	if (cmd != SWEET_GPR_CALL) {
++		return ENOTTY;
++	}
++	struct sweet_gpr_cmd *c = (struct sweet_gpr_cmd *)data;
++	if (c->len > sizeof(c->payload)) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sg_lock);
++	uint32_t seq = sweet_gpr_seq + 1;
++	sweet_gpr_req = *c;
++	__asm__ volatile("dmb ish" ::: "memory");
++	sweet_gpr_seq = seq;
++	for (int i = 0; i < 10000 && sweet_gpr_done != seq; i++) {
++		IOSleep(1);
++	}
++	if (sweet_gpr_done == seq) {
++		__asm__ volatile("dmb ish" ::: "memory");
++		*c = sweet_gpr_req;
++	} else {
++		err = ETIMEDOUT;
++	}
++	lck_mtx_unlock(&sg_lock);
++	return err;
++}
++
++/*
++ * /dev/redwood-mic: the main microphone, for RedwoodAudio.driver's "Codec" input (userland/audio
++ * audio_plugin.c codec_read()): 48 kHz 16-bit mono, read() never waits. Open, the DSP's record
++ * graph runs (TopazModem mic_service(), once arplay has set it up: SWEET_GPR_CALL op 5); closed,
++ * it stops.
++ */
++#define SM_RING 16384u                          /* samples, 341 ms */
++static int16_t sm_ring[SM_RING];
++static volatile uint32_t sm_head, sm_tail;
++volatile uint32_t sweet_mic_want;               /* readers open */
++void sweet_mic_put(const int16_t *s, uint32_t n);
++
++void
++sweet_mic_put(const int16_t *s, uint32_t n)
++{
++	uint32_t h = sm_head;
++	if (n > SM_RING - 1 - (h - sm_tail)) {
++		sm_tail = h + n - (SM_RING - 1);        /* the oldest go */
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		sm_ring[(h + i) % SM_RING] = s[i];
++	}
++	__asm__ volatile("dmb ish" ::: "memory");
++	sm_head = h + n;
++}
++
++static int
++sm_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (sweet_mic_want++ == 0) {
++		sm_tail = sm_head;
++	}
++	return 0;
++}
++
++static int
++sm_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	sweet_mic_want = 0;                     /* (d_close: the last close) */
++	return 0;
++}
++
++static int
++sm_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	int16_t buf[512];
++	while (uio_resid(uio) >= 2) {
++		uint32_t t = sm_tail, n = sm_head - t;
++		__asm__ volatile("dmb ish" ::: "memory");
++		if (n == 0) {
++			break;
++		}
++		if (n > 512) {
++			n = 512;
++		}
++		if (n > (uint32_t)(uio_resid(uio) / 2)) {
++			n = (uint32_t)(uio_resid(uio) / 2);
++		}
++		for (uint32_t i = 0; i < n; i++) {
++			buf[i] = sm_ring[(t + i) % SM_RING];
++		}
++		sm_tail = t + n;
++		int err = uiomove((char *)buf, (int)(n * 2), uio);
++		if (err != 0) {
++			return err;
++		}
++	}
++	return 0;
++}
++
++static const struct cdevsw sm_cdevsw = {
++	.d_open = sm_open, .d_close = sm_close, .d_read = sm_read, .d_write = eno_rdwrt, .d_ioctl = eno_ioctl,
++	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select, .d_mmap = eno_mmap,
++	.d_strategy = eno_strat, .d_type = 0,
++};
++
++static const struct cdevsw sg_cdevsw = {
++	.d_open = sg_open, .d_close = sg_close, .d_read = eno_rdwrt, .d_write = eno_rdwrt, .d_ioctl = sg_ioctl,
++	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select, .d_mmap = eno_mmap,
++	.d_strategy = eno_strat, .d_type = 0,
++};
++
++/* with /dev/redwood-audio, once the DSP's playback graph is up (TopazModem audio_test()) */
++void
++sweet_gpr_dev_init(void)
++{
++	static int major = -1;
++	if (major >= 0) {
++		return;
++	}
++	major = cdevsw_add(-1, &sg_cdevsw);
++	if (major < 0) {
++		printf("sweet gpr: no major\n");
++		return;
++	}
++	void *n = devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "redwood-gpr");
++	int mmajor = cdevsw_add(-1, &sm_cdevsw);
++	void *m = mmajor >= 0 ? devfs_make_node(makedev(mmajor, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-mic") : NULL;
++	printf("sweet gpr: /dev/redwood-gpr %s, /dev/redwood-mic %s\n", n ? "ready" : "failed", m ? "ready" : "failed");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 6608445..3822f7c 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -110,7 +110,7 @@ static void *
+ pool_alloc(uint64_t size, uint64_t *pa)
+ {
+ 	size = (size + 0xfff) & ~0xfffull;
+-	if (pool == NULL || pool_used + size > MODEM_POOL_SIZE - 0x10000) {     /* (the last 64 KB: the ADSP's buffers) */
++	if (pool == NULL || pool_used + size > MODEM_POOL_SIZE - 0x40000) {     /* (the last 256 KB: the ADSP's buffers) */
+ 		return NULL;
+ 	}
+ 	*pa = MODEM_POOL_BASE + pool_used;
+@@ -9797,6 +9797,7 @@ static struct {
+ 	uint32_t opcode, token, n, p[8];
+ } a_box;                                        /* the last answer (audio_test() waits for it) */
+ static unsigned a_writes_done;
++static void a_mic_done(const uint32_t *pl, uint32_t pn);
+ 
+ static void
+ a_gpr_send(uint32_t dst_port, uint32_t opcode, uint32_t token, const void *payload, uint32_t len)
+@@ -9839,6 +9840,10 @@ a_gpr_rx(const uint8_t *p, uint32_t len)
+ 		    (w[1] >> 8) & 0xff, w[2], w[1] & 0xff, w[3], w[4], w[5], len, pn > 0 ? pl[0] : 0, pn > 1 ? pl[1] : 0,
+ 		    pn > 2 ? pl[2] : 0, pn > 3 ? pl[3] : 0);
+ 	}
++	if (w[5] == 0x05001005u) {                              /* a buffer the record graph filled (mic_service()) */
++		a_mic_done(pl, pn);
++		return;
++	}
+ 	if (w[5] == 0x05001004u || w[5] == 0x05001000u) {       /* a buffer back from the shared memory endpoint */
+ 		a_writes_done++;
+ 		if (a_writes_done <= 2 || (pn > 3 && pl[3] != 0)) {
+@@ -11154,6 +11159,7 @@ codec_up(void)
+ 	c_wr(c_rx, 0x100, 3); c_wr(c_rx, 0x104, 3); c_wr(c_rx, 0x104, 1);
+ 	c_wr(c_rx, 0x108, 2); c_wr(c_rx, 0x108, 3); c_wr(c_rx, 0x108, 1);
+ 	/* TX macro MCLK, FS, SWR clock: RX and VA run on the TX MCLK (0192-0195 left it off) */
++	c_upd(c_tx, 0x090, 0x01, 0x01);             /* FREQ_MCLK 9.6 MHz, before the MCLK (vendor tx_macro; the microphones) */
+ 	c_wr(c_tx, 0x000, 1); c_wr(c_tx, 0x004, 3); c_wr(c_tx, 0x004, 1);
+ 	c_wr(c_tx, 0x008, 2); c_wr(c_tx, 0x008, 3); c_wr(c_tx, 0x008, 1);
+ 	LOG("adsp: RX macro MCLK %08x FS %08x SWR %08x; VA MCLK %08x FS %08x SWR %08x TOP %08x", c_rd(c_rx, 0x100),
+@@ -11444,6 +11450,328 @@ codec_rx_on(void)
+ 	    c_rd(c_rx, 0x480), c_rd(c_rx, 0x500), s_va.errors);
+ }
+ 
++/* ---------------- the codec: the handset microphones (AMIC1 + AMIC3) to the TX macro's AIF1 capture */
++
++/*
++ * Android's "handset-mic" path (mixer_paths_bengal_idp.xml:2524-2540), written out as register writes:
++ *   AMIC1 (main, bottom mic; "main-mic" = amic1, :2543) -> WCD937x ADC1 -> slave DP1 ch 1 -> VA SoundWire master
++ *     port 2 ch 1 (SWRM_TX2_CH1) -> TX macro SWR_MIC4 -> TX SMIC MUX1 -> DEC1
++ *   AMIC3 (top mic; "top-mic" = amic3, :2551) -> ADC2 MUX INP3 -> ADC2 -> slave DP2 ch 1 -> master port 3 ch 1
++ *     (SWRM_TX3_CH1) -> SWR_MIC8 -> TX SMIC MUX0 -> DEC0
++ *   DEC0 + DEC1 -> TX_AIF1_CAP -> ADSP TX_CODEC_DMA_TX_3 (2 channels, mask 0x3: ch 1 = DEC0 = top mic,
++ *   ch 2 = DEC1 = main mic; the order is the decimator bit order of tx_macro_get_channel_map()).
++ * There is no register for "TX_AIF1_CAP Mixer DECn": it only sets the channel mask the DMA reads.
++ *
++ * Sources (all checked, file:line or module:.text offset):
++ *  [MP]  /home/angel/ios-build/vendor/extract/etc/mixer_paths_bengal_idp.xml
++ *  [DT]  lunaris dtbo.img, overlay #45 (model "Qualcomm Technologies, Inc. Khaje IDP sapphire"), decompiled
++ *        with dtc; line numbers are those of that .dts
++ *  [SWR] swr_ctrl_dlkm.ko, [WCD] wcd937x_dlkm.ko, [TXM] tx_macro_dlkm.ko, [VAM] va_macro_dlkm.ko:
++ *        /home/angel/ios-build/fox/rd/vendor/lib/modules/1.1/ (Xiaomi's own vendor build, disassembled)
++ *  [ML]  /home/angel/linux-ref/{wcd937x.c,wcd937x.h,wcd937x-sdw.c,lpass-tx-macro.c,lpass-va-macro.c,qcom.c}
++ *
++ * Values and where they come from (vendor preferred over mainline where they differ):
++ *  - MIC BIAS: AMIC1 <- MIC BIAS1, AMIC3 <- MIC BIAS3 ([DT] sound/qcom,audio-routing :3221);
++ *    2700 mV for all three ([DT]:3178-3180 qcom,cdc-micbiasN-mv = 0xa8c) -> VOUT (2700-1000)/50 = 34 = 0x22
++ *    ([ML] wcd937x.c:876 wcd937x_get_micb_vout_ctl_val; same formula in [WCD]).
++ *  - Enable sequences: micbias [WCD] wcd937x_micbias_control .text 0xd2c (= [ML] wcd937x.c:1026),
++ *    ADC [WCD] wcd937x_codec_enable_adc 0x310c, REQ [WCD] wcd937x_enable_req 0x32d0 (= [ML] wcd937x.c:902-990).
++ *    Mainline's DAPM order: supplies (micbias) -> muxes (TX DEC MUX = tx_macro_enable_dec) -> mixers (ADC REQ)
++ *    -> ADCs (whose PRE_PMU starts the SoundWire data path: swr_slvdev_datapath_control).
++ *  - ADC1/ADC2 Volume 6: ANA_TX_CH1/CH2 bits 4:0 = 6 (6 dB) ([WCD] .data compound literal: reg 0x300e/0x300f,
++ *    shift 0, max 20; [ML] wcd937x.c:2050). ADC2 MUX INP3: TX_NEW_TX_CH2_SEL (0x3127) bit 7 = 1
++ *    ([WCD] .rodata 0x7d60 enum: reg 0x3127 shift 7, 2 items; [ML] wcd937x.c:2135-2145).
++ *  - Slave TX ports: ADC1 = slave port idx 0 = DP1 ch mask 0x1, ADC2 = idx 1 = DP2 ch mask 0x1, ch rate 4.8 MHz
++ *    ([DT]:3194 qcom,tx_swr_ch_map <0 ADC1 0x1 4800000 SWRM_TX1_CH1>, <1 ADC2 0x1 4800000 ...>; [ML] wcd937x-sdw.c:33,
++ *    wcd937x.h WCD937X_ADC_1_PORT = 1, WCD937X_ADC_2_3_PORT = 2). "ADCn ChMap" only picks the MASTER port
++ *    (no WCD register): SWRM_TX2_CH1 (0x32) -> master port 2 mask 0x1, SWRM_TX3_CH1 (0x36) -> port 3 mask 0x1
++ *    ([DT]:3150 qcom,swr-port-mapping of va_swr_master).
++ *  - Port parameters, use case 0 (bus clock 9.6 MHz): [SWR] swrm_copy_data_port_config 0x6dd8, TX-master branch
++ *    0x6f6c-0x706c: si = 2 * bus_clk / ch_rate - 1 = 3; offset1 and lane from the slave's DT table, offset2 0,
++ *    hstart/hstop/word length/block packing/block group = 0xff (= not written); [DT]:3193 qcom,swr-tx-port-params
++ *    UC0 = DP1 (off1 1, lane 0), DP2 (off1 0, lane 1), DP3 (1, 0), DP4 (1, 0).
++ *    Slave writes: 0x120+0x100*(n-1)+0x10*bank ch_en, +2 si, +4 off1, +5 off2, +8 lane (0x7150-0x7514).
++ *    Master: offset1 = min over slaves = slave's; PORT_CTRL = ch<<24|off2<<16|off1<<8|si, SAMPLECTRL2 = si>>8,
++ *    PORT_CTRL_2 = lane, HCTRL = 0xF0 because the TX master's hstart/hstop stay 0xff from probe
++ *    ([SWR] swrm_probe 0x2e74-0x2edc and 0x7768-0x7788); BLOCK_CTRL_1/2/3 are left alone (0xff).
++ *  - Frame for data on the VA bus: [SWR] swrm_slvdev_datapath_control 0x4850-0x4ad8 for master id 3 (TX):
++ *    SCP_HOST_CLK_DIV2_CTL(new bank) = 1, ports into the inactive bank, MCP_FRAME_CTRL(new bank) = 50 rows
++ *    (ctrl 1), 16 columns (ctrl 7), divider 0, SSP 6 (field 5), broadcast SCP_FRAME_CTRL(new bank) = 0x0F.
++ *    That is exactly the shape swr_ports_on() gives the RX bus.
++ *  - TX macro: SMIC MUX on ADC_MUXn_CFG0 bits 3:0, 13 items ZERO, SWR_MIC0..11 -> SWR_MIC8 = 9, SWR_MIC4 = 5;
++ *    TX DECn MUX on ADC_MUXn_CFG1 bits 1:0, SWR_MIC = 1 ([TXM] .rodata enums 0xe660/0xe888).
++ *    [TXM] tx_macro_put_dec_enum 0x2da0 for SMIC values >= 5: TXn_TX_PATH_CFG0 bit 7 = 1, VA 0x94 bit 7 = 0
++ *    (register 0x3094 in the bolero map: VA base 0x3000, [DT] fs-gen-sequence 0x3000/0x3004/0x3080), and
++ *    TX_TOP_CSR_SWR_DMICn_CTL ((2*val+0xb6)&~3: 0xC0 for val 5, 0xC8 for val 9) bits 3:1 = dmic_clk_div = 2
++ *    ([DT]:3085 qcom,tx-dmic-sample-rate 2400000; [TXM] probe 0x6a4: 9.6 MHz / 2.4 MHz = 4 -> .rodata 0x17568[2] = 2).
++ *    NOTE mainline (v9.2, lpass-tx-macro.c tx_macro_update_smic_sel_v9_2) would leave bit 7 at 0: vendor wins.
++ *  - Decimator: [TXM] tx_macro_enable_dec 0x25d8 + hpf callback 0x22e8 + mute callback 0x2494, with
++ *    bolero-version 5 ([DT]:3070) so is_amic_enabled() is true (0x2fa8: version 5 -> any SWR_MIC is "amic"):
++ *    unmute after 100 ms, HPF 150 Hz while settling, back to the saved cut-off (CFG0 reset 0x10 -> 4 Hz) after
++ *    300 ms (75 jiffies), SEC2 bits 1:0 = 2 then 1 (no 0 for amic). Rate 48 kHz = 4 in TX_PATH_CTL bits 3:0
++ *    ([TXM] tx_macro_hw_params 0x3cf8, [ML] lpass-tx-macro.c:1124).
++ *  - TX_DEC0/1 Volume 84: kcontrol min -84, max 40, sign bit 7 ([TXM] .data compound literal reg 0x40c/0x48c)
++ *    -> register = 84 + (-84) = 0x00 = 0 dB (the default 90 would be +6 dB).
++ *  - TX_TOP_CSR_FREQ_MCLK (0x90) bit 0 = 1: [TXM] tx_macro_mclk_enable 0x1610, before MCLK_CONTROL/FS_CNT
++ *    (codec_up() does not write it). TX0_TX_PATH_SEC7 bits 5:0 = 0x0A: [TXM] tx_macro_init 0x1b34.
++ *  - MICBn_TEST_CTL_2 bits 5:3 = 0: [ML] wcd937x.c:285-287 (io_init; codec_up() skips them).
++ *
++ * NOT verified (ranked by risk, highest first):
++ *  1. The VA bus clock is 9.6 MHz (codec_up()/swrm_start() comment: "50 rows, 2 columns, SSP 48 (9.6 MHz bus,
++ *     4 kHz frame sync)"). Use case 0 port params and si = 3 depend on it. With the vendor's dynamic bus clock the
++ *     two 4.8 MHz ADCs add up to 9.6 MHz, so Android also ends up in use case 0 (connect_port 0x41ec-0x42e0).
++ *     If only ONE ADC were used, Android would drop to 4.8 MHz / use case 1 (DP1 off1 0 lane 1) - not done here.
++ *  2. The master-side registers vendor leaves untouched (BLOCK_CTRL_1 word length, BLOCK_CTRL2/3) are assumed
++ *     to hold reset values; the slave's DPn hstart/hstop/word length/block ctrl are not written either (as vendor).
++ *  3. Writing TX FREQ_MCLK while the TX MCLK (and the VA SoundWire bus) already runs: Android writes it before
++ *     the MCLK enable. Better move it into codec_up() before c_wr(c_tx, 0x000, 1); here it is only written if
++ *     still 0, and the VA bus is checked right after (chip id read + error count logged).
++ *  4. "SWR DMIC" treatment of SWR_MIC4/8 (TX_PATH_CFG0 bit 7, SWR_DMIC0/2 clock 2.4 MHz) - copied from the vendor
++ *     binary; it contradicts mainline v9.2. If the capture is silent/garbled, try bit 7 = 0 first.
++ *  5. The ADSP's channel order (ch 1 = DEC0) and that the ADSP CODEC_DMA TX-3 needs nothing from the macro.
++ *  6. Unmute/HPF timings are done synchronously (IOSleep 100 + 200 ms) instead of delayed work.
++ */
++
++static bool c_tx_on;
++
++/* the WCD937x TX data ports (slave DP1 = ADC1, DP2 = ADC2) and VA master ports 2 and 3, then a bank switch */
++static void
++va_tx_ports(bool on)
++{
++	struct swrm *m = &s_va;
++	uint8_t dev = w_tx_dev;
++	uint32_t bank = (c_rd(m->b, 0x104C) & 1) ? 0 : 1;   /* MCP_STATUS: the inactive bank */
++	uint32_t ch = on ? 1u : 0u;
++
++	for (unsigned pass = 0; pass < 2; pass++) {
++		uint32_t bk = 0x10 * bank, mb = 0x40 * bank;
++		if (pass == 0) {
++			swr_write(m, 0xF, (uint16_t)(0xE0 + bk), 0x01);    /* SCP_HOST_CLK_DIV2_CTL (broadcast) */
++		}
++		/* slave DP1 (ADC1): ch mask 1, si 3 (4.8 MHz at 9.6 MHz DDR), offset1 1, offset2 0, lane 0 */
++		swr_write(m, dev, (uint16_t)(0x120 + bk), (uint8_t)ch);
++		if (on) {
++			swr_write(m, dev, (uint16_t)(0x122 + bk), 3);
++			swr_write(m, dev, (uint16_t)(0x124 + bk), 1);
++			swr_write(m, dev, (uint16_t)(0x125 + bk), 0);
++			swr_write(m, dev, (uint16_t)(0x128 + bk), 0);
++		}
++		/* slave DP2 (ADC2): ch mask 1, si 3, offset1 0, offset2 0, lane 1 (the second data line, LPI pin 2) */
++		swr_write(m, dev, (uint16_t)(0x220 + bk), (uint8_t)ch);
++		if (on) {
++			swr_write(m, dev, (uint16_t)(0x222 + bk), 3);
++			swr_write(m, dev, (uint16_t)(0x224 + bk), 0);
++			swr_write(m, dev, (uint16_t)(0x225 + bk), 0);
++			swr_write(m, dev, (uint16_t)(0x228 + bk), 1);
++		}
++		/* master port 2 = SWRM_TX2 (SWR_MIC4..7): DP_PORT_CTRL ch << 24 | off2 << 16 | off1 << 8 | si */
++		c_wr(m->b, 0x1124 + 0x100 * 1 + mb, (ch << 24) | (0u << 16) | (1u << 8) | 3u);
++		c_wr(m->b, 0x113C + 0x100 * 1 + mb, 0);           /* SAMPLECTRL2: si >> 8 */
++		c_wr(m->b, 0x1128 + 0x100 * 1 + mb, 0);           /* PORT_CTRL_2: lane 0 */
++		c_wr(m->b, 0x1134 + 0x100 * 1 + mb, 0xF0);        /* HCTRL: hstop 15, hstart 0 (vendor default) */
++		/* master port 3 = SWRM_TX3 (SWR_MIC8..11) */
++		c_wr(m->b, 0x1124 + 0x100 * 2 + mb, (ch << 24) | (0u << 16) | (0u << 8) | 3u);
++		c_wr(m->b, 0x113C + 0x100 * 2 + mb, 0);
++		c_wr(m->b, 0x1128 + 0x100 * 2 + mb, 1);           /* lane 1 */
++		c_wr(m->b, 0x1134 + 0x100 * 2 + mb, 0xF0);
++		/* this bank's frame: 50 rows, 16 columns, divider 0, SSP period 6 (both banks, so a later switch keeps it) */
++		uint32_t v = c_rd(m->b, 0x101C + mb) & ~0x00FF07FFu;
++		c_wr(m->b, 0x101C + mb, v | (1u << 3) | 7u | (0u << 8) | (5u << 16));
++		if (pass == 0) {
++			swr_write(m, 0xF, (uint16_t)(0x60 + bk), (1 << 3) | 7);   /* SCP_FRAME_CTRL bank: switch */
++			IOSleep(2);
++			bank ^= 1;                              /* and the same into the other bank */
++		}
++	}
++}
++
++static void
++codec_tx_diag(const char *when)
++{
++	struct swrm *m = &s_va;
++	uint32_t nb = c_rd(m->b, 0x104C) & 1;
++	uint8_t d1 = 0, d2 = 0, i1 = 0, i2 = 0;
++	(void)swr_read(m, w_tx_dev, (uint16_t)(0x120 + 0x10 * nb), &d1);
++	(void)swr_read(m, w_tx_dev, (uint16_t)(0x220 + 0x10 * nb), &d2);
++	(void)swr_read(m, w_tx_dev, 0x100, &i1);           /* DP1_INTSTAT */
++	(void)swr_read(m, w_tx_dev, 0x200, &i2);           /* DP2_INTSTAT */
++	LOG("adsp: TX %s: WCD MICB1 %02x MICB3 %02x TX_CH1 %02x TX_CH2 %02x CH2_SEL %02x ANA_CLK %02x DIG_CLK %02x REQ %02x; slave DP1 ch %02x int %02x DP2 ch %02x int %02x",
++	    when, w_rd(0x3022), w_rd(0x3025), w_rd(0x300E), w_rd(0x300F), w_rd(0x3127), w_rd(0x3408), w_rd(0x3409), w_rd(0x3457),
++	    d1, i1, d2, i2);
++	LOG("adsp: TX %s: DEC0 CTL %08x CFG0 %08x VOL %08x MUX %08x/%08x; DEC1 CTL %08x CFG0 %08x VOL %08x MUX %08x/%08x; FREQ_MCLK %08x DMIC0 %08x DMIC2 %08x",
++	    when, c_rd(c_tx, 0x400), c_rd(c_tx, 0x404), c_rd(c_tx, 0x40C), c_rd(c_tx, 0x100), c_rd(c_tx, 0x104),
++	    c_rd(c_tx, 0x480), c_rd(c_tx, 0x484), c_rd(c_tx, 0x48C), c_rd(c_tx, 0x108), c_rd(c_tx, 0x10C),
++	    c_rd(c_tx, 0x090), c_rd(c_tx, 0x0C0), c_rd(c_tx, 0x0C8));
++	/* 2nd round: the VA-side mic clock selects and DMIC cfg */
++	LOG("adsp: TX %s: VA SWR_MIC_CTL %02x %02x %02x DMIC_CFG %02x SWR_CTRL %02x TOP_CFG0 %02x SWR_CONTROL %02x",
++	    when, c_rd(c_va, 0x0D0), c_rd(c_va, 0x0D4), c_rd(c_va, 0x0D8), c_rd(c_va, 0x094), c_rd(c_va, 0x0DC),
++	    c_rd(c_va, 0x080), c_rd(c_va, 0x008));
++	LOG("adsp: TX %s: SoundWire VA bank %u frame %08x/%08x, port 2 %08x lane %08x, port 3 %08x lane %08x, intr %08x slaves %08x, errors %u",
++	    when, nb, c_rd(m->b, 0x101C), c_rd(m->b, 0x105C), c_rd(m->b, 0x1224 + 0x40 * nb), c_rd(m->b, 0x1228 + 0x40 * nb),
++	    c_rd(m->b, 0x1324 + 0x40 * nb), c_rd(m->b, 0x1328 + 0x40 * nb), c_rd(m->b, 0x200), c_rd(m->b, 0x1090), m->errors);
++}
++
++/*
++ * The handset mics into TX_AIF1_CAP (DEC0 = AMIC3 via ADC2, DEC1 = AMIC1 via ADC1), 48 kHz. Android starts the
++ * ADSP's CODEC_DMA TX-3 port (dai prepare) before this DAPM power-up; either order works for the codec.
++ */
++static void
++codec_tx_on(void)
++{
++	if (w_tx_dev == 0 || c_tx == NULL || c_va == NULL || c_tx_on) {
++		return;
++	}
++	unsigned e0 = s_va.errors;
++
++	/* TX macro: MCLK frequency 9.6 MHz (vendor writes it before the MCLK enable; see assumption 3) */
++	uint32_t fm = c_rd(c_tx, 0x090);
++	if ((fm & 1) == 0) {
++		c_upd(c_tx, 0x090, 0x01, 0x01);
++		IODelay(100);
++	}
++	uint8_t id = w_rd(0x3401);                  /* DIGITAL_CHIP_ID0: is the VA bus still fine? */
++	LOG("adsp: TX: FREQ_MCLK was %08x now %08x; WCD chip id0 %02x, VA errors %u -> %u", fm, c_rd(c_tx, 0x090), id, e0, s_va.errors);
++	c_upd(c_tx, 0x42C, 0x3F, 0x0A);             /* TX0_TX_PATH_SEC7 (tx_macro_init) */
++	/*
++	 * FIX (2nd round, prime suspect for the all-zero capture): VA_TOP_CSR_SWR_MIC_CTL0/1/2 clock select of the
++	 * SoundWire mic inputs. Reset value 0xEE (no clock, [ML] lpass-va-macro.c:286-288); the vendor writes
++	 * mask 0xEE = 0xCC (DIV1) in va_macro_init when bolero-version == 5 ([VAM] .text 0x1854-0x189c; mainline
++	 * va_macro probe, lpass-va-macro.c:1601-1611 "has_swr_master"). Without it the TX decimators see no
++	 * SWR_MIC data. Belongs in codec_up() next to the VA fs-gen writes; idempotent here.
++	 */
++	{
++		uint32_t m0 = c_rd(c_va, 0x0D0), m1 = c_rd(c_va, 0x0D4), m2 = c_rd(c_va, 0x0D8);
++		c_upd(c_va, 0x0D0, 0xEE, 0xCC);
++		c_upd(c_va, 0x0D4, 0xEE, 0xCC);
++		c_upd(c_va, 0x0D8, 0xEE, 0xCC);
++		LOG("adsp: TX: VA SWR_MIC_CTL0/1/2 were %02x %02x %02x now %02x %02x %02x", m0, m1, m2,
++		    c_rd(c_va, 0x0D0), c_rd(c_va, 0x0D4), c_rd(c_va, 0x0D8));
++	}
++
++	/* WCD937x: io_init leftovers, micbias voltages 2700 mV (MICB1, MICB3) */
++	w_upd(0x306C, 0x38, 0x00); w_upd(0x306F, 0x38, 0x00); w_upd(0x3072, 0x38, 0x00);   /* MICBn_TEST_CTL_2 */
++	w_upd(0x3022, 0x3F, 0x22);                  /* ANA_MICB1 VOUT */
++	w_upd(0x3025, 0x3F, 0x22);                  /* ANA_MICB3 VOUT */
++
++	/* the mixer controls of "handset-mic" */
++	w_upd(0x3127, 0x80, 0x80);                  /* ADC2 MUX = INP3 (AMIC3) */
++	w_upd(0x300E, 0x1F, 16);                    /* ADC1 16 dB (Android: 6; heard too low in a call) */
++	w_upd(0x300F, 0x1F, 16);                    /* ADC2 16 dB */
++	/* TX SMIC MUX0 = SWR_MIC8 (9), MUX1 = SWR_MIC4 (5): tx_macro_put_dec_enum side effects, then the enum */
++	c_upd(c_tx, 0x404, 0x80, 0x80);             /* TX0_TX_PATH_CFG0: ADC_DMIC_SEL (vendor, val >= 5) */
++	c_upd(c_va, 0x094, 0x80, 0x00);             /* VA_TOP_CSR_DMIC_CFG: no "reset all DMICs" */
++	c_upd(c_tx, 0x0C8, 0x0E, 2 << 1);           /* TX_TOP_CSR_SWR_DMIC2_CTL: clock 9.6 MHz / 4 */
++	c_upd(c_tx, 0x100, 0x0F, 9);                /* ADC_MUX0_CFG0: SWR_MIC8 */
++	c_upd(c_tx, 0x484, 0x80, 0x80);             /* TX1_TX_PATH_CFG0 */
++	c_upd(c_va, 0x094, 0x80, 0x00);
++	c_upd(c_tx, 0x0C0, 0x0E, 2 << 1);           /* TX_TOP_CSR_SWR_DMIC0_CTL */
++	c_upd(c_tx, 0x108, 0x0F, 5);                /* ADC_MUX1_CFG0: SWR_MIC4 */
++	c_upd(c_tx, 0x104, 0x03, 1);                /* TX DEC0 MUX = SWR_MIC (ADC_MUX0_CFG1) */
++	c_upd(c_tx, 0x10C, 0x03, 1);                /* TX DEC1 MUX = SWR_MIC */
++	c_wr(c_tx, 0x40C, 0x00);                    /* TX_DEC0 Volume 84 = 0 dB */
++	c_wr(c_tx, 0x48C, 0x00);                    /* TX_DEC1 Volume 84 */
++	/* hw_params: 48 kHz */
++	c_upd(c_tx, 0x400, 0x0F, 4);
++	c_upd(c_tx, 0x480, 0x0F, 4);
++
++	/* MIC BIAS1 and MIC BIAS3 (supplies): wcd937x_micbias_control(MICB_ENABLE), then 1 ms (POST_PMU) */
++	w_upd(0x3409, 0xF0, 0xF0);                  /* DIG_CLK_CTL: TX clocks */
++	w_upd(0x3408, 0x10, 0x10);                  /* ANA_CLK_CTL */
++	w_upd(0x306C, 0x01, 0x01); w_upd(0x306F, 0x01, 0x01); w_upd(0x3072, 0x01, 0x01);
++	w_upd(0x3022, 0xC0, 0x40);                  /* MICB1 enable */
++	IOSleep(1);
++	w_upd(0x3025, 0xC0, 0x40);                  /* MICB3 enable */
++	IOSleep(1);
++
++	/* TX DEC0/DEC1 MUX (tx_macro_enable_dec): PRE_PMU, then POST_PMU */
++	uint8_t hpf[2];
++	for (unsigned k = 0; k < 2; k++) {
++		uint32_t b = 0x400 + 0x80 * k;
++		c_upd(c_tx, b + 0x04, 0x06, 0x00);      /* CFG0: ADC mode default (DEC MODE not set by the path) */
++		c_upd(c_tx, b + 0x00, 0x10, 0x10);      /* PGA mute */
++	}
++	for (unsigned k = 0; k < 2; k++) {
++		uint32_t b = 0x400 + 0x80 * k;
++		c_upd(c_tx, b + 0x00, 0x20, 0x20);      /* decimator clock */
++		hpf[k] = (uint8_t)((c_rd(c_tx, b + 0x04) >> 5) & 3);
++		if (hpf[k] != 2) {
++			c_upd(c_tx, b + 0x04, 0x60, 2 << 5);   /* HPF 150 Hz while it settles */
++			c_upd(c_tx, b + 0x18, 0x03, 0x02);     /* SEC2: HPF frequency change */
++			c_upd(c_tx, b + 0x18, 0x03, 0x01);
++			IOSleep(6);
++		}
++		c_wr(c_tx, b + 0x0C, c_rd(c_tx, b + 0x0C));   /* gain after the decimator is on */
++	}
++
++	/* ADC1 REQ / ADC2 REQ (wcd937x_enable_req PRE_PMU, the same writes for both) */
++	w_upd(0x3457, 0x02, 0x02);                  /* CDC_REQ_CTL */
++	w_upd(0x3457, 0x01, 0x00);
++	w_upd(0x300F, 0x40, 0x40);                  /* ANA_TX_CH2 */
++	w_upd(0x3011, 0x40, 0x40);                  /* ANA_TX_CH3_HPF */
++	w_upd(0x3409, 0x70, 0x70);
++	w_upd(0x300E, 0x80, 0x80);                  /* ADC1 on */
++	w_upd(0x300F, 0x40, 0x00);
++	w_upd(0x300F, 0x80, 0x80);                  /* ADC2 on */
++	w_upd(0x3010, 0x80, 0x80);                  /* ANA_TX_CH3 (vendor sets it too) */
++
++	/* ADC1 / ADC2 PRE_PMU: clocks, then the SoundWire data path (swr_slvdev_datapath_control) */
++	w_upd(0x3409, 0x80, 0x80);
++	w_upd(0x3408, 0x08, 0x08);
++	w_upd(0x3408, 0x10, 0x10);
++	va_tx_ports(true);
++	c_tx_on = true;
++
++	/* unmute after 100 ms (amic), HPF back to its own cut-off after 300 ms */
++	IOSleep(100);
++	c_upd(c_tx, 0x400, 0x10, 0x00);
++	c_upd(c_tx, 0x480, 0x10, 0x00);
++	IOSleep(200);
++	for (unsigned k = 0; k < 2; k++) {
++		uint32_t b = 0x400 + 0x80 * k;
++		if (hpf[k] != 2) {
++			c_upd(c_tx, b + 0x04, 0x60, (uint32_t)hpf[k] << 5);
++			c_upd(c_tx, b + 0x18, 0x03, 0x02);
++			IOSleep(1);
++			c_upd(c_tx, b + 0x18, 0x03, 0x01);
++		}
++	}
++	codec_tx_diag("on");
++}
++
++static void
++codec_tx_off(void)
++{
++	if (!c_tx_on) {
++		return;
++	}
++	/* decimators: PRE_PMD mute */
++	c_upd(c_tx, 0x400, 0x10, 0x10);
++	c_upd(c_tx, 0x480, 0x10, 0x10);
++	/* ADC POST_PMD, the data path off, REQ POST_PMD */
++	w_upd(0x3408, 0x08, 0x00);
++	va_tx_ports(false);
++	w_upd(0x300E, 0x80, 0x00);
++	w_upd(0x300F, 0x80, 0x00);
++	w_upd(0x3010, 0x80, 0x00);
++	w_upd(0x3409, 0x10, 0x00);
++	w_upd(0x3408, 0x10, 0x00);
++	w_upd(0x3409, 0x80, 0x00);
++	/* micbias off */
++	w_upd(0x3022, 0xC0, 0x00);
++	w_upd(0x3025, 0xC0, 0x00);
++	/* decimators: POST_PMD (clock off, mode 0, path reset pulse, mute cleared as vendor leaves it) */
++	for (unsigned k = 0; k < 2; k++) {
++		uint32_t b = 0x400 + 0x80 * k;
++		c_upd(c_tx, b + 0x00, 0x20, 0x00);
++		c_upd(c_tx, b + 0x04, 0x06, 0x00);
++		c_upd(c_tx, b + 0x00, 0x40, 0x40);
++		c_upd(c_tx, b + 0x00, 0x40, 0x00);
++		c_upd(c_tx, b + 0x00, 0x10, 0x00);
++	}
++	c_tx_on = false;
++	codec_tx_diag("off");
++}
++
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read_any(unsigned sid, unsigned addr, uint8_t *out);
+ 
+@@ -11479,6 +11807,7 @@ uint32_t sweet_audio_avail(void);
+ uint32_t sweet_audio_take(int16_t *mono, uint32_t frames);
+ void sweet_audio_flush(void);
+ void sweet_audio_dev_init(void);
++void sweet_gpr_dev_init(void);
+ extern volatile uint32_t sweet_audio_vol_below, sweet_audio_vol_muted, sweet_audio_vol_gen;
+ extern volatile uint64_t sweet_audio_frames_in, sweet_audio_frames_dropped;
+ }
+@@ -11676,6 +12005,7 @@ audio_test(void)
+ 	a_stream_pa = buf_pa + tone + 0x1000;
+ 	LOG("adsp: stop %lld (the graph stays open for iOS's sound and kern.sweet_audio)", r1);
+ 	sweet_audio_dev_init();
++	sweet_gpr_dev_init();
+ }
+ 
+ /*
+@@ -11784,6 +12114,301 @@ audio_beep(unsigned seconds)
+ 	LOG("adsp: beep done: %u of %u buffers back in %u ms, stop %lld", a_writes_done, sent, a_ms - t0, r1);
+ }
+ 
++/*
++ * ---------------- /dev/redwood-gpr (bsd/dev/sweet_gpr_dev.c): AudioReach packets from user space
++ *
++ * A voice call's graphs are what Android's GSL builds from the ACDB (graph opens of 4 KB, VCPM
++ * calibration tables of up to 45 KB that the DSP reads for as long as the graph is open): a tool
++ * replays them (userland/audio/arplay). Their memory is the 192 KB under the playback's 64 KB at
++ * the pool's end, given to the DSP by a second map (the same stream 0x1c1, in bypass).
++ */
++struct sweet_gpr_cmd {                          /* as bsd/dev/sweet_gpr_dev.c */
++	uint32_t op, arg;
++	uint32_t src_port, dst_port, opcode, token, rsp_opcode, wait_ms;
++	uint32_t flags, oob_offset, oob_len, len;
++	int32_t status;
++	uint32_t got_opcode, got_n, got[8];
++	uint8_t payload[512];
++};
++extern "C" {
++extern struct sweet_gpr_cmd sweet_gpr_req;
++extern volatile uint32_t sweet_gpr_seq, sweet_gpr_done;
++extern uint8_t *volatile sweet_gpr_va;
++extern volatile uint32_t sweet_gpr_size;
++}
++#define G_SIZE  0x30000u
++static uint64_t g_pa;                           /* as the DSP sees it (A_SID_BITS) */
++static uint32_t g_handle;
++
++static int32_t
++gpr_setup(void)
++{
++	if (g_handle != 0) {
++		return 0;
++	}
++	if (!a_spf_ready || a_mem_handle == 0) {
++		return -2;                              /* not before the playback's test has mapped its memory */
++	}
++	uint64_t pa = MODEM_POOL_BASE + MODEM_POOL_SIZE - 0x10000 - G_SIZE;
++	if (pool_used > pa - MODEM_POOL_BASE) {
++		LOG("adsp: gpr: the pool reaches %llx, over %llx", MODEM_POOL_BASE + pool_used, pa);
++		return -4;
++	}
++	IOMemoryMap *m = map_phys(pa, G_SIZE, true);
++	uint8_t *va = m != NULL ? (uint8_t *)m->getVirtualAddress() : NULL;
++	if (va == NULL) {
++		return -5;
++	}
++	bzero(va, G_SIZE);
++	mb();
++	pa |= A_SID_BITS;
++	uint8_t b[20];
++	uint8_t *p = b;
++	a_put16(&p, 3);                                 /* APM_MEMORY_MAP_SHMEM8_4K_POOL, one region */
++	a_put16(&p, 1);
++	a_put32(&p, 0);
++	a_put32(&p, (uint32_t)pa); a_put32(&p, (uint32_t)(pa >> 32));
++	a_put32(&p, G_SIZE);
++	a_gpr_pkt(GPR_PORT_APM_CLIENT, APM_PORT, APM_CMD_SHARED_MEM_MAP_REGIONS, 2, b, sizeof(b));
++	int64_t r = a_wait(APM_CMD_SHARED_MEM_MAP_REGIONS, APM_CMD_RSP_SHARED_MEM_MAP_REGIONS, 2000);
++	LOG("adsp: gpr: %u KB at %llx for the DSP: map %lld, handle %x", G_SIZE / 1024, pa, r, r == 0 ? a_box.p[0] : 0);
++	if (r != 0 || a_box.p[0] == 0) {
++		return r != 0 ? (int32_t)r : -6;
++	}
++	g_pa = pa;
++	g_handle = a_box.p[0];
++	sweet_gpr_size = G_SIZE;
++	mb();
++	sweet_gpr_va = va;
++	return 0;
++}
++
++static void
++gpr_cmd(struct sweet_gpr_cmd *c)
++{
++	uint8_t pl[512];
++
++	if (c->len > sizeof(pl) || ((c->flags & 1) && (c->len < 16 || g_handle == 0 || c->oob_offset > G_SIZE ||
++	    c->oob_len > G_SIZE - c->oob_offset))) {
++		c->status = -7;
++		return;
++	}
++	memcpy(pl, c->payload, c->len);
++	if (c->flags & 1) {
++		uint64_t a = g_pa + c->oob_offset;
++		uint32_t h[4] = { (uint32_t)a, (uint32_t)(a >> 32), g_handle, c->oob_len };
++		memcpy(pl, h, sizeof(h));
++	}
++	mb();
++	a_box.full = false;
++	a_gpr_pkt(c->src_port, c->dst_port, c->opcode, c->token, pl, c->len);
++	int64_t r = a_wait(c->opcode, c->rsp_opcode, c->wait_ms != 0 ? MIN(c->wait_ms, 8000u) : 2000);
++	c->status = (int32_t)r;
++	c->got_opcode = a_box.opcode;
++	c->got_n = a_box.n;
++	for (unsigned i = 0; i < 8; i++) {
++		c->got[i] = i < a_box.n ? a_box.p[i] : 0;
++	}
++	LOG("adsp: gpr: %08x to %x (%u bytes%s) -> %d", c->opcode, c->dst_port, c->len, (c->flags & 1) ? ", out of band" : "", c->status);
++}
++
++/* iOS's playback graph off while a call has the codec DMA interface, back on after */
++static int32_t
++gpr_playback(bool on)
++{
++	if (!on) {
++		if (s_playing) {
++			(void)a_graph_mgmt(APM_CMD_GRAPH_STOP);
++			s_playing = false;
++		}
++		if (a_live) {
++			int64_t r = a_graph_mgmt(APM_CMD_GRAPH_CLOSE);
++			a_live = false;
++			LOG("adsp: gpr: iOS's playback graph closed: %lld", r);
++			return (int32_t)r;
++		}
++		return 0;
++	}
++	if (a_live || a_live_buf == 0) {
++		return 0;
++	}
++	int64_t r = a_graph_open(0x0B001001, 0x0B001001);
++	if (r == 0) {
++		r = a_formats();
++	}
++	a_live = r == 0;
++	sweet_audio_flush();
++	s_vol_gen = ~0u;
++	LOG("adsp: gpr: iOS's playback graph open again: %lld", r);
++	return (int32_t)r;
++}
++
++/*
++ * /dev/redwood-mic (bsd/dev/sweet_gpr_dev.c): the record graph arplay opened and prepared (op 5:
++ * its subgraph list, its RD_SHARED_MEM_EP, where its buffers go), started while the device is
++ * open: 4 buffers of 20 ms read in turn, each one's two channels (the handset's two microphones,
++ * DEC0 and DEC1) summed into the device's one.
++ */
++extern "C" {
++extern volatile uint32_t sweet_mic_want;
++void sweet_mic_put(const int16_t *s, uint32_t n);
++}
++#define M_NBUF  4u
++#define M_BYTES 3840u
++static struct { uint32_t src, ep, off, len; uint8_t start[128]; } m_cfg;
++static bool m_running;
++static uint32_t m_back;                         /* bit i: buffer i came back */
++static unsigned m_filled, m_bad;
++
++static void
++a_mic_done(const uint32_t *pl, uint32_t pn)
++{
++	if (pn < 5 || !m_running || sweet_gpr_va == NULL) {
++		return;
++	}
++	uint64_t a = ((uint64_t)pl[2] << 32) | pl[1], base = g_pa + m_cfg.off;
++	if (a < base || (a - base) % M_BYTES != 0 || (a - base) / M_BYTES >= M_NBUF) {
++		m_bad++;
++		return;
++	}
++	unsigned i = (unsigned)((a - base) / M_BYTES);
++	if (pl[0] == 0) {
++		const int16_t *s = (const int16_t *)(sweet_gpr_va + m_cfg.off + i * M_BYTES);
++		uint32_t frames = MIN(pl[4], M_BYTES) / 4;
++		int16_t mono[M_BYTES / 4];
++		for (uint32_t j = 0; j < frames; j++) {
++			int32_t v = (int32_t)s[2 * j] + s[2 * j + 1];
++			mono[j] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
++		}
++		sweet_mic_put(mono, frames);
++		m_filled++;
++	} else {
++		m_bad++;
++	}
++	m_back |= 1u << i;
++}
++
++static void
++mic_read(unsigned i)
++{
++	uint64_t a = g_pa + m_cfg.off + i * M_BYTES;
++	uint32_t w[8] = { (uint32_t)a, (uint32_t)(a >> 32), g_handle, M_BYTES, 0, 0, 0, 0 };
++	a_gpr_pkt(m_cfg.src, m_cfg.ep, 0x0400100Bu, i, w, sizeof(w));   /* DATA_CMD_RD_SH_MEM_EP_DATA_BUFFER_V2 */
++}
++
++static int64_t
++mic_graph(uint32_t opcode)
++{
++	a_box.full = false;
++	a_gpr_pkt(m_cfg.src, APM_PORT, opcode, 0, m_cfg.start, m_cfg.len);
++	return a_wait(opcode, 0, 2000);
++}
++
++static void
++mic_service(void)
++{
++	if (m_cfg.len == 0) {
++		return;
++	}
++	if (sweet_mic_want && !m_running) {
++		int64_t r = mic_graph(APM_CMD_GRAPH_START);
++		LOG("adsp: mic: record graph started: %lld", r);
++		if (r != 0) {
++			m_cfg.len = 0;                  /* not again until arplay sets it up again */
++			return;
++		}
++		m_running = true;
++		m_back = 0;
++		m_filled = m_bad = 0;
++		for (unsigned i = 0; i < M_NBUF; i++) {
++			mic_read(i);
++		}
++	} else if (!sweet_mic_want && m_running) {
++		int64_t r = mic_graph(APM_CMD_GRAPH_STOP);
++		m_running = false;
++		LOG("adsp: mic: stopped (%lld): %u buffers filled, %u refused", r, m_filled, m_bad);
++	}
++	if (m_running && m_back != 0) {
++		uint32_t b = m_back;
++		m_back = 0;
++		for (unsigned i = 0; i < M_NBUF; i++) {
++			if (b & (1u << i)) {
++				mic_read(i);
++			}
++		}
++	}
++}
++
++static void codec_tx_on(void);
++static void codec_tx_off(void);
++
++static void
++gpr_request(void)
++{
++	if (sweet_gpr_seq == sweet_gpr_done) {
++		return;
++	}
++	mb();
++	struct sweet_gpr_cmd *c = &sweet_gpr_req;
++	switch (c->op) {
++	case 1:
++		c->status = gpr_setup();
++		c->got[0] = g_handle;
++		c->got[1] = G_SIZE;
++		break;
++	case 2:
++		gpr_cmd(c);
++		break;
++	case 3:
++		c->status = gpr_playback(c->arg != 0);
++		break;
++	case 4:
++		if (c_rx != NULL) {
++			c_wr(c_rx, 0x414, c->arg & 0xFF);
++			c_wr(c_rx, 0x514, (c->arg >> 8) & 0xFF);
++			c->status = 0;
++		} else {
++			c->status = -2;
++		}
++		break;
++	case 5:
++		if (m_running) {
++			(void)mic_graph(APM_CMD_GRAPH_STOP);
++			m_running = false;
++		}
++		m_cfg.len = 0;
++		if (c->len > sizeof(m_cfg.start) || c->arg > G_SIZE - M_NBUF * M_BYTES || g_handle == 0) {
++			c->status = -7;
++			break;
++		}
++		m_cfg.src = c->src_port;
++		m_cfg.ep = c->dst_port;
++		m_cfg.off = c->arg;
++		memcpy(m_cfg.start, c->payload, c->len);
++		m_cfg.len = c->len;
++		c->status = 0;
++		LOG("adsp: mic: record graph %s (endpoint %x, buffers at %x)", c->len ? "set up" : "gone", c->dst_port, c->arg);
++		break;
++	case 6:
++		if (w_tx_dev == 0) {
++			c->status = -2;
++			break;
++		}
++		if (c->arg) {
++			codec_tx_on();
++		} else {
++			codec_tx_off();
++		}
++		c->status = 0;
++		break;
++	default:
++		c->status = -22;
++		break;
++	}
++	mb();
++	sweet_gpr_done = sweet_gpr_seq;
++}
++
+ extern "C" {
+ extern volatile uint64_t sweet_audio_req, sweet_audio_rsp;
+ extern volatile uint32_t sweet_audio_seq, sweet_audio_done;
+@@ -11974,6 +12599,8 @@ adsp_thread(void *arg __unused, wait_result_t wr __unused)
+ 			}
+ 			if (tested) {
+ 				audio_request();
++				gpr_request();
++				mic_service();
+ 				stream_service();
+ 			}
+ 			if (a_up(&a_ch[0]) && a_hello_rx && !a_hello_sent) {

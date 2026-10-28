@@ -1,5 +1,34 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-10-28: call audio both ways, the microphone (kernel 0243)
+
+A call is heard on the top speaker (the earpiece) and the other side hears the microphones; calls can be placed
+again and again. The modem's voice goes modem <-> ADSP directly (VCPM, VSID 0x11C05000): iOS only has to open
+the DSP's voice graphs and the codec's paths.
+- The graphs are what Android's GSL sends, taken from the phone's own ACDB: Qualcomm's open-source GSL + ACDB
+  parser run on the PC with a fake GPR (an "AudioReach harness", not in the repo) log every packet of a voice call
+  (RX handset + TX handset mic, PAL order) and of a 48 kHz record. userland/audio/arplay/arconv.py turns such a
+  log into a script; arplay replays it through kernel 0243's /dev/redwood-gpr (packets to the DSP, 192 KB under
+  the playback's 64 KB at the pool's end mapped to it: graph opens of 4 KB, VCPM calibration tables of up to
+  45 KB that the DSP reads while the graph is open). The RX endpoint is moved to RX-1 (codec DMA index 2, the
+  speaker path the codec is set up for) and iOS's playback graph is closed meanwhile; GRAPH_CLOSE's payload was
+  not in the log (GSL had freed it): the prepare's subgraph list instead.
+- `arplay watch` (launchd job com.sapphire.arplay) follows ccbridge's notification com.sapphire.call.audio
+  (VOICE ALL_CALL_STATUS_IND: alerting, conversation or held) and sets the RX macro gains (top -6 dB, bottom off).
+- Microphones: codec_tx_on() (WCD937x ADC1 = AMIC1 via MICBIAS1, ADC2 = AMIC3 via MICBIAS3, slave DP1/DP2 to VA
+  SoundWire master ports 2/3, TX macro DEC1/DEC0 from SWR_MIC4/SWR_MIC8), from Xiaomi's own swr_ctrl, wcd937x,
+  tx_macro and va_macro modules and the sapphire DT (dtbo overlay 45). The capture was all zeros until the VA
+  macro's SWR_MIC_CTL0/1/2 (0xD0/0xD4/0xD8) got their clock select (0xEE -> 0xCC, va_macro_init on bolero 5).
+  ADC gain 16 dB (Android's 6 was heard too low).
+- /dev/redwood-mic: the record graph, open while no call, started while the device is open; RedwoodAudio.driver's
+  "Codec" input reads it (two microphones summed).
+- RedwoodAudio.driver: the codec has an output and a mute control on output element 3, from which VirtualAudio
+  makes the "Built-In Receiver" port (Device_Codec_Aspen: element 4 would be a second speaker, 5 the HAC coil).
+  Apps get Receiver/Speaker now; the plug-in posts com.sapphire.audio.receiver.
+- Not yet: the in-call speaker and mute buttons. Call routes (receiver + speaker) need the HAL device "Baseband
+  Voice" (VirtualAudio RoutingHandler_Call: "basebandDevice is NULL" without it); with a silent one the routes
+  were there but the call screen no longer came up and the next call hung (REDWOOD_BASEBAND, off).
+
 ## SAPPHIRE 2026-10-28: outgoing calls (no call audio yet)
 
 Outgoing CS calls ring the other phone and are answered (LTE -> CSFB to UMTS); the call screen follows the call

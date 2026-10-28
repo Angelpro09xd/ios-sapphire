@@ -35,6 +35,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <spawn.h>
+#include <notify.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
 
@@ -845,6 +846,46 @@ br_ctl(struct br_chan *c, const uint8_t *sdu, size_t n)
 static void *br_reader_main(void *arg);
 
 /*
+ * The call's sound: the DSP's voice graphs are opened by a root tool (arplay watch, through
+ * /dev/redwood-gpr), not from CommCenter. It learns from here whether a call has sound: the
+ * notification "com.sapphire.call.audio", state 1 while a call is alerting (the network's
+ * ringback), in conversation or held, 0 otherwise. From VOICE ALL_CALL_STATUS_IND (0x2e): TLV 1,
+ * a count, then 7 bytes a call (id, state, type, direction, mode, multiparty, ALS).
+ */
+static void
+br_voice_ind(const uint8_t *sdu, size_t sn)
+{
+	static int token = -1;
+	static uint64_t was;
+	uint16_t msg;
+	memcpy(&msg, sdu + 3, 2);
+	if (msg != 0x002e) return;
+	int on = 0;
+	for (size_t o = 7; o + 3 <= sn;) {
+		uint16_t tl;
+		memcpy(&tl, sdu + o + 1, 2);
+		if (o + 3 + tl > sn) break;
+		const uint8_t *t = sdu + o + 3;
+		if (sdu[o] == 0x01 && tl >= 1) {
+			for (unsigned i = 0; i < t[0] && 1 + 7 * (i + 1) <= tl; i++) {
+				uint8_t st = t[1 + 7 * i + 1];
+				on |= st == 3 || st == 5 || st == 6;
+			}
+		}
+		o += 3 + tl;
+	}
+	if (token == -1 && notify_register_check("com.sapphire.call.audio", &token) != NOTIFY_STATUS_OK) {
+		token = -2;
+	}
+	if (token >= 0 && (uint64_t)on != was) {
+		was = (uint64_t)on;
+		notify_set_state(token, was);
+		notify_post("com.sapphire.call.audio");
+		say("bridge: call sound %s", on ? "on" : "off");
+	}
+}
+
+/*
  * NAS: CommCenter asks its registration through Apple's own NAS messages (0x556a, 0x555b, not
  * on this modem) and otherwise waits for indications, which the modem sends only on a change:
  * a modem that registered before CommCenter started never tells it. The bridge asks GET SERVING
@@ -1120,6 +1161,7 @@ br_reader_main(void *arg)
 				uint16_t txn;
 				memcpy(&txn, sdu + 1, 2);
 				if (sdu[0] == 0x04) {           /* indication: every client of the service */
+					if (v->svc == 0x09) br_voice_ind(sdu, sn);
 					for (unsigned m = 0; m < v->ncids; m++) br_to_cc(c, v->svc, v->cids[m], sdu, sn);
 					continue;
 				}
