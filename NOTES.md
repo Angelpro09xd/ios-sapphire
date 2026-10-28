@@ -1,5 +1,19 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-10-29: Files, app extensions, button chord
+
+- Files shows On My iPhone with files and folders (userland/tweaks/fileprovider: fileproviderd's FP library
+  accepted on HFS+, APFS-only fsctls of fpfs_* answered for HFS+; loaded by fpstart, launchd cache entry of
+  com.apple.FileProvider -> /redwood/bin/fpstart, backup launchd.plist.pre-files, and by lswrap in place of
+  LocalStorageFileProvider). An app's folder shows only once its Documents holds something (as on iOS).
+- xnu 0245: every app extension died at start (PlugInKit "failed to get my own sandbox container"); the Sandbox
+  stand-in now answers container path (op 4, .appex only: the user's home), extension issue and consume.
+  TrollStore's IPA picker (DocumentManager.Service) works with it.
+- userland/tweaks/buttonregenerator: Vol+ and Vol- together toggle silent mode (iOS's own ringer path, HUD,
+  bell). Works with the screen on; the screen-off variant (wake, HUD, sleep) hung SpringBoard twice, so the
+  tweak is NOT installed (moved to /var/root/br-disabled). To look at: what the wake/haptic path waits on.
+- SpringBoard sits at the Apple logo blocked on wifid after a boot: `killall -9 wifid` lets it go on.
+
 ## SAPPHIRE 2026-10-28: the iOS root grown to its whole partition (107 GiB)
 
 The root (HFS+ on userdata, sda18, 115 GB) was the 16 GiB image it was flashed as: iOS showed 17 GB and
