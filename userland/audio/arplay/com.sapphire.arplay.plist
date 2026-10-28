@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.sapphire.arplay: the call's sound (arplay watch, kernel 0243's /dev/redwood-gpr): the voice graphs
+  while a call has sound, the record graph for /dev/redwood-mic otherwise. arplay waits for the device
+  itself (it comes ~45 s into the boot). This dict (plus POSIXSpawnType Interactive, UserName root) is in
+  launchd's cache, /System/Library/xpc/launchd.plist, under /System/Library/LaunchDaemons/com.sapphire.arplay.plist:
+  /var/jb/Library/LaunchDaemons is not loaded at boot here. Files: userland/audio/arplay/install.sh.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.sapphire.arplay</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/arplay</string>
+		<string>watch</string>
+		<string>/redwood/share/arplay/voice_handset.arp</string>
+		<string>/redwood/share/arplay/record_mic.arp</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>StandardOutPath</key>
+	<string>/var/tmp/arplay.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/tmp/arplay.log</string>
+</dict>
+</plist>
