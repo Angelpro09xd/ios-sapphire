@@ -1,5 +1,20 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-10-28: outgoing calls (no call audio yet)
+
+Outgoing CS calls ring the other phone and are answered (LTE -> CSFB to UMTS); the call screen follows the call
+and closes when it ends, and calls can be placed again and again. Three things were in the way:
+- "Radio is not on and call is not emergency. Cannot dial.": CallController's radio-on byte (+0x1a3) follows
+  /cc/props/radio_mode, which never goes online here (CommCenter logs "Radio is in reset" while the baseband is
+  kBooted). ccbridge patches the four readers on the dial path to radio on.
+- The call screen stayed up (green clock) after the call: CommCenter's VOICE INDICATION_REGISTER turns call
+  notification events (TLV 0x13) off, so ALL_CALL_STATUS_IND (0x2e) never came. The bridge turns them on.
+- The second call did nothing: when the call scene goes away InCallService's main thread waited forever in
+  -[TUVideoDeviceController stopPreview] -> TUVideoDeviceControllerProvider inputDevices -> AVCapture device
+  discovery (mediaserverd's capture server never answers). userland/tweaks/nocamera returns no video devices.
+userland/telephony/ctdial dials from the shell (CTCallDial); `uiopen tel:` does not place calls.
+Next: call audio (AudioReach voice graphs on the ADSP + WCD937x earpiece/mic paths) and /dev/redwood-mic.
+
 ## SAPPHIRE 2026-10-28: the charger took 500 mA from any charger (kernel 0242)
 
 Overnight on the 33 W charger the phone ran down to 4% while iOS showed "charging" (3.59 V, -227 mA). The
