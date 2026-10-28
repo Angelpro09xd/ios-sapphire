@@ -1,0 +1,42 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0244: MessagesBlastDoorService gets libsapphire-bdsandbox.dylib inserted (incoming SMS:
+ BlastDoor refuses to run without a sandbox, which this port has none of)
+
+---
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 462a500..d69dc2d 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -262,6 +262,13 @@ static int sweet_glload = 0;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_glload, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_glload, 0,
+     "DYLD_INSERT_LIBRARIES of the EAGL bridge's loader for apps");
+ #define SWEET_GLLOAD_ENV "DYLD_INSERT_LIBRARIES=/redwood/lib/libredwood-glload.dylib"
++/*
++ * sapphire 0244: MessagesBlastDoorService, BlastDoor's parser that imagent hands every incoming SMS to,
++ * stops at its start without a sandbox ("BlastDoor cannot run unsandboxed.") and this port has none:
++ * libsapphire-bdsandbox.dylib (userland/telephony/bdsandbox.c) makes its check answer that it has one.
++ * Its XPCService EnvironmentVariables are not applied to it, so the kernel adds the library, as for apps.
++ */
++#define SWEET_BDSANDBOX_ENV "DYLD_INSERT_LIBRARIES=/redwood/lib/libsapphire-bdsandbox.dylib"
+ #endif
+ 
+ #if DEVELOPMENT || DEBUG
+@@ -5782,6 +5789,18 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_argspace -= new_ptr_size;
+ 		imgp->ip_envc++;
+ 	}
++	if (sweet_glload && strnstr(imgp->ip_strings, "/MessagesBlastDoorService.xpc/", strlen(EXECUTABLE_KEY) + MAXPATHLEN) != NULL) {
++		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(SWEET_BDSANDBOX_ENV), UIO_SYSSPACE, TRUE);
++		if (error) {
++			goto bad;
++		}
++		if (imgp->ip_argspace < new_ptr_size) {
++			error = E2BIG;
++			goto bad;
++		}
++		imgp->ip_argspace -= new_ptr_size;
++		imgp->ip_envc++;
++	}
+ #endif
+ 
+ 	/* Save space for envv[] NULL terminator */

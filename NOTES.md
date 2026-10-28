@@ -1,5 +1,22 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-10-28: SMS from and into Messages (kernel 0244)
+
+Messages sends and receives SMS (before, only qmitool did). CommCenter already spoke WMS through ccbridge;
+what was in the way:
+- Sending: "Cannot compose SMS message now: sms ready: false [... in-reset: true, ... baseband activation
+  status: false]", then "Not Delivered": the radio state the call paths had too. ccbridge makes the check
+  (0x1007ebdf8) answer ready past airplane mode and ECBM.
+- Receiving: CommCenter decoded and acknowledged the SMS (transfer route, no SMSC in front of the PDU --
+  as CommCenter wants it: with the SMSC put back it said "Decoding 3GPP SMS failed"), but imagent only
+  takes them once CommCenter's SMS state says ready (0x1008002d8, "SMS ready" x24: now 1).
+- Then imagent hands each SMS to MessagesBlastDoorService, which refuses to run unsandboxed (Sandbox.swift:
+  "BlastDoor cannot run unsandboxed.", a fatal error at every start; this port has no Sandbox.kext).
+  /redwood/lib/libsapphire-bdsandbox.dylib (userland/telephony/bdsandbox.c) makes its two checks answer 1;
+  kernel 0244 inserts it into that service as 0238 does glload into apps (its XPCService
+  EnvironmentVariables were not applied). This runs BlastDoor's parser without its sandbox.
+- After a boot imagent took incoming SMS only once Messages had been opened.
+
 ## SAPPHIRE 2026-10-28: call audio both ways, the microphone (kernel 0243)
 
 A call is heard on the top speaker (the earpiece) and the other side hears the microphones; calls can be placed
