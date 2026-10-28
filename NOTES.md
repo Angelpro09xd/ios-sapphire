@@ -25,9 +25,13 @@ the DSP's voice graphs and the codec's paths.
 - RedwoodAudio.driver: the codec has an output and a mute control on output element 3, from which VirtualAudio
   makes the "Built-In Receiver" port (Device_Codec_Aspen: element 4 would be a second speaker, 5 the HAC coil).
   Apps get Receiver/Speaker now; the plug-in posts com.sapphire.audio.receiver.
-- Not yet: the in-call speaker and mute buttons. Call routes (receiver + speaker) need the HAL device "Baseband
-  Voice" (VirtualAudio RoutingHandler_Call: "basebandDevice is NULL" without it); with a silent one the routes
-  were there but the call screen no longer came up and the next call hung (REDWOOD_BASEBAND, off).
+- In-call speaker and mute: userland/tweaks/callbuttons (InCallService's PHAudioCallControlsViewController):
+  the speaker button always enabled, a tap posts com.sapphire.audio.receiver (arplay: bottom speaker 0 dB, top
+  off), mute posts com.sapphire.call.mute (arplay: the WCD937x ADCs off). iOS's own way needs the HAL device
+  "Baseband Voice" (VirtualAudio RoutingHandler_Call: "basebandDevice is NULL" without it); with a silent one
+  the routes were there but the call screen no longer came up and the next call hung (REDWOOD_BASEBAND, off).
+- arplay started by launchd at boot never got its notifications (the same job restarted later did): it waits
+  until the boot is 2 minutes old. Its job is in launchd's cache (/var/jb/Library/LaunchDaemons is not loaded).
 
 ## SAPPHIRE 2026-10-28: outgoing calls (no call audio yet)
 

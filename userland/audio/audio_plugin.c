@@ -225,6 +225,10 @@ struct device {
 	UInt64 periods;                 /* whole timestamp periods since */
 };
 
+#ifndef REDWOOD_BASEBAND
+#define REDWOOD_BASEBAND        0
+#endif
+
 static struct device devices[] = {
 	{ .object = OBJECT_SPEAKER, .uid = CFSTR("Speaker"), .output = OBJECT_SPEAKER_OUTPUT, .input = OBJECT_SPEAKER_INPUT,
 	  .output_channels = REDWOOD_AUDIO_CHANNELS, .input_channels = 2 },
@@ -234,7 +238,7 @@ static struct device devices[] = {
 	  .output_channels = REDWOOD_AUDIO_CHANNELS, .input_channels = 1 },
 #if REDWOOD_BASEBAND
 	{ .object = OBJECT_BASEBAND, .uid = CFSTR("Baseband Voice"), .output = OBJECT_BASEBAND_OUTPUT,
-	  .input = OBJECT_BASEBAND_INPUT, .output_channels = 1, .input_channels = 1, .rate = 8000 },
+	  .input = OBJECT_BASEBAND_INPUT, .output_channels = 1, .input_channels = 1, .rate = REDWOOD_AUDIO_RATE },
 #endif
 };
 
@@ -248,9 +252,6 @@ static struct device devices[] = {
  * Off (REDWOOD_BASEBAND 0): with it the call's routes were there (receiver, speaker), but the call
  * screen no longer came up and the next call hung everything (sapphire, 2026-10-28).
  */
-#ifndef REDWOOD_BASEBAND
-#define REDWOOD_BASEBAND        0
-#endif
 static const Float64 baseband_rates[] = { 8000, 16000, 32000, 48000 };
 #define BASEBAND_RATES          (sizeof(baseband_rates) / sizeof(baseband_rates[0]))
 
@@ -657,6 +658,12 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			WORD(d->object);
 			break;
 		case kAudioDevicePropertyClockDomain:
+			/*
+			 * one clock, the system's, for all of them: the call aggregates the baseband with the codec
+			 * or the speaker, and 0 ("unknown") had it treat them as drifting apart
+			 */
+			WORD(1);
+			break;
 		case kAudioDevicePropertyLatency:
 		case kAudioDevicePropertySafetyOffset:
 		case kAudioDevicePropertyIsHidden:
