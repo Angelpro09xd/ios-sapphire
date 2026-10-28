@@ -1,5 +1,15 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-10-28: the charger took 500 mA from any charger (kernel 0242)
+
+Overnight on the 33 W charger the phone ran down to 4% while iOS showed "charging" (3.59 V, -227 mA). The
+PM7250B's charger was in USB 5/1 mode (USBIN_ICL_OPTIONS 0x1366 = 0x02: 500 mA from any source); Linux's smb5
+leaves HW auto mode (0x1366 = 0x03: the input limit follows the detected charger, DCP: 0x1370 = 1.5 A, AICL on).
+0242 sets bit 0 every poll (sweetchg_auto=0: off) and adds kern.sweet_spmi (op<<56|sid<<48|addr<<32|value;
+op 1 read, 2 write to sid 0 PON / sid 2 0x1000-0x16ff). On the PC's port under 0242: +852 mA into the battery
+(1342 ICL_OVERRIDE = 1, 1370 = 1.5 A, AICL). FCC (0x1061) is still the boot's 0x1e = 1.5 A (Linux: 0x6c).
+Recovery charges (its Linux has smb5) but its percent stayed at 4% while the voltage rose 3.64 -> 3.85 V.
+
 ## SAPPHIRE 2026-10-28: kernels built on this PC (WSL), no CI (kernel 0241)
 
 Codemagic is out of build minutes and GitHub Actions is blocked by billing, so the kernel now builds on Linux:

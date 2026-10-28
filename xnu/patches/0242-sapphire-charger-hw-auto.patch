@@ -1,0 +1,221 @@
+From ce6da7001b985f89cfe227302712e1e270a47679 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 28 Oct 2026 08:08:55 +0100
+Subject: [PATCH] sapphire-0242: the charger input limit follows the detected
+ charger (HW auto mode, as Linux leaves it): iOS took 500 mA from any charger
+ and ran down while plugged in; kern.sweet_spmi
+
+---
+ bsd/dev/sweet_spmi.c              | 92 ++++++++++++++++++++++++++-----
+ bsd/dev/sweet_spmi.h              |  2 +
+ iokit/Kernel/arm/SweetBattery.cpp | 26 +++++++++
+ 3 files changed, 106 insertions(+), 14 deletions(-)
+
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index b7b26ec..4c5aa0b 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -8,6 +8,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/sysctl.h>
+ #include <machine/machine_routines.h>
+ #include <IOKit/IOLocks.h>
+ #include <kern/locks.h>
+@@ -152,44 +153,107 @@ sweet_spmi_read_any(unsigned sid, unsigned addr, uint8_t *out)
+  */
+ #define SP_CHNLS_PA     0x01e00000u
+ #define PON_SPARE       0x088fu
+-int sweet_spmi_set_reboot_reason(unsigned mode);
++
++/*
++ * 0242: one register written through its peripheral's RW channel, only if the channel is ours (owner
++ * EE 0) and only where this file writes: PM6125's PON (sid 0, 0x800) and PM7250B's charger (sid 2,
++ * SMB5 0x1000-0x16ff). The channel pages are mapped once. 0 when the write completed without error.
++ */
++static vm_offset_t sp_chmap[512];
++int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
+ int
+-sweet_spmi_set_reboot_reason(unsigned mode)
++sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
+ {
+-	if (mode > 0x7f || (!sp_ready && sweet_spmi_init() != 0)) {
++	unsigned peripheral = addr >> 8;
++	if (!(sid == 0 && peripheral == 0x08) && !(sid == 2 && peripheral >= 0x10 && peripheral <= 0x16)) {
+ 		return -1;
+ 	}
+-	uint8_t old = 0;
+-	if (sweet_spmi_read_any(0, PON_SPARE, &old) != 0) {
+-		return -2;
++	if (!sp_ready && sweet_spmi_init() != 0) {
++		return -1;
+ 	}
+ 	lck_mtx_lock(&sweet_spmi_mtx);
+-	uint16_t apid = sp_find_apid(PON_SPARE >> 8);
+-	if (apid == SP_NO_APID || (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) != 0) {
++	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
++	if (apid == SP_NO_APID || apid >= 512 || (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) != 0) {
+ 		lck_mtx_unlock(&sweet_spmi_mtx);
+-		printf("SWEET REBOOT: PON channel APID %u is not ours\n", apid);
++		printf("SWEET SPMI: sid %u %#x: channel APID %u is not ours\n", sid, addr, apid);
+ 		return -3;
+ 	}
+-	vm_offset_t ch = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++	if (sp_chmap[apid] == 0) {
++		sp_chmap[apid] = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++	}
++	vm_offset_t ch = sp_chmap[apid];
+ 	if (ch == 0) {
+ 		lck_mtx_unlock(&sweet_spmi_mtx);
+ 		return -4;
+ 	}
+-	uint8_t val = (uint8_t)((old & 1u) | (mode << 1));
+ 	*(volatile uint32_t *)(ch + 0x10u) = val;                       /* WDATA0 */
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(ch + 0x00u) = ((PON_SPARE & 0xffu) << 4); /* EXT_WRITEL (0), BC=0 */
++	*(volatile uint32_t *)(ch + 0x00u) = ((addr & 0xffu) << 4);     /* EXT_WRITEL (0), BC=0 */
+ 	__asm__ volatile("dsb osh" ::: "memory");
+ 	uint32_t status = 0;
+ 	for (unsigned i = 0; i < 1000 && !((status = sp_rd(ch, 0x08u)) & 1u); ++i) {
+ 		delay(1);
+ 	}
+ 	lck_mtx_unlock(&sweet_spmi_mtx);
++	return (status & 0x0eu) || !(status & 1u) ? -5 : 0;
++}
++
++int sweet_spmi_set_reboot_reason(unsigned mode);
++int
++sweet_spmi_set_reboot_reason(unsigned mode)
++{
++	if (mode > 0x7f || (!sp_ready && sweet_spmi_init() != 0)) {
++		return -1;
++	}
++	uint8_t old = 0;
++	if (sweet_spmi_read_any(0, PON_SPARE, &old) != 0) {
++		return -2;
++	}
++	uint8_t val = (uint8_t)((old & 1u) | (mode << 1));
++	int r = sweet_spmi_write(0, PON_SPARE, val);
+ 	uint8_t now = 0;
+ 	(void)sweet_spmi_read_any(0, PON_SPARE, &now);
+-	printf("SWEET REBOOT: PON spare %#x -> %#x (mode %u, status %#x)\n", old, now, mode, status);
+-	return (status & 0x0eu) || !(status & 1u) || now != val ? -5 : 0;
++	printf("SWEET REBOOT: PON spare %#x -> %#x (mode %u, write %d)\n", old, now, mode, r);
++	return r != 0 || now != val ? -5 : 0;
++}
++
++/*
++ * 0242: kern.sweet_spmi, a PMIC register from ssh. Write op << 56 | sid << 48 | addr << 32 | value, read
++ * the answer: op 1 read (any register; the answer is its value, or 0x100 + the error), op 2 write
++ * (sweet_spmi_write's registers only; the answer is the value read back, or 0x100 + the error).
++ */
++static uint64_t sweet_spmi_answer;
++static int
++sysctl_sweet_spmi SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint64_t v = sweet_spmi_answer;
++	int err = sysctl_io_number(req, (long long)v, sizeof(v), &v, NULL);
++	if (err != 0 || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	unsigned op = (unsigned)(v >> 56), sid = (unsigned)(v >> 48) & 0xffu, addr = (unsigned)(v >> 32) & 0xffffu;
++	if (!sp_ready && sweet_spmi_init() != 0) {
++		return ENXIO;
++	}
++	uint8_t val = 0;
++	int r;
++	if (op == 1) {
++		r = sweet_spmi_read_any(sid, addr, &val);
++	} else if (op == 2) {
++		r = sweet_spmi_write(sid, addr, (uint8_t)v);
++		if (r == 0) {
++			r = sweet_spmi_read_any(sid, addr, &val);
++		}
++		printf("SWEET SPMI: write sid %u %#x = %#x: %d, now %#x\n", sid, addr, (unsigned)(uint8_t)v, r, val);
++	} else {
++		return EINVAL;
++	}
++	sweet_spmi_answer = r == 0 ? val : 0x100u + (unsigned)(-r);
++	return 0;
+ }
++SYSCTL_PROC(_kern, OID_AUTO, sweet_spmi, CTLTYPE_QUAD | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
++    sysctl_sweet_spmi, "Q", "PMIC register: op<<56|sid<<48|addr<<32|value; op 1 read, 2 write");
+ 
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 45565d1..510743a 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,6 +8,8 @@ extern "C" {
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* 0242: PON (sid 0, 0x800) and the PM7250B's charger (sid 2, 0x1000-0x16ff) only; 0 success. */
++int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 7fdd803..14fb4fc 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -15,6 +15,7 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
+ /* bsd/dev/sweet_i2c1.c: topaz battery bus (QUP0 SE1) */
+ extern "C" int sweet_i2c1_init(void);
+ extern "C" int sweet_cpufreq_max(void);    /* bsd/dev/sweet_cpufreq.c */
+@@ -32,6 +33,7 @@ private:
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
+ 	unsigned fSid;          /* the PMIC with the charger and the gauge: 0 PM6150 (sweet), 2 PM7250B (sapphire) */
++	bool fChargerAuto;      /* 0242: keep the charger's input limit in HW auto mode (sweetchg_auto=0: off) */
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+@@ -286,6 +288,27 @@ SweetBattery::poll(void)
+ 			IOLog("%s\n", line);
+ 		}
+ 	}
++	if (sid == 2 && fChargerAuto) {
++		/*
++		 * 0242: the PM7250B's charger came up in USB 5/1 mode (USBIN_ICL_OPTIONS 0x1366 = 0x02: 500 mA
++		 * from any source) and nothing here changed it, so on the 33 W charger the phone took 500 mA,
++		 * less than iOS spends, and ran down overnight while showing "charging". Linux's smb5 leaves
++		 * HW auto mode (USBIN_MODE_CHG, bit 0; 0x1366 = 0x03): the input limit follows the charger the
++		 * hardware detects (a PC's port 500 mA, a wall charger USBIN_CURRENT_LIMIT_CFG 0x1370, 1.5 A,
++		 * with AICL backing off if its voltage sags). Checked every poll: a reset of the charger
++		 * (hard reset, unplug) puts the default back. sweetchg_auto=0: left alone.
++		 */
++		uint8_t icl = 0;
++		if (!sweet_spmi_read(sid, 0x1366, &icl) && !(icl & 1u)) {
++			int r = sweet_spmi_write(sid, 0x1366, (uint8_t)(icl | 1u));
++			uint8_t now = 0;
++			(void)sweet_spmi_read(sid, 0x1366, &now);
++			IOLog("SWEET BATTERY: charger input limit from the hardware: 0x1366 %#x -> %#x (%d)\n", icl, now, r);
++			if (r != 0) {
++				fChargerAuto = false;   /* not ours to write: do not retry every 2 s */
++			}
++		}
++	}
+ 	uint8_t type = 0, present = 0, usb = 0, path = 0, charger = 0, error = 0, temperature = 0, msoc = 0;
+ 	bool regs =
+ 	    !sweet_spmi_read(sid, 0x4804, &type) && type == 0x0d &&
+@@ -404,6 +427,9 @@ SweetBattery::start(IOService *provider)
+ 	unsigned sid = 2;       /* sapphire: PM7250B; boot-arg sweetbattery_sid=0 for the PM6150 / topaz path */
+ 	(void)PE_parse_boot_argn("sweetbattery_sid", &sid, sizeof(sid));
+ 	fSid = sid;
++	int chgAuto = 1;
++	(void)PE_parse_boot_argn("sweetchg_auto", &chgAuto, sizeof(chgAuto));
++	fChargerAuto = chgAuto != 0;
+ 	fReal = real == 1 && (fSid == 0 ? sweet_i2c1_init() == 0 : sweet_spmi_init() == 0);
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+-- 
+2.53.0
+
