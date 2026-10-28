@@ -21,6 +21,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 struct sweet_gpr_cmd {
@@ -215,11 +218,51 @@ gains(void)
 	    op(4, ((uint32_t)ear & 0xFF) | ((uint32_t)aux & 0xFF) << 8));
 }
 
+/*
+ * Mute ("com.sapphire.call.mute", state 1, from the call screen's tweak userland/tweaks/callbuttons): the
+ * WCD937x's ADC1 and ADC2 off (bit 7 of TX_CH1 0x300E / TX_CH2 0x300F), through kern.sweet_audio
+ * (op 3 read / 2 write, target 1 the WCD937x).
+ */
+static uint64_t
+wcd(uint32_t op_, uint32_t reg, uint32_t v)
+{
+	uint64_t q = (uint64_t)op_ << 56 | 1ull << 48 | (uint64_t)reg << 32 | v, a = 0;
+	size_t n = sizeof(a);
+	if (sysctlbyname("kern.sweet_audio", NULL, NULL, &q, sizeof(q)) != 0 ||
+	    sysctlbyname("kern.sweet_audio", &a, &n, NULL, 0) != 0) {
+		return ~0ull;
+	}
+	return a;
+}
+
+static void
+mute_mics(int muted)
+{
+	for (uint32_t reg = 0x300E; reg <= 0x300F; reg++) {
+		uint64_t v = wcd(3, reg, 0);
+		if (v <= 0xFF) {
+			(void)wcd(2, reg, (uint32_t)(muted ? v & ~0x80u : v | 0x80u));
+		}
+	}
+	printf("arplay: microphones %s\n", muted ? "muted" : "on");
+}
+
 static void
 watch(const char *path, int ear, int aux)
 {
-	static int open_now;
-	int token, rtoken;
+	static int open_now, muted;
+	int token, rtoken, mtoken;
+	if (notify_register_dispatch("com.sapphire.call.mute", &mtoken, dispatch_get_main_queue(), ^(int t) {
+		uint64_t st = 0;
+		notify_get_state(t, &st);
+		if (open_now && (int)(st != 0) != muted) {
+			muted = st != 0;
+			mute_mics(muted);
+		}
+		fflush(stdout);
+	}) != NOTIFY_STATUS_OK) {
+		fprintf(stderr, "arplay: no notification for mute\n");
+	}
 	call_ear = ear;
 	call_aux = aux;
 	if (notify_register_dispatch("com.sapphire.audio.receiver", &rtoken, dispatch_get_main_queue(), ^(int t) {
@@ -248,6 +291,10 @@ watch(const char *path, int ear, int aux)
 			gains();
 		} else if (!st && open_now) {
 			open_now = 0;
+			if (muted) {
+				muted = 0;
+				mute_mics(0);
+			}
 			(void)script(path, "stop");
 			mic(1);
 		}
@@ -281,6 +328,21 @@ main(int argc, char **argv)
 		return 1;
 	}
 	if (argc >= 3 && argc != 5 && argc <= 6 && strcmp(argv[1], "watch") == 0) {
+		/*
+		 * Started by launchd at boot, its notifications never came (ccbridge's "call sound on" was
+		 * posted, nothing arrived), while the same job restarted later got them: registered only
+		 * once the boot is 2 minutes old.
+		 */
+		struct timeval boot;
+		size_t bn = sizeof(boot);
+		if (sysctlbyname("kern.boottime", &boot, &bn, NULL, 0) == 0) {
+			long up = (long)time(NULL) - boot.tv_sec;
+			if (up >= 0 && up < 120) {
+				printf("arplay: %ld s since the boot: waiting until 120\n", up);
+				fflush(stdout);
+				sleep((unsigned)(120 - up));
+			}
+		}
 		mic_script = argc >= 4 ? argv[3] : NULL;
 		watch(argv[2], argc == 6 ? atoi(argv[4]) : -6, argc == 6 ? atoi(argv[5]) : -84);
 	}
