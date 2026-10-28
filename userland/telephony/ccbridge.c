@@ -1351,6 +1351,15 @@ bm_spies_install(void)
 		 */
 		static const uint32_t sms_ready[] = { 0x17fffffeu };     /* b 0x1007ebe4c: mov w0, #1 */
 		patch_code("CommCenter SMS ready", 0x1007ebe54UL + main_slide - slide, 0x910013e891274274ULL, sms_ready, 1);
+		/*
+		 * Incoming SMS were decoded and acknowledged, then "kCTEventMessageReceived sent to 0 (of 52)
+		 * clients": imagent registers for them only once CommCenter says SMS is ready, which its
+		 * state (0x1008002d8: "#I Baseband service ready:%s baseband activation status:%s SMS ready
+		 * when IMS registered:%s SMS ready:%s") made "baseband ready and activated, else ready over
+		 * IMS" -- never, here. SMS ready (x24) is now 1.
+		 */
+		static const uint32_t sms_state_ready[] = { 0x52800038u };       /* mov w24, #1 (was mov x24, x22) */
+		patch_code("CommCenter SMS ready state", 0x1008003d4UL + main_slide - slide, 0xf94012b7aa1603f8ULL, sms_state_ready, 1);
 	}
 	real_atcs_assert = (void *)hook_cache("_ATCSException::triggerAssertion(..., mm)", 0x19ed00350UL, (void *)my_atcs_assert);
 	real_ctl_ctor = hook_cache("mav_router::device::controller::controller", 0x1ea5ff8d4UL, (void *)my_ctl_ctor);
