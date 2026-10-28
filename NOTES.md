@@ -13,6 +13,10 @@ the tree prepared exactly as CI does (darwin-xnu-build at DXB_SHA, its patches a
   (no `__CTF`), 24449 vs 24471 global symbols, the missing ones DriverKit glue iig-lite generates differently.
 - `make install` fails at the DriverKit exports check after the kernel is linked; `kernel.sh` repacks the
   linked kernel from the obj dir.
+- **launchd's glload job comes too late:** booted without the boot-arg, SpringBoard started before
+  kern.sweet_glload=1 and had no tweaks (no status bar, stock look) until restarted. Image in use now:
+  `C:\adb\sapphire-uefi-4k-0241-glload.img` = 0241 + boot-arg `sweet_glload=1` (`--set sweet_glload=1`):
+  tweaks, status bar and 2x from the first SpringBoard (confirmed by the user); kernel.sh's default base.
 
 ## SAPPHIRE 2026-10-27 (late): iOS at 2x, tweaks, at most 3 frames on the GPU (kernels 0239-0241)
 
