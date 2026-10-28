@@ -966,6 +966,15 @@ br_merge_ind_reg(struct br_svc *v, uint16_t msg, uint8_t *sdu, size_t sn)
 		size_t len = sdu[o + 1] | sdu[o + 2] << 8;
 		if (o + 3 + len > end) break;
 		if (len == 1) {
+			if (v->svc == 0x09 && type == 0x13 && !sdu[o + 3]) {
+				/*
+				 * VOICE call notification events: CommCenter turns them off (Apple's baseband
+				 * reports calls some other way), so ALL_CALL_STATUS (0x2e) never came: a call
+				 * that rang, was answered and hung up stayed "dialing" in iOS (the green clock).
+				 */
+				sdu[o + 3] = 1;
+				say("bridge: VOICE call notification events turned on");
+			}
 			if (sdu[o + 3]) {
 				v->ind_on[type] = 1;
 			} else if (v->ind_on[type]) {
@@ -1279,6 +1288,19 @@ bm_spies_install(void)
 		static const uint32_t nop[] = { 0xd503201fu };
 		patch_code("CommCenter operator name activation check", 0x1006e7468UL + main_slide - slide,
 		    0x3959226834000228ULL, nop, 1);
+		/*
+		 * Calls: CallController's "radio on" (byte +0x1a3, "#I Radio on: %s") follows the
+		 * /cc/props/radio_mode property, which stays off here (the radio is "in reset" for
+		 * CommCenter: the baseband mode reaches kBooted but nothing announces it online), so every
+		 * dial ended in "Radio is not on and call is not emergency. Cannot dial." (Call Failed).
+		 * The modem is online and registered (CS attached): the flag's readers in the call paths
+		 * (the dial check, its getter, two more) read 1.
+		 */
+		static const uint32_t on_w23[] = { 0x52800037u }, on_w8[] = { 0x52800028u }, on_w22[] = { 0x52800036u };
+		patch_code("CommCenter dial: radio on", 0x100ffb440UL + main_slide - slide, 0xf9402ffb39468eb7ULL, on_w23, 1);
+		patch_code("CommCenter radio on getter", 0x100fe81b8UL + main_slide - slide, 0x340000a839468c08ULL, on_w8, 1);
+		patch_code("CommCenter call path radio on (1)", 0x101003dfcUL + main_slide - slide, 0x350000a839468e68ULL, on_w8, 1);
+		patch_code("CommCenter call path radio on (2)", 0x10100f6d8UL + main_slide - slide, 0x1400000939468eb6ULL, on_w22, 1);
 	}
 	real_atcs_assert = (void *)hook_cache("_ATCSException::triggerAssertion(..., mm)", 0x19ed00350UL, (void *)my_atcs_assert);
 	real_ctl_ctor = hook_cache("mav_router::device::controller::controller", 0x1ea5ff8d4UL, (void *)my_ctl_ctor);

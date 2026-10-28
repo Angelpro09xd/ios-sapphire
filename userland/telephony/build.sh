@@ -20,3 +20,8 @@ echo "../obj/ccstart"
 $L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -Wextra -Wno-unused-parameter \
 	-framework CoreFoundation -framework SystemConfiguration -framework CoreTelephony -o ../obj/pdpnet pdpnet.c
 echo "../obj/pdpnet"
+# ctdial: a call straight through CommCenter (CTCallDial), for testing the dial path without the Phone app
+$L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -Wextra -Wno-unused-parameter \
+	-framework CoreFoundation -o ../obj/ctdial ctdial.c
+ldid -Sctdial.entitlements ../obj/ctdial 2>/dev/null || echo "sign ../obj/ctdial with ctdial.entitlements"
+echo "../obj/ctdial"
