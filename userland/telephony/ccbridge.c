@@ -1343,6 +1343,14 @@ bm_spies_install(void)
 		patch_code("CommCenter radio on getter", 0x100fe81b8UL + main_slide - slide, 0x340000a839468c08ULL, on_w8, 1);
 		patch_code("CommCenter call path radio on (1)", 0x101003dfcUL + main_slide - slide, 0x350000a839468e68ULL, on_w8, 1);
 		patch_code("CommCenter call path radio on (2)", 0x10100f6d8UL + main_slide - slide, 0x1400000939468eb6ULL, on_w22, 1);
+		/*
+		 * SMS: the same radio state kept every SMS from leaving ("Cannot compose SMS message now: sms
+		 * ready: false [airplane mode: false, in-reset: true, ecbm for text: false, baseband
+		 * activation status: false]", then "Not Delivered"). Its check (0x1007ebdf8) goes on, past
+		 * airplane mode and ECBM, to in-reset and activation; there it now answers ready.
+		 */
+		static const uint32_t sms_ready[] = { 0x17fffffeu };     /* b 0x1007ebe4c: mov w0, #1 */
+		patch_code("CommCenter SMS ready", 0x1007ebe54UL + main_slide - slide, 0x910013e891274274ULL, sms_ready, 1);
 	}
 	real_atcs_assert = (void *)hook_cache("_ATCSException::triggerAssertion(..., mm)", 0x19ed00350UL, (void *)my_atcs_assert);
 	real_ctl_ctor = hook_cache("mav_router::device::controller::controller", 0x1ea5ff8d4UL, (void *)my_ctl_ctor);
