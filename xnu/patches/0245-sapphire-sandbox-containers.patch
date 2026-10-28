@@ -1,0 +1,177 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0245: the Sandbox stand-in answers container path (app extensions), extension
+ issue and consume
+
+---
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index deb4d3f..fdb0379 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -31,6 +31,8 @@
+ #include <sys/mount.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
++#include <sys/kauth.h>
++#include <kern/kalloc.h>
+ #include <sys/systm.h>
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+@@ -297,14 +299,140 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  * launchd reports mach lookups as "error = 159: Sandbox restriction"
+  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
+  * "profile not found"). SWEET runs without a sandbox: operations succeed
+- * (checks allow, profile init is accepted); the few that must return
+- * data (container paths, extension tokens) fail with ENOENT. The first
+- * use of each operation number is logged.
++ * (checks allow, profile init is accepted). The first use of each
++ * operation number is logged.
++ *
++ * sapphire 0245: three operations must give data back, not ENOENT, or code
++ * that assumes a sandbox breaks (libsystem_sandbox 20H392 argument layouts):
++ *
++ * op 4, container path ({u64 pid, u64 pidversion, u64 buf, u64 bufsize,
++ *   u64 by_audit_token}): PlugInKit's -[PKService checkEnvironment:] throws
++ *   "Bootstrapping; failed to get my own sandbox container" in every app
++ *   extension without one (LocalStorageFileProvider, PhotosFileProvider,
++ *   com.apple.DocumentManager.Service... all SIGABRT at start). Answered only
++ *   for processes whose executable is inside a ".appex/" (anything else keeps
++ *   ENOENT = not sandboxed, as before), with the home of the process's user
++ *   (/private/var/mobile or /private/var/root): nothing here keeps per-
++ *   extension data containers, and that is where their files live already.
++ * op 5, extension issue ({u64 class, u64 type, u64 data, u64 flags,
++ *   u64 out (2 KB buffer), u64 pid, u64 x}): FileProvider wraps every URL
++ *   it hands out (FPSandboxingURLWrapper) and gives up without a token
++ *   ("Could not issue com.apple.app-sandbox.read-write sandbox extension").
++ *   A token in the usual "hash;..;class;..;path" layout is written; nothing
++ *   checks it, since nothing is confined.
++ * op 6, extension consume ({u64 token, u64 len, u64 out handle}): succeeds
++ *   with handle 1 (sandbox_extension_consume() returns it; -1 means failure).
+  */
+ static uint64_t sweet_sandbox_seen;
+ 
++#define SWEET_SB_TOKEN_MAX      2048    /* libsystem_sandbox's output buffer */
++
++static int
++sweet_sandbox_container_path(user_addr_t arg)
++{
++	uint64_t a[5];
++	char *path = NULL;
++	int len = MAXPATHLEN, error;
++	proc_t target;
++	vnode_t vp;
++	const char *home;
++
++	error = copyin(arg, a, sizeof(a));
++	if (error) {
++		return error;
++	}
++	if (a[4] != 0) {        /* by audit token: a[0] points at it, its val[5] is the pid */
++		uint32_t token[8];
++		error = copyin((user_addr_t)a[0], token, sizeof(token));
++		if (error) {
++			return error;
++		}
++		a[0] = token[5];
++	}
++	target = proc_find((int)a[0]);
++	if (target == PROC_NULL) {
++		return ESRCH;
++	}
++	vp = proc_getexecutablevnode(target);
++	kauth_cred_t cred = kauth_cred_proc_ref(target);
++	home = kauth_cred_getuid(cred) == 0 ? "/private/var/root" : "/private/var/mobile";
++	kauth_cred_unref(&cred);
++	proc_rele(target);
++	if (vp == NULLVP) {
++		return ENOENT;
++	}
++	path = kalloc_data(MAXPATHLEN, Z_WAITOK | Z_ZERO);
++	error = path != NULL ? vn_getpath(vp, path, &len) : ENOMEM;
++	vnode_put(vp);
++	if (error == 0 && strnstr(path, ".appex/", MAXPATHLEN) == NULL) {
++		error = ENOENT;         /* not an app extension: not sandboxed */
++	}
++	if (path != NULL) {
++		kfree_data(path, MAXPATHLEN);
++	}
++	if (error) {
++		return error;
++	}
++	if (a[3] < strlen(home) + 1) {
++		return ERANGE;
++	}
++	return copyout(home, (user_addr_t)a[2], strlen(home) + 1);
++}
++
++static int
++sweet_sandbox_extension_issue(user_addr_t arg)
++{
++	uint64_t a[7];
++	char class_name[128] = "";
++	char *data = NULL, *token = NULL;
++	size_t done;
++	int error;
++
++	error = copyin(arg, a, sizeof(a));
++	if (error) {
++		return error;
++	}
++	if (a[0] != 0 && copyinstr((user_addr_t)a[0], class_name, sizeof(class_name), &done) != 0) {
++		class_name[0] = '\0';
++	}
++	data = kalloc_data(MAXPATHLEN, Z_WAITOK | Z_ZERO);
++	token = kalloc_data(SWEET_SB_TOKEN_MAX, Z_WAITOK | Z_ZERO);
++	if (data == NULL || token == NULL) {
++		error = ENOMEM;
++		goto out;
++	}
++	if (a[2] != 0 && copyinstr((user_addr_t)a[2], data, MAXPATHLEN, &done) != 0) {
++		data[0] = '\0';
++	}
++	snprintf(token, SWEET_SB_TOKEN_MAX,
++	    "0000000000000000000000000000000000000000000000000000000000000000;00;00000000;00000000;00000000;"
++	    "0000000000000000;%s;01;%08llx;0000000000000000;%s", class_name, a[1], data);
++	error = copyout(token, (user_addr_t)a[4], strlen(token) + 1);
++out:
++	if (data != NULL) {
++		kfree_data(data, MAXPATHLEN);
++	}
++	if (token != NULL) {
++		kfree_data(token, SWEET_SB_TOKEN_MAX);
++	}
++	return error;
++}
++
++static int
++sweet_sandbox_extension_consume(user_addr_t arg)
++{
++	uint64_t a[3];
++	int64_t handle = 1;
++	int error = copyin(arg, a, sizeof(a));
++
++	if (error == 0 && a[2] != 0) {
++		error = copyout(&handle, (user_addr_t)a[2], sizeof(handle));
++	}
++	return error;
++}
++
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+@@ -313,9 +441,12 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 		printf("SWEET Sandbox: %s op %d\n", name, call);
+ 	}
+ 	switch (call) {
+-	case 4:         /* container path (audit token / pid) */
++	case 4:         /* container path (pid / audit token) */
++		return sweet_sandbox_container_path(arg);
+ 	case 5:         /* extension issue */
++		return sweet_sandbox_extension_issue(arg);
+ 	case 6:         /* extension consume */
++		return sweet_sandbox_extension_consume(arg);
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:
