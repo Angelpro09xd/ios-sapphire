@@ -5,8 +5,8 @@
   this dict is put into launchd's cache, /System/Library/xpc/launchd.plist, under
   /System/Library/LaunchDaemons/com.sapphire.fpd.plist by fpd-launchd.py (install.sh; the cache before it:
   launchd.plist.pre-fpd). This file itself is also copied to /redwood/share/fpd/ to start the job without a
-  reboot (fptest.sh start). fpd exits 0 when there is nothing to do (no kernel support, qsee off, no
-  template): not restarted then; a crash is restarted after 30 s.
+  reboot (fptest.sh start). Kept alive always (jetsam once killed it as an idle daemon, which launchd counted as a clean
+  exit): high jetsam priority, no pressured exit; a restart comes at most every 30 s.
 -->
 <plist version="1.0">
 <dict>
@@ -19,9 +19,19 @@
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
+	<true/>
+	<key>EnablePressuredExit</key>
+	<false/>
+	<key>EnableTransactions</key>
+	<false/>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>JetsamProperties</key>
 	<dict>
-		<key>SuccessfulExit</key>
-		<false/>
+		<key>JetsamPriority</key>
+		<integer>18</integer>
+		<key>JetsamMemoryLimit</key>
+		<integer>32</integer>
 	</dict>
 	<key>ThrottleInterval</key>
 	<integer>30</integer>
