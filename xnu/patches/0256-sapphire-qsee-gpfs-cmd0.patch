@@ -1,0 +1,39 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0256: Goodix GP file service: raw dumps, command 0 reads
+
+The TA's GP file reads arrive on listener 0x7000 with command id 0 (not 4/8
+as minkipc's gpfs_msg.h has it). Log the first requests raw, before they are
+answered in place, and serve a command 0 that has a read's shape (a count
+that fits the buffer at +264) as PERSIST_FILE_READ.
+---
+ iokit/Kernel/arm/SweetQsee.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetQsee.cpp b/iokit/Kernel/arm/SweetQsee.cpp
+index e56cc16..9444cfe 100755
+--- a/iokit/Kernel/arm/SweetQsee.cpp
++++ b/iokit/Kernel/arm/SweetQsee.cpp
+@@ -1744,6 +1744,23 @@ gp_serve(void)
+ 
+ 	mb();
+ 	q_fs_reqs++;
++	{
++		/* the first requests raw, before anything is answered in place */
++		static unsigned dumps;
++		if (dumps < 3) {
++			dumps++;
++			LOG("gpfs raw +000: %08x %08x %08x %08x %08x %08x %08x %08x", get32(b, 0), get32(b, 4), get32(b, 8),
++			    get32(b, 12), get32(b, 16), get32(b, 20), get32(b, 24), get32(b, 28));
++			LOG("gpfs raw +256: %08x %08x %08x %08x %08x %08x %08x %08x", get32(b, 256), get32(b, 260), get32(b, 264),
++			    get32(b, 268), get32(b, 272), get32(b, 276), get32(b, 280), get32(b, 284));
++		}
++	}
++	if (cmd == 0 && get32(b, 264) > 0 && get32(b, 264) <= GSB_SIZE - 12) {
++		/* this TZ sends its reads with command id 0: a {path; offset; count} read in every other respect */
++		LOG("gpfs: command 0 with a read's shape (offset %d count %u): served as PERSIST_FILE_READ", (int32_t)get32(b, 260),
++		    get32(b, 264));
++		cmd = 8;
++	}
+ 	switch (cmd) {
+ 	case 4:                                     /* DATA_FILE_READ */
+ 	case 8: {                                   /* PERSIST_FILE_READ {path; off@260; count@264} -> {err@4; n@8; data@12} */
