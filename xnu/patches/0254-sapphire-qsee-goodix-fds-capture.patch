@@ -1,0 +1,199 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0254: Goodix file service: small fds; the HAL's capture sequence
+
+With 0253 the TA opened each file and closed it at once: fts_open's
+lseek(fd, 0, SEEK_END) failed inside the TA's libc before any request
+reached the listener, with the fd 100 it was handed. The fs_msg replies were
+checked again against minkipc's layouts (open/close/lseek/get_errno
+{cmd; ret}, read {cmd; buf[20000]; ret}, fstat {cmd; tz_stat(96); ret},
+par_free_size {cmd; u64; ret}) and match; fds now start at 8. The first
+request of each kind is dumped, and an open closed with nothing in between
+is pointed out. Op 11 follows FingerprintCore::onAuthDownEvt: AUTHENTICATE,
+WAKEUP, SET_EXPO (level 1), CAPTURE_IMG, ALGO_AUTHENTICATE with the HAL's
+fields (+0x24 auth type 1, +0x58 2, temperature and light -1000), its
+returned struct logged, ALGO_KPI, AUTH_CANCEL; op 13 is the same at exposure
+level 5. ALGO_INIT +0x24 is logged as the factory SPMT flag.
+---
+ bsd/dev/sweet_qsee_ctl.c       |  2 +-
+ iokit/Kernel/arm/SweetQsee.cpp | 77 ++++++++++++++++++++++++++++++++++++------
+ 2 files changed, 68 insertions(+), 11 deletions(-)
+
+diff --git a/bsd/dev/sweet_qsee_ctl.c b/bsd/dev/sweet_qsee_ctl.c
+index 5f1519d..b983446 100755
+--- a/bsd/dev/sweet_qsee_ctl.c
++++ b/bsd/dev/sweet_qsee_ctl.c
+@@ -8,7 +8,7 @@
+  *   3 APP_SHUTDOWN goodixfp, 4 goodixfp shutdown + start only, 5 op 1 reusing a loaded goodixfp,
+  *   6 op 1 with slow power timings, 7 L9's PMIC registers (read only), 8 register the QSEE log
+  *   buffer, 9 copy it for kern.sweet_qsee_log (read only, opaque: the raw 32 KB), 10 init with
+- *   the file listener, 11 one capture, 12 cancel and sensor off
++ *   the file listener, 11 one capture, 12 cancel and sensor off, 13 one capture at exposure 5
+  * kern.sweet_qsee_file (write only): "name\0bytes" puts a file the TA may read into the kernel's
+  * RAM store (empty bytes drop it); kern.sweet_qsee_files lists the store.
+  */
+diff --git a/iokit/Kernel/arm/SweetQsee.cpp b/iokit/Kernel/arm/SweetQsee.cpp
+index 85a9ff1..4cef109 100755
+--- a/iokit/Kernel/arm/SweetQsee.cpp
++++ b/iokit/Kernel/arm/SweetQsee.cpp
+@@ -26,6 +26,13 @@
+  * kern.sweet_qsee_files lists it); the TA's writes stay in RAM. Op 10 = init (the milestone,
+  * SENSOR_INIT, ALGO_INIT, AUTH_INIT_FINISHED, SET_ACTIVE_GROUP 0), op 11 = one capture
+  * (AUTHENTICATE, CAPTURE_IMG, ALGO_AUTHENTICATE, ALGO_KPI, AUTH_CANCEL), op 12 = cancel + off.
++ * 0254: the TA opened every file and closed it at once: its libc's lseek(fd, 0, SEEK_END) failed
++ * before any request reached us (fts_open: open, lseek, close), with the fd 100 we handed out.
++ * The fs_msg replies match minkipc's layouts (checked again); fds are now small (8..23) like a
++ * Linux qseecomd's. The first request of each kind is dumped (32 bytes), and an open closed with
++ * nothing in between is pointed out. Op 11 follows FingerprintCore::onAuthDownEvt: AUTHENTICATE,
++ * WAKEUP, SET_EXPO (level 1; op 13: 5), CAPTURE_IMG, ALGO_AUTHENTICATE with the HAL's fields,
++ * the returned struct logged, ALGO_KPI, AUTH_CANCEL. ALGO_INIT +0x24 is logged as the SPMT flag.
+  * A listener request from TrustZone (INCOMPLETE / BLOCKED_ON_LISTENER) is logged and answered
+  * with a failure: no listener is registered and nothing is ever written anywhere (persist holds
+  * the sensor's factory calibration).
+@@ -36,7 +43,8 @@
+  *   start only (no sensor commands), 5 the milestone reusing a loaded goodixfp, 6 as 1 with slow
+  *   power timings (100 ms settle, 120 ms after reset), 7 L9's PMIC registers (read only),
+  *   8 register the QSEE log buffer (only), 9 copy it for kern.sweet_qsee_log (stalls: never),
+- *   10 init with the file listener, 11 one capture, 12 cancel and sensor off.
++ *   10 init with the file listener, 11 one capture, 12 cancel and sensor off, 13 = 11 at
++ *   exposure level 5.
+  * Reading it gives the result of the last request (0 ok, else an errno).
+  *
+  * Memory: TrustZone reads what it is given by physical address, below 4 GB, physically
+@@ -94,7 +102,7 @@ extern "C" int topaz_rpm_vote(uint32_t set, uint32_t type, uint32_t id, uint32_t
+ #define QF_FILE_MAX         (5u << 20)
+ #define QF_TOTAL_MAX        (12u << 20)
+ #define QF_NFD              16
+-#define QF_FD_BASE          100
++#define QF_FD_BASE          8                   /* 0254: small fds, as a Linux qseecomd hands out (100 was refused) */
+ 
+ /* SMC function ids: SMC64 standard calls; owner 2 SIP, 50 QSEE OS, 48 TZ apps */
+ #define FN_FEAT_VERSION     0x42000603u
+@@ -1461,6 +1469,21 @@ fs_serve(void)
+ 
+ 	mb();
+ 	q_fs_reqs++;
++	{
++		static uint32_t seen;
++		uint32_t bit = cmd >= 0x201 && cmd < 0x221 ? 1u << (cmd - 0x201) : 0;
++		if (bit != 0 && (seen & bit) == 0) {
++			seen |= bit;
++			LOG("fs first %s request: %08x %08x %08x %08x %08x %08x %08x %08x", fs_cmd_name(cmd), get32(b, 0), get32(b, 4),
++			    get32(b, 8), get32(b, 12), get32(b, 16), get32(b, 20), get32(b, 24), get32(b, 28));
++		}
++	}
++	static uint32_t last_cmd;
++	static int32_t last_fd = -1;
++	if (cmd == 0x209 && last_cmd == 0x202 && (int32_t)get32(b, 4) == last_fd) {
++		LOG("fs: fd %d closed right after its open: nothing (lseek/fstat/read) reached us in between", last_fd);
++	}
++	last_cmd = cmd;
+ 	switch (cmd) {
+ 	case 0x202:                                 /* OPEN {path[256]; flags} */
+ 	case 0x203:                                 /* OPENAT {dirfd; path[256]; flags} */
+@@ -1470,6 +1493,7 @@ fs_serve(void)
+ 		qf_basename(b + po, name);
+ 		ret = fs_open(name, flags, &e);
+ 		put32(b, 4, (uint32_t)ret);
++		last_fd = ret;
+ 		LOG("fs %s %s flags 0%o -> %d%s", fs_cmd_name(cmd), name, flags, ret, ret < 0 ? (e == ENOENT ? " (no such file)" : " (error)") : "");
+ 		break;
+ 	}
+@@ -1750,7 +1774,9 @@ fp_init(void)
+ 	bzero(q_cmd, 0x30);
+ 	put32(q_cmd, 0x24, 1);
+ 	g = gf_cmd(1001, 0, 0x30, "ALGO_INIT");
+-	LOG("ALGO_INIT: out +0x24 %u, +0x28 %08x%08x", get32(q_cmd, 0x24), get32(q_cmd, 0x2c), get32(q_cmd, 0x28));
++	LOG("ALGO_INIT: SPMT flag (+0x24) %u%s, +0x28 %08x%08x", get32(q_cmd, 0x24),
++	    get32(q_cmd, 0x24) != 0 ? " (factory SPMT passed)" : " (NOT passed: the HAL would refuse to authenticate)",
++	    get32(q_cmd, 0x2c), get32(q_cmd, 0x28));
+ 	if (g != 0) {
+ 		goto fail;
+ 	}
+@@ -1777,16 +1803,22 @@ fail:
+ 	return EIO;
+ }
+ 
+-/* op 11: AUTHENTICATE, CAPTURE_IMG, ALGO_AUTHENTICATE, ALGO_KPI, AUTH_CANCEL (no illumination here) */
++/*
++ * op 11 (exposure level 1) / op 13 (level 5): FingerprintCore::onAuthDownEvt without the HAL's UI
++ * wait (no illumination here): AUTHENTICATE, WAKEUP (onAuthStart), SET_EXPO (captureImage, retry
++ * 0), CAPTURE_IMG, ALGO_AUTHENTICATE with the fields the HAL sets (0xa4, its own header), the
++ * returned struct, ALGO_KPI, AUTH_CANCEL.
++ */
+ static int
+-fp_capture(void)
++fp_capture(uint8_t expo)
+ {
+-	uint32_t ga = ~0u, gc = ~0u, gk = ~0u;
++	uint32_t gw = ~0u, ge = ~0u, ga = ~0u, gc = ~0u, gk = ~0u;
+ 
+ 	if (!q_inited || q_goodix_id == 0) {
+ 		LOG("op 11: run op 10 first");
+ 		return EAGAIN;
+ 	}
++	LOG("capture begins (exposure level %u)", expo);
+ 	bzero(q_cmd, 0x30);
+ 	put32(q_cmd, 0x1c, 0);
+ 	put64(q_cmd, 0x20, 1);
+@@ -1795,15 +1827,35 @@ fp_capture(void)
+ 		return EIO;
+ 	}
+ 	if (g == 0) {
++		bzero(q_cmd, 0x20);
++		q_cmd[0x1d] = 0xff;
++		gw = gf_cmd(1002, 9, 0x20, "WAKEUP");
++		bzero(q_cmd, 0x1c);
++		q_cmd[0x10] = expo;
++		ge = gf_cmd(1002, 14, 0x1c, "SET_EXPO");
+ 		bzero(q_cmd, 0x28);
+-		put32(q_cmd, 0x1c, 0);                  /* retry index */
++		put32(q_cmd, 0x1c, 0);                  /* retry */
+ 		put32(q_cmd, 0x20, 2);                  /* op: authenticate */
+ 		gc = gf_cmd(1002, 3, 0x28, "CAPTURE_IMG");
+ 		if (gc == 0) {
+ 			bzero(q_cmd, 0xa4);
++			put32(q_cmd, 0x1c, 0);              /* retry */
++			put32(q_cmd, 0x24, 1);              /* auth type */
++			q_cmd[0x3c] = 0;
++			q_cmd[0x58] = 2;
++			put32(q_cmd, 0x90, (uint32_t)-1000); /* temperature unknown */
++			put32(q_cmd, 0x94, (uint32_t)-1000); /* light unknown */
+ 			q_cmd[0x9e] = 0;
+ 			q_cmd[0x9f] = 0;
+ 			ga = gf_cmd(1001, 2, 0xa4, "ALGO_AUTHENTICATE");
++			for (uint32_t i = 0; i < 0xa4; i += 16) {
++				char line[64] = "";
++				size_t n = 0;
++				for (uint32_t j = i; j + 4 <= 0xa4 && j < i + 16; j += 4) {
++					n += snprintf(line + n, sizeof(line) - n, " %08x", get32(q_cmd, j));
++				}
++				LOG("auth image:   +%02x%s", i, line);
++			}
+ 		}
+ 		bzero(q_cmd, 0xbc);
+ 		gk = gf_cmd(1001, 4, 0xbc, "ALGO_KPI");
+@@ -1817,8 +1869,10 @@ fp_capture(void)
+ 	}
+ 	bzero(q_cmd, 0x1c);
+ 	(void)gf_cmd(1000, 8, 0x1c, "AUTH_CANCEL");
+-	LOG("op 11: authenticate %u %s, capture %u %s, algo %u %s, kpi %u %s", g, gf_err_name(g), gc,
+-	    gc == ~0u ? "-" : gf_err_name(gc), ga, ga == ~0u ? "-" : gf_err_name(ga), gk, gk == ~0u ? "-" : gf_err_name(gk));
++#define GN(x) ((x) == ~0u ? "-" : gf_err_name(x))
++	LOG("capture (expo %u): authenticate %u %s, wakeup %u %s, set_expo %u %s, capture %u %s, algo %u %s, kpi %u %s", expo,
++	    g, GN(g), gw, GN(gw), ge, GN(ge), gc, GN(gc), ga, GN(ga), gk, GN(gk));
++#undef GN
+ 	return 0;
+ }
+ 
+@@ -1890,7 +1944,10 @@ sweet_qsee_op(int op)
+ 		r = fp_init();
+ 		break;
+ 	case 11:
+-		r = fp_capture();
++		r = fp_capture(1);
++		break;
++	case 13:
++		r = fp_capture(5);
+ 		break;
+ 	case 12:
+ 		r = fp_stop();
