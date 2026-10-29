@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.sapphire.vibd: the vibration motor for everyone (vibd.c). Put into launchd's cache,
+  /System/Library/xpc/launchd.plist, under /System/Library/LaunchDaemons/com.sapphire.vibd.plist by launchd-job.py
+  (install.sh; the cache before it: launchd.plist.pre-vibd): /var/jb/Library/LaunchDaemons is not loaded at boot
+  here. Kept alive like fpd (jetsam once killed fpd as an idle daemon).
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.sapphire.vibd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/vibd</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>EnablePressuredExit</key>
+	<false/>
+	<key>EnableTransactions</key>
+	<false/>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>JetsamProperties</key>
+	<dict>
+		<key>JetsamPriority</key>
+		<integer>18</integer>
+		<key>JetsamMemoryLimit</key>
+		<integer>16</integer>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>UserName</key>
+	<string>root</string>
+	<key>POSIXSpawnType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>/var/tmp/vibd.out</string>
+	<key>StandardErrorPath</key>
+	<string>/var/tmp/vibd.out</string>
+</dict>
+</plist>
