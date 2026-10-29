@@ -1,0 +1,277 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0260: Goodix spot lit by the panel's local HBM
+
+The matcher sees the finger but scores it low: Android lights the spot with
+the panel's own local HBM (a 1000-nit white circle), not a white page.
+SweetFramebuffer gets sweet_fb_dsi_seq(): a panel command sequence in the
+qcom dtsi format sent command by command through the existing command-DMA
+path (the one the brightness uses), under its lock, each logged with its
+DMA-done result; nothing is sent while the panel is off. SweetQsee carries the
+n7_38_0c_0a sequences from the Lunaris dtbo (local HBM normal white 1000 nit,
+local HBM off to normal, global HBM on/off): ops 22/23 local HBM on/off,
+24/25 global HBM on/off; kern.sweet_qsee_arg bit 8 (0x100) lights the spot
+before ops 15 and 20 (three frames, 50 ms) and turns it off afterwards.
+---
+ bsd/dev/sweet_qsee_ctl.c              |   3 +-
+ iokit/Kernel/arm/SweetFramebuffer.cpp |  65 ++++++++++++++++++++
+ iokit/Kernel/arm/SweetQsee.cpp        | 108 ++++++++++++++++++++++++++++++++--
+ 3 files changed, 170 insertions(+), 6 deletions(-)
+
+diff --git a/bsd/dev/sweet_qsee_ctl.c b/bsd/dev/sweet_qsee_ctl.c
+index e2b9e69..b6dac71 100755
+--- a/bsd/dev/sweet_qsee_ctl.c
++++ b/bsd/dev/sweet_qsee_ctl.c
+@@ -13,7 +13,8 @@
+  *   16 enroll finish, 17 untrusted auth (then reads: the matched finger id, or -gf error),
+  *   18 untrusted auth with retries (reads as 17), 19 enumerate + authenticator id, 20 = 18 with
+  *   kern.sweet_qsee_arg (bits 0-3 auth type, 4 no UNTRUSTED_CFG(auth), 5 UNTRUSTED_CFG(enroll)
+- *   first, 6 exposure 5, 7 no AUTHENTICATE)
++ *   first, 6 exposure 5, 7 no AUTHENTICATE, 8 the spot lit by the panel's local HBM; bit 8 also for
++ *   op 15), 22/23 local HBM on/off, 24/25 global HBM on/off
+  * kern.sweet_qsee_filesel (write a name) + kern.sweet_qsee_fileout (read: that store file's bytes)
+  * kern.sweet_qsee_file (write only): "name\0bytes" puts a file the TA may read into the kernel's
+  * RAM store (empty bytes drop it); kern.sweet_qsee_files lists the store.
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d84bcd0..28c3b72 100755
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -73,6 +73,7 @@ sweet_hold_set(SweetSurface **set, bool on)
+ }
+ class AppleCLCD;
+ static AppleCLCD *sweet_cons_fb;
++static AppleCLCD *sweet_dsi_fb;                 /* 0260: sweet_fb_dsi_seq() */
+ static void sweet_cons_show(void);
+ class OSDictionary;
+ static void sweet_bl_log(const char *who, OSDictionary *d);
+@@ -436,6 +437,9 @@ AppleCLCD::start(IOService *provider)
+ 	fBlLevel = 0x133;                       /* panel init level (stock DT) */
+ 	fBlSent = ~0u;
+ 	fBlCall = thread_call_allocate(&AppleCLCD::blWork, this);
++	if (fDsi != NULL && fDsiBuf != NULL && fBlLock != NULL) {
++		sweet_dsi_fb = this;
++	}
+ 	if (fDsi != NULL) {
+ 		IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
+ 		setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
+@@ -1819,4 +1823,65 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	}
+ 	return ret;
+ }
++/*
++ * 0260: a panel command sequence for SweetQsee.cpp (the fingerprint spot's local HBM), in the
++ * qcom dtsi format: per command {dtype, last, vc, flags, wait ms, len hi, len lo, payload}. Sent
++ * one by one through the same command-DMA path as the brightness (dsiSend, high speed), under the
++ * brightness lock; each one logged with its DMA-done result. Returns the commands not done, -1
++ * without a DSI path, -2 while the panel is off.
++ */
++extern "C" int
++sweet_fb_dsi_seq(const uint8_t *seq, uint32_t len, const char *what)
++{
++	AppleCLCD *fb = sweet_dsi_fb;
++	if (fb == NULL) {
++		IOLog("SWEET FB: dsi %s: no DSI command path\n", what);
++		return -1;
++	}
++	if (fb->fPowerOff) {
++		IOLog("SWEET FB: dsi %s: the panel is off: not sent\n", what);
++		return -2;
++	}
++	int failed = 0;
++	unsigned n = 0;
++	IOLockLock(fb->fBlLock);
++	IOLog("SWEET FB: dsi %s: ctrl %#x, dma ctrl %#x, trigger %#x, int %#x\n", what, dsi_rd(fb->fDsi, 0x004),
++	    dsi_rd(fb->fDsi, 0x03c), dsi_rd(fb->fDsi, 0x084), dsi_rd(fb->fDsi, 0x110));
++	for (uint32_t o = 0; o + 7 <= len;) {
++		uint8_t dt = seq[o], wait = seq[o + 4];
++		uint32_t dl = ((uint32_t)seq[o + 5] << 8) | seq[o + 6];
++		const uint8_t *pl = seq + o + 7;
++		if (o + 7 + dl > len || dl > 60) {
++			IOLog("SWEET FB: dsi %s: bad command at %u (len %u): stop\n", what, o, dl);
++			failed++;
++			break;
++		}
++		bool done = false, known = true;
++		for (int i = 0; i < 4 && !done && known; i++) {
++			if (dt == 0x39 || dt == 0x29) {
++				uint8_t hdr[4] = { (uint8_t)dl, (uint8_t)(dl >> 8), dt, 0xc0 };
++				done = fb->dsiSend(hdr, pl, dl);
++			} else if ((dt == 0x05 || dt == 0x15) && dl >= 1 && dl <= 2) {
++				uint8_t hdr[4] = { pl[0], (uint8_t)(dl > 1 ? pl[1] : 0), dt, 0x80 };
++				done = fb->dsiSend(hdr, NULL, 0);
++			} else {
++				known = false;
++			}
++			if (!done && known) {
++				IODelay(2000);
++			}
++		}
++		IOLog("SWEET FB: dsi %s #%u: dt %02x len %u: %02x %02x %02x %02x: %s\n", what, n, dt, dl, dl > 0 ? pl[0] : 0,
++		    dl > 1 ? pl[1] : 0, dl > 2 ? pl[2] : 0, dl > 3 ? pl[3] : 0, !known ? "UNKNOWN TYPE, skipped" : done ? "done" : "NO DONE");
++		failed += done ? 0 : 1;
++		n++;
++		if (wait != 0) {
++			IOSleep(wait);
++		}
++		o += 7 + dl;
++	}
++	IOLockUnlock(fb->fBlLock);
++	IOLog("SWEET FB: dsi %s: %u commands, %d not done\n", what, n, failed);
++	return failed;
++}
+ #endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetQsee.cpp b/iokit/Kernel/arm/SweetQsee.cpp
+index d95f3b4..56d1c43 100755
+--- a/iokit/Kernel/arm/SweetQsee.cpp
++++ b/iokit/Kernel/arm/SweetQsee.cpp
+@@ -52,6 +52,10 @@
+  * 0259: op 19 = ENUMERATE + GET_ID (also at the end of op 10 and op 16, as the HAL does); op 20 =
+  * op 18 driven by kern.sweet_qsee_arg (bits 0-3 auth type, 4 no UNTRUSTED_CFG 0, 5 UNTRUSTED_CFG
+  * 1 first, 6 exposure 5, 7 no AUTHENTICATE).
++ * 0260: the panel's own illumination of the spot (n7_38_0c_0a, Lunaris dtbo): op 22 local HBM on
++ * (1000-nit white circle), 23 local HBM off (back to normal), 24 global HBM on, 25 global HBM off,
++ * through SweetFramebuffer's DSI command path; kern.sweet_qsee_arg bit 8 (0x100) makes ops 15
++ * and 20 light the spot first (3 frames), and turn it off at the end.
+  * A listener request from TrustZone (INCOMPLETE / BLOCKED_ON_LISTENER) is logged and answered
+  * with a failure: no listener is registered and nothing is ever written anywhere (persist holds
+  * the sensor's factory calibration).
+@@ -64,7 +68,8 @@
+  *   8 register the QSEE log buffer (only), 9 copy it for kern.sweet_qsee_log (stalls: never),
+  *   10 init with the file listener, 11 one capture, 12 cancel and sensor off, 13 = 11 at
+  *   exposure level 5, 14 enroll begin, 15 one enroll touch, 16 enroll finish, 17 untrusted auth,
+- *   18 untrusted auth with retries, 19 enumerate + authenticator id, 20 = 18 with kern.sweet_qsee_arg.
++ *   18 untrusted auth with retries, 19 enumerate + authenticator id, 20 = 18 with kern.sweet_qsee_arg,
++ *   22/23 local HBM on/off, 24/25 global HBM on/off.
+  * Reading it gives the result of the last request (0 ok, else an errno).
+  *
+  * Memory: TrustZone reads what it is given by physical address, below 4 GB, physically
+@@ -2105,6 +2110,85 @@ fp_capture(uint8_t expo, int *value)
+ 	return 0;
+ }
+ 
++/* ---------------------------------------------------------------- 0260: the spot's illumination */
++
++/* n7_38_0c_0a (Lunaris dtbo, qcom,mdss_dsi_panel_n7_38_0c_0a_fhdp_video): mi,mdss-dsi-local-hbm-normal-white-1000nit-command */
++static const uint8_t lhbm_on[] = {
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a, 0x39, 0x00, 0x00, 0x40, 0x00, 0x00,
++	0x02, 0x60, 0x01, 0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0x53, 0x24, 0x39, 0x00, 0x00, 0x40,
++	0x00, 0x00, 0x04, 0xb0, 0x01, 0x53, 0xb2, 0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x0f, 0xb2, 0x00,
++	0x04, 0x7f, 0xf7, 0xff, 0x7f, 0xf7, 0xff, 0x7f, 0xf7, 0xff, 0x7f, 0xff, 0xff, 0x39, 0x00, 0x00,
++	0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0xb5, 0xb4, 0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb4,
++	0x01, 0x00, 0x14, 0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x01, 0x08, 0xb5, 0x39, 0x00,
++	0x00, 0x40, 0x00, 0x00, 0x10, 0xb5, 0x02, 0x00, 0x00, 0x00, 0x00, 0x1b, 0x87, 0xd9, 0x28, 0x08,
++	0xa1, 0x21, 0xc8, 0x3d, 0x5d, 0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x01, 0x4e, 0xb2,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x06, 0xb2, 0x03, 0x33, 0xaf, 0x3f, 0xff, 0x39, 0x00, 0x00,
++	0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x19, 0xf4, 0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf4,
++	0x1c, 0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x01, 0x17, 0xb2, 0x39, 0x00, 0x00, 0x40,
++	0x00, 0x00, 0x02, 0xb2, 0x01, 0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0xbd, 0xb4,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xb4, 0x03, 0xff, 0x39, 0x00, 0x00, 0x40, 0x00, 0x00,
++	0x04, 0xb0, 0x00, 0x36, 0xb4, 0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x0d, 0xb4, 0x00, 0x40, 0x14,
++	0x02, 0x80, 0x52, 0x0a, 0x41, 0x48, 0x7f, 0xff, 0xff, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
++	0xf7, 0x0b,
++};
++/* mi,mdss-dsi-local-hbm-off-to-normal-command */
++static const uint8_t lhbm_off[] = {
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a, 0x39, 0x00, 0x00, 0x40, 0x00, 0x00,
++	0x02, 0x53, 0x28, 0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x01, 0x17, 0xb2, 0x39, 0x00,
++	0x00, 0x40, 0x00, 0x00, 0x02, 0xb2, 0x00, 0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00,
++	0x19, 0xf4, 0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf4, 0x0a, 0x39, 0x00, 0x00, 0x40, 0x00,
++	0x00, 0x04, 0xb0, 0x01, 0x53, 0xb2, 0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x0f, 0xb2, 0x01, 0xc2,
++	0x00, 0x40, 0x14, 0x02, 0x80, 0x52, 0x0a, 0x41, 0x48, 0x7f, 0xff, 0xff, 0x39, 0x00, 0x00, 0x40,
++	0x00, 0x00, 0x04, 0xb0, 0x00, 0xb5, 0xb4, 0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb4, 0x00,
++	0x00, 0x14, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xf7, 0x0b,
++};
++/* mi,mdss-dsi-hbm-on-command (lp mode on Android; sent high speed here) */
++static const uint8_t hbm_on[] = {
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0x53, 0xe8, 0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03,
++	0x51, 0x07, 0xff, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xf7, 0x0b,
++};
++/* mi,mdss-dsi-hbm-off-command */
++static const uint8_t hbm_off[] = {
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0x53, 0x28, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
++	0x51, 0x07, 0xff,
++};
++
++extern "C" int sweet_fb_dsi_seq(const uint8_t *seq, uint32_t len, const char *what);   /* SweetFramebuffer.cpp */
++
++static int
++panel_seq(int which)
++{
++	static const struct { const uint8_t *seq; uint32_t len; const char *what; } t[] = {
++		{ lhbm_on, sizeof(lhbm_on), "local HBM on (1000-nit white)" },
++		{ lhbm_off, sizeof(lhbm_off), "local HBM off" },
++		{ hbm_on, sizeof(hbm_on), "global HBM on" },
++		{ hbm_off, sizeof(hbm_off), "global HBM off" },
++	};
++	int f = sweet_fb_dsi_seq(t[which].seq, t[which].len, t[which].what);
++	LOG("panel: %s: %s (%d)", t[which].what, f == 0 ? "sent" : f == -1 ? "no DSI path" : f == -2 ? "panel off" : "NOT all done", f);
++	return f == 0 ? 0 : f == -2 ? EAGAIN : EIO;
++}
++
++/* ops 15 / 20 with arg bit 8: the spot lit before, off after (onBeforeAuthCapture's 3 frames) */
++static bool
++spot_on(uint32_t arg)
++{
++	if ((arg & 0x100) == 0) {
++		return false;
++	}
++	(void)panel_seq(0);
++	IOSleep(50);
++	return true;
++}
++
++static void
++spot_off(bool on)
++{
++	if (on) {
++		(void)panel_seq(1);
++	}
++}
++
+ /* ---------------------------------------------------------------- 0257: untrusted enroll / auth */
+ 
+ static uint32_t q_enroll_fid;
+@@ -2292,10 +2376,10 @@ fp_auth_retry(int *value, uint32_t arg)
+ 	uint32_t max = q_auth_retries == 0 ? 2 : MIN(q_auth_retries, 5u);
+ 	const uint32_t atype = (arg & 0xf) == 0 ? 1 : (arg & 0xf);
+ 	const uint8_t expo = (arg & 0x40) != 0 ? 5 : 1;
+-	LOG("auth: arg 0x%x: auth type %u, %s, %s, exposure %u, %s", arg, atype,
++	LOG("auth: arg 0x%x: auth type %u, %s, %s, exposure %u, %s, %s", arg, atype,
+ 	    (arg & 0x10) != 0 ? "no UNTRUSTED_CFG(auth)" : "UNTRUSTED_CFG(auth)",
+ 	    (arg & 0x20) != 0 ? "UNTRUSTED_CFG(enroll) first" : "no UNTRUSTED_CFG(enroll)", expo,
+-	    (arg & 0x80) != 0 ? "no AUTHENTICATE" : "AUTHENTICATE");
++	    (arg & 0x80) != 0 ? "no AUTHENTICATE" : "AUTHENTICATE", (arg & 0x100) != 0 ? "spot lit (local HBM)" : "spot not lit");
+ 	uint32_t gu = 0, g = 0;
+ 	if ((arg & 0x10) == 0) {
+ 		gu = untrusted_cfg(0);
+@@ -2493,7 +2577,11 @@ sweet_qsee_op(int op)
+ 		r = fp_enroll_begin();
+ 		break;
+ 	case 15:
+-		r = fp_enroll_touch(&value);
++		{
++			bool lit = spot_on((uint32_t)sweet_qsee_arg);
++			r = fp_enroll_touch(&value);
++			spot_off(lit);
++		}
+ 		break;
+ 	case 16:
+ 		r = fp_enroll_finish();
+@@ -2508,7 +2596,17 @@ sweet_qsee_op(int op)
+ 		r = fp_enum("op 19");
+ 		break;
+ 	case 20:
+-		r = fp_auth_retry(&value, (uint32_t)sweet_qsee_arg);
++		{
++			bool lit = spot_on((uint32_t)sweet_qsee_arg);
++			r = fp_auth_retry(&value, (uint32_t)sweet_qsee_arg);
++			spot_off(lit);
++		}
++		break;
++	case 22:
++	case 23:
++	case 24:
++	case 25:
++		r = panel_seq(op - 22);
+ 		break;
+ 	case 12:
+ 		r = fp_stop();
