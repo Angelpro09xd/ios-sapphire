@@ -1,0 +1,383 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0250: Goodix probe: QSEE log, the TA's real name, power timings
+
+0249 reached PRE_DETECT and got GF_ERROR_CHIP_ID_NOT_CORRECT (1043). To see
+what the TA read, the QSEE log buffer (TZ_OS_REGISTER_LOG_BUFFER, 32 KB in the
+pool) is registered once before APP_START and its new lines are logged as
+"TZ <cmd>|..." after APP_START, APP_SHUTDOWN and every command (bounded ring
+reads, v1/v2 header detected). TZ knows the app as "fingerprint" (goodixfp.b03
+metadata), so lookup and shutdown use that name and op 1 really restarts it.
+Power-up waits 20 ms after gpio65 before the reset pulse; gpio104 is otherwise
+pulsed only after WAKEUP(reset), not on FAILED_AND_RETRY. Op 6 = op 1 with
+slow timings (100 ms settle, 120 ms after each reset); op 7 reads L9's PMIC
+registers back over the SPMI observer (read only).
+---
+ bsd/dev/sweet_qsee_ctl.c       |   5 +-
+ iokit/Kernel/arm/SweetQsee.cpp | 199 ++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 180 insertions(+), 24 deletions(-)
+
+diff --git a/bsd/dev/sweet_qsee_ctl.c b/bsd/dev/sweet_qsee_ctl.c
+index b60ceb5..fe0ff62 100755
+--- a/bsd/dev/sweet_qsee_ctl.c
++++ b/bsd/dev/sweet_qsee_ctl.c
+@@ -5,7 +5,8 @@
+  * errno, -1 nothing run yet):
+  *   1 milestone 1 (QSEE version, whitelist, lookups, sensor power, goodixfp restarted,
+  *     WAKEUP(reset) + WAKEUP + PRE_DETECT + DETECT_SENSOR), 2 the sensor's GPIOs off,
+- *   3 APP_SHUTDOWN goodixfp, 4 goodixfp shutdown + start only, 5 op 1 reusing a loaded goodixfp
++ *   3 APP_SHUTDOWN goodixfp, 4 goodixfp shutdown + start only, 5 op 1 reusing a loaded goodixfp,
++ *   6 op 1 with slow power timings, 7 L9's PMIC registers (read only)
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -28,5 +29,5 @@ sysctl_sweet_qsee SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_qsee, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+-    0, 0, sysctl_sweet_qsee, "I", "QSEE / goodixfp probe: 1 run, 2 off, 3 unload, 4 TA restart, 5 run reusing the TA (qsee=1)");
++    0, 0, sysctl_sweet_qsee, "I", "QSEE / goodixfp probe: 1 run, 2 off, 3 unload, 4 TA restart, 5 reuse TA, 6 slow, 7 L9 (qsee=1)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetQsee.cpp b/iokit/Kernel/arm/SweetQsee.cpp
+index 888fc54..b23a984 100755
+--- a/iokit/Kernel/arm/SweetQsee.cpp
++++ b/iokit/Kernel/arm/SweetQsee.cpp
+@@ -12,6 +12,11 @@
+  * order (HalContext::init): WAKEUP(1002,9) with reset-before-wakeup, a hardware reset pulse,
+  * WAKEUP, then PRE_DETECT / DETECT_SENSOR retried only on FAILED_AND_RETRY; a clean TA restart;
+  * read-only logs of the SPI pins, the reset pin and the QUP SE5 clocks.
++ * 0250: the QSEE log buffer (TZ_OS_REGISTER_LOG_BUFFER, 32 KB in the pool) registered once and
++ * its new lines logged ("TZ <cmd>|") after APP_START and every command; the app is "fingerprint"
++ * to TZ (goodixfp.b03 metadata n=fingerprint; goodixfp is only the file name); power: 20 ms
++ * after gpio65 (op 6: 100 ms, and 120 ms after each reset); gpio104 is pulsed after power-up and
++ * after WAKEUP(reset) only; op 7 reads L9 back from the PMIC (SPMI observer, read only).
+  * A listener request from TrustZone (INCOMPLETE / BLOCKED_ON_LISTENER) is logged and answered
+  * with a failure: no listener is registered and nothing is ever written anywhere (persist holds
+  * the sensor's factory calibration).
+@@ -19,7 +24,8 @@
+  * Only with boot-arg qsee=1, and only when asked: sysctl kern.sweet_qsee (bsd/dev/sweet_qsee_ctl.c)
+  *   1 the milestone with a clean TA restart (goodixfp shut down if loaded, started again),
+  *   2 the sensor's GPIOs off, 3 APP_SHUTDOWN goodixfp (if it is loaded), 4 goodixfp shutdown +
+- *   start only (no sensor commands), 5 the milestone reusing a loaded goodixfp.
++ *   start only (no sensor commands), 5 the milestone reusing a loaded goodixfp, 6 as 1 with slow
++ *   power timings (100 ms settle, 120 ms after reset), 7 L9's PMIC registers (read only).
+  * Reading it gives the result of the last request (0 ok, else an errno).
+  *
+  * Memory: TrustZone reads what it is given by physical address, below 4 GB, physically
+@@ -61,6 +67,10 @@ extern "C" int topaz_rpm_vote(uint32_t set, uint32_t type, uint32_t id, uint32_t
+ #define OFF_NAME            0xE01000u           /* APP_LOOKUP's name */
+ #define OFF_EXT             0xE02000u           /* SMC arguments past the fourth */
+ #define OFF_SGL             0xE03000u           /* the whitelist table */
++#define OFF_LOG             0xE04000u           /* 0250: the QSEE log buffer, 32 KB */
++#define LOG_SIZE            0x8000u
++#define FN_REG_LOG_BUF      0x72000106u         /* TZ_OS_REGISTER_LOG_BUFFER_ID, arginfo 0x22 (PA, len) */
++#define TA_NAME             "fingerprint"       /* what TZ calls goodixfp (b03 metadata) */
+ 
+ /* SMC function ids: SMC64 standard calls; owner 2 SIP, 50 QSEE OS, 48 TZ apps */
+ #define FN_FEAT_VERSION     0x42000603u
+@@ -151,6 +161,14 @@ static int q_last = -1;                         /* what reading the sysctl answe
+ static uint64_t q_version;
+ static bool q_whitelist, q_powered;
+ static uint32_t q_goodix_id, q_seq;
++static bool q_log_tried, q_log_ok;
++static unsigned q_log_ver;                      /* 0 not known yet, 1 {u16 wrap, u16 offset}, 2 {u32, u32} */
++static uint32_t q_log_wrap, q_log_off;
++static unsigned q_settle_ms = 20, q_reset_ms = 60;
++
++/* bsd/dev/sweet_spmi.c: the SPMI observer, reads only */
++extern "C" int sweet_spmi_init(void);
++extern "C" int sweet_spmi_read_any(unsigned sid, unsigned addr, uint8_t *out);
+ 
+ static inline void mb(void) { __asm__ volatile ("dsb sy" ::: "memory"); }
+ 
+@@ -469,9 +487,10 @@ fp_power_on(void)
+ 		return false;
+ 	}
+ 	q_powered = true;
+-	IOSleep(10);
++	IOSleep(q_settle_ms);
+ 	/* HalContext::init: reset(true) = fp_hw_reset(60) */
+-	if (!fp_reset_pulse(60)) {
++	LOG("sensor: gpio65 high %u ms, reset pulse, then %u ms", q_settle_ms, q_reset_ms);
++	if (!fp_reset_pulse(q_reset_ms)) {
+ 		return false;
+ 	}
+ 	volatile uint32_t *irq = tlmm(GPIO_IRQ);
+@@ -481,6 +500,102 @@ fp_power_on(void)
+ 	return true;
+ }
+ 
++/* ---------------------------------------------------------------- the QSEE log */
++
++/* once per boot (TZ keeps the buffer): the pool's 32 KB, zeroed */
++static void
++tz_log_register(void)
++{
++	uint64_t ret[3];
++
++	if (q_log_tried) {
++		return;
++	}
++	q_log_tried = true;
++	bzero(q_va + OFF_LOG, LOG_SIZE);
++	mb();
++	uint64_t a[2] = { QSEE_POOL_PA + OFF_LOG, LOG_SIZE };
++	int64_t x0 = scm_call(FN_REG_LOG_BUF, 0x22, a, 2, ret);
++	q_log_ok = x0 == 0 && (uint32_t)ret[0] != RES_FAILURE;
++	LOG("QSEE log buffer %llx (%u bytes): x0 %lld, result %d, resp_type %x, data %x: %s", QSEE_POOL_PA + OFF_LOG, LOG_SIZE,
++	    x0, (int32_t)ret[0], (uint32_t)ret[1], (uint32_t)ret[2], q_log_ok ? "registered" : "NOT registered, no TZ log");
++}
++
++/*
++ * The log lines TZ wrote since the last call. Header {wrap, offset} (u16 pairs, or u32 on v2:
++ * told apart by the first non-zero offset), then a ring; every index is taken modulo the ring.
++ */
++static void
++tz_log_dump(const char *cmd)
++{
++	if (!q_log_ok) {
++		return;
++	}
++	const volatile uint8_t *b = q_va + OFF_LOG;
++	mb();
++	uint32_t w16 = b[0] | (uint32_t)b[1] << 8, o16 = b[2] | (uint32_t)b[3] << 8;
++	uint32_t w32 = w16 | o16 << 16, o32 = b[4] | (uint32_t)b[5] << 8 | (uint32_t)b[6] << 16 | (uint32_t)b[7] << 24;
++	if (q_log_ver == 0) {
++		if (o16 != 0) {
++			q_log_ver = 1;
++		} else if (o32 != 0 && o32 < LOG_SIZE) {
++			q_log_ver = 2;
++		} else {
++			LOG("TZ %s| (log still empty: %02x %02x %02x %02x %02x %02x %02x %02x)", cmd, b[0], b[1], b[2], b[3], b[4],
++			    b[5], b[6], b[7]);
++			return;
++		}
++		LOG("TZ log: header v%u (wrap/offset %u bytes each)", q_log_ver, q_log_ver == 1 ? 2 : 4);
++	}
++	const uint32_t hdr = q_log_ver == 1 ? 4 : 8, ring = LOG_SIZE - hdr;
++	const uint32_t wrap = q_log_ver == 1 ? w16 : w32, off = q_log_ver == 1 ? o16 : o32;
++	if (off >= ring) {
++		LOG("TZ %s| offset %u beyond the ring (%u): log dumps stopped", cmd, off, ring);
++		q_log_ok = false;
++		return;
++	}
++	uint32_t start = q_log_off, n;
++	if (wrap == q_log_wrap && off >= q_log_off) {
++		n = off - q_log_off;
++	} else if (wrap == q_log_wrap + 1 && off < q_log_off) {
++		n = ring - q_log_off + off;
++	} else {
++		LOG("TZ %s| (the log wrapped past us: wrap %u -> %u, offset %u -> %u; the whole ring)", cmd, q_log_wrap, wrap,
++		    q_log_off, off);
++		start = off;
++		n = ring;
++	}
++	q_log_wrap = wrap;
++	q_log_off = off;
++	char line[161];
++	unsigned len = 0, lines = 0;
++	for (uint32_t i = 0; i < n && i < ring; i++) {
++		char c = (char)b[hdr + (start + i) % ring];
++		if (c == '\0' || c == '\r') {
++			continue;
++		}
++		if (c != '\n') {
++			line[len++] = (c >= 0x20 && c < 0x7f) ? c : '.';
++		}
++		if (c == '\n' || len == sizeof(line) - 1) {
++			line[len] = 0;
++			if (len > 0 && lines < 400) {
++				LOG("TZ %s|%s", cmd, line);
++			}
++			lines += len > 0;
++			len = 0;
++		}
++	}
++	if (len > 0 && lines < 400) {
++		line[len] = 0;
++		LOG("TZ %s|%s", cmd, line);
++		lines++;
++	}
++	if (lines > 400) {
++		LOG("TZ %s| (%u more lines not shown)", cmd, lines - 400);
++	}
++}
++
+ /* ---------------------------------------------------------------- the TA */
+ 
+ static const char *const ta_files[] = {
+@@ -550,7 +665,9 @@ ta_start(void)
+ 	const uint64_t t0 = mach_absolute_time();
+ 	int64_t x0 = scm_call(FN_APP_START, 0x3, a, 3, ret);
+ 	LOG("APP_START goodixfp: x0 %lld after %llu ms", x0, ms_since(t0));
+-	if (!qsee_finish("APP_START goodixfp", x0, ret, 0)) {
++	bool started = qsee_finish("APP_START goodixfp", x0, ret, 0);
++	tz_log_dump("APP_START");
++	if (!started) {
+ 		return -1;
+ 	}
+ 	if ((uint32_t)ret[1] != RESP_APP_ID || (uint32_t)ret[2] == 0) {
+@@ -612,6 +729,7 @@ gf_send(uint32_t app_id, uint8_t *cmd, uint32_t len, const char *name)
+ 		}
+ 		LOG("%s:   +%02x%s", name, i, line);
+ 	}
++	tz_log_dump(name);
+ 	return ok;
+ }
+ 
+@@ -642,7 +760,7 @@ gf_wakeup(uint32_t app_id, bool reset_first, uint32_t *res)
+ 	return true;
+ }
+ 
+-/* PRE_DETECT / DETECT_SENSOR: retried (after a reset pulse) only on FAILED_AND_RETRY, as SensorDetector does */
++/* PRE_DETECT / DETECT_SENSOR: retried only on FAILED_AND_RETRY, as SensorDetector does */
+ static bool
+ gf_detect_step(uint32_t app_id, uint32_t cmd, uint32_t len, const char *name, uint8_t *c)
+ {
+@@ -667,10 +785,8 @@ gf_detect_step(uint32_t app_id, uint32_t cmd, uint32_t len, const char *name, ui
+ 			LOG("%s: gf error %u %s: stop", name, r, gf_err_name(r));
+ 			return false;
+ 		}
+-		LOG("%s: FAILED_AND_RETRY (try %u): reset pulse, again", name, i + 1);
+-		if (!fp_reset_pulse(60)) {
+-			return false;
+-		}
++		LOG("%s: FAILED_AND_RETRY (try %u): again in 10 ms (no reset: 0250)", name, i + 1);
++		IOSleep(10);
+ 	}
+ 	LOG("%s: still FAILED_AND_RETRY after 4 tries: stop", name);
+ 	return false;
+@@ -689,8 +805,8 @@ sensor_probe(uint32_t app_id)
+ 	}
+ 	if (r == 0) {
+ 		/* Device::reset(false): another hardware reset pulse */
+-		LOG("WAKEUP(reset) ok: hardware reset pulse");
+-		if (!fp_reset_pulse(60)) {
++		LOG("WAKEUP(reset) ok: hardware reset pulse (then %u ms)", q_reset_ms);
++		if (!fp_reset_pulse(q_reset_ms)) {
+ 			return false;
+ 		}
+ 	}
+@@ -714,20 +830,21 @@ sensor_probe(uint32_t app_id)
+ 	return true;
+ }
+ 
+-/* APP_SHUTDOWN of a loaded goodixfp: 0 done or not loaded, else an errno */
++/* APP_SHUTDOWN of a loaded goodixfp ("fingerprint" to TZ): 0 done or not loaded, else an errno */
+ static int
+ shutdown_app(void)
+ {
+ 	uint64_t ret[3];
+ 
+-	int64_t id = qsee_lookup("goodixfp");
++	int64_t id = qsee_lookup(TA_NAME);
+ 	if (id <= 0) {
+ 		return id == 0 ? 0 : EIO;
+ 	}
+ 	uint64_t a[1] = { (uint64_t)id };
+ 	int64_t x0 = scm_call(FN_APP_SHUTDOWN, 0x1, a, 1, ret);
+-	bool ok = qsee_finish("APP_SHUTDOWN goodixfp", x0, ret, (uint32_t)id);
+-	LOG("APP_SHUTDOWN goodixfp (app %lld): %s", id, ok ? "done" : "FAILED");
++	bool ok = qsee_finish("APP_SHUTDOWN " TA_NAME, x0, ret, (uint32_t)id);
++	tz_log_dump("APP_SHUTDOWN");
++	LOG("APP_SHUTDOWN " TA_NAME " (app %lld): %s", id, ok ? "done" : "FAILED");
+ 	if (ok) {
+ 		q_goodix_id = 0;
+ 	}
+@@ -741,12 +858,12 @@ ta_ready(bool restart)
+ 	if (restart && shutdown_app() != 0) {
+ 		return -1;
+ 	}
+-	int64_t id = qsee_lookup("goodixfp");
++	int64_t id = qsee_lookup(TA_NAME);
+ 	if (id < 0) {
+ 		return -1;
+ 	}
+ 	if (id > 0) {
+-		LOG("goodixfp already loaded: app id %lld (reused)", id);
++		LOG(TA_NAME " (goodixfp) already loaded: app id %lld (reused)", id);
+ 		return id;
+ 	}
+ 	id = ta_start();
+@@ -765,6 +882,7 @@ qsee_up(void)
+ 		return false;
+ 	}
+ 	if (q_version != 0) {
++		tz_log_register();
+ 		return true;
+ 	}
+ 	if (!qsee_feature(10, &q_version)) {
+@@ -774,16 +892,47 @@ qsee_up(void)
+ 	}
+ 	q_whitelist = qsee_feature(15, &wl) && wl >= (1ull << 22);
+ 	LOG("QSEE version %llx, whitelist %s (%llx)", q_version, q_whitelist ? "supported" : "NOT supported", wl);
++	tz_log_register();
+ 	return true;
+ }
+ 
+-/* op 1 (restart true) / op 5 (reuse a loaded goodixfp) */
++/*
++ * op 7: L9 as the PMIC has it (PM6125, SPMI SID 0, LDO9 at 0x4800: PMIC5 LDO STATUS1 0x08,
++ * VSET 0x40/0x41 mV, MODE_CTL 0x45, EN_CTL 0x46). Observer reads only, nothing written. (0193:
++ * an SPMI read once hung the audio thread, so this is an op of its own, never part of op 1.)
++ */
+ static int
+-milestone(bool restart)
++l9_readback(void)
++{
++	static const uint8_t regs[] = { 0x04, 0x05, 0x08, 0x40, 0x41, 0x45, 0x46 };
++	uint8_t v[sizeof(regs)] = {};
++	int e = sweet_spmi_init();
++	if (e != 0) {
++		LOG("L9: SPMI not available (%d)", e);
++		return EIO;
++	}
++	for (unsigned i = 0; i < sizeof(regs); i++) {
++		e = sweet_spmi_read_any(0, 0x4800u + regs[i], &v[i]);
++		if (e != 0) {
++			LOG("L9: SPMI read 0x%x failed: %d", 0x4800u + regs[i], e);
++			return EIO;
++		}
++	}
++	LOG("L9 (PM6125 0x4800): type %02x subtype %02x status1 %02x (ready %u), vset %u mV, mode %02x, en_ctl %02x (%s)", v[0],
++	    v[1], v[2], v[2] >> 7, v[3] | (unsigned)v[4] << 8, v[5], v[6], (v[6] & 0x80) ? "enabled" : "not enabled by apps");
++	return 0;
++}
++
++/* op 1 (restart true) / op 5 (reuse a loaded goodixfp) / op 6 (restart, slow power timings) */
++static int
++milestone(bool restart, bool slow)
+ {
+ 	const uint64_t t0 = mach_absolute_time();
+ 
+-	LOG("milestone 1b begins (%s)", restart ? "clean TA restart" : "reusing a loaded TA");
++	q_settle_ms = slow ? 100 : 20;
++	q_reset_ms = slow ? 120 : 60;
++	LOG("milestone 1b begins (%s, %s timings: %u ms settle, %u ms after reset)", restart ? "clean TA restart" :
++	    "reusing a loaded TA", slow ? "slow" : "normal", q_settle_ms, q_reset_ms);
+ 	if (!qsee_up()) {
+ 		return EIO;
+ 	}
+@@ -844,7 +993,7 @@ sweet_qsee_op(int op)
+ 	IOLockLock(q_lock);
+ 	switch (op) {
+ 	case 1:
+-		r = milestone(true);
++		r = milestone(true, false);
+ 		break;
+ 	case 2:
+ 		fp_power_off();
+@@ -864,7 +1013,13 @@ sweet_qsee_op(int op)
+ 		break;
+ 	}
+ 	case 5:
+-		r = milestone(false);
++		r = milestone(false, false);
++		break;
++	case 6:
++		r = milestone(true, true);
++		break;
++	case 7:
++		r = l9_readback();
+ 		break;
+ 	default:
+ 		r = EINVAL;
