@@ -1,0 +1,505 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0249: Goodix probe: libgf_hal's wakeup sequence (milestone 1b)
+
+0248's PRE_DETECT reached the TA and came back GF_ERROR_SPI_TRANSFER_ERROR
+(1025): libgf_hal wakes the sensor first. Op 1 now restarts goodixfp cleanly
+(APP_SHUTDOWN if loaded, APP_START), powers the sensor (L9, gpio65, 10 ms,
+reset pulse low 5 ms / high / 60 ms), sends WAKEUP (1002,9) with
+reset-before-wakeup (+0x1d 0xff, +0x1e 1), a hardware reset pulse when it
+answers 0, WAKEUP again (+0x1e 0), then PRE_DETECT and DETECT_SENSOR, retried
+after a reset pulse only on FAILED_AND_RETRY (0x458). gf error codes are logged
+by name; envelope +0x1c mirrors the gf result and is no longer a transport
+failure; the whitelist table is 64 bytes. Op 4 restarts the TA only, op 5 runs
+op 1 reusing a loaded TA. Read-only logs of gpio14..17, gpio104, gpio83 and
+the GCC QUPv3 wrapper 0 / SE5 clock branches around the wakeup.
+fp_diag reads only gpio104/83: the SE5 SPI pins and QUP clocks belong to TZ.
+---
+ bsd/dev/sweet_qsee_ctl.c       |   7 +-
+ iokit/Kernel/arm/SweetQsee.cpp | 327 +++++++++++++++++++++++++++++++----------
+ 2 files changed, 250 insertions(+), 84 deletions(-)
+
+diff --git a/bsd/dev/sweet_qsee_ctl.c b/bsd/dev/sweet_qsee_ctl.c
+index 7c19bac..b60ceb5 100755
+--- a/bsd/dev/sweet_qsee_ctl.c
++++ b/bsd/dev/sweet_qsee_ctl.c
+@@ -3,8 +3,9 @@
+  * with boot-arg qsee=1 (otherwise every request answers ENODEV and nothing runs).
+  * Write an op, it runs in the writer's thread; reading gives the last result (0 ok, else an
+  * errno, -1 nothing run yet):
+- *   1 milestone 1 (QSEE version, whitelist, lookups, sensor power, APP_START goodixfp,
+- *     PRE_DETECT + DETECT_SENSOR), 2 the sensor's GPIOs off, 3 APP_SHUTDOWN goodixfp
++ *   1 milestone 1 (QSEE version, whitelist, lookups, sensor power, goodixfp restarted,
++ *     WAKEUP(reset) + WAKEUP + PRE_DETECT + DETECT_SENSOR), 2 the sensor's GPIOs off,
++ *   3 APP_SHUTDOWN goodixfp, 4 goodixfp shutdown + start only, 5 op 1 reusing a loaded goodixfp
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -27,5 +28,5 @@ sysctl_sweet_qsee SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_qsee, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+-    0, 0, sysctl_sweet_qsee, "I", "QSEE / goodixfp probe: 1 run, 2 sensor off, 3 unload (boot-arg qsee=1)");
++    0, 0, sysctl_sweet_qsee, "I", "QSEE / goodixfp probe: 1 run, 2 off, 3 unload, 4 TA restart, 5 run reusing the TA (qsee=1)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetQsee.cpp b/iokit/Kernel/arm/SweetQsee.cpp
+index 023ec20..888fc54 100755
+--- a/iokit/Kernel/arm/SweetQsee.cpp
++++ b/iokit/Kernel/arm/SweetQsee.cpp
+@@ -8,12 +8,18 @@
+  *   the sensor powered (PM6125 L9 vote, gpio65 high, gpio104 reset pulse, xiaomi_fp.ko timing);
+  *   APP_START goodixfp from the modem partition (goodixfp.mdt + b00..b07 back to back, ~11.3 MB);
+  *   SENSOR PRE_DETECT (1002,0) and DETECT_SENSOR (1002,1) through libgf_hal's 64-byte envelope.
++ * 0249 (milestone 1b, after 0248's PRE_DETECT answered SPI_TRANSFER_ERROR): libgf_hal's init
++ * order (HalContext::init): WAKEUP(1002,9) with reset-before-wakeup, a hardware reset pulse,
++ * WAKEUP, then PRE_DETECT / DETECT_SENSOR retried only on FAILED_AND_RETRY; a clean TA restart;
++ * read-only logs of the SPI pins, the reset pin and the QUP SE5 clocks.
+  * A listener request from TrustZone (INCOMPLETE / BLOCKED_ON_LISTENER) is logged and answered
+  * with a failure: no listener is registered and nothing is ever written anywhere (persist holds
+  * the sensor's factory calibration).
+  *
+  * Only with boot-arg qsee=1, and only when asked: sysctl kern.sweet_qsee (bsd/dev/sweet_qsee_ctl.c)
+- *   1 the milestone, 2 the sensor's GPIOs off, 3 APP_SHUTDOWN goodixfp (if it is loaded).
++ *   1 the milestone with a clean TA restart (goodixfp shut down if loaded, started again),
++ *   2 the sensor's GPIOs off, 3 APP_SHUTDOWN goodixfp (if it is loaded), 4 goodixfp shutdown +
++ *   start only (no sensor commands), 5 the milestone reusing a loaded goodixfp.
+  * Reading it gives the result of the last request (0 ok, else an errno).
+  *
+  * Memory: TrustZone reads what it is given by physical address, below 4 GB, physically
+@@ -96,6 +102,47 @@ extern "C" int topaz_rpm_vote(uint32_t set, uint32_t type, uint32_t id, uint32_t
+ #define GF_TARGET_SENSOR    1002
+ #define GF_SENSOR_PRE_DETECT 0
+ #define GF_SENSOR_DETECT    1
++#define GF_SENSOR_WAKEUP    9
++#define GF_FAILED_AND_RETRY 0x458
++
++/*
++ * 0249, read-only diagnostics: GCC (0x1400000) QUPv3 wrapper 0 branches (gcc-khaje.c, the same
++ * layout sweet_i2c1.c / sweet_touch.c use for SE1 0x1f274 and SE2 0x1f3a4: SE n's CBCR at
++ * 0x1f144 + n * 0x130, its RCG right after it; bit 31 of a CBCR = clock off), the APCS vote
++ * register 0x7900c (bits 6 m_ahb, 7 s_ahb, 8 core, 9 core_2x, 10 + n SE n). SE5 is presumed to
++ * be the sensor's SPI (fingerprint-hw.md), on gpio14..17.
++ */
++#define GCC_PA              0x01400000ull
++#define GCC_QUP_VOTE        0x7900cu
++#define GCC_WRAP0_M_AHB     0x1f004u
++#define GCC_WRAP0_S_AHB     0x1f008u
++#define GCC_WRAP0_CORE      0x1f00cu
++#define GCC_WRAP0_CORE2X    0x1f014u
++#define GCC_WRAP0_S5_CBCR   (0x1f144u + 5 * 0x130u)
++
++static const struct { uint32_t code; const char *name; } gf_errors[] = {
++	{ 0, "OK" },
++	{ 1003, "NOT_INIT" },
++	{ 1004, "BAD_PARAMS" },
++	{ 1024, "INVALID_DATA" },
++	{ 1025, "SPI_TRANSFER_ERROR" },
++	{ 1026, "SPI_GENERAL_ERROR" },
++	{ 1027, "SPI_IRQ_HANDLE" },
++	{ 1028, "SPI_RAW_DATA_CRC_FAILED" },
++	{ 1051, "TA_DEAD" },
++	{ 1112, "FAILED_AND_RETRY" },
++};
++
++static const char *
++gf_err_name(uint32_t code)
++{
++	for (unsigned i = 0; i < sizeof(gf_errors) / sizeof(gf_errors[0]); i++) {
++		if (gf_errors[i].code == code) {
++			return gf_errors[i].name;
++		}
++	}
++	return "?";
++}
+ 
+ static IOLock *q_lock;
+ static IOMemoryMap *q_map;
+@@ -367,6 +414,37 @@ gpio_out(unsigned gpio, bool high)
+ 	return true;
+ }
+ 
++/* read only: the presumed SPI pins, the reset pin, and the QUP clocks */
++static void
++fp_diag(const char *when)
++{
++	/* not gpio14..17 or the QUP clocks: TZ owns the sensor's SPI and touching them hangs the phone */
++	static const unsigned pins[] = { GPIO_RST, GPIO_IRQ };
++	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
++		volatile uint32_t *g = tlmm(pins[i]);
++		if (g != NULL) {
++			uint32_t ctl = g[0], io = g[1];
++			LOG("diag %s: gpio%u ctl %08x (func %u, drv %u mA, pull %u, oe %u) io %08x", when, pins[i], ctl,
++			    (ctl >> 2) & 0xf, (((ctl >> 6) & 7) + 1) * 2, ctl & 3, (ctl >> 9) & 1, io);
++		}
++	}
++}
++
++/* FP_IOC_RESET / fp_hw_reset(): reset low, 5 ms, high, then delay_ms */
++static bool
++fp_reset_pulse(unsigned delay_ms)
++{
++	if (!gpio_out(GPIO_RST, false)) {
++		return false;
++	}
++	IOSleep(5);
++	if (!gpio_out(GPIO_RST, true)) {
++		return false;
++	}
++	IOSleep(delay_ms);
++	return true;
++}
++
+ static void
+ fp_power_off(void)
+ {
+@@ -392,15 +470,10 @@ fp_power_on(void)
+ 	}
+ 	q_powered = true;
+ 	IOSleep(10);
+-	/* fp_hw_reset(): reset_low, 5 ms, reset_high, then the caller's delay */
+-	if (!gpio_out(GPIO_RST, false)) {
++	/* HalContext::init: reset(true) = fp_hw_reset(60) */
++	if (!fp_reset_pulse(60)) {
+ 		return false;
+ 	}
+-	IOSleep(5);
+-	if (!gpio_out(GPIO_RST, true)) {
+-		return false;
+-	}
+-	IOSleep(60);
+ 	volatile uint32_t *irq = tlmm(GPIO_IRQ);
+ 	if (irq != NULL) {
+ 		LOG("sensor: on; irq gpio%u ctl %08x io %08x (level %u)", GPIO_IRQ, irq[0], irq[1], irq[1] & 1);
+@@ -510,13 +583,14 @@ gf_send(uint32_t app_id, uint8_t *cmd, uint32_t len, const char *name)
+ 	*(uint32_t *)(sb + 0x08) = len;
+ 	*(uint32_t *)(sb + 0x0c) = ++q_seq;
+ 	*(uint64_t *)(sb + 0x10) = (uint64_t)sec * 1000 + usec / 1000;
+-	bzero(sgl, 32);
++	bzero(sgl, 64);
+ 	sgl[0] = 0x80000000u | 0;                   /* single address, 32-bit, at offset 0 */
+ 	sgl[1] = CMD_SIZE;
+ 	mb();
+ 	const uint64_t t0 = mach_absolute_time();
+ 	if (q_whitelist) {
+-		uint64_t a[7] = { app_id, QSEE_POOL_PA + OFF_SB, 0x40, QSEE_POOL_PA + OFF_SB, 0x40, QSEE_POOL_PA + OFF_SGL, 32 };
++		/* 0249: the table is 8 entries, 64 bytes (libQSEEComAPI's size) */
++		uint64_t a[7] = { app_id, QSEE_POOL_PA + OFF_SB, 0x40, QSEE_POOL_PA + OFF_SB, 0x40, QSEE_POOL_PA + OFF_SGL, 64 };
+ 		x0 = scm_call(FN_SEND_DATA_WL, 0x8887, a, 7, ret);
+ 	} else {
+ 		uint64_t a[5] = { app_id, QSEE_POOL_PA + OFF_SB, 0x40, QSEE_POOL_PA + OFF_SB, 0x40 };
+@@ -526,9 +600,10 @@ gf_send(uint32_t app_id, uint8_t *cmd, uint32_t len, const char *name)
+ 	bool ok = qsee_finish(name, x0, ret, app_id);
+ 	mb();
+ 	memcpy(cmd, buf, len);
+-	uint32_t status = *(uint32_t *)(sb + 0x1c);
+-	LOG("%s: envelope TEE status %u, gf result %u (0x%x), reset_flag %u, seq %u", name, status, *(uint32_t *)(cmd + 0x0c),
+-	    *(uint32_t *)(cmd + 0x0c), cmd[0], *(uint32_t *)(sb + 0x0c));
++	/* envelope +0x1c mirrors the gf result (0249): not a transport failure */
++	uint32_t status = *(uint32_t *)(sb + 0x1c), res = *(uint32_t *)(cmd + 0x0c);
++	LOG("%s: envelope TEE status %u, gf result %u (0x%x) %s, reset_flag %u, seq %u", name, status, res, res,
++	    gf_err_name(res), cmd[0], *(uint32_t *)(sb + 0x0c));
+ 	for (uint32_t i = 0; i < len; i += 16) {
+ 		char line[64] = "";
+ 		size_t n = 0;
+@@ -537,7 +612,7 @@ gf_send(uint32_t app_id, uint8_t *cmd, uint32_t len, const char *name)
+ 		}
+ 		LOG("%s:   +%02x%s", name, i, line);
+ 	}
+-	return ok && status == 0;
++	return ok;
+ }
+ 
+ static void
+@@ -548,71 +623,175 @@ gf_header(uint8_t *c, uint32_t len, uint32_t target, uint32_t cmd)
+ 	*(uint32_t *)(c + 0x08) = cmd;
+ }
+ 
++/* WAKEUP (1002,9), 0x20: +0x1d screen index 0xff, +0x1e reset-before-wakeup; out +0x1c "woken" */
+ static bool
+-sensor_probe(uint32_t app_id)
++gf_wakeup(uint32_t app_id, bool reset_first, uint32_t *res)
+ {
+ 	uint8_t c[0x40];
++	const char *name = reset_first ? "WAKEUP(reset)" : "WAKEUP";
++
++	gf_header(c, 0x20, GF_TARGET_SENSOR, GF_SENSOR_WAKEUP);
++	c[0x1d] = 0xff;
++	c[0x1e] = reset_first ? 1 : 0;
++	if (!gf_send(app_id, c, 0x20, name)) {
++		LOG("%s: the call itself failed", name);
++		return false;
++	}
++	*res = *(uint32_t *)(c + 0x0c);
++	LOG("%s: gf result %u %s, woken byte +0x1c = %u", name, *res, gf_err_name(*res), c[0x1c]);
++	return true;
++}
++
++/* PRE_DETECT / DETECT_SENSOR: retried (after a reset pulse) only on FAILED_AND_RETRY, as SensorDetector does */
++static bool
++gf_detect_step(uint32_t app_id, uint32_t cmd, uint32_t len, const char *name, uint8_t *c)
++{
+ 	clock_sec_t sec;
+ 	clock_usec_t usec;
+-	bool pre = false;
+-
+-	for (unsigned i = 0; i < 4 && !pre; i++) {     /* SensorDetector::init: up to 4 tries */
+-		gf_header(c, 0x28, GF_TARGET_SENSOR, GF_SENSOR_PRE_DETECT);
+-		clock_get_calendar_microtime(&sec, &usec);
+-		*(uint64_t *)(c + 0x20) = (uint64_t)sec;
+-		if (!gf_send(app_id, c, 0x28, "PRE_DETECT")) {
+-			LOG("PRE_DETECT: the call itself failed: stop");
++
++	for (unsigned i = 0; i < 4; i++) {
++		gf_header(c, len, GF_TARGET_SENSOR, cmd);
++		if (cmd == GF_SENSOR_PRE_DETECT) {
++			clock_get_calendar_microtime(&sec, &usec);
++			*(uint64_t *)(c + 0x20) = (uint64_t)sec;
++		}
++		if (!gf_send(app_id, c, len, name)) {
++			LOG("%s: the call itself failed: stop", name);
++			return false;
++		}
++		uint32_t r = *(uint32_t *)(c + 0x0c);
++		if (r == 0) {
++			return true;
++		}
++		if (r != GF_FAILED_AND_RETRY) {
++			LOG("%s: gf error %u %s: stop", name, r, gf_err_name(r));
++			return false;
++		}
++		LOG("%s: FAILED_AND_RETRY (try %u): reset pulse, again", name, i + 1);
++		if (!fp_reset_pulse(60)) {
+ 			return false;
+ 		}
+-		pre = *(uint32_t *)(c + 0x0c) == 0;
+-		if (!pre) {
+-			IOSleep(10);
++	}
++	LOG("%s: still FAILED_AND_RETRY after 4 tries: stop", name);
++	return false;
++}
++
++/* HalContext::init from step 7: doResetBeforeWakeup, doWakeup, PRE_DETECT, DETECT_SENSOR */
++static bool
++sensor_probe(uint32_t app_id)
++{
++	uint8_t c[0x40];
++	uint32_t r = 0;
++
++	fp_diag("before WAKEUP(reset)");
++	if (!gf_wakeup(app_id, true, &r)) {
++		return false;
++	}
++	if (r == 0) {
++		/* Device::reset(false): another hardware reset pulse */
++		LOG("WAKEUP(reset) ok: hardware reset pulse");
++		if (!fp_reset_pulse(60)) {
++			return false;
+ 		}
+ 	}
++	fp_diag("after WAKEUP(reset)");
++	if (!gf_wakeup(app_id, false, &r)) {
++		return false;
++	}
++	if (r != 0) {
++		LOG("WAKEUP: gf error %u %s: going on to PRE_DETECT for the log", r, gf_err_name(r));
++	}
++	bool pre = gf_detect_step(app_id, GF_SENSOR_PRE_DETECT, 0x28, "PRE_DETECT", c);
++	fp_diag("after PRE_DETECT");
+ 	if (!pre) {
+-		LOG("PRE_DETECT: gf error after 4 tries: stop");
+ 		return false;
+ 	}
+-	gf_header(c, 0x2c, GF_TARGET_SENSOR, GF_SENSOR_DETECT);
+-	if (!gf_send(app_id, c, 0x2c, "DETECT_SENSOR")) {
+-		LOG("DETECT_SENSOR: the call failed");
++	if (!gf_detect_step(app_id, GF_SENSOR_DETECT, 0x2c, "DETECT_SENSOR", c)) {
+ 		return false;
+ 	}
+-	uint32_t err = *(uint32_t *)(c + 0x0c);
+ 	const uint32_t *info = (const uint32_t *)(c + 0x1c);
+-	LOG("DETECT_SENSOR: gf result %u, sensor info %08x %08x %08x %08x%s", err, info[0], info[1], info[2], info[3],
+-	    err == 0 ? ": TZ talks to the sensor" : "");
+-	return err == 0;
++	LOG("DETECT_SENSOR: sensor info %08x %08x %08x %08x: TZ talks to the sensor", info[0], info[1], info[2], info[3]);
++	return true;
+ }
+ 
+-/* ---------------------------------------------------------------- the milestone */
+-
++/* APP_SHUTDOWN of a loaded goodixfp: 0 done or not loaded, else an errno */
+ static int
+-milestone(void)
++shutdown_app(void)
++{
++	uint64_t ret[3];
++
++	int64_t id = qsee_lookup("goodixfp");
++	if (id <= 0) {
++		return id == 0 ? 0 : EIO;
++	}
++	uint64_t a[1] = { (uint64_t)id };
++	int64_t x0 = scm_call(FN_APP_SHUTDOWN, 0x1, a, 1, ret);
++	bool ok = qsee_finish("APP_SHUTDOWN goodixfp", x0, ret, (uint32_t)id);
++	LOG("APP_SHUTDOWN goodixfp (app %lld): %s", id, ok ? "done" : "FAILED");
++	if (ok) {
++		q_goodix_id = 0;
++	}
++	return ok ? 0 : EIO;
++}
++
++/* the TA: restart = shutdown a loaded one first (a clean TA state), else reuse it */
++static int64_t
++ta_ready(bool restart)
++{
++	if (restart && shutdown_app() != 0) {
++		return -1;
++	}
++	int64_t id = qsee_lookup("goodixfp");
++	if (id < 0) {
++		return -1;
++	}
++	if (id > 0) {
++		LOG("goodixfp already loaded: app id %lld (reused)", id);
++		return id;
++	}
++	id = ta_start();
++	if (id > 0) {
++		LOG("goodixfp started: app id %lld", id);
++	}
++	return id;
++}
++
++static bool
++qsee_up(void)
+ {
+ 	uint64_t wl = 0;
+-	const uint64_t t0 = mach_absolute_time();
+ 
+-	LOG("milestone 1 begins");
+ 	if (!pool_map()) {
+-		return ENOMEM;
++		return false;
++	}
++	if (q_version != 0) {
++		return true;
+ 	}
+ 	if (!qsee_feature(10, &q_version)) {
+ 		LOG("no QSEE version: stop");
+-		return EIO;
++		q_version = 0;
++		return false;
+ 	}
+ 	q_whitelist = qsee_feature(15, &wl) && wl >= (1ull << 22);
+ 	LOG("QSEE version %llx, whitelist %s (%llx)", q_version, q_whitelist ? "supported" : "NOT supported", wl);
++	return true;
++}
+ 
++/* op 1 (restart true) / op 5 (reuse a loaded goodixfp) */
++static int
++milestone(bool restart)
++{
++	const uint64_t t0 = mach_absolute_time();
++
++	LOG("milestone 1b begins (%s)", restart ? "clean TA restart" : "reusing a loaded TA");
++	if (!qsee_up()) {
++		return EIO;
++	}
+ 	int64_t km = qsee_lookup("keymaster64");
+ 	LOG("keymaster64: %s %lld", km > 0 ? "loaded, app id" : km == 0 ? "not loaded" : "lookup failed", km);
+ 	if (km < 0) {
+ 		return EIO;
+ 	}
+-	int64_t id = qsee_lookup("goodixfp");
+-	if (id < 0) {
+-		return EIO;
+-	}
+ 
+ 	/* the crypto engine's clock, as qseecom votes it (core_clk_src: RPM "ce" 0, ce-opp-freq 192 MHz) */
+ 	int ce = topaz_rpm_vote(0, 0x00006563, 0, 0x007a484b, 192000);
+@@ -623,48 +802,22 @@ milestone(void)
+ 		fp_power_off();
+ 		return EIO;
+ 	}
+-	if (id == 0) {
+-		id = ta_start();
+-		if (id <= 0) {
+-			LOG("goodixfp did not start: stop");
+-			fp_power_off();
+-			return ENOEXEC;
+-		}
+-		LOG("goodixfp started: app id %lld", id);
+-	} else {
+-		LOG("goodixfp already loaded: app id %lld", id);
++	int64_t id = ta_ready(restart);
++	if (id <= 0) {
++		LOG("goodixfp not available: stop");
++		fp_power_off();
++		return ENOEXEC;
+ 	}
+ 	q_goodix_id = (uint32_t)id;
+ 	if (!sensor_probe((uint32_t)id)) {
+ 		fp_power_off();
+-		LOG("milestone 1 failed at the sensor (%llu ms); goodixfp stays loaded (op 3 unloads it)", ms_since(t0));
++		LOG("milestone 1b failed at the sensor (%llu ms); goodixfp stays loaded (op 3 unloads it)", ms_since(t0));
+ 		return EIO;
+ 	}
+-	LOG("milestone 1 done in %llu ms: sensor powered, goodixfp app %u (op 2 powers the sensor off)", ms_since(t0), q_goodix_id);
++	LOG("milestone 1b done in %llu ms: sensor powered, goodixfp app %u (op 2 powers the sensor off)", ms_since(t0), q_goodix_id);
+ 	return 0;
+ }
+ 
+-static int
+-shutdown_app(void)
+-{
+-	uint64_t ret[3];
+-
+-	if (!pool_map()) {
+-		return ENOMEM;
+-	}
+-	int64_t id = qsee_lookup("goodixfp");
+-	if (id <= 0) {
+-		return id == 0 ? ENOENT : EIO;
+-	}
+-	uint64_t a[1] = { (uint64_t)id };
+-	int64_t x0 = scm_call(FN_APP_SHUTDOWN, 0x1, a, 1, ret);
+-	bool ok = qsee_finish("APP_SHUTDOWN goodixfp", x0, ret, (uint32_t)id);
+-	if (ok) {
+-		q_goodix_id = 0;
+-	}
+-	return ok ? 0 : EIO;
+-}
+-
+ /* kern.sweet_qsee (bsd/dev/sweet_qsee_ctl.c); op < 0: the last result */
+ extern "C" int
+ sweet_qsee_op(int op)
+@@ -691,15 +844,27 @@ sweet_qsee_op(int op)
+ 	IOLockLock(q_lock);
+ 	switch (op) {
+ 	case 1:
+-		r = milestone();
++		r = milestone(true);
+ 		break;
+ 	case 2:
+ 		fp_power_off();
+ 		r = 0;
+ 		break;
+ 	case 3:
+-		r = shutdown_app();
+-		LOG("APP_SHUTDOWN goodixfp: %d", r);
++		r = qsee_up() ? shutdown_app() : EIO;
++		break;
++	case 4: {
++		/* the TA only: shutdown + start, no sensor commands */
++		r = EIO;
++		if (qsee_up()) {
++			int64_t id = ta_ready(true);
++			r = id > 0 ? 0 : ENOEXEC;
++			LOG("op 4: goodixfp restart: %s (app id %lld)", r == 0 ? "ok" : "FAILED", id);
++		}
++		break;
++	}
++	case 5:
++		r = milestone(false);
+ 		break;
+ 	default:
+ 		r = EINVAL;
