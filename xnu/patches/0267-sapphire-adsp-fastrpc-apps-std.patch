@@ -1,0 +1,834 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0267: apps_std for the sensors PD from a RAM file store
+
+The sensors PD (0266) opens apps_std through remotectl and stats
+/vendor/etc/sensors/sns_reg_config. The reverse calls are now unpacked and
+packed as libadsprpc listener_android does (u32 length per buffer, data
+8-byte aligned) and served: remotectl open of apps_std gets a handle;
+apps_std fopen, fopen_with_env, fread, fwrite, fclose, fseek, ftell, flen,
+feof, fgets, fileExists, opendir/readdir/closedir, stat (31), frename,
+fremove, from files written to kern.sweet_frpc_file ("path NUL bytes",
+RAM only, listed by kern.sweet_frpc_files). Writes by the PD stay in RAM.
+Method numbers and argument sizes from the apps_std skel in Lunaris
+libadsprpc. next2 gets a 48 KB slot.
+---
+--- a/bsd/dev/sweet_qmi_dev.c	2026-10-30 00:35:17.532517000 +0100
++++ b/bsd/dev/sweet_qmi_dev.c	2026-10-30 00:35:58.727984400 +0100
+@@ -346,6 +346,54 @@
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_frpc_log, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_frpc_log, "A", "FastRPC log");
+ 
++/*
++ * 0267: the files the sensors PD reads (apps_std over FastRPC), RAM only: kern.sweet_frpc_file = "path\0bytes"
++ * (full path, e.g. /vendor/etc/sensors/sns_reg_config); kern.sweet_frpc_files lists them.
++ */
++extern int topaz_frpc_file_put(const uint8_t *buf, uint32_t len);
++extern int topaz_frpc_files(char *out, size_t max);
++static int
++sysctl_sweet_frpc_file SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	size_t len = req->newlen;
++	if (req->newptr == USER_ADDR_NULL) {
++		return 0;
++	}
++	if (len < 3 || len > (1u << 20)) {
++		return len < 3 ? EINVAL : EFBIG;
++	}
++	uint8_t *buf = kalloc_data(len, Z_WAITOK);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	int err = SYSCTL_IN(req, buf, len);
++	if (err == 0) {
++		err = topaz_frpc_file_put(buf, (uint32_t)len);
++	}
++	kfree_data(buf, len);
++	return err;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_frpc_file, CTLTYPE_OPAQUE | CTLFLAG_WR | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_frpc_file, "S", "a file for the sensors PD: write path\0bytes (RAM only)");
++
++static int
++sysctl_sweet_frpc_files SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	const size_t max = 128 * 1024;
++	char *buf = kalloc_data(max, Z_WAITOK);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	int n = topaz_frpc_files(buf, max);
++	int err = SYSCTL_OUT(req, buf, (size_t)(n > 0 ? n : 0) + 1);
++	kfree_data(buf, max);
++	return err;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_frpc_files, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_frpc_files, "A", "the sensors PD's RAM files");
++
+ /* 0226: IP packets to and from the modem through the IPA (qmitool ping) */
+ extern int topaz_ipa_tx(const uint8_t *pkt, uint32_t len, uint8_t mux);
+ extern int topaz_ipa_rx(uint8_t *out, uint32_t max);
+--- a/iokit/Kernel/arm/TopazModem.cpp	2026-10-30 00:35:17.520302700 +0100
++++ b/iokit/Kernel/arm/TopazModem.cpp	2026-10-30 00:35:58.716691200 +0100
+@@ -12659,7 +12659,7 @@
+ 	sweet_audio_done = sweet_audio_seq;
+ }
+ 
+-/* ---------------- FastRPC to the ADSP's sensors PD (0265, 0266) */
++/* ---------------- FastRPC to the ADSP's sensors PD (0265-0267) */
+ 
+ #include <stdarg.h>
+ 
+@@ -12686,11 +12686,13 @@
+ #define FR_SID          0x1c3u
+ #define FR_SID_BITS     ((uint64_t)(FR_SID & 0xf) << 32)
+ #define FR_MEM_OFF      (MODEM_POOL_SIZE - 0x50000)
+-#define FR_SLOTS        4
+-#define FR_SLOT_SIZE    0x4000u
++#define FR_SLOTS        2
++#define FR_SLOT_OFF(s)  ((s) == 1 ? 0u : 0x4000u)     /* 0267: slot 1 16 KB, slot 2 (next2) 48 KB */
++#define FR_SLOT_LEN(s)  ((s) == 1 ? 0x4000u : 0xC000u)
+ #define FR_PD_SENSORS   2
+ #define FR_TGID         0x5e0
+-#define FR_BUFS         0x2000u                 /* next2's receive buffer */
++#define FR_BUFS         0x4000u                 /* next2's receive buffer */
++#define FR_PREV_MAX     0x6000u                 /* next2's answer (the out-buffers) */
+ #define FR_SC(m, in, out) ((((uint32_t)(m) & 0x1f) << 24) | (((uint32_t)(in) & 0xff) << 16) | (((uint32_t)(out) & 0xff) << 8))
+ #define FR_UNSUPPORTED  20                      /* AEE_EUNSUPPORTED */
+ 
+@@ -12710,7 +12712,7 @@
+ static volatile bool fr_started;
+ static unsigned fr_auto, fr_unmatched, fr_calls;
+ static IOLock *fr_log_lock;
+-static char fr_log[12288];
++static char fr_log[32768];
+ static uint32_t fr_log_n;
+ 
+ static void
+@@ -12787,8 +12789,8 @@
+     const uint32_t *outlen)
+ {
+ 	uint32_t nin = (sc >> 16) & 0xff, nout = (sc >> 8) & 0xff, n = nin + nout;
+-	uint8_t *b = fr_va + (s - 1) * FR_SLOT_SIZE;
+-	uint64_t pa = fr_pa + (s - 1) * FR_SLOT_SIZE;
++	uint8_t *b = fr_va + FR_SLOT_OFF(s);
++	uint64_t pa = fr_pa + FR_SLOT_OFF(s);
+ 	uint32_t meta = n * (uint32_t)(sizeof(struct fr_rarg) + sizeof(struct fr_ibuf) + sizeof(struct fr_page)) + 16 * 8 + 64 * 4;
+ 	struct fr_rarg *ra = (struct fr_rarg *)b;
+ 	struct fr_ibuf *il = (struct fr_ibuf *)(b + sizeof(struct fr_rarg) * n);
+@@ -12810,7 +12812,7 @@
+ 			continue;
+ 		}
+ 		at = (at + 127) & ~127u;
+-		if (at + len > FR_SLOT_SIZE) {
++		if (at + len > FR_SLOT_LEN(s)) {
+ 			fr_logf("invoke %x: %u bytes do not fit", sc, at + len);
+ 			return false;
+ 		}
+@@ -12856,7 +12858,7 @@
+ static const uint8_t *
+ fr_out(unsigned s, uint32_t i)
+ {
+-	return fr_va + (s - 1) * FR_SLOT_SIZE + fr_slot[s - 1].off[i];
++	return fr_va + FR_SLOT_OFF(s) + fr_slot[s - 1].off[i];
+ }
+ 
+ /* 0266: what the channel and the SMMU say when a call gets no answer */
+@@ -12889,17 +12891,608 @@
+ static int32_t fr_prev_result;
+ static unsigned fr_reverse, fr_next2_posts;
+ 
++static uint8_t fr_rbuf[FR_BUFS], fr_pbuf[FR_PREV_MAX];
++static uint32_t fr_plen;
++
+ static bool
+ fr_next2(void)
+ {
+-	uint32_t prim_in[4] = { fr_prev_ctx, (uint32_t)fr_prev_result, 0, FR_BUFS };
+-	const void *in[2] = { prim_in, NULL };
+-	uint32_t inlen[2] = { sizeof(prim_in), 0 }, outlen[2] = { 16, FR_BUFS };
++	uint32_t prim_in[4] = { fr_prev_ctx, (uint32_t)fr_prev_result, fr_plen, FR_BUFS };
++	const void *in[2] = { prim_in, fr_pbuf };
++	uint32_t inlen[2] = { sizeof(prim_in), fr_plen }, outlen[2] = { 16, FR_BUFS };
+ 	fr_next2_posts++;
+ 	return fr_post(2, false, FR_LISTENER, FR_SC(4, 2, 2), in, inlen, outlen);
+ }
+ 
+-/* a finished next2: log the reverse call, answer it "unsupported", post the next one */
++/*
++ * 0267: the files the sensors PD reads through reverse calls (apps_std), from a RAM store filled
++ * from user space (kern.sweet_frpc_file = "path\0bytes", full paths such as
++ * /vendor/etc/sensors/sns_reg_config or /mnt/vendor/persist/sensors/registry/registry/<group>).
++ * Directories are what the stored paths imply. The PD's writes (registry updates) stay in RAM:
++ * no partition is ever touched.
++ */
++#define FS_MAX          1536
++#define FS_PATH         160
++#define FS_BYTES_MAX    (16u << 20)
++#define FS_FILES        64
++#define FS_DIRS         16
++#define FR_H_STD        0x5d0                   /* our handle for apps_std */
++#define FR_EFAIL        1                       /* AEE_EFAILED */
++
++struct fs_ent { char path[FS_PATH]; uint8_t *data; uint32_t size, cap; bool written; };
++static struct fs_ent *fs_tab;
++static unsigned fs_n;
++static uint32_t fs_bytes;
++static IOLock *fs_lock;
++static struct { int ent; uint32_t pos; bool used, wr; } fs_fh[FS_FILES];
++static struct { char path[FS_PATH]; unsigned cursor; bool used; } fs_dh[FS_DIRS];
++static unsigned fs_reads, fs_writes, fs_misses;
++
++static int
++fs_find(const char *path)
++{
++	for (unsigned i = 0; i < fs_n; i++) {
++		if (strcmp(fs_tab[i].path, path) == 0) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++/* fs_lock held: a file's bytes replaced (or a new file) */
++static int
++fs_put_locked(const char *path, const uint8_t *data, uint32_t len, bool written)
++{
++	if (fs_tab == NULL) {
++		fs_tab = (struct fs_ent *)IOMalloc(FS_MAX * sizeof(struct fs_ent));
++		if (fs_tab == NULL) {
++			return ENOMEM;
++		}
++		bzero(fs_tab, FS_MAX * sizeof(struct fs_ent));
++	}
++	if (strlen(path) >= FS_PATH || path[0] != '/') {
++		return EINVAL;
++	}
++	int i = fs_find(path);
++	if (i < 0) {
++		if (fs_n >= FS_MAX) {
++			return ENOSPC;
++		}
++		i = (int)fs_n++;
++		strlcpy(fs_tab[i].path, path, FS_PATH);
++	}
++	struct fs_ent *e = &fs_tab[i];
++	uint32_t cap = MAX(len, 64u);
++	if (e->cap < len || e->data == NULL) {
++		if (fs_bytes + cap > FS_BYTES_MAX) {
++			return EFBIG;
++		}
++		uint8_t *d = (uint8_t *)IOMalloc(cap);
++		if (d == NULL) {
++			return ENOMEM;
++		}
++		if (e->data != NULL) {
++			IOFree(e->data, e->cap);
++			fs_bytes -= e->cap;
++		}
++		e->data = d;
++		e->cap = cap;
++		fs_bytes += cap;
++	}
++	if (len != 0) {
++		memcpy(e->data, data, len);
++	}
++	e->size = len;
++	e->written = written;
++	return 0;
++}
++
++/* fs_lock held: grow a file for a write at pos */
++static bool
++fs_grow_locked(struct fs_ent *e, uint32_t need)
++{
++	if (need <= e->cap) {
++		return true;
++	}
++	uint32_t cap = MAX(need, e->cap * 2);
++	if (fs_bytes + cap - e->cap > FS_BYTES_MAX) {
++		return false;
++	}
++	uint8_t *d = (uint8_t *)IOMalloc(cap);
++	if (d == NULL) {
++		return false;
++	}
++	bzero(d, cap);
++	if (e->data != NULL) {
++		memcpy(d, e->data, e->size);
++		IOFree(e->data, e->cap);
++	}
++	fs_bytes += cap - e->cap;
++	e->data = d;
++	e->cap = cap;
++	return true;
++}
++
++extern "C" int
++topaz_frpc_file_put(const uint8_t *buf, uint32_t len)
++{
++	uint32_t nl = (uint32_t)strnlen((const char *)buf, MIN(len, (uint32_t)FS_PATH));
++	if (nl == 0 || nl >= len || nl >= FS_PATH) {
++		return EINVAL;
++	}
++	IOLock *l = a_lock_get(&fs_lock);
++	IOLockLock(l);
++	int err = fs_put_locked((const char *)buf, buf + nl + 1, len - nl - 1, false);
++	IOLockUnlock(l);
++	return err;
++}
++
++/* kern.sweet_frpc_files: "size path" lines (w: written by the PD) */
++extern "C" int
++topaz_frpc_files(char *out, size_t max)
++{
++	size_t n = 0;
++	IOLock *l = a_lock_get(&fs_lock);
++	IOLockLock(l);
++	n += snprintf(out + n, max - n, "%u files, %u bytes; PD reads %u writes %u misses %u\n", fs_n, fs_bytes, fs_reads,
++	    fs_writes, fs_misses);
++	for (unsigned i = 0; i < fs_n && n + FS_PATH + 24 < max; i++) {
++		n += snprintf(out + n, max - n, "%u%s %s\n", fs_tab[i].size, fs_tab[i].written ? "w" : "", fs_tab[i].path);
++	}
++	IOLockUnlock(l);
++	return (int)n;
++}
++
++/* a path as the PD gives it: no trailing slash, no double slashes */
++static void
++fs_norm(char *dst, const uint8_t *src, uint32_t len)
++{
++	uint32_t n = 0;
++	for (uint32_t i = 0; i < len && src[i] != 0 && n + 1 < FS_PATH; i++) {
++		if (src[i] == '/' && n > 0 && dst[n - 1] == '/') {
++			continue;
++		}
++		dst[n++] = (char)src[i];
++	}
++	while (n > 1 && dst[n - 1] == '/') {
++		n--;
++	}
++	dst[n] = 0;
++}
++
++/* is there anything under dir/ ? */
++static bool
++fs_is_dir_locked(const char *dir)
++{
++	size_t dl = strlen(dir);
++	for (unsigned i = 0; i < fs_n; i++) {
++		if (strncmp(fs_tab[i].path, dir, dl) == 0 && fs_tab[i].path[dl] == '/') {
++			return true;
++		}
++	}
++	return dl == 1 && fs_n > 0;                 /* "/" */
++}
++
++/* the child of dir that entry i is under (a file or a subdirectory), or NULL */
++static const char *
++fs_child(const char *dir, unsigned i, size_t *clen)
++{
++	size_t dl = strcmp(dir, "/") == 0 ? 0 : strlen(dir);
++	const char *p = fs_tab[i].path;
++	if (strncmp(p, dir, dl) != 0 || p[dl] != '/') {
++		return NULL;
++	}
++	p += dl + 1;
++	const char *slash = strchr(p, '/');
++	*clen = slash != NULL ? (size_t)(slash - p) : strlen(p);
++	return p;
++}
++
++static uint32_t u32_at(const uint8_t *p, unsigned i) { uint32_t v; memcpy(&v, p + 4 * i, 4); return v; }
++static void put32(uint8_t *p, unsigned i, uint32_t v) { memcpy(p + 4 * i, &v, 4); }
++
++/* a reverse call, its arguments unpacked */
++struct fr_rev {
++	uint32_t handle, sc, method, nin, nout;
++	const uint8_t *in[16];
++	uint32_t inl[16];
++	uint8_t *out[16];
++	uint32_t outl[16];
++};
++
++static unsigned fr_std_logged;
++
++#define STDLOG(...) do { if (fr_std_logged++ < 400) fr_logf(__VA_ARGS__); } while (0)
++
++/* apps_remotectl (handle 0): open / close */
++static int
++fr_remotectl(struct fr_rev *r)
++{
++	char name[64] = "";
++	if (r->method == 0 && r->nin >= 2 && r->nout >= 1 && r->outl[0] >= 8) {
++		fs_norm(name, r->in[1], MIN(r->inl[1], (uint32_t)sizeof(name)));
++		bool std = strcmp(name, "apps_std") == 0;
++		put32(r->out[0], 0, std ? FR_H_STD : 0);
++		put32(r->out[0], 1, std ? 0 : FR_UNSUPPORTED);
++		STDLOG("remotectl open \"%s\" -> %s", name, std ? "apps_std" : "not here");
++		return 0;
++	}
++	if (r->method == 1) {
++		STDLOG("remotectl close 0x%x", r->nin >= 1 && r->inl[0] >= 4 ? u32_at(r->in[0], 0) : 0);
++		return 0;
++	}
++	fr_logf("remotectl method %u: not here", r->method);
++	return FR_UNSUPPORTED;
++}
++
++static int
++fs_open_locked(const char *path, const char *mode, uint32_t *fh)
++{
++	bool wr = strchr(mode, 'w') != NULL || strchr(mode, 'a') != NULL || strchr(mode, '+') != NULL;
++	int e = fs_find(path);
++	if (e < 0 && !wr) {
++		fs_misses++;
++		return FR_EFAIL;
++	}
++	if (e < 0 || strchr(mode, 'w') != NULL) {
++		if (fs_put_locked(path, NULL, 0, true) != 0) {
++			return FR_EFAIL;
++		}
++		e = fs_find(path);
++	}
++	for (unsigned k = 0; k < FS_FILES; k++) {
++		if (!fs_fh[k].used) {
++			fs_fh[k].used = true;
++			fs_fh[k].ent = e;
++			fs_fh[k].wr = wr;
++			fs_fh[k].pos = strchr(mode, 'a') != NULL ? fs_tab[e].size : 0;
++			*fh = k + 1;
++			return 0;
++		}
++	}
++	return FR_EFAIL;
++}
++
++static struct fs_ent *
++fs_fh_ent(uint32_t fh, unsigned *k)
++{
++	if (fh == 0 || fh > FS_FILES || !fs_fh[fh - 1].used) {
++		return NULL;
++	}
++	*k = fh - 1;
++	return &fs_tab[fs_fh[fh - 1].ent];
++}
++
++/* apps_std (Lunaris libadsprpc's skel: methods 0-30, 31+ through method 31 with the id first) */
++static int
++fr_std_locked(struct fr_rev *r)
++{
++	char path[FS_PATH], mode[8], path2[FS_PATH];
++	const uint8_t *pin = r->nin >= 1 ? r->in[0] : NULL;
++	uint32_t pl = r->nin >= 1 ? r->inl[0] : 0, m = r->method;
++	unsigned k;
++	struct fs_ent *e;
++
++	if (m == 31 && pl >= 4) {                   /* extended: the method id is the first word */
++		m = u32_at(pin, 0);
++		pin += 4;
++		pl -= 4;
++	}
++#define NEED(ni, no) do { if (r->nin < (ni) || r->nout < (no)) { fr_logf("apps_std %u: in %u out %u", m, r->nin, r->nout); return FR_EFAIL; } } while (0)
++	switch (m) {
++	case 0:                                     /* fopen(name, mode, rout FILE) */
++	case 19: {                                  /* fopen_with_env(env, delim, name, mode, rout FILE) */
++		unsigned ni = m == 0 ? 1 : 3;
++		NEED(ni + 2, 1);
++		uint32_t fh = 0;
++		fs_norm(path, r->in[ni], r->inl[ni]);
++		fs_norm(mode, r->in[ni + 1], MIN(r->inl[ni + 1], (uint32_t)sizeof(mode)));
++		int rv = fs_open_locked(path, mode, &fh);
++		put32(r->out[0], 0, fh);
++		STDLOG("std fopen%s \"%s\" \"%s\" -> %s", m == 19 ? "_with_env" : "", path, mode, rv == 0 ? "ok" : "missing");
++		return rv;
++	}
++	case 2:                                     /* fflush */
++	case 23:                                    /* fsync */
++		return 0;
++	case 3:                                     /* fclose(FILE) */
++		if (pl >= 4 && (e = fs_fh_ent(u32_at(pin, 0), &k)) != NULL) {
++			if (fs_fh[k].wr) {
++				STDLOG("std fclose \"%s\": %u bytes written (RAM)", e->path, e->size);
++			}
++			fs_fh[k].used = false;
++		}
++		return 0;
++	case 4: {                                   /* fread(FILE, rout buf, rout bytesRead, rout eof) */
++		NEED(1, 2);
++		if (pl < 8 || (e = fs_fh_ent(u32_at(pin, 0), &k)) == NULL || r->outl[0] < 8) {
++			return FR_EFAIL;
++		}
++		uint32_t want = MIN(u32_at(pin, 1), r->outl[1]), pos = fs_fh[k].pos;
++		uint32_t n = pos < e->size ? MIN(want, e->size - pos) : 0;
++		memcpy(r->out[1], e->data + pos, n);
++		fs_fh[k].pos += n;
++		put32(r->out[0], 0, n);
++		put32(r->out[0], 1, fs_fh[k].pos >= e->size);
++		fs_reads++;
++		return 0;
++	}
++	case 5: {                                   /* fwrite(FILE, buf, rout written, rout error) */
++		NEED(2, 1);
++		if (pl < 4 || (e = fs_fh_ent(u32_at(pin, 0), &k)) == NULL || !fs_fh[k].wr || r->outl[0] < 8) {
++			return FR_EFAIL;
++		}
++		uint32_t n = r->inl[1], pos = fs_fh[k].pos;
++		if (!fs_grow_locked(e, pos + n)) {
++			return FR_EFAIL;
++		}
++		memcpy(e->data + pos, r->in[1], n);
++		fs_fh[k].pos += n;
++		e->size = MAX(e->size, pos + n);
++		e->written = true;
++		put32(r->out[0], 0, n);
++		put32(r->out[0], 1, 0);
++		fs_writes++;
++		return 0;
++	}
++	case 8:                                     /* ftell(FILE, rout pos) */
++		NEED(1, 1);
++		if (pl < 4 || (e = fs_fh_ent(u32_at(pin, 0), &k)) == NULL) {
++			return FR_EFAIL;
++		}
++		put32(r->out[0], 0, fs_fh[k].pos);
++		return 0;
++	case 9: {                                   /* fseek(FILE, offset, whence) */
++		if (pl < 12 || (e = fs_fh_ent(u32_at(pin, 0), &k)) == NULL) {
++			return FR_EFAIL;
++		}
++		int32_t off = (int32_t)u32_at(pin, 1);
++		uint32_t wh = u32_at(pin, 2);
++		int64_t base = wh == 0 ? 0 : wh == 1 ? (int64_t)fs_fh[k].pos : (int64_t)e->size;
++		if (base + off < 0) {
++			return FR_EFAIL;
++		}
++		fs_fh[k].pos = (uint32_t)(base + off);
++		return 0;
++	}
++	case 10: {                                  /* flen(FILE, rout uint64 len) */
++		NEED(1, 1);
++		if (pl < 4 || (e = fs_fh_ent(u32_at(pin, 0), &k)) == NULL || r->outl[0] < 8) {
++			return FR_EFAIL;
++		}
++		uint64_t len = e->size;
++		memcpy(r->out[0], &len, 8);
++		return 0;
++	}
++	case 11:                                    /* rewind(FILE) */
++		if (pl >= 4 && (e = fs_fh_ent(u32_at(pin, 0), &k)) != NULL) {
++			fs_fh[k].pos = 0;
++		}
++		return 0;
++	case 12:                                    /* feof(FILE, rout eof) */
++		NEED(1, 1);
++		if (pl < 4 || (e = fs_fh_ent(u32_at(pin, 0), &k)) == NULL) {
++			return FR_EFAIL;
++		}
++		put32(r->out[0], 0, fs_fh[k].pos >= e->size);
++		return 0;
++	case 13:                                    /* ferror */
++		NEED(1, 1);
++		put32(r->out[0], 0, 0);
++		return 0;
++	case 14:                                    /* clearerr */
++		return 0;
++	case 20: {                                  /* fgets(FILE, rout buf, rout eof) */
++		NEED(1, 2);
++		if (pl < 8 || (e = fs_fh_ent(u32_at(pin, 0), &k)) == NULL || r->outl[1] == 0) {
++			return FR_EFAIL;
++		}
++		uint32_t cap = r->outl[1], pos = fs_fh[k].pos, n = 0;
++		while (n + 1 < cap && pos < e->size) {
++			uint8_t c = e->data[pos++];
++			r->out[1][n++] = c;
++			if (c == '\n') {
++				break;
++			}
++		}
++		r->out[1][n] = 0;
++		fs_fh[k].pos = pos;
++		put32(r->out[0], 0, pos >= e->size);
++		fs_reads++;
++		return 0;
++	}
++	case 22: {                                  /* fileExists(path, rout exists) */
++		NEED(2, 1);
++		fs_norm(path, r->in[1], r->inl[1]);
++		bool ex = fs_find(path) >= 0 || fs_is_dir_locked(path);
++		put32(r->out[0], 0, ex);
++		STDLOG("std fileExists \"%s\" -> %u", path, ex);
++		return 0;
++	}
++	case 24:                                    /* fremove(path) */
++		if (r->nin >= 2) {
++			fs_norm(path, r->in[1], r->inl[1]);
++			int i = fs_find(path);
++			STDLOG("std fremove \"%s\" (%s, RAM only)", path, i >= 0 ? "there" : "missing");
++			if (i >= 0) {
++				fs_tab[i].size = 0;
++				fs_tab[i].path[0] = '#';        /* hidden */
++			}
++		}
++		return 0;
++	case 26: {                                  /* opendir(path, rout DIR (u64)) */
++		NEED(2, 1);
++		fs_norm(path, r->in[1], r->inl[1]);
++		if (!fs_is_dir_locked(path) || r->outl[0] < 8) {
++			STDLOG("std opendir \"%s\" -> missing", path);
++			fs_misses++;
++			return FR_EFAIL;
++		}
++		for (k = 0; k < FS_DIRS; k++) {
++			if (!fs_dh[k].used) {
++				fs_dh[k].used = true;
++				fs_dh[k].cursor = 0;
++				strlcpy(fs_dh[k].path, path, FS_PATH);
++				uint64_t h = k + 1;
++				memcpy(r->out[0], &h, 8);
++				STDLOG("std opendir \"%s\" -> dir %u", path, k + 1);
++				return 0;
++			}
++		}
++		return FR_EFAIL;
++	}
++	case 27: {                                  /* closedir(DIR) */
++		uint64_t h = 0;
++		if (pl >= 8) {
++			memcpy(&h, pin, 8);
++		}
++		if (h >= 1 && h <= FS_DIRS) {
++			fs_dh[h - 1].used = false;
++		}
++		return 0;
++	}
++	case 28: {                                  /* readdir(DIR, rout {int ino; char name[255]}, rout eof) */
++		NEED(1, 1);
++		uint64_t h = 0;
++		if (pl >= 8) {
++			memcpy(&h, pin, 8);
++		}
++		if (h < 1 || h > FS_DIRS || !fs_dh[h - 1].used || r->outl[0] < 264) {
++			return FR_EFAIL;
++		}
++		bzero(r->out[0], 264);
++		const char *dir = fs_dh[h - 1].path;
++		for (unsigned i = fs_dh[h - 1].cursor; i < fs_n; i++) {
++			size_t cl;
++			const char *c = fs_child(dir, i, &cl);
++			if (c == NULL || cl == 0 || cl > 254) {
++				continue;
++			}
++			bool seen = false;                  /* a subdirectory: only its first entry counts */
++			for (unsigned j = 0; j < i && !seen; j++) {
++				size_t cl2;
++				const char *c2 = fs_child(dir, j, &cl2);
++				seen = c2 != NULL && cl2 == cl && strncmp(c, c2, cl) == 0;
++			}
++			if (seen) {
++				continue;
++			}
++			fs_dh[h - 1].cursor = i + 1;
++			put32(r->out[0], 0, i + 1);
++			memcpy(r->out[0] + 4, c, cl);
++			return 0;
++		}
++		fs_dh[h - 1].cursor = fs_n;
++		put32(r->out[0], 65, 1);                    /* eof at byte 260 */
++		return 0;
++	}
++	case 29:                                    /* mkdir */
++	case 32:                                    /* ftrunc */
++		return 0;
++	case 31: {                                  /* stat(path, rout apps_std_STAT, 96 bytes) */
++		NEED(2, 1);
++		fs_norm(path, r->in[1], r->inl[1]);
++		int i = fs_find(path);
++		bool dir = i < 0 && fs_is_dir_locked(path);
++		STDLOG("std stat \"%s\" -> %s", path, i >= 0 ? "file" : dir ? "dir" : "missing");
++		if ((i < 0 && !dir) || r->outl[0] < 96) {
++			fs_misses++;
++			return FR_EFAIL;
++		}
++		uint8_t *s = r->out[0];
++		bzero(s, 96);
++		uint64_t ino = (uint64_t)(i + 1), size = i >= 0 ? fs_tab[i].size : 0;
++		uint32_t mod = dir ? 040755 : 0100644, nlink = 1;
++		memcpy(s + 16, &ino, 8);
++		memcpy(s + 24, &mod, 4);
++		memcpy(s + 28, &nlink, 4);
++		memcpy(s + 40, &size, 8);
++		return 0;
++	}
++	case 33:                                    /* frename(old, new): primIn {lenOld, lenNew} */
++		if (r->nin >= 3) {
++			fs_norm(path, r->in[1], r->inl[1]);
++			fs_norm(path2, r->in[2], r->inl[2]);
++			int i = fs_find(path), j = fs_find(path2);
++			STDLOG("std frename \"%s\" -> \"%s\" (RAM only)", path, path2);
++			if (i < 0) {
++				return FR_EFAIL;
++			}
++			if (j >= 0 && j != i) {
++				fs_tab[j].path[0] = '#';
++			}
++			strlcpy(fs_tab[i].path, path2, FS_PATH);
++			return 0;
++		}
++		return FR_EFAIL;
++	default:
++		break;
++	}
++#undef NEED
++	fr_logf("apps_std method %u (in %u out %u): not here", m, r->nin, r->nout);
++	return FR_UNSUPPORTED;
++}
++
++/* unpack (listener_android: per in-buffer u32 length, then the data 8-aligned; per out-buffer u32 length) */
++static bool
++fr_unpack(struct fr_rev *r, const uint8_t *b, uint32_t n)
++{
++	uint32_t off = 0;
++	if (r->nin > 16 || r->nout > 16) {
++		return false;
++	}
++	for (uint32_t i = 0; i < r->nin; i++) {
++		if (off + 4 > n) {
++			return false;
++		}
++		uint32_t len = u32_at(b + off, 0);
++		off += 4;
++		if (len != 0) {
++			off = (off + 7) & ~7u;
++		}
++		if (off + len > n) {
++			return false;
++		}
++		r->in[i] = b + off;
++		r->inl[i] = len;
++		off += len;
++	}
++	for (uint32_t i = 0; i < r->nout; i++) {
++		if (off + 4 > n) {
++			return false;
++		}
++		r->outl[i] = u32_at(b + off, 0);
++		off += 4;
++	}
++	return off == n;
++}
++
++/* lay the out-buffers out the same way (u32 length, data 8-aligned); returns the packed length, ~0 if it does not fit */
++static uint32_t
++fr_pack_outs(struct fr_rev *r, uint8_t *p, uint32_t cap)
++{
++	uint32_t off = 0;
++	for (uint32_t i = 0; i < r->nout; i++) {
++		uint32_t len = r->outl[i];
++		if (off + 4 > cap) {
++			return ~0u;
++		}
++		put32(p + off, 0, len);
++		off += 4;
++		if (len != 0) {
++			off = (off + 7) & ~7u;
++		}
++		if (off + len > cap) {
++			return ~0u;
++		}
++		r->out[i] = p + off;
++		bzero(p + off, len);
++		off += len;
++	}
++	return off;
++}
++
++/* a finished next2: the reverse call served (apps_remotectl, apps_std), its answer goes with the next next2 */
+ static void
+ fr_service(void)
+ {
+@@ -12910,6 +13503,10 @@
+ 	int32_t rv = fr_slot[1].retval;
+ 	uint32_t po[4];
+ 	memcpy(po, fr_out(2, 2), 16);
++	uint32_t blen = MIN(po[3], FR_BUFS);
++	if (rv == 0) {
++		memcpy(fr_rbuf, fr_out(2, 3), blen);
++	}
+ 	fr_release(2);
+ 	if (rv == 0x2e) {                           /* interrupted: the same call again (listener_android) */
+ 		(void)fr_next2();
+@@ -12924,21 +13521,45 @@
+ 		}
+ 		fr_prev_ctx = 0;
+ 		fr_prev_result = 0;
++		fr_plen = 0;
+ 		(void)fr_next2();
+ 		return;
+ 	}
+-	uint32_t blen = MIN(po[3], FR_BUFS);
+-	fr_logf("reverse call %u: ctx 0x%x handle 0x%x sc 0x%08x (method %u, in %u, out %u), in-args %u bytes",
+-	    fr_reverse, po[0], po[1], po[2], (po[2] >> 24) & 0x1f, (po[2] >> 16) & 0xff, (po[2] >> 8) & 0xff, po[3]);
+-	if (fr_reverse < 64) {
+-		fr_dump("  in-args", fr_out(2, 3), blen);
++	struct fr_rev r;
++	bzero(&r, sizeof(r));
++	r.handle = po[1];
++	r.sc = po[2];
++	r.method = (po[2] >> 24) & 0x1f;
++	r.nin = (po[2] >> 16) & 0xff;
++	r.nout = (po[2] >> 8) & 0xff;
++	int result = FR_UNSUPPORTED;
++	fr_plen = 0;
++	if (po[3] > FR_BUFS || !fr_unpack(&r, fr_rbuf, po[3])) {
++		fr_logf("reverse call %u: handle 0x%x sc 0x%08x: %u bytes of arguments not understood", fr_reverse, po[1], po[2],
++		    po[3]);
++		fr_dump("  in-args", fr_rbuf, blen);
++	} else if ((fr_plen = fr_pack_outs(&r, fr_pbuf, sizeof(fr_pbuf))) == ~0u) {
++		fr_logf("reverse call %u: handle 0x%x sc 0x%08x: out-buffers too big", fr_reverse, po[1], po[2]);
++		fr_plen = 0;
++	} else if (r.handle == 0) {
++		result = fr_remotectl(&r);
++	} else if (r.handle == FR_H_STD) {
++		IOLock *l = a_lock_get(&fs_lock);
++		IOLockLock(l);
++		result = fs_tab != NULL ? fr_std_locked(&r) : FR_EFAIL;
++		IOLockUnlock(l);
++		if (fs_tab == NULL) {
++			fr_logf("apps_std: no files loaded (kern.sweet_frpc_file)");
++		}
++	} else {
++		fr_logf("reverse call %u: handle 0x%x sc 0x%08x (method %u, in %u, out %u): not here", fr_reverse, po[1], po[2],
++		    r.method, r.nin, r.nout);
++		fr_dump("  in-args", fr_rbuf, blen);
+ 	}
+ 	fr_reverse++;
+ 	fr_prev_ctx = po[0];
+-	fr_prev_result = FR_UNSUPPORTED;
+-	if (fr_reverse < 1024) {
+-		(void)fr_next2();
+-	}
++	fr_prev_result = result;
++	(void)fr_next2();
+ }
+ 
+ /* waits for slot s, serving reverse calls meanwhile (a call may need them: a skel loaded through apps_std) */
+@@ -13011,7 +13632,7 @@
+ 	}
+ 	fr_va = pool + FR_MEM_OFF;
+ 	fr_pa = MODEM_POOL_BASE + FR_MEM_OFF;
+-	bzero(fr_va, FR_SLOTS * FR_SLOT_SIZE);
++	bzero(fr_va, 0x10000);
+ 	if (!smmu_identity(FR_SID, 0, "fastrpc (ADSP compute cb 0x1c3)")) {
+ 		fr_logf("no SMMU stream 0x%x", FR_SID);
+ 		fr_state = -2;
+@@ -13059,7 +13680,7 @@
+ 			fr_release(1);
+ 		}
+ 	}
+-	fr_logf("serving reverse calls (answered unsupported)");
++	fr_logf("serving reverse calls (apps_std from the RAM file store)");
+ 	for (unsigned t = 0; fr_state == 2; t++) {
+ 		fr_service();
+ 		IOSleep(2);
