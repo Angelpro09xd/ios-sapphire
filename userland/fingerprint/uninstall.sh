@@ -1,7 +1,8 @@
 #!/bin/bash
 # uninstall.sh [--restore-backup] [PHONE]: fingerprint unlock off the phone, from WSL.
 #   stops com.sapphire.fpd, takes its job out of launchd's cache (fpd-launchd.py remove: every other job is
-#   kept as it is now), removes the tweak and /redwood/bin/fpd + /redwood/share/fpd, restarts SpringBoard.
+#   kept as it is now), removes both tweaks, the Huella app, /redwood/bin/fpd (+ fpctl ...) and
+#   /redwood/share/fpd, restarts SpringBoard.
 #   --restore-backup: puts back launchd.plist.pre-fpd (the cache from before the first install) instead of
 #   editing the current one -- only if no other job was added to the cache since.
 # /var/root/fp (the user's calibration and template copies) and /var/root/fpload, fpsave are never touched.
@@ -18,7 +19,12 @@ ssh $O $P /var/jb/bin/bash -s <<'EOF'
 export PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin
 launchctl bootout system/com.sapphire.fpd 2>/dev/null || launchctl remove com.sapphire.fpd 2>/dev/null || true
 killall fpd 2>/dev/null || true
-rm -f /var/jb/usr/lib/TweakInject/SapphireFingerprint.dylib /var/jb/usr/lib/TweakInject/SapphireFingerprint.plist
+rm -f /var/jb/usr/lib/TweakInject/SapphireFingerprint.dylib* /var/jb/usr/lib/TweakInject/SapphireFingerprint.plist
+rm -f /var/jb/usr/lib/TweakInject/SapphireFingerprintSettings.dylib* /var/jb/usr/lib/TweakInject/SapphireFingerprintSettings.plist
+h=$(ls -d /var/containers/Bundle/Application/*/TrollStore.app/trollstorehelper 2>/dev/null | head -1)
+[ -n "$h" ] && "$h" uninstall com.sapphire.fingerprint 2>/dev/null && echo "Huella app removed (TrollStore)"
+if [ -d /Applications/Huella.app ]; then uicache -u /Applications/Huella.app 2>/dev/null; rm -rf /Applications/Huella.app; echo "Huella app removed (/Applications)"; fi
+rm -f /var/run/fpd.sock
 EOF
 
 if [ $restore = 1 ]; then
@@ -49,7 +55,7 @@ fi
 
 ssh $O $P /var/jb/bin/bash -s <<'EOF'
 export PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin
-rm -f /redwood/bin/fpd /redwood/bin/fpload /redwood/bin/fpsave
+rm -f /redwood/bin/fpd /redwood/bin/fpd.prev /redwood/bin/fpload /redwood/bin/fpsave /redwood/bin/fpctl
 rm -rf /redwood/share/fpd
 killall -9 SpringBoard 2>/dev/null || true
 echo "uninstalled (SpringBoard restarted without the tweak)"
