@@ -1,0 +1,59 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0264: /dev/redwood-qmi reaches the ADSP node
+
+qmi_user_send() still dropped every userland QMI message not addressed to the
+modem node (silently), so SNS_CLIENT on the ADSP (node 5) never saw a
+request. Messages to the ADSP node now go out through qrtr_send(), which picks
+the ADSP edge by node, and a closing client gets QRTR DEL_CLIENT on the ADSP
+node too, so its sensor streams stop. Other nodes are dropped with a log line.
+---
+--- a/iokit/Kernel/arm/TopazModem.cpp	2026-10-29 23:59:56.962387560 +0100
++++ b/iokit/Kernel/arm/TopazModem.cpp	2026-10-29 23:59:56.999000974 +0100
+@@ -480,6 +480,7 @@
+ static void svc_announce(void);
+ static bool adsp_qrtr_send(uint32_t dst_node, const uint8_t *pkt, uint32_t len);
+ static uint32_t adsp_qrtr_version(uint32_t dst_node);
++static uint32_t adsp_node(void);
+ static void svc_summary(void);
+ /* sapphire 0220: /dev/redwood-qmi (bsd/dev/sweet_qmi_dev.c), QMI for userland */
+ extern "C" int sweet_qmi_deliver(uint32_t dst_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t len);
+@@ -8885,13 +8886,24 @@
+ static void
+ qmi_user_send(uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len, int ctrl)
+ {
++	uint32_t an = adsp_node();
+ 	if (ctrl) {
+ 		struct qrtr_ctrl c = { QRTR_TYPE_DEL_CLIENT, QRTR_NODE_APPS, src_port, 0, 0 };
+ 		qrtr_send(QRTR_TYPE_DEL_CLIENT, QRTR_PORT_CTRL, q_modem_node, QRTR_PORT_CTRL, &c, sizeof(c));
++		if (an != QRTR_NODE_BCAST) {
++			/* 0264: the ADSP's services (SNS_CLIENT) drop the client's streams too */
++			qrtr_send(QRTR_TYPE_DEL_CLIENT, QRTR_PORT_CTRL, an, QRTR_PORT_CTRL, &c, sizeof(c));
++		}
+ 		return;
+ 	}
+-	if (node != q_modem_node) {
+-		return;                                 /* only the modem's services (the ADSP has its own edge) */
++	/* 0264: the modem's node, or the ADSP's (qrtr_send() picks its edge by node) */
++	if (node != q_modem_node && (an == QRTR_NODE_BCAST || node != an)) {
++		static unsigned dropped;
++		if (dropped++ < 8) {
++			LOG("qmi user: port %x to node %u: no such node (modem %u, adsp %u), dropped", src_port, node,
++			    q_modem_node, an);
++		}
++		return;
+ 	}
+ 	qrtr_send(QRTR_TYPE_DATA, src_port, node, port, data, len);
+ }
+@@ -12765,6 +12777,12 @@
+ }
+ 
+ static uint32_t
++adsp_node(void)
++{
++	return a_node;
++}
++
++static uint32_t
+ adsp_qrtr_version(uint32_t dst_node)
+ {
+ 	return a_node != QRTR_NODE_BCAST && dst_node == a_node ? a_qver : q_ver;
