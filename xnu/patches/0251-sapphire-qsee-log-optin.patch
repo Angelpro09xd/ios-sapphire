@@ -1,0 +1,276 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0251: Goodix probe: QSEE log buffer only on request
+
+With 0250 the first read of the registered QSEE log buffer, right after
+APP_START, stalled the thread and every kernel log line after it. The buffer
+is no longer registered by default and never read on the command path. Op 8
+registers it (only); op 9 reads its 8 header bytes one at a time, logging each,
+then copies it in 4 KB steps into a kernel copy that the new read-only sysctl
+kern.sweet_qsee_log returns raw (32 KB, parsed in user space). The
+"fingerprint" lookup, the 20 ms power settle and op 6 stay.
+---
+ bsd/dev/sweet_qsee_ctl.c       |  28 ++++++++-
+ iokit/Kernel/arm/SweetQsee.cpp | 129 ++++++++++++++++++-----------------------
+ 2 files changed, 84 insertions(+), 73 deletions(-)
+
+diff --git a/bsd/dev/sweet_qsee_ctl.c b/bsd/dev/sweet_qsee_ctl.c
+index fe0ff62..70af9bd 100755
+--- a/bsd/dev/sweet_qsee_ctl.c
++++ b/bsd/dev/sweet_qsee_ctl.c
+@@ -6,13 +6,15 @@
+  *   1 milestone 1 (QSEE version, whitelist, lookups, sensor power, goodixfp restarted,
+  *     WAKEUP(reset) + WAKEUP + PRE_DETECT + DETECT_SENSOR), 2 the sensor's GPIOs off,
+  *   3 APP_SHUTDOWN goodixfp, 4 goodixfp shutdown + start only, 5 op 1 reusing a loaded goodixfp,
+- *   6 op 1 with slow power timings, 7 L9's PMIC registers (read only)
++ *   6 op 1 with slow power timings, 7 L9's PMIC registers (read only), 8 register the QSEE log
++ *   buffer, 9 copy it for kern.sweet_qsee_log (read only, opaque: the raw 32 KB)
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/kernel.h>
+ #include <sys/sysctl.h>
+ #include <sys/errno.h>
++#include <kern/kalloc.h>
+ 
+ int sweet_qsee_op(int op);
+ 
+@@ -30,4 +32,28 @@ sysctl_sweet_qsee SYSCTL_HANDLER_ARGS
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_qsee, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_qsee, "I", "QSEE / goodixfp probe: 1 run, 2 off, 3 unload, 4 TA restart, 5 reuse TA, 6 slow, 7 L9 (qsee=1)");
++
++/* 0251: the QSEE log buffer as op 9 copied it (empty until then) */
++uint32_t sweet_qsee_log_get(void *dst, uint32_t max);
++
++static int
++sysctl_sweet_qsee_log SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	const uint32_t max = 0x8000;
++	if (req->newptr != USER_ADDR_NULL) {
++		return EPERM;
++	}
++	uint8_t *buf = kalloc_data(max, Z_WAITOK);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	uint32_t n = sweet_qsee_log_get(buf, max);
++	int err = n == 0 ? ENOENT : SYSCTL_OUT(req, buf, n);
++	kfree_data(buf, max);
++	return err;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_qsee_log, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_qsee_log, "S", "the QSEE log buffer copied by kern.sweet_qsee=9 (raw)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetQsee.cpp b/iokit/Kernel/arm/SweetQsee.cpp
+index b23a984..743f6a1 100755
+--- a/iokit/Kernel/arm/SweetQsee.cpp
++++ b/iokit/Kernel/arm/SweetQsee.cpp
+@@ -17,6 +17,10 @@
+  * to TZ (goodixfp.b03 metadata n=fingerprint; goodixfp is only the file name); power: 20 ms
+  * after gpio65 (op 6: 100 ms, and 120 ms after each reset); gpio104 is pulsed after power-up and
+  * after WAKEUP(reset) only; op 7 reads L9 back from the PMIC (SPMI observer, read only).
++ * 0251: 0250 stalled the whole kernel log right after APP_START, in the first read of the log
++ * buffer (or its IOLog). The buffer is no longer registered by default and never read on the
++ * command path: op 8 registers it, op 9 reads its header byte by byte (each logged) and copies
++ * it in 4 KB steps into a kernel copy that kern.sweet_qsee_log hands to user space as is.
+  * A listener request from TrustZone (INCOMPLETE / BLOCKED_ON_LISTENER) is logged and answered
+  * with a failure: no listener is registered and nothing is ever written anywhere (persist holds
+  * the sensor's factory calibration).
+@@ -25,7 +29,8 @@
+  *   1 the milestone with a clean TA restart (goodixfp shut down if loaded, started again),
+  *   2 the sensor's GPIOs off, 3 APP_SHUTDOWN goodixfp (if it is loaded), 4 goodixfp shutdown +
+  *   start only (no sensor commands), 5 the milestone reusing a loaded goodixfp, 6 as 1 with slow
+- *   power timings (100 ms settle, 120 ms after reset), 7 L9's PMIC registers (read only).
++ *   power timings (100 ms settle, 120 ms after reset), 7 L9's PMIC registers (read only),
++ *   8 register the QSEE log buffer (only), 9 copy it for kern.sweet_qsee_log.
+  * Reading it gives the result of the last request (0 ok, else an errno).
+  *
+  * Memory: TrustZone reads what it is given by physical address, below 4 GB, physically
+@@ -162,8 +167,6 @@ static uint64_t q_version;
+ static bool q_whitelist, q_powered;
+ static uint32_t q_goodix_id, q_seq;
+ static bool q_log_tried, q_log_ok;
+-static unsigned q_log_ver;                      /* 0 not known yet, 1 {u16 wrap, u16 offset}, 2 {u32, u32} */
+-static uint32_t q_log_wrap, q_log_off;
+ static unsigned q_settle_ms = 20, q_reset_ms = 60;
+ 
+ /* bsd/dev/sweet_spmi.c: the SPMI observer, reads only */
+@@ -522,78 +525,59 @@ tz_log_register(void)
+ }
+ 
+ /*
+- * The log lines TZ wrote since the last call. Header {wrap, offset} (u16 pairs, or u32 on v2:
+- * told apart by the first non-zero offset), then a ring; every index is taken modulo the ring.
++ * op 9: the log buffer copied for kern.sweet_qsee_log. First the 8 header bytes one at a time,
++ * each logged before the next read (if a read stalls, the last line says where), then the rest
++ * in 4 KB memcpy steps, each logged. Nothing parses it here: user space does.
+  */
+-static void
+-tz_log_dump(const char *cmd)
++static uint8_t *q_log_copy;
++static uint32_t q_log_copy_len;
++
++static int
++tz_log_copy(void)
+ {
+ 	if (!q_log_ok) {
+-		return;
+-	}
+-	const volatile uint8_t *b = q_va + OFF_LOG;
+-	mb();
+-	uint32_t w16 = b[0] | (uint32_t)b[1] << 8, o16 = b[2] | (uint32_t)b[3] << 8;
+-	uint32_t w32 = w16 | o16 << 16, o32 = b[4] | (uint32_t)b[5] << 8 | (uint32_t)b[6] << 16 | (uint32_t)b[7] << 24;
+-	if (q_log_ver == 0) {
+-		if (o16 != 0) {
+-			q_log_ver = 1;
+-		} else if (o32 != 0 && o32 < LOG_SIZE) {
+-			q_log_ver = 2;
+-		} else {
+-			LOG("TZ %s| (log still empty: %02x %02x %02x %02x %02x %02x %02x %02x)", cmd, b[0], b[1], b[2], b[3], b[4],
+-			    b[5], b[6], b[7]);
+-			return;
+-		}
+-		LOG("TZ log: header v%u (wrap/offset %u bytes each)", q_log_ver, q_log_ver == 1 ? 2 : 4);
+-	}
+-	const uint32_t hdr = q_log_ver == 1 ? 4 : 8, ring = LOG_SIZE - hdr;
+-	const uint32_t wrap = q_log_ver == 1 ? w16 : w32, off = q_log_ver == 1 ? o16 : o32;
+-	if (off >= ring) {
+-		LOG("TZ %s| offset %u beyond the ring (%u): log dumps stopped", cmd, off, ring);
+-		q_log_ok = false;
+-		return;
++		LOG("log copy: the buffer is not registered (op 8 first)");
++		return ENOENT;
+ 	}
+-	uint32_t start = q_log_off, n;
+-	if (wrap == q_log_wrap && off >= q_log_off) {
+-		n = off - q_log_off;
+-	} else if (wrap == q_log_wrap + 1 && off < q_log_off) {
+-		n = ring - q_log_off + off;
+-	} else {
+-		LOG("TZ %s| (the log wrapped past us: wrap %u -> %u, offset %u -> %u; the whole ring)", cmd, q_log_wrap, wrap,
+-		    q_log_off, off);
+-		start = off;
+-		n = ring;
+-	}
+-	q_log_wrap = wrap;
+-	q_log_off = off;
+-	char line[161];
+-	unsigned len = 0, lines = 0;
+-	for (uint32_t i = 0; i < n && i < ring; i++) {
+-		char c = (char)b[hdr + (start + i) % ring];
+-		if (c == '\0' || c == '\r') {
+-			continue;
+-		}
+-		if (c != '\n') {
+-			line[len++] = (c >= 0x20 && c < 0x7f) ? c : '.';
+-		}
+-		if (c == '\n' || len == sizeof(line) - 1) {
+-			line[len] = 0;
+-			if (len > 0 && lines < 400) {
+-				LOG("TZ %s|%s", cmd, line);
+-			}
+-			lines += len > 0;
+-			len = 0;
++	if (q_log_copy == NULL) {
++		q_log_copy = (uint8_t *)IOMalloc(LOG_SIZE);
++		if (q_log_copy == NULL) {
++			return ENOMEM;
+ 		}
+ 	}
+-	if (len > 0 && lines < 400) {
+-		line[len] = 0;
+-		LOG("TZ %s|%s", cmd, line);
+-		lines++;
++	q_log_copy_len = 0;
++	const volatile uint8_t *b = q_va + OFF_LOG;
++	mb();
++	for (unsigned i = 0; i < 8; i++) {
++		LOG("log copy: reading header byte %u", i);
++		q_log_copy[i] = b[i];
++		LOG("log copy: header byte %u = %02x", i, q_log_copy[i]);
++	}
++	for (uint32_t off = 8; off < LOG_SIZE; off += 0x1000) {
++		uint32_t n = LOG_SIZE - off < 0x1000u ? LOG_SIZE - off : 0x1000u;
++		memcpy(q_log_copy + off, (const void *)(q_va + OFF_LOG + off), n);
++		LOG("log copy: %u bytes at +0x%x copied", n, off);
++	}
++	q_log_copy_len = LOG_SIZE;
++	LOG("log copy: %u bytes ready in kern.sweet_qsee_log", q_log_copy_len);
++	return 0;
++}
++
++/* kern.sweet_qsee_log (bsd/dev/sweet_qsee_ctl.c): the copy into dst, its length (0: none) */
++extern "C" uint32_t
++sweet_qsee_log_get(void *dst, uint32_t max)
++{
++	uint32_t n = 0;
++	if (q_lock == NULL) {
++		return 0;
+ 	}
+-	if (lines > 400) {
+-		LOG("TZ %s| (%u more lines not shown)", cmd, lines - 400);
++	IOLockLock(q_lock);
++	if (q_log_copy != NULL) {
++		n = q_log_copy_len < max ? q_log_copy_len : max;
++		memcpy(dst, q_log_copy, n);
+ 	}
++	IOLockUnlock(q_lock);
++	return n;
+ }
+ 
+ /* ---------------------------------------------------------------- the TA */
+@@ -666,7 +650,6 @@ ta_start(void)
+ 	int64_t x0 = scm_call(FN_APP_START, 0x3, a, 3, ret);
+ 	LOG("APP_START goodixfp: x0 %lld after %llu ms", x0, ms_since(t0));
+ 	bool started = qsee_finish("APP_START goodixfp", x0, ret, 0);
+-	tz_log_dump("APP_START");
+ 	if (!started) {
+ 		return -1;
+ 	}
+@@ -729,7 +712,6 @@ gf_send(uint32_t app_id, uint8_t *cmd, uint32_t len, const char *name)
+ 		}
+ 		LOG("%s:   +%02x%s", name, i, line);
+ 	}
+-	tz_log_dump(name);
+ 	return ok;
+ }
+ 
+@@ -843,7 +825,6 @@ shutdown_app(void)
+ 	uint64_t a[1] = { (uint64_t)id };
+ 	int64_t x0 = scm_call(FN_APP_SHUTDOWN, 0x1, a, 1, ret);
+ 	bool ok = qsee_finish("APP_SHUTDOWN " TA_NAME, x0, ret, (uint32_t)id);
+-	tz_log_dump("APP_SHUTDOWN");
+ 	LOG("APP_SHUTDOWN " TA_NAME " (app %lld): %s", id, ok ? "done" : "FAILED");
+ 	if (ok) {
+ 		q_goodix_id = 0;
+@@ -882,7 +863,6 @@ qsee_up(void)
+ 		return false;
+ 	}
+ 	if (q_version != 0) {
+-		tz_log_register();
+ 		return true;
+ 	}
+ 	if (!qsee_feature(10, &q_version)) {
+@@ -892,7 +872,6 @@ qsee_up(void)
+ 	}
+ 	q_whitelist = qsee_feature(15, &wl) && wl >= (1ull << 22);
+ 	LOG("QSEE version %llx, whitelist %s (%llx)", q_version, q_whitelist ? "supported" : "NOT supported", wl);
+-	tz_log_register();
+ 	return true;
+ }
+ 
+@@ -1021,6 +1000,12 @@ sweet_qsee_op(int op)
+ 	case 7:
+ 		r = l9_readback();
+ 		break;
++	case 8:
++		r = qsee_up() ? (tz_log_register(), q_log_ok ? 0 : EIO) : EIO;
++		break;
++	case 9:
++		r = tz_log_copy();
++		break;
+ 	default:
+ 		r = EINVAL;
+ 		break;
