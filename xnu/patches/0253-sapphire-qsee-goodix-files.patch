@@ -1,0 +1,1128 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0253: Goodix TA file listener, init and one capture (milestone 2)
+
+Listener 10 (the QSEE file service) is registered with its own 20 KB buffer
+in the pool and served inside the SCM loop (up to 2000 rounds), one log line
+per request. Files come from a kernel RAM store that user space fills through
+the new write-only sysctl kern.sweet_qsee_file ("name\0bytes", up to 5 MB
+each, 8 files, 12 MB in all; empty bytes drop one) and that
+kern.sweet_qsee_files lists. The TA sees them by basename; its writes,
+creates, removes and renames change the RAM copy only and are logged: nothing
+reaches any disk. Op 10 = the milestone with the listener up, then
+SENSOR_INIT (chip type and config checksums logged), ALGO_INIT,
+AUTH_INIT_FINISHED, SET_ACTIVE_GROUP 0; op 11 = AUTHENTICATE, CAPTURE_IMG,
+ALGO_AUTHENTICATE, ALGO_KPI (quality, area, score...), AUTH_CANCEL; op 12 =
+AUTH_CANCEL and sensor off. gf results are named from libgf_hal's whole error
+table; long commands dump only their first 64 bytes.
+---
+ bsd/dev/sweet_qsee_ctl.c       |  53 ++-
+ iokit/Kernel/arm/SweetQsee.cpp | 922 ++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 954 insertions(+), 21 deletions(-)
+
+diff --git a/bsd/dev/sweet_qsee_ctl.c b/bsd/dev/sweet_qsee_ctl.c
+index 70af9bd..5f1519d 100755
+--- a/bsd/dev/sweet_qsee_ctl.c
++++ b/bsd/dev/sweet_qsee_ctl.c
+@@ -7,7 +7,10 @@
+  *     WAKEUP(reset) + WAKEUP + PRE_DETECT + DETECT_SENSOR), 2 the sensor's GPIOs off,
+  *   3 APP_SHUTDOWN goodixfp, 4 goodixfp shutdown + start only, 5 op 1 reusing a loaded goodixfp,
+  *   6 op 1 with slow power timings, 7 L9's PMIC registers (read only), 8 register the QSEE log
+- *   buffer, 9 copy it for kern.sweet_qsee_log (read only, opaque: the raw 32 KB)
++ *   buffer, 9 copy it for kern.sweet_qsee_log (read only, opaque: the raw 32 KB), 10 init with
++ *   the file listener, 11 one capture, 12 cancel and sensor off
++ * kern.sweet_qsee_file (write only): "name\0bytes" puts a file the TA may read into the kernel's
++ * RAM store (empty bytes drop it); kern.sweet_qsee_files lists the store.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -56,4 +59,52 @@ sysctl_sweet_qsee_log SYSCTL_HANDLER_ARGS
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_qsee_log, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_qsee_log, "S", "the QSEE log buffer copied by kern.sweet_qsee=9 (raw)");
++
++/* 0253: the TA's files, RAM only (iokit/Kernel/arm/SweetQsee.cpp) */
++int sweet_qsee_file_put(const uint8_t *buf, uint32_t len);
++uint32_t sweet_qsee_files_list(char *out, uint32_t max);
++
++static int
++sysctl_sweet_qsee_file SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	size_t len = req->newlen;
++	if (req->newptr == USER_ADDR_NULL) {
++		return 0;
++	}
++	if (len < 2 || len > (5u << 20) + 64) {
++		return len < 2 ? EINVAL : EFBIG;
++	}
++	uint8_t *buf = kalloc_data(len, Z_WAITOK);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	int err = SYSCTL_IN(req, buf, len);
++	if (err == 0) {
++		err = sweet_qsee_file_put(buf, (uint32_t)len);
++	}
++	kfree_data(buf, len);
++	return err;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_qsee_file, CTLTYPE_OPAQUE | CTLFLAG_WR | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_qsee_file, "S", "a file for the goodix TA: write name\\0bytes (RAM only)");
++
++static int
++sysctl_sweet_qsee_files SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	const uint32_t max = 2048;
++	char *buf = kalloc_data(max, Z_WAITOK);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	uint32_t n = sweet_qsee_files_list(buf, max);
++	int err = SYSCTL_OUT(req, buf, n + 1);
++	kfree_data(buf, max);
++	return err;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_qsee_files, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_qsee_files, "A", "the goodix TA's RAM file store: name size dirty source");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetQsee.cpp b/iokit/Kernel/arm/SweetQsee.cpp
+index 7f1ed1b..85a9ff1 100755
+--- a/iokit/Kernel/arm/SweetQsee.cpp
++++ b/iokit/Kernel/arm/SweetQsee.cpp
+@@ -21,6 +21,11 @@
+  * buffer (or its IOLog). The buffer is no longer registered by default and never read on the
+  * command path: op 8 registers it, op 9 reads its header byte by byte (each logged) and copies
+  * it in 4 KB steps into a kernel copy that kern.sweet_qsee_log hands to user space as is.
++ * 0253 (milestone 2): listener 10, the QSEE file service, registered with its own buffer in the
++ * pool and served from a RAM store that user space fills (kern.sweet_qsee_file, "name\0bytes";
++ * kern.sweet_qsee_files lists it); the TA's writes stay in RAM. Op 10 = init (the milestone,
++ * SENSOR_INIT, ALGO_INIT, AUTH_INIT_FINISHED, SET_ACTIVE_GROUP 0), op 11 = one capture
++ * (AUTHENTICATE, CAPTURE_IMG, ALGO_AUTHENTICATE, ALGO_KPI, AUTH_CANCEL), op 12 = cancel + off.
+  * A listener request from TrustZone (INCOMPLETE / BLOCKED_ON_LISTENER) is logged and answered
+  * with a failure: no listener is registered and nothing is ever written anywhere (persist holds
+  * the sensor's factory calibration).
+@@ -30,7 +35,8 @@
+  *   2 the sensor's GPIOs off, 3 APP_SHUTDOWN goodixfp (if it is loaded), 4 goodixfp shutdown +
+  *   start only (no sensor commands), 5 the milestone reusing a loaded goodixfp, 6 as 1 with slow
+  *   power timings (100 ms settle, 120 ms after reset), 7 L9's PMIC registers (read only),
+- *   8 register the QSEE log buffer (only), 9 copy it for kern.sweet_qsee_log.
++ *   8 register the QSEE log buffer (only), 9 copy it for kern.sweet_qsee_log (stalls: never),
++ *   10 init with the file listener, 11 one capture, 12 cancel and sensor off.
+  * Reading it gives the result of the last request (0 ok, else an errno).
+  *
+  * Memory: TrustZone reads what it is given by physical address, below 4 GB, physically
+@@ -49,6 +55,8 @@
+ #include <kern/clock.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/errno.h>
++#include <sys/param.h>
++#include <libkern/crc.h>
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern unsigned long gPhysBase, gPhysSize;
+@@ -76,6 +84,17 @@ extern "C" int topaz_rpm_vote(uint32_t set, uint32_t type, uint32_t id, uint32_t
+ #define LOG_SIZE            0x8000u
+ #define FN_REG_LOG_BUF      0x72000106u         /* TZ_OS_REGISTER_LOG_BUFFER_ID, arginfo 0x22 (PA, len) */
+ #define TA_NAME             "fingerprint"       /* what TZ calls goodixfp (b03 metadata) */
++#define OFF_LSB             0xE10000u           /* 0253: listener 10's buffer (past the log area, 0xE04000-0xE0C000) */
++#define LSB_SIZE            0x5000u             /* 20480 >= the 20040 bytes minkipc requires */
++#define FN_REG_LISTENER     0x72000206u         /* TZ_OS_REGISTER_LISTENER_SMCINVOKE_ID, arginfo 0x83 */
++#define FN_REG_LISTENER_OLD 0x72000201u         /* TZ_OS_REGISTER_LISTENER_ID */
++#define FS_LISTENER         10u
++#define FS_MAX_DATA         20000u
++#define QF_MAX_FILES        8
++#define QF_FILE_MAX         (5u << 20)
++#define QF_TOTAL_MAX        (12u << 20)
++#define QF_NFD              16
++#define QF_FD_BASE          100
+ 
+ /* SMC function ids: SMC64 standard calls; owner 2 SIP, 50 QSEE OS, 48 TZ apps */
+ #define FN_FEAT_VERSION     0x42000603u
+@@ -137,17 +156,184 @@ extern "C" int topaz_rpm_vote(uint32_t set, uint32_t type, uint32_t id, uint32_t
+ #define GCC_WRAP0_CORE2X    0x1f014u
+ #define GCC_WRAP0_S5_CBCR   (0x1f144u + 5 * 0x130u)
+ 
++/* libgf_hal's err_table (0x53a20), 1000..1177 */
+ static const struct { uint32_t code; const char *name; } gf_errors[] = {
+ 	{ 0, "OK" },
+-	{ 1003, "NOT_INIT" },
++	{ 1000, "BASE" },
++	{ 1001, "OUT_OF_MEMORY" },
++	{ 1002, "OPEN_TA_FAILED" },
++	{ 1003, "MODULE_NOT_INITED" },
+ 	{ 1004, "BAD_PARAMS" },
++	{ 1005, "NO_SPACE" },
++	{ 1006, "MEMORY_COPY_FAILED" },
++	{ 1007, "REACH_FINGERS_UPLIMIT" },
++	{ 1008, "NOT_MATCH" },
++	{ 1009, "CANCELED" },
++	{ 1010, "TIMEOUT" },
++	{ 1011, "PREPROCESS_FAILED" },
++	{ 1012, "GENERIC" },
++	{ 1013, "ACQUIRED_PARTIAL" },
++	{ 1014, "ACQUIRED_IMAGER_DIRTY" },
++	{ 1015, "DUPLICATE_FINGER" },
++	{ 1016, "OPEN_DEVICE_FAILED" },
++	{ 1017, "HAL_GENERAL_ERROR" },
++	{ 1018, "HAL_FILE_DESCRIPTION_NULL" },
++	{ 1019, "HAL_IOCTL_FAILED" },
++	{ 1020, "HAL_TIMER_FUNC" },
++	{ 1021, "CORRUPT_CONTENT" },
++	{ 1022, "INCORRECT_VERSION" },
++	{ 1023, "CORRUPT_OBJECT" },
+ 	{ 1024, "INVALID_DATA" },
+ 	{ 1025, "SPI_TRANSFER_ERROR" },
+ 	{ 1026, "SPI_GENERAL_ERROR" },
+ 	{ 1027, "SPI_IRQ_HANDLE" },
+ 	{ 1028, "SPI_RAW_DATA_CRC_FAILED" },
++	{ 1029, "SPI_RAW_DATA_BUF_BUSY" },
++	{ 1030, "SPI_FW_CFG_DATA_ERROR" },
++	{ 1031, "SPI_FW_DOWNLOAD_FAILED" },
++	{ 1032, "SPI_CFG_DOWNLOAD_FAILED" },
++	{ 1033, "SAVE_FP_TEMPLATE" },
++	{ 1034, "FP_BUSY" },
++	{ 1035, "OPEN_SECURE_OBJECT_FAILED" },
++	{ 1036, "READ_SECURE_OBJECT_FAILED" },
++	{ 1037, "WRITE_SECURE_OBJECT_FAILED" },
++	{ 1038, "DELETE_SECURE_OBJECT_FAILED" },
++	{ 1039, "SECURE_OBJECT_NOT_EXIST" },
++	{ 1040, "WRITE_CONFIG_FAILED" },
++	{ 1041, "TEST_SENSOR_FAILED" },
++	{ 1042, "SET_MODE_FAILED" },
++	{ 1043, "CHIP_ID_NOT_CORRECT" },
++	{ 1044, "MAX_NUM" },
++	{ 1045, "TEST_BAD_POINT_FAILED" },
++	{ 1046, "TEST_FRR_FAR_ENROLL_DIFFERENT_FINGER" },
++	{ 1047, "DUPLICATE_AREA" },
++	{ 1048, "SPI_COMMUNICATION" },
++	{ 1049, "FINGER_NOT_EXIST" },
++	{ 1050, "INVALID_PREPROCESS_VERSION" },
+ 	{ 1051, "TA_DEAD" },
++	{ 1052, "NAV_TOO_FAST" },
++	{ 1053, "UNSUPPORT_CHIP" },
++	{ 1054, "INVALID_FINGER_PRESS" },
++	{ 1055, "TA_GENERATE_RANDOM" },
++	{ 1056, "BIO_ASSAY_FAIL" },
++	{ 1057, "INVALID_HAT_VERSION" },
++	{ 1058, "INVALID_CHALLENGE" },
++	{ 1059, "UNTRUSTED_ENROLL" },
++	{ 1060, "INVALID_BASE" },
++	{ 1061, "SENSOR_BROKEN_CHECK_NEXT_FRAME" },
++	{ 1062, "SENSOR_BROKEN_CHECK_ALGO_ERROR" },
++	{ 1063, "SENSOR_IS_BROKEN" },
++	{ 1064, "SENSOR_NOT_AVAILABLE" },
++	{ 1065, "SENSOR_TEST_FAILED" },
++	{ 1066, "MATCH_FAIL_AND_RETRY" },
++	{ 1067, "FINGER_NOT_LEAVE" },
++	{ 1068, "GET_TEMPERATURE_FAILED" },
++	{ 1069, "GET_OTP_INFO_FAILED" },
++	{ 1070, "TEST_RESET_PIN" },
++	{ 1071, "TEST_INTERRUPT_PIN" },
++	{ 1072, "UNKNOWN_CMD" },
++	{ 1073, "TEST_SPI_TRANSFER_TIMEOUT" },
++	{ 1074, "ENCODE_TLV" },
++	{ 1075, "INVALID_FP_ID" },
++	{ 1076, "NATIVE_SERVICE_BASE" },
++	{ 1077, "NATIVE_SERVICE_GETSERVICE" },
++	{ 1078, "NATIVE_SERVICE_INIT_HAL" },
++	{ 1079, "MKDIR_FAILED" },
++	{ 1080, "FILE_OPEN_FAILED" },
++	{ 1081, "FILE_NOT_EXIST" },
++	{ 1082, "FILE_READ_FAILED" },
++	{ 1083, "FILE_WRITE_FAILED" },
++	{ 1084, "FILE_DELETE_FAILED" },
++	{ 1085, "TOO_MUCH_UNDER_SATURATED_PIXELS" },
++	{ 1086, "TOO_MUCH_OVER_SATURATED_PIXELS" },
++	{ 1087, "SENSOR_HAS_CHANGED" },
++	{ 1088, "OPEN_SESSION_FAILED" },
++	{ 1089, "FACTORY_TEST_FAILED" },
++	{ 1090, "NO_GROUP_ID" },
++	{ 1091, "UNKNOWN_TEST_TOKEN" },
++	{ 1092, "FINGER_FEATURE_STUDY_FAILED" },
++	{ 1093, "INVALID_OTP_VERSION" },
++	{ 1094, "CALIBRATION_NOT_READY" },
++	{ 1095, "ALGO_INVALID_DATA" },
++	{ 1096, "TOO_FAST" },
++	{ 1097, "TEST_NOT_SUPPORTED" },
++	{ 1098, "NO_NEED_UPDATE_BASE" },
++	{ 1099, "OTP_CHECK_FAIL" },
++	{ 1100, "INIT_ALGO_REGISTER_INFO" },
++	{ 1101, "DYNAMIC_ENROLL_INVALID_PRESS_TOO_MUCH" },
++	{ 1102, "DYNAMIC_ERNOLL_INCOMPLETE_TEMPLATE" },
++	{ 1103, "ALGO_DIRTY_FINGER" },
++	{ 1104, "PREPROCESS_FAIL_AND_RETRY" },
++	{ 1105, "CRC_CHECK_FAILED_AND_RETRY" },
++	{ 1106, "ALGO_COVER_BROKEN" },
++	{ 1108, "FARGO_CHIP_ID_NOT_CORRECT" },
++	{ 1109, "CREATE_FINGER_TEMPLATE" },
++	{ 1110, "DUMP_CONFIG_NOT_CORRECT" },
++	{ 1111, "INVALID_STATE" },
+ 	{ 1112, "FAILED_AND_RETRY" },
++	{ 1113, "MT_INFO_CHECK_FAIL" },
++	{ 1114, "TEST_RESET_INT_PIN_MCU" },
++	{ 1115, "TEST_RESET_INT_PIN_SENSOR" },
++	{ 1116, "TEST_RESET_INT_PIN_PMIC" },
++	{ 1117, "TEST_MT" },
++	{ 1118, "TEST_SPMT" },
++	{ 1119, "TEST_OTP" },
++	{ 1120, "CHIP_IS_NOT_READY" },
++	{ 1121, "FACTORY_FOV_INVALID" },
++	{ 1122, "FACTORY_BADPOINT_INVALID" },
++	{ 1123, "FACTORY_SCALE_INVALID" },
++	{ 1124, "FACTORY_TNOISE_INVALID" },
++	{ 1125, "FACTORY_SNOISE_INVALID" },
++	{ 1126, "FACTORY_FLESH_TOUCHDIFF_INVALID" },
++	{ 1127, "FACTORY_LIGHT_LEAK_RATIO_INVALID" },
++	{ 1128, "FACTORY_RELATIVEILLUMINANCE_INVALID" },
++	{ 1129, "FACTORY_CROP_INVALID" },
++	{ 1130, "FACTORY_SSNR_INVALID" },
++	{ 1131, "FACTORY_SHAPENESS_INVALID" },
++	{ 1132, "FACTORY_CONSTRAST_INVALID" },
++	{ 1133, "FACTORY_RAWDATA_INVALID" },
++	{ 1134, "HOLD_MCU_FAILED" },
++	{ 1135, "CAPTURE_IMAGE_FAILED" },
++	{ 1136, "NO_NEED_FORCE_STUDY" },
++	{ 1137, "NOT_LIVE_FINGER" },
++	{ 1138, "RESIDUAL_FINGER" },
++	{ 1139, "FACTORY_SCREEN_STRUCT_INVALID" },
++	{ 1140, "ALGO_INIT_FAILED" },
++	{ 1141, "NOT_MATCH_NOT_LIVE_FINGER" },
++	{ 1142, "ENROLL_AUTH_TOKEN_TIME_OUT" },
++	{ 1143, "UI_READY_TIMEOUT" },
++	{ 1144, "FACTORY_TILT_LEVEL_INVALID" },
++	{ 1145, "ALG_ANTIPEEPING_FINGER" },
++	{ 1146, "ALG_SCREEN_STRUCT_IMG" },
++	{ 1147, "ACQUIRED_IMAGER_DRY" },
++	{ 1148, "ACQUIRED_IMAGER_WET" },
++	{ 1149, "FACTORY_CAHRT_DIRECTION_INVALID" },
++	{ 1150, "GPIO_FAILED" },
++	{ 1151, "DSP_NOT_AVAILABLE" },
++	{ 1152, "DSP_WAIT_TIMEOUT" },
++	{ 1153, "DSP_GET_FEATURE_FAIL" },
++	{ 1155, "UI_DISAPPEAR" },
++	{ 1156, "FARR_MOCK_DISABLE" },
++	{ 1157, "ACQUIRED_NOT_LIVE_FINGER" },
++	{ 1158, "RPMB_GENERAL_ERROR" },
++	{ 1159, "RPMB_WRITE_ERROR" },
++	{ 1160, "RPMB_READ_ERROR" },
++	{ 1161, "CHECK_PERFORMANCE_TESTING_RESULT_NOT_PASS" },
++	{ 1162, "ALG_LOGO_DETECTION_FAILED" },
++	{ 1163, "BRIGHTNESS_CHANGE_FAIL" },
++	{ 1164, "BRIGHTNESS_NOT_STABILITY" },
++	{ 1165, "CHART_DIRECTION_INCORRECT" },
++	{ 1166, "TEST_SMT" },
++	{ 1167, "ANOMALY_FINGER" },
++	{ 1168, "NEED_CANCLE_ENROLL" },
++	{ 1170, "TA_TRANSFER_SIZE" },
++	{ 1171, "TEMPORARY_LOCKOUT" },
++	{ 1172, "PERMANENT_LOCKOUT" },
++	{ 1173, "SLAVE_TA_DEAD" },
++	{ 1174, "ACQUIRED_THICK_FILM" },
++	{ 1175, "TYPE_NOT_SUPPORTED" },
++	{ 1176, "MEMORY_OVERFLOW" },
++	{ 1177, "FAST_DOWN" },
+ };
+ 
+ static const char *
+@@ -170,6 +356,8 @@ static bool q_whitelist, q_powered;
+ static uint32_t q_goodix_id, q_seq;
+ static bool q_log_tried, q_log_ok;
+ static unsigned q_settle_ms = 20, q_reset_ms = 60;
++static bool q_lsnr_ok;                          /* 0253: listener 10 registered */
++static void fs_serve(void);
+ 
+ /* bsd/dev/sweet_spmi.c: the SPMI observer, reads only */
+ extern "C" int sweet_spmi_init(void);
+@@ -325,24 +513,37 @@ result_name(uint32_t r)
+ 
+ /*
+  * After a QSEOS call: TrustZone may want a listener (file system 10, time 11, RPMB 0x2000...).
+- * None is registered: each request is answered "failure" (LISTENER_RSP status -1), a blocked
+- * session is told to continue. At most 16 rounds. True when the call ended in SUCCESS.
++ * Listener 10 (0253) is served from the RAM store and answered SUCCESS (its own result is in the
++ * message); any other one is answered "failure" (LISTENER_RSP status -1); a blocked session is
++ * told to continue. At most 2000 rounds (big files come in 20000-byte reads). True on SUCCESS.
+  */
+ static bool
+ qsee_finish(const char *what, int64_t x0, uint64_t ret[3], uint32_t app_id)
+ {
+-	for (unsigned round = 0; round < 16; round++) {
++	unsigned served = 0;
++	for (unsigned round = 0; round < 2000; round++) {
+ 		uint32_t res = (uint32_t)ret[0], type = (uint32_t)ret[1], data = (uint32_t)ret[2];
+ 		if (x0 != 0) {
+ 			LOG("%s: SCM error %lld (x1 %llx x2 %llx x3 %llx)", what, x0, ret[0], ret[1], ret[2]);
+ 			return false;
+ 		}
+-		LOG("%s: result %d %s, resp_type %x, data %u (0x%x)", what, (int32_t)res, result_name(res), type, data, data);
++		if (res == RES_INCOMPLETE && data == FS_LISTENER && q_lsnr_ok) {
++			fs_serve();
++			served++;
++			uint64_t a[2] = { FS_LISTENER, RES_SUCCESS };
++			x0 = scm_call(FN_LISTENER_RSP, 0x2, a, 2, ret);
++			continue;
++		}
++		LOG("%s: result %d %s, resp_type %x, data %u (0x%x)%s", what, (int32_t)res, result_name(res), type, data, data,
++		    served > 0 ? " (after file requests)" : "");
+ 		if (res == RES_SUCCESS) {
++			if (served > 0) {
++				LOG("%s: %u file requests served", what, served);
++			}
+ 			return true;
+ 		}
+ 		if (res == RES_INCOMPLETE) {
+-			LOG("%s: TrustZone asks listener %u (0x%x)%s: answered FAILURE (no listeners in milestone 1)", what, data, data,
++			LOG("%s: TrustZone asks listener %u (0x%x)%s: answered FAILURE (not served)", what, data, data,
+ 			    data == 10 ? " = file system" : data == 11 ? " = time" : data == 0x2000 ? " = RPMB" :
+ 			    data == 0x7000 ? " = GP fs" : "");
+ 			uint64_t a[2] = { data, RES_FAILURE };
+@@ -362,7 +563,7 @@ qsee_finish(const char *what, int64_t x0, uint64_t ret[3], uint32_t app_id)
+ 		}
+ 		return false;
+ 	}
+-	LOG("%s: still not done after 16 listener rounds: given up", what);
++	LOG("%s: still not done after 2000 listener rounds: given up", what);
+ 	return false;
+ }
+ 
+@@ -711,7 +912,11 @@ gf_send(uint32_t app_id, uint8_t *cmd, uint32_t len, const char *name)
+ 	uint32_t status = *(uint32_t *)(sb + 0x1c), res = *(uint32_t *)(cmd + 0x0c);
+ 	LOG("%s: envelope TEE status %u, gf result %u (0x%x) %s, reset_flag %u, seq %u", name, status, res, res,
+ 	    gf_err_name(res), cmd[0], *(uint32_t *)(sb + 0x0c));
+-	for (uint32_t i = 0; i < len; i += 16) {
++	const uint32_t shown = len <= 0xc0u ? len : 0x40u;
++	if (shown < len) {
++		LOG("%s:   (%u bytes, the first %u shown)", name, len, shown);
++	}
++	for (uint32_t i = 0; i < shown; i += 16) {
+ 		char line[64] = "";
+ 		size_t n = 0;
+ 		for (uint32_t j = i; j + 4 <= len && j < i + 16; j += 4) {
+@@ -953,29 +1158,697 @@ milestone(bool restart, bool slow)
+ 	return 0;
+ }
+ 
+-/* kern.sweet_qsee (bsd/dev/sweet_qsee_ctl.c); op < 0: the last result */
+-extern "C" int
+-sweet_qsee_op(int op)
++/* ---------------------------------------------------------------- 0253: files (listener 10) */
++
++/*
++ * The TA's files (persist/goodix/..., fpdata/...) come from a RAM store that user space fills through
++ * kern.sweet_qsee_file ("name\0bytes"; empty bytes clear it). The TA sees them by basename. All its
++ * writes, creates, removes and renames change the RAM copy only (an overlay, logged): nothing
++ * reaches any disk. kern.sweet_qsee_files lists the store.
++ */
++struct qfile {
++	char     name[64];
++	uint8_t *data;
++	uint32_t len, cap;
++	bool     used, dirty, from_user;
++};
++static struct qfile q_files[QF_MAX_FILES];
++static struct { int file; uint32_t pos; bool used; } q_fds[QF_NFD];
++static int q_errno;
++static uint32_t q_fs_reqs;
++static bool q_lsnr_tried, q_inited;
++static uint8_t q_cmd[0x400];                    /* the biggest command here: SENSOR_INIT, 0x2c0 */
++
++static inline uint32_t get32(const uint8_t *p, uint32_t o) { uint32_t v; memcpy(&v, p + o, 4); return v; }
++static inline void put32(uint8_t *p, uint32_t o, uint32_t v) { memcpy(p + o, &v, 4); }
++static inline void put64(uint8_t *p, uint32_t o, uint64_t v) { memcpy(p + o, &v, 8); }
++
++static void
++qsee_lock_init(void)
+ {
+-	static int enabled = -1;
+-	int r;
++	if (q_lock == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (!OSCompareAndSwapPtr(NULL, l, (void * volatile *)&q_lock)) {
++			IOLockFree(l);
++		}
++	}
++}
+ 
++static bool
++qsee_enabled(void)
++{
++	static int enabled = -1;
+ 	if (enabled < 0) {
+ 		int v = 0;
+ 		enabled = PE_parse_boot_argn("qsee", &v, sizeof(v)) && v != 0;
+ 	}
+-	if (op < 0) {
+-		return q_last;
++	return enabled != 0;
++}
++
++static uint32_t
++qf_total(void)
++{
++	uint32_t t = 0;
++	for (unsigned i = 0; i < QF_MAX_FILES; i++) {
++		t += q_files[i].used ? q_files[i].cap : 0;
++	}
++	return t;
++}
++
++/* the basename of a 256-byte path field (bounded: never reads past it) */
++static void
++qf_basename(const uint8_t *p, char out[64])
++{
++	char path[257];
++	memcpy(path, p, 256);
++	path[256] = 0;
++	const char *b = path;
++	for (const char *c = path; *c != 0; c++) {
++		if (*c == '/') {
++			b = c + 1;
++		}
++	}
++	strlcpy(out, b, 64);
++}
++
++static int
++qf_find(const char *name)
++{
++	for (int i = 0; i < QF_MAX_FILES; i++) {
++		if (q_files[i].used && strcmp(q_files[i].name, name) == 0) {
++			return i;
++		}
++	}
++	return -1;
++}
++
++static int
++qf_create(const char *name)
++{
++	if (name[0] == 0) {
++		return -1;
++	}
++	for (int i = 0; i < QF_MAX_FILES; i++) {
++		if (!q_files[i].used) {
++			bzero(&q_files[i], sizeof(q_files[i]));
++			strlcpy(q_files[i].name, name, sizeof(q_files[i].name));
++			q_files[i].used = true;
++			return i;
++		}
++	}
++	return -1;
++}
++
++/* room for need bytes (exact: what user space gives; else doubling from 64 KB), within the caps */
++static bool
++qf_reserve(int i, uint32_t need, bool exact)
++{
++	struct qfile *f = &q_files[i];
++	if (need <= f->cap) {
++		return true;
++	}
++	if (need > QF_FILE_MAX) {
++		return false;
++	}
++	uint32_t cap = exact ? need : MAX(MAX(need, f->cap * 2), 0x10000u);
++	cap = MIN(cap, QF_FILE_MAX);
++	if (qf_total() - f->cap + cap > QF_TOTAL_MAX) {
++		return false;
+ 	}
+-	if (!enabled) {
++	uint8_t *d = (uint8_t *)IOMalloc(cap);
++	if (d == NULL) {
++		return false;
++	}
++	if (f->data != NULL) {
++		memcpy(d, f->data, f->len);
++		IOFree(f->data, f->cap);
++	}
++	f->data = d;
++	f->cap = cap;
++	return true;
++}
++
++static void
++qf_free(int i)
++{
++	if (q_files[i].data != NULL) {
++		IOFree(q_files[i].data, q_files[i].cap);
++	}
++	bzero(&q_files[i], sizeof(q_files[i]));
++	for (unsigned k = 0; k < QF_NFD; k++) {
++		if (q_fds[k].used && q_fds[k].file == i) {
++			q_fds[k].file = -1;
++		}
++	}
++}
++
++static int
++qf_fd(int fd)
++{
++	int k = fd - QF_FD_BASE;
++	if (k < 0 || k >= QF_NFD || !q_fds[k].used || q_fds[k].file < 0 || !q_files[q_fds[k].file].used) {
++		return -1;
++	}
++	return k;
++}
++
++/* kern.sweet_qsee_file: "name\0bytes" from user space; no bytes: the file is dropped */
++extern "C" int
++sweet_qsee_file_put(const uint8_t *buf, uint32_t len)
++{
++	uint32_t nl = 0;
++
++	if (!qsee_enabled()) {
+ 		return ENODEV;
+ 	}
++	while (nl < len && nl < 64 && buf[nl] != 0) {
++		nl++;
++	}
++	if (nl == 0 || nl >= 64 || nl >= len) {
++		return EINVAL;
++	}
++	char name[64];
++	memcpy(name, buf, nl);
++	name[nl] = 0;
++	if (strchr(name, '/') != NULL) {
++		return EINVAL;
++	}
++	const uint8_t *data = buf + nl + 1;
++	uint32_t dlen = len - nl - 1;
++	if (dlen > QF_FILE_MAX) {
++		return EFBIG;
++	}
++	qsee_lock_init();
++	IOLockLock(q_lock);
++	int r = 0, i = qf_find(name);
++	if (dlen == 0) {
++		if (i >= 0) {
++			qf_free(i);
++		}
++		LOG("file %s: cleared", name);
++	} else {
++		if (i < 0) {
++			i = qf_create(name);
++		}
++		if (i < 0) {
++			r = ENOSPC;
++		} else {
++			q_files[i].len = 0;
++			if (!qf_reserve(i, dlen, true)) {
++				r = ENOSPC;
++			} else {
++				memcpy(q_files[i].data, data, dlen);
++				q_files[i].len = dlen;
++				q_files[i].dirty = false;
++				q_files[i].from_user = true;
++			}
++		}
++		LOG("file %s: %u bytes from user space: %s (store %u bytes)", name, dlen, r == 0 ? "kept" : "NO ROOM", qf_total());
++	}
++	IOLockUnlock(q_lock);
++	return r;
++}
++
++/* kern.sweet_qsee_files: "name size dirty user\n" per file; returns the length (always terminated) */
++extern "C" uint32_t
++sweet_qsee_files_list(char *out, uint32_t max)
++{
++	uint32_t n = 0;
++	if (max == 0) {
++		return 0;
++	}
++	out[0] = 0;
+ 	if (q_lock == NULL) {
+-		IOLock *l = IOLockAlloc();
+-		if (!OSCompareAndSwapPtr(NULL, l, (void * volatile *)&q_lock)) {
+-			IOLockFree(l);
++		return 0;
++	}
++	IOLockLock(q_lock);
++	for (unsigned i = 0; i < QF_MAX_FILES && n + 1 < max; i++) {
++		if (q_files[i].used) {
++			int w = snprintf(out + n, max - n, "%s %u %s %s\n", q_files[i].name, q_files[i].len,
++			    q_files[i].dirty ? "dirty" : "clean", q_files[i].from_user ? "user" : "ta");
++			if (w < 0) {
++				break;
++			}
++			n = MIN(n + (uint32_t)w, max - 1);
++		}
++	}
++	IOLockUnlock(q_lock);
++	return n;
++}
++
++static const char *
++fs_cmd_name(uint32_t c)
++{
++	static const char *const names[] = { "start", "open", "openat", "unlinkat", "fcntl", "creat", "read", "write",
++		                             "close", "lseek", "link", "unlink", "rmdir", "fstat", "lstat", "mkdir", "testdir",
++		                             "telldir", "remove", "chown_chmod", "unused", "sync", "rename", "par_free_size",
++		                             "dir_open", "dir_read", "dir_close", "get_errno" };
++	return c >= 0x201 && c < 0x201 + sizeof(names) / sizeof(names[0]) ? names[c - 0x201] : "?";
++}
++
++static int32_t
++fs_open(const char *name, uint32_t flags, int *e)
++{
++	int i = qf_find(name);
++	if (i < 0) {
++		if ((flags & 0x40) == 0) {             /* O_CREAT */
++			*e = ENOENT;
++			return -1;
++		}
++		i = qf_create(name);
++		if (i < 0) {
++			*e = ENOSPC;
++			return -1;
+ 		}
++		q_files[i].dirty = true;
++	}
++	if ((flags & 0x200) != 0 && (flags & 3) != 0) {  /* O_TRUNC, for writing */
++		q_files[i].len = 0;
++		q_files[i].dirty = true;
++	}
++	for (unsigned k = 0; k < QF_NFD; k++) {
++		if (!q_fds[k].used) {
++			q_fds[k].used = true;
++			q_fds[k].file = i;
++			q_fds[k].pos = (flags & 0x400) != 0 ? q_files[i].len : 0;   /* O_APPEND */
++			return QF_FD_BASE + (int32_t)k;
++		}
++	}
++	*e = EMFILE;
++	return -1;
++}
++
++static void
++fs_stat(uint8_t *b, int i)
++{
++	bzero(b + 4, 96);
++	put32(b, 4 + 16, 0x8180);                   /* st_mode: S_IFREG | 0600 */
++	put32(b, 4 + 20, 1);                        /* st_nlink */
++	put64(b, 4 + 44, q_files[i].len);           /* st_size */
++	put32(b, 4 + 52, 4096);                     /* st_blksize */
++	put64(b, 4 + 56, (q_files[i].len + 511) / 512);
++}
++
++/* one file-service request in the listener buffer, answered in place (minkipc fs_msg.h layouts) */
++static void
++fs_serve(void)
++{
++	uint8_t *b = q_va + OFF_LSB;
++	char name[64], name2[64];
++	int e = 0;
++	int32_t ret = -1;
++	uint32_t cmd = get32(b, 0);
++
++	mb();
++	q_fs_reqs++;
++	switch (cmd) {
++	case 0x202:                                 /* OPEN {path[256]; flags} */
++	case 0x203:                                 /* OPENAT {dirfd; path[256]; flags} */
++	case 0x206: {                               /* CREAT {path[256]; mode} */
++		uint32_t po = cmd == 0x203 ? 8 : 4;
++		uint32_t flags = cmd == 0x206 ? 0x241u : get32(b, po + 256);
++		qf_basename(b + po, name);
++		ret = fs_open(name, flags, &e);
++		put32(b, 4, (uint32_t)ret);
++		LOG("fs %s %s flags 0%o -> %d%s", fs_cmd_name(cmd), name, flags, ret, ret < 0 ? (e == ENOENT ? " (no such file)" : " (error)") : "");
++		break;
++	}
++	case 0x207: {                               /* READ {fd; count} -> {buf[20000]; ret@20004} */
++		int32_t fd = (int32_t)get32(b, 4);
++		uint32_t count = get32(b, 8), n = 0;
++		int k = qf_fd(fd);
++		if (k < 0) {
++			e = EBADF;
++		} else {
++			struct qfile *f = &q_files[q_fds[k].file];
++			uint32_t pos = q_fds[k].pos;
++			n = pos < f->len ? MIN(MIN(count, FS_MAX_DATA), f->len - pos) : 0;
++			if (n > 0) {
++				memcpy(b + 4, f->data + pos, n);
++			}
++			q_fds[k].pos = pos + n;
++			ret = (int32_t)n;
++			LOG("fs read %s @%u %u -> %u", f->name, pos, count, n);
++		}
++		put32(b, 4 + FS_MAX_DATA, (uint32_t)ret);
++		if (k < 0) {
++			LOG("fs read fd %d: bad fd", fd);
++		}
++		break;
++	}
++	case 0x208: {                               /* WRITE {fd; buf[20000]; count@20008} -> {ret} */
++		int32_t fd = (int32_t)get32(b, 4);
++		uint32_t count = get32(b, 8 + FS_MAX_DATA);
++		int k = qf_fd(fd);
++		if (k < 0 || count > FS_MAX_DATA) {
++			e = k < 0 ? EBADF : EINVAL;
++			LOG("fs write fd %d count %u: %s", fd, count, k < 0 ? "bad fd" : "too long");
++		} else {
++			int fi = q_fds[k].file;
++			struct qfile *f = &q_files[fi];
++			uint32_t pos = q_fds[k].pos;
++			if (!qf_reserve(fi, pos + count, false)) {
++				e = ENOSPC;
++				LOG("fs write %s @%u %u: NO ROOM in the RAM store", f->name, pos, count);
++			} else {
++				if (pos > f->len) {
++					bzero(f->data + f->len, pos - f->len);
++				}
++				memcpy(f->data + pos, b + 8, count);
++				q_fds[k].pos = pos + count;
++				f->len = MAX(f->len, pos + count);
++				f->dirty = true;
++				ret = (int32_t)count;
++				LOG("fs write %s @%u %u (now %u bytes; RAM only)", f->name, pos, count, f->len);
++			}
++		}
++		put32(b, 4, (uint32_t)ret);
++		break;
++	}
++	case 0x209: {                               /* CLOSE {fd} */
++		int32_t fd = (int32_t)get32(b, 4);
++		int k = fd - QF_FD_BASE;
++		if (k >= 0 && k < QF_NFD && q_fds[k].used) {
++			q_fds[k].used = false;
++			ret = 0;
++		} else {
++			e = EBADF;
++		}
++		put32(b, 4, (uint32_t)ret);
++		LOG("fs close %d -> %d", fd, ret);
++		break;
++	}
++	case 0x20A: {                               /* LSEEK {fd; off; whence} -> {ret} */
++		int32_t fd = (int32_t)get32(b, 4), off = (int32_t)get32(b, 8), whence = (int32_t)get32(b, 12);
++		int k = qf_fd(fd);
++		if (k < 0 || whence < 0 || whence > 2) {
++			e = k < 0 ? EBADF : EINVAL;
++		} else {
++			int64_t base = whence == 0 ? 0 : whence == 1 ? (int64_t)q_fds[k].pos : (int64_t)q_files[q_fds[k].file].len;
++			int64_t np = base + off;
++			if (np < 0 || np > (int64_t)QF_FILE_MAX) {
++				e = EINVAL;
++			} else {
++				q_fds[k].pos = (uint32_t)np;
++				ret = (int32_t)np;
++			}
++		}
++		put32(b, 4, (uint32_t)ret);
++		LOG("fs lseek %d %d whence %d -> %d", fd, off, whence, ret);
++		break;
++	}
++	case 0x204:                                 /* UNLINKAT {dirfd; path} */
++	case 0x20C:                                 /* UNLINK {path} */
++	case 0x213: {                               /* REMOVE {path} */
++		qf_basename(b + (cmd == 0x204 ? 8 : 4), name);
++		int i = qf_find(name);
++		if (i < 0) {
++			e = ENOENT;
++		} else {
++			qf_free(i);
++			ret = 0;
++		}
++		put32(b, 4, (uint32_t)ret);
++		LOG("fs %s %s -> %d (RAM only)", fs_cmd_name(cmd), name, ret);
++		break;
++	}
++	case 0x20E:                                 /* FSTAT {fd} -> {stat; ret@100} */
++	case 0x20F: {                               /* LSTAT {path} */
++		int i = -1;
++		if (cmd == 0x20E) {
++			int k = qf_fd((int32_t)get32(b, 4));
++			i = k < 0 ? -1 : q_fds[k].file;
++			strlcpy(name, i < 0 ? "(bad fd)" : q_files[i].name, sizeof(name));
++		} else {
++			qf_basename(b + 4, name);
++			i = qf_find(name);
++		}
++		if (i < 0) {
++			e = cmd == 0x20E ? EBADF : ENOENT;
++			bzero(b + 4, 96);
++		} else {
++			fs_stat(b, i);
++			ret = 0;
++		}
++		put32(b, 100, (uint32_t)ret);
++		LOG("fs %s %s -> %d (size %u)", fs_cmd_name(cmd), name, ret, i < 0 ? 0 : q_files[i].len);
++		break;
++	}
++	case 0x217: {                               /* RENAME {old[256]; new[256]} */
++		qf_basename(b + 4, name);
++		qf_basename(b + 260, name2);
++		int i = qf_find(name), j = qf_find(name2);
++		if (i < 0 || name2[0] == 0) {
++			e = ENOENT;
++		} else {
++			if (j >= 0 && j != i) {
++				qf_free(j);
++			}
++			strlcpy(q_files[i].name, name2, sizeof(q_files[i].name));
++			q_files[i].dirty = true;
++			ret = 0;
++		}
++		put32(b, 4, (uint32_t)ret);
++		LOG("fs rename %s -> %s: %d (RAM only)", name, name2, ret);
++		break;
++	}
++	case 0x205:                                 /* FCNTL */
++	case 0x20D:                                 /* RMDIR */
++	case 0x210:                                 /* MKDIR */
++	case 0x211:                                 /* TESTDIR: every directory "exists" */
++	case 0x214:                                 /* CHOWN_CHMOD */
++	case 0x216:                                 /* SYNC */
++		ret = 0;
++		if (cmd == 0x205 || cmd == 0x216) {
++			LOG("fs %s fd %d -> 0", fs_cmd_name(cmd), (int32_t)get32(b, 4));
++		} else {
++			char path[64];
++			memcpy(path, b + 4, sizeof(path) - 1);
++			path[sizeof(path) - 1] = 0;
++			LOG("fs %s %s -> 0", fs_cmd_name(cmd), path);
++		}
++		put32(b, 4, 0);
++		break;
++	case 0x218:                                 /* PAR_FR_SIZE -> {u64 size; ret} */
++		put64(b, 4, 64ull << 20);
++		put32(b, 12, 0);
++		ret = 0;
++		LOG("fs par_free_size -> 64 MB");
++		break;
++	case 0x219:                                 /* DIR_OPEN -> {u64 pdir; ret} */
++		put64(b, 4, 0);
++		put32(b, 12, (uint32_t)-1);
++		e = ENOENT;
++		LOG("fs dir_open: not supported -> -1");
++		break;
++	case 0x21A:                                 /* DIR_READ -> {dirent(275); ret} */
++		put32(b, 4 + 275, (uint32_t)-1);
++		LOG("fs dir_read: not supported -> -1");
++		break;
++	case 0x21B:                                 /* DIR_CLOSE */
++		put32(b, 4, 0);
++		ret = 0;
++		break;
++	case 0x21C:                                 /* GET_ERRNO -> {ret = errno} */
++		put32(b, 4, (uint32_t)q_errno);
++		LOG("fs get_errno -> %d", q_errno);
++		ret = 0;
++		e = q_errno;
++		break;
++	default:
++		put32(b, 4, (uint32_t)-1);
++		LOG("fs: unknown request %x -> -1", cmd);
++		break;
++	}
++	if (ret < 0) {
++		q_errno = e != 0 ? e : EIO;
+ 	}
++	mb();
++}
++
++/* listener 10 with its buffer in the pool (once per boot: TZ keeps it) */
++static bool
++fs_register(void)
++{
++	uint64_t ret[3];
++
++	if (q_lsnr_ok || q_lsnr_tried) {
++		return q_lsnr_ok;
++	}
++	q_lsnr_tried = true;
++	bzero(q_va + OFF_LSB, LSB_SIZE);
++	mb();
++	uint64_t a[3] = { FS_LISTENER, QSEE_POOL_PA + OFF_LSB, LSB_SIZE };
++	int64_t x0 = scm_call(FN_REG_LISTENER, 0x83, a, 3, ret);
++	LOG("listener %u: REGISTER (smcinvoke id) buffer %llx %u bytes: x0 %lld, result %d", FS_LISTENER, QSEE_POOL_PA + OFF_LSB,
++	    LSB_SIZE, x0, (int32_t)ret[0]);
++	if (x0 != 0) {
++		x0 = scm_call(FN_REG_LISTENER_OLD, 0x83, a, 3, ret);
++		LOG("listener %u: REGISTER (legacy id): x0 %lld, result %d", FS_LISTENER, x0, (int32_t)ret[0]);
++	}
++	q_lsnr_ok = x0 == 0 && (uint32_t)ret[0] == RES_SUCCESS;
++	LOG("listener %u (file service): %s", FS_LISTENER, q_lsnr_ok ? "registered" : "NOT registered");
++	return q_lsnr_ok;
++}
++
++/* ---------------------------------------------------------------- 0253: init and one capture */
++
++/* q_cmd with the caller's fields; the gf result, or ~0u when the call itself failed */
++static uint32_t
++gf_cmd(uint32_t target, uint32_t cmd, uint32_t len, const char *name)
++{
++	q_cmd[0] = 0;
++	put32(q_cmd, 4, target);
++	put32(q_cmd, 8, cmd);
++	put32(q_cmd, 0x0c, 0);
++	if (!gf_send(q_goodix_id, q_cmd, len, name)) {
++		LOG("%s (%u,%u): the call itself failed", name, target, cmd);
++		return ~0u;
++	}
++	uint32_t r = get32(q_cmd, 0x0c);
++	LOG("%s (%u,%u): gf result %u %s", name, target, cmd, r, gf_err_name(r));
++	return r;
++}
++
++/* op 10: the TA restarted with the file listener up, then libgf_hal's init after DETECT */
++static int
++fp_init(void)
++{
++	uint32_t g;
++	const uint64_t t0 = mach_absolute_time();
++
++	q_inited = false;
++	if (!qsee_up()) {
++		return EIO;
++	}
++	if (!fs_register()) {
++		LOG("op 10: no file listener: stop");
++		return EIO;
++	}
++	int r = milestone(true, false);
++	if (r != 0) {
++		return r;
++	}
++	/* SENSOR_INIT: CustomizedSensor::createInitCmd, locked device, no panel white point, product 3 (sapphire) */
++	bzero(q_cmd, 0x2c0);
++	q_cmd[0x23c] = 0;
++	put32(q_cmd, 0x2a8, 0);
++	put32(q_cmd, 0x2b0, 3);
++	put32(q_cmd, 0x2b4, 12);
++	put32(q_cmd, 0x2b8, 0);
++	q_cmd[0x2bc] = 1;
++	q_cmd[0x2bd] = 0;
++	q_cmd[0x2be] = 1;
++	g = gf_cmd(1002, 2, 0x2c0, "SENSOR_INIT");
++	LOG("SENSOR_INIT: chip type %u (+0x238); config +0x20 %08x %08x %08x %08x crc %08x; +0x138 crc %08x; +0x23d crc %08x",
++	    get32(q_cmd, 0x238), get32(q_cmd, 0x20), get32(q_cmd, 0x24), get32(q_cmd, 0x28), get32(q_cmd, 0x2c),
++	    crc32(0, q_cmd + 0x20, 0x118), crc32(0, q_cmd + 0x138, 0x100), crc32(0, q_cmd + 0x23d, 0x2a));
++	if (g != 0) {
++		goto fail;
++	}
++	/* ALGO_INIT: CustomizedAlgo::init */
++	bzero(q_cmd, 0x30);
++	put32(q_cmd, 0x24, 1);
++	g = gf_cmd(1001, 0, 0x30, "ALGO_INIT");
++	LOG("ALGO_INIT: out +0x24 %u, +0x28 %08x%08x", get32(q_cmd, 0x24), get32(q_cmd, 0x2c), get32(q_cmd, 0x28));
++	if (g != 0) {
++		goto fail;
++	}
++	bzero(q_cmd, 0x1c);
++	g = gf_cmd(1000, 13, 0x1c, "AUTH_INIT_FINISHED");
++	if (g != 0) {
++		goto fail;
++	}
++	bzero(q_cmd, 0x120);
++	put32(q_cmd, 0x1c, 0);
++	strlcpy((char *)q_cmd + 0x20, "/data/vendor_de/0/fpdata", 256);
++	g = gf_cmd(1000, 0, 0x120, "SET_ACTIVE_GROUP");
++	if (g != 0) {
++		goto fail;
++	}
++	q_inited = true;
++	LOG("op 10: init done in %llu ms (%u file requests so far; sensor awake, op 11 captures, op 12 stops)", ms_since(t0),
++	    q_fs_reqs);
++	return 0;
++fail:
++	LOG("op 10: stopped at gf %u %s after %llu ms (%u file requests); sensor off", g, g == ~0u ? "(call failed)" :
++	    gf_err_name(g), ms_since(t0), q_fs_reqs);
++	fp_power_off();
++	return EIO;
++}
++
++/* op 11: AUTHENTICATE, CAPTURE_IMG, ALGO_AUTHENTICATE, ALGO_KPI, AUTH_CANCEL (no illumination here) */
++static int
++fp_capture(void)
++{
++	uint32_t ga = ~0u, gc = ~0u, gk = ~0u;
++
++	if (!q_inited || q_goodix_id == 0) {
++		LOG("op 11: run op 10 first");
++		return EAGAIN;
++	}
++	bzero(q_cmd, 0x30);
++	put32(q_cmd, 0x1c, 0);
++	put64(q_cmd, 0x20, 1);
++	uint32_t g = gf_cmd(1000, 1, 0x30, "AUTHENTICATE");
++	if (g == ~0u) {
++		return EIO;
++	}
++	if (g == 0) {
++		bzero(q_cmd, 0x28);
++		put32(q_cmd, 0x1c, 0);                  /* retry index */
++		put32(q_cmd, 0x20, 2);                  /* op: authenticate */
++		gc = gf_cmd(1002, 3, 0x28, "CAPTURE_IMG");
++		if (gc == 0) {
++			bzero(q_cmd, 0xa4);
++			q_cmd[0x9e] = 0;
++			q_cmd[0x9f] = 0;
++			ga = gf_cmd(1001, 2, 0xa4, "ALGO_AUTHENTICATE");
++		}
++		bzero(q_cmd, 0xbc);
++		gk = gf_cmd(1001, 4, 0xbc, "ALGO_KPI");
++		if (gk == 0) {
++			LOG("KPI: quality %u, valid area %u, match score %u, study %u, key points %u, increase rate %u, overlay %u",
++			    get32(q_cmd, 0x1c), get32(q_cmd, 0x20), get32(q_cmd, 0x24), get32(q_cmd, 0x28), get32(q_cmd, 0x2c),
++			    get32(q_cmd, 0x30), get32(q_cmd, 0x34));
++			LOG("KPI: us raw %u, preprocess %u, feature %u, auth %u", get32(q_cmd, 0x38), get32(q_cmd, 0x40),
++			    get32(q_cmd, 0x44), get32(q_cmd, 0x48));
++		}
++	}
++	bzero(q_cmd, 0x1c);
++	(void)gf_cmd(1000, 8, 0x1c, "AUTH_CANCEL");
++	LOG("op 11: authenticate %u %s, capture %u %s, algo %u %s, kpi %u %s", g, gf_err_name(g), gc,
++	    gc == ~0u ? "-" : gf_err_name(gc), ga, ga == ~0u ? "-" : gf_err_name(ga), gk, gk == ~0u ? "-" : gf_err_name(gk));
++	return 0;
++}
++
++/* op 12: AUTH_CANCEL, sensor off */
++static int
++fp_stop(void)
++{
++	if (q_goodix_id != 0 && q_va != NULL) {
++		bzero(q_cmd, 0x1c);
++		(void)gf_cmd(1000, 8, 0x1c, "AUTH_CANCEL");
++	}
++	fp_power_off();
++	q_inited = false;
++	LOG("op 12: stopped (%u file requests served this boot)", q_fs_reqs);
++	return 0;
++}
++
++/* kern.sweet_qsee (bsd/dev/sweet_qsee_ctl.c); op < 0: the last result */
++extern "C" int
++sweet_qsee_op(int op)
++{
++	int r;
++
++	if (op < 0) {
++		return q_last;
++	}
++	if (!qsee_enabled()) {
++		return ENODEV;
++	}
++	qsee_lock_init();
+ 	IOLockLock(q_lock);
+ 	switch (op) {
+ 	case 1:
+@@ -1013,6 +1886,15 @@ sweet_qsee_op(int op)
+ 	case 9:
+ 		r = tz_log_copy();
+ 		break;
++	case 10:
++		r = fp_init();
++		break;
++	case 11:
++		r = fp_capture();
++		break;
++	case 12:
++		r = fp_stop();
++		break;
+ 	default:
+ 		r = EINVAL;
+ 		break;
