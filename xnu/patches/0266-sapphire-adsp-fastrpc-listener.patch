@@ -1,0 +1,297 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0266: FastRPC listener on its static handle
+
+0265 attached to the sensors PD (retval 0) but its remotectl open of
+"adsp_listener" never got an answer. libadsprpc does not open the listener:
+it invokes static handle 3 (init2 0x03000000, next2 0x04020200). Now the same;
+reverse calls are served while any other call waits (an open can need them),
+next2 retval 0x2e is retried, adsp_default_listener is opened with 20 s and
+registered. More log: every outgoing message and its buffer, and on a timeout
+the channel receive buffers and queue, the ADSP state and the SMMU global
+fault registers.
+---
+--- a/iokit/Kernel/arm/TopazModem.cpp	2026-10-30 00:22:37.308983600 +0100
++++ b/iokit/Kernel/arm/TopazModem.cpp	2026-10-30 00:22:37.388038000 +0100
+@@ -12659,7 +12659,7 @@
+ 	sweet_audio_done = sweet_audio_seq;
+ }
+ 
+-/* ---------------- FastRPC to the ADSP's sensors PD (0265) */
++/* ---------------- FastRPC to the ADSP's sensors PD (0265, 0266) */
+ 
+ #include <stdarg.h>
+ 
+@@ -12838,20 +12838,15 @@
+ 	fr_slot[s - 1].busy = true;
+ 	mb();
+ 	fr_calls++;
++	if (s != 2 || fr_calls <= 4) {             /* 0266: what goes out (next2's only at first) */
++		fr_logf("-> pid %d tid %d ctx %llx handle %u sc %08x addr %llx size %llx", m.pid, m.tid,
++		    (unsigned long long)m.ctx, m.handle, m.sc, (unsigned long long)m.addr, (unsigned long long)m.size);
++		fr_dump("   buffer", b, MIN(at, 0x300u));
++	}
+ 	a_send(&a_ch[2], &m, sizeof(m));
+ 	return true;
+ }
+ 
+-static bool
+-fr_wait(unsigned s, unsigned ms)
+-{
+-	for (unsigned i = 0; i < ms && !fr_slot[s - 1].done; i++) {
+-		IOSleep(1);
+-	}
+-	mb();
+-	return fr_slot[s - 1].done;
+-}
+-
+ static void
+ fr_release(unsigned s)
+ {
+@@ -12864,6 +12859,100 @@
+ 	return fr_va + (s - 1) * FR_SLOT_SIZE + fr_slot[s - 1].off[i];
+ }
+ 
++/* 0266: what the channel and the SMMU say when a call gets no answer */
++static void
++fr_diag(const char *when)
++{
++	static volatile uint8_t *smmu;
++	struct a_chan *c = &a_ch[2];
++	unsigned used = 0;
++	for (unsigned i = 0; i < c->ri_count; i++) {
++		used += c->ri[i].used;
++	}
++	fr_logf("%s: channel %s, the ADSP's receive buffers %u (%u in use), queue %u, drops %u; slave-kernel %08x", when,
++	    a_up(c) ? "up" : "down", c->ri_count, used, c->qt - c->qh, c->drops, a_sk ? *a_sk : 0);
++	if (smmu == NULL) {
++		smmu = (volatile uint8_t *)ml_io_map(SMMU_PA, 0x1000);
++	}
++	if (smmu != NULL) {
++		fr_logf("%s: SMMU sGFSR %08x sGFSYNR0 %08x sGFSYNR1 %08x sGFSYNR2 %08x", when, r32(smmu, 0x48), r32(smmu, 0x50),
++		    r32(smmu, 0x54), r32(smmu, 0x58));
++	}
++}
++
++/*
++ * adsp_listener next2 on its static handle 3 (libadsprpc: remote_handle_invoke(3, 0x04020200, ...)):
++ * in {prevCtx, prevResult, len(prevbufs), len(bufs)} + prevbufs, out {ctx, handle, sc, bufsLenReq} + bufs
++ */
++#define FR_LISTENER     3
++static uint32_t fr_prev_ctx;
++static int32_t fr_prev_result;
++static unsigned fr_reverse, fr_next2_posts;
++
++static bool
++fr_next2(void)
++{
++	uint32_t prim_in[4] = { fr_prev_ctx, (uint32_t)fr_prev_result, 0, FR_BUFS };
++	const void *in[2] = { prim_in, NULL };
++	uint32_t inlen[2] = { sizeof(prim_in), 0 }, outlen[2] = { 16, FR_BUFS };
++	fr_next2_posts++;
++	return fr_post(2, false, FR_LISTENER, FR_SC(4, 2, 2), in, inlen, outlen);
++}
++
++/* a finished next2: log the reverse call, answer it "unsupported", post the next one */
++static void
++fr_service(void)
++{
++	if (!fr_slot[1].busy || !fr_slot[1].done) {
++		return;
++	}
++	mb();
++	int32_t rv = fr_slot[1].retval;
++	uint32_t po[4];
++	memcpy(po, fr_out(2, 2), 16);
++	fr_release(2);
++	if (rv == 0x2e) {                           /* interrupted: the same call again (listener_android) */
++		(void)fr_next2();
++		return;
++	}
++	if (rv != 0) {
++		fr_logf("next2: retval %d (0x%x)", rv, (unsigned)rv);
++		if (fr_next2_posts > 8 && fr_reverse == 0) {
++			fr_logf("next2 keeps failing: the listener stops");
++			fr_state = -7;
++			return;
++		}
++		fr_prev_ctx = 0;
++		fr_prev_result = 0;
++		(void)fr_next2();
++		return;
++	}
++	uint32_t blen = MIN(po[3], FR_BUFS);
++	fr_logf("reverse call %u: ctx 0x%x handle 0x%x sc 0x%08x (method %u, in %u, out %u), in-args %u bytes",
++	    fr_reverse, po[0], po[1], po[2], (po[2] >> 24) & 0x1f, (po[2] >> 16) & 0xff, (po[2] >> 8) & 0xff, po[3]);
++	if (fr_reverse < 64) {
++		fr_dump("  in-args", fr_out(2, 3), blen);
++	}
++	fr_reverse++;
++	fr_prev_ctx = po[0];
++	fr_prev_result = FR_UNSUPPORTED;
++	if (fr_reverse < 1024) {
++		(void)fr_next2();
++	}
++}
++
++/* waits for slot s, serving reverse calls meanwhile (a call may need them: a skel loaded through apps_std) */
++static bool
++fr_wait(unsigned s, unsigned ms)
++{
++	for (unsigned i = 0; i < ms && !fr_slot[s - 1].done; i++) {
++		fr_service();
++		IOSleep(1);
++	}
++	mb();
++	return fr_slot[s - 1].done;
++}
++
+ /* a call that answers within ms: its retval, or -1 on a timeout (the slot then stays taken) */
+ static int
+ fr_call(unsigned s, bool kernel, uint32_t handle, uint32_t sc, const void *const *in, const uint32_t *inlen,
+@@ -12875,6 +12964,7 @@
+ 	}
+ 	if (!fr_wait(s, ms)) {
+ 		fr_logf("%s: no answer in %u ms", what, ms);
++		fr_diag(what);
+ 		return -1;
+ 	}
+ 	fr_logf("%s: retval %d (0x%x)", what, fr_slot[s - 1].retval, (unsigned)fr_slot[s - 1].retval);
+@@ -12883,15 +12973,15 @@
+ 
+ /* remotectl_open(name): static handle 0, method 0, in {len(name), len(dlerror)} + name, out {handle, nErr} + dlerror */
+ static int
+-fr_open(const char *name, uint32_t *h)
++fr_open(const char *name, uint32_t *h, unsigned ms)
+ {
+ 	uint32_t prim_in[2] = { (uint32_t)strlen(name) + 1, 128 };
+ 	const void *in[2] = { prim_in, name };
+ 	uint32_t inlen[2] = { sizeof(prim_in), prim_in[0] }, outlen[2] = { 8, 128 };
+ 	char what[64];
+ 	snprintf(what, sizeof(what), "open \"%s\"", name);
+-	int r = fr_call(1, false, 0, FR_SC(0, 2, 2), in, inlen, outlen, 3000, what);
+-	if (r == -1) {
++	int r = fr_call(1, false, 0, FR_SC(0, 2, 2), in, inlen, outlen, ms, what);
++	if (r == -1 || r == -2) {
+ 		return r;
+ 	}
+ 	uint32_t prim_out[2];
+@@ -12905,20 +12995,10 @@
+ 	return r != 0 ? r : (int)prim_out[1];
+ }
+ 
+-/* adsp_listener next2 (method 4): in {prevCtx, prevResult, len(prevbufs), len(bufs)} + prevbufs, out {ctx, handle, sc, bufsLenReq} + bufs */
+-static bool
+-fr_next2(uint32_t lh, uint32_t prev_ctx, int32_t prev_result)
+-{
+-	uint32_t prim_in[4] = { prev_ctx, (uint32_t)prev_result, 0, FR_BUFS };
+-	const void *in[2] = { prim_in, NULL };
+-	uint32_t inlen[2] = { sizeof(prim_in), 0 }, outlen[2] = { 16, FR_BUFS };
+-	return fr_post(2, false, lh, FR_SC(4, 2, 2), in, inlen, outlen);
+-}
+-
+ static void
+ fr_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+-	uint32_t tgid = FR_TGID, lh = 0, dh = 0;
++	uint32_t tgid = FR_TGID, dh = 0;
+ 	int r;
+ 
+ 	fr_state = 1;
+@@ -12937,7 +13017,9 @@
+ 		fr_state = -2;
+ 		goto out;
+ 	}
+-	fr_logf("buffers at %llx (+%llx stream bits), %u slots", (unsigned long long)fr_pa, (unsigned long long)FR_SID_BITS, FR_SLOTS);
++	fr_logf("buffers at %llx (+%llx stream bits), %u slots", (unsigned long long)fr_pa, (unsigned long long)FR_SID_BITS,
++	    FR_SLOTS);
++	fr_diag("before the attach");
+ 
+ 	/* INIT_ATTACH_SNS: handle 1, method 0, in: the tgid; a kernel message (pid 0), ctx pd 2 */
+ 	{
+@@ -12952,66 +13034,41 @@
+ 			goto out;
+ 		}
+ 	}
+-	/* the reverse-call listener, as listener_android.c: open, init2 (else init), then next2 */
+-	if (fr_open("adsp_listener", &lh) != 0) {
+-		fr_state = -4;
+-		goto out;
+-	}
+-	r = fr_call(1, false, lh, FR_SC(3, 0, 0), NULL, NULL, NULL, 3000, "adsp_listener init2");
++	/*
++	 * 0266: the listener as libadsprpc runs it: no open (0265's remotectl open of "adsp_listener" got no
++	 * answer), static handle 3: init2 = remote_handle_invoke(3, 0x03000000, NULL), then next2 (0x04020200)
++	 * kept posted.
++	 */
++	r = fr_call(1, false, FR_LISTENER, FR_SC(3, 0, 0), NULL, NULL, NULL, 5000, "adsp_listener init2 (handle 3)");
+ 	if (r != -1) {
+ 		fr_release(1);
+ 	}
+ 	if (r != 0) {
+-		r = fr_call(1, false, lh, FR_SC(2, 0, 0), NULL, NULL, NULL, 3000, "adsp_listener init");
+-		if (r != -1) {
+-			fr_release(1);
+-		}
+-		if (r != 0) {
+-			fr_state = -5;
+-			goto out;
+-		}
++		fr_state = -5;
++		goto out;
+ 	}
+-	if (!fr_next2(lh, 0, 0)) {
++	if (!fr_next2()) {
+ 		fr_state = -6;
+ 		goto out;
+ 	}
+-	/* adsp_default_listener_register (method 0), as adsp_default_listener.c */
+-	if (fr_open("adsp_default_listener", &dh) == 0) {
+-		r = fr_call(1, false, dh, FR_SC(0, 0, 0), NULL, NULL, NULL, 3000, "adsp_default_listener register");
++	fr_state = 2;
++	/* adsp_default_listener.c: remote_handle_open("adsp_default_listener"), then register = invoke(h, 0, NULL) */
++	if (fr_open("adsp_default_listener", &dh, 20000) == 0 && dh != 0) {
++		r = fr_call(1, false, dh, FR_SC(0, 0, 0), NULL, NULL, NULL, 20000, "adsp_default_listener register");
+ 		if (r != -1) {
+ 			fr_release(1);
+ 		}
+ 	}
+-	fr_state = 2;
+-	/* the reverse calls: logged, answered "unsupported" */
+-	for (unsigned k = 0; k < 256; k++) {
+-		while (!fr_slot[1].done) {
+-			IOSleep(5);
+-		}
+-		mb();
+-		int32_t rv = fr_slot[1].retval;
+-		uint32_t po[4];
+-		memcpy(po, fr_out(2, 2), 16);
+-		uint32_t blen = MIN(po[3], FR_BUFS);
+-		fr_logf("reverse call %u: next2 retval %d: ctx 0x%x handle 0x%x sc 0x%08x (method %u, in %u, out %u) bufs %u",
+-		    k, rv, po[0], po[1], po[2], (po[2] >> 24) & 0x1f, (po[2] >> 16) & 0xff, (po[2] >> 8) & 0xff, po[3]);
+-		if (rv == 0) {
+-			fr_dump("  in-args", fr_out(2, 3), blen);
+-		}
+-		fr_release(2);
+-		if (rv != 0 && k > 2) {
+-			fr_logf("next2 keeps failing: stopped");
+-			fr_state = -7;
+-			goto out;
+-		}
+-		if (!fr_next2(lh, rv == 0 ? po[0] : 0, rv == 0 ? FR_UNSUPPORTED : 0)) {
+-			fr_state = -6;
+-			goto out;
++	fr_logf("serving reverse calls (answered unsupported)");
++	for (unsigned t = 0; fr_state == 2; t++) {
++		fr_service();
++		IOSleep(2);
++		if (t == 30000) {
++			fr_diag("60 s");
+ 		}
+ 	}
+-	fr_logf("256 reverse calls logged: no more answers");
+ out:
+-	fr_logf("stopped, state %d; %u calls, %u unmatched messages", fr_state, fr_calls, fr_unmatched);
++	fr_logf("stopped, state %d; %u calls, %u reverse, %u unmatched messages", fr_state, fr_calls, fr_reverse, fr_unmatched);
+ 	thread_terminate(current_thread());
+ }
+ 
