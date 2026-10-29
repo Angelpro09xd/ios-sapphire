@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.sapphire.fpd: fingerprint unlock (fpd.c). /var/jb/Library/LaunchDaemons is not loaded at boot here, so
+  this dict is put into launchd's cache, /System/Library/xpc/launchd.plist, under
+  /System/Library/LaunchDaemons/com.sapphire.fpd.plist by fpd-launchd.py (install.sh; the cache before it:
+  launchd.plist.pre-fpd). This file itself is also copied to /redwood/share/fpd/ to start the job without a
+  reboot (fptest.sh start). fpd exits 0 when there is nothing to do (no kernel support, qsee off, no
+  template): not restarted then; a crash is restarted after 30 s.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.sapphire.fpd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/fpd</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>UserName</key>
+	<string>root</string>
+	<key>POSIXSpawnType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>/var/tmp/fpd.out</string>
+	<key>StandardErrorPath</key>
+	<string>/var/tmp/fpd.out</string>
+</dict>
+</plist>
