@@ -1,0 +1,52 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0247: AppleKeyStore: no lock assertions while locked
+
+SpringBoard asked for the passcode never: after revoking authentication at
+screen lock, -[SBFUserAuthenticationController _isUserAuthenticated] (auth
+state 2) decides by taking an SBTransient MKBDeviceLockAssertion
+(aks_assert_hold, 26) - "Checking if passcode locked", type GracePeriod - and
+treats a granted one as "still in the grace period, authenticated". 26 always
+succeeded, so a locked phone opened with a swipe. Refuse aks_assert_hold with
+kIOReturnNotPermitted while a passcode is set and the bag is locked, as the kext
+does (MKBDeviceLockAssertion maps 0xe00002e2 to its "locked" error).
+---
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index c30fe0a..482c0bd 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -1055,13 +1055,34 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	case kAKSSetSystem:
+ 	case kAKSUnlockBag:
+ 	case kAKSLockBag:
+-	case kAKSAssertHold:
+ 	case kAKSAssertDrop:
+ 	case kAKSAssertConsume:
+ 	case kAKSUnloadSessionBags:
+ 	case kAKSChangeSecretEpilogue:
+ 		args->scalarOutputCount = 0;
+ 		break;
++	case kAKSAssertHold: {
++		/*
++		 * aks_assert_hold(handle, type, timeout): scalars { type, timeout, handle }; types
++		 * (MKBDeviceLockAssertion's MKBAssertionKey) 0 Other, 1 RemoteProfile, 2 SBTransient,
++		 * 3 RestoreFromBackup, 4 TimeMachine. A lock assertion keeps an unlocked bag
++		 * unlocked; it cannot be taken while the bag is locked. SpringBoard depends on
++		 * that: after it revokes authentication (screen lock) it decides whether the
++		 * passcode is needed by taking an SBTransient assertion ("Checking if passcode
++		 * locked", type GracePeriod): taken = still in the grace period = no passcode.
++		 * Granting it while locked let a swipe unlock a locked phone.
++		 */
++		bool refuse;
++
++		args->scalarOutputCount = 0;
++		IOLockLock(sweet_aks_lock);
++		refuse = sa.has_pass && sa.locked;
++		IOLockUnlock(sweet_aks_lock);
++		if (refuse) {
++			ret = kIOReturnNotPermitted;
++		}
++		break;
++	}
+ 	case kAKSNotifyStateSet:
+ 		IOLockLock(sweet_aks_lock);
+ 		sa.notify_state = true;

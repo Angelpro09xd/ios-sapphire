@@ -1,5 +1,22 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-10-29: a real passcode lock (kernels 0246, 0247)
+
+The lock screen never asked for the passcode: the kernel's AppleKeyStore stand-in said "unlocked" at boot,
+accepted any passcode and every selector. 0246 makes it a passcode state machine (research/passcode-aks.md):
+- MKB lock state 3 without a passcode; set/change through keybagd's aks_change_secret (sel 15), then keybagd's
+  save (sel 3) keeps the state inside the system bag it writes (/private/var/keybags/systembag.kb, KeyBagKeys:
+  a 104-byte blob with a PBKDF2-HMAC-SHA256 verifier, salt, failure count, HMAC); at boot keybagd loads it back
+  (sel 14 answers NotFound once, then sel 6). The kernel itself writes no file (an earlier version that did froze
+  the phone; the actual panic was writeBytes on an unprepared user client memory descriptor: "IOGMD: not wired
+  for the IODMACommand" -> prepare()/complete() around every descriptor copy).
+- Boots locked before first unlock; unlock only with the passcode (sel 9 / 42), failed attempts with iOS's
+  back-off; lock on sel 8/32; IOKit interest messages 0xe3ffd00d (lock state) / 0xe3ffd00f (first unlock).
+- 0247: SpringBoard decides "still in the grace period" when it can take a lock assertion (sel 26, SBTransient):
+  refused while locked, as a real keystore does, so the lock screen asks for the passcode.
+- Recovery: boot-arg sweetaks_nopass=1 (the verifier is ignored, the next save clears it), or over ssh put back
+  systembag.kb.pre-0246 (keybagd --init goes fatal without a systembag.kb: never delete it).
+
 ## SAPPHIRE 2026-10-29: Files, app extensions, button chord
 
 - Files shows On My iPhone with files and folders (userland/tweaks/fileprovider: fileproviderd's FP library
