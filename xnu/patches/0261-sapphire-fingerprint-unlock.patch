@@ -1,0 +1,408 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0261: fingerprint unlock (kernel side)
+
+The touch driver reports when a finger is on the fingerprint spot
+(kern.sweet_fod_press, 1 while a touch is inside the circle at 540,2109
+r 105 panel pixels; kern.sweet_fod_seq counts presses). kern.sweet_qsee op 26
+lights the spot and authenticates again and again until a match, the finger
+off the spot for over 150 ms, or 3 s, then turns the spot off; a match is
+kept with its time, failures count up to 5, after which op 26 asks for the
+passcode until the next good one. Op 27 asks AppleKeyStore
+(sweet_aks_biometric_unlock) to unlock with a match under 3 s old: only with a
+passcode set, the device unlocked with it since boot and locked now; it then
+does what a good passcode does (unlocked, failures cleared, the same
+interest messages). Ops 26 and 27 log one summary line per attempt.
+---
+ bsd/dev/sweet_qsee_ctl.c              |   4 +-
+ bsd/dev/sweet_touch.c                 |  42 +++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp |  10 ++-
+ iokit/Kernel/arm/SweetKeyStore.cpp    |  56 ++++++++++++++
+ iokit/Kernel/arm/SweetQsee.cpp        | 134 +++++++++++++++++++++++++++++++++-
+ 5 files changed, 237 insertions(+), 9 deletions(-)
+
+diff --git a/bsd/dev/sweet_qsee_ctl.c b/bsd/dev/sweet_qsee_ctl.c
+index b6dac71..caf82bb 100755
+--- a/bsd/dev/sweet_qsee_ctl.c
++++ b/bsd/dev/sweet_qsee_ctl.c
+@@ -14,7 +14,9 @@
+  *   18 untrusted auth with retries (reads as 17), 19 enumerate + authenticator id, 20 = 18 with
+  *   kern.sweet_qsee_arg (bits 0-3 auth type, 4 no UNTRUSTED_CFG(auth), 5 UNTRUSTED_CFG(enroll)
+  *   first, 6 exposure 5, 7 no AUTHENTICATE, 8 the spot lit by the panel's local HBM; bit 8 also for
+- *   op 15), 22/23 local HBM on/off, 24/25 global HBM on/off
++ *   op 15), 22/23 local HBM on/off, 24/25 global HBM on/off, 26 lit auth while the finger is on the
++ *   spot (reads: finger id bits, -1008 no match, -4 lifted, -error; EPERM after 5 failures until a
++ *   passcode), 27 unlock by a match under 3 s old (0, EPERM, EAGAIN)
+  * kern.sweet_qsee_filesel (write a name) + kern.sweet_qsee_fileout (read: that store file's bytes)
+  * kern.sweet_qsee_file (write only): "name\0bytes" puts a file the TA may read into the kernel's
+  * RAM store (empty bytes drop it); kern.sweet_qsee_files lists the store.
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 68e8181..67d4cc8 100755
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -16,6 +16,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <sys/sysctl.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -395,9 +396,50 @@ touch_checksum(const uint8_t *buf, unsigned len)
+ 	return (sum & 0xffffu) == touch_be16(buf + len - 2);
+ }
+ 
++/*
++ * 0261: the fingerprint spot (sapphire FOD: centre 540,2109, radius 105 in the 1080x2400 panel
++ * pixels the reports are mapped to). kern.sweet_fod_press: 1 while a touch is inside it;
++ * kern.sweet_fod_seq: +1 at every press inside it.
++ */
++#define FOD_X   540
++#define FOD_Y   2109
++#define FOD_R   105
++int sweet_fod_press, sweet_fod_seq;
++SYSCTL_INT(_kern, OID_AUTO, sweet_fod_press, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fod_press, 0,
++    "1 while a touch is inside the fingerprint circle");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fod_seq, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fod_seq, 0,
++    "presses inside the fingerprint circle so far");
++
++static void
++touch_fod(uint32_t mask, const int *x, const int *y)
++{
++	static bool logged;
++	int in = 0, fx = 0, fy = 0;
++	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
++		if (mask & (1u << id)) {
++			int dx = x[id] - FOD_X, dy = y[id] - FOD_Y;
++			if (dx * dx + dy * dy <= FOD_R * FOD_R) {
++				in = 1;
++				fx = x[id];
++				fy = y[id];
++			}
++		}
++	}
++	if (in && !sweet_fod_press) {
++		sweet_fod_seq++;
++		if (!logged) {
++			logged = true;
++			printf("SWEET TOUCH: first press in the fingerprint circle at %d,%d (panel pixels 1080x2400, raw range %ux%u)\n",
++			    fx, fy, st.rx, st.ry);
++		}
++	}
++	sweet_fod_press = in;
++}
++
+ static void
+ touch_report(uint32_t mask, const int *x, const int *y)
+ {
++	touch_fod(mask, x, y);
+ 	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
+ 		uint32_t bit = 1u << id;
+ 		if (mask & bit) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 28c3b72..e90bff4 100755
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1831,7 +1831,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+  * without a DSI path, -2 while the panel is off.
+  */
+ extern "C" int
+-sweet_fb_dsi_seq(const uint8_t *seq, uint32_t len, const char *what)
++sweet_fb_dsi_seq(const uint8_t *seq, uint32_t len, const char *what, int quiet)
+ {
+ 	AppleCLCD *fb = sweet_dsi_fb;
+ 	if (fb == NULL) {
+@@ -1845,7 +1845,7 @@ sweet_fb_dsi_seq(const uint8_t *seq, uint32_t len, const char *what)
+ 	int failed = 0;
+ 	unsigned n = 0;
+ 	IOLockLock(fb->fBlLock);
+-	IOLog("SWEET FB: dsi %s: ctrl %#x, dma ctrl %#x, trigger %#x, int %#x\n", what, dsi_rd(fb->fDsi, 0x004),
++	if (!quiet) IOLog("SWEET FB: dsi %s: ctrl %#x, dma ctrl %#x, trigger %#x, int %#x\n", what, dsi_rd(fb->fDsi, 0x004),
+ 	    dsi_rd(fb->fDsi, 0x03c), dsi_rd(fb->fDsi, 0x084), dsi_rd(fb->fDsi, 0x110));
+ 	for (uint32_t o = 0; o + 7 <= len;) {
+ 		uint8_t dt = seq[o], wait = seq[o + 4];
+@@ -1871,7 +1871,7 @@ sweet_fb_dsi_seq(const uint8_t *seq, uint32_t len, const char *what)
+ 				IODelay(2000);
+ 			}
+ 		}
+-		IOLog("SWEET FB: dsi %s #%u: dt %02x len %u: %02x %02x %02x %02x: %s\n", what, n, dt, dl, dl > 0 ? pl[0] : 0,
++		if (!quiet || !done) IOLog("SWEET FB: dsi %s #%u: dt %02x len %u: %02x %02x %02x %02x: %s\n", what, n, dt, dl, dl > 0 ? pl[0] : 0,
+ 		    dl > 1 ? pl[1] : 0, dl > 2 ? pl[2] : 0, dl > 3 ? pl[3] : 0, !known ? "UNKNOWN TYPE, skipped" : done ? "done" : "NO DONE");
+ 		failed += done ? 0 : 1;
+ 		n++;
+@@ -1881,7 +1881,9 @@ sweet_fb_dsi_seq(const uint8_t *seq, uint32_t len, const char *what)
+ 		o += 7 + dl;
+ 	}
+ 	IOLockUnlock(fb->fBlLock);
+-	IOLog("SWEET FB: dsi %s: %u commands, %d not done\n", what, n, failed);
++	if (!quiet || failed != 0) {
++		IOLog("SWEET FB: dsi %s: %u commands, %d not done\n", what, n, failed);
++	}
+ 	return failed;
+ }
+ #endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index 482c0bd..43960bd 100755
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -165,6 +165,7 @@ static_assert(sizeof(struct sweet_aks_bag) == 104, "bag blob size");
+ static const uint8_t sweet_aks_check_key[] = "SWEET AKS system bag v1";
+ 
+ static IOLock *sweet_aks_lock;          /* the fields of sa; never held across anything that blocks */
++static volatile uint32_t sweet_aks_pass_ok;     /* 0261: good passcodes so far */
+ static AppleKeyStore *sweet_aks_service;
+ static thread_call_t sweet_aks_grace_call;
+ static uint32_t sweet_aks_grace_secs;
+@@ -482,6 +483,7 @@ sweet_aks_check(const uint8_t *pass, size_t len, uint32_t *post)
+ 	if (match) {
+ 		sa.failed = 0;
+ 		sa.backoff_until = 0;
++		sweet_aks_pass_ok++;            /* 0261: ends a fingerprint lockout */
+ 	} else {
+ 		failed = ++sa.failed;
+ 		sweet_aks_arm_backoff_locked();
+@@ -1168,4 +1170,58 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	    post != 0 ? ", now " : "", post != 0 ? sweet_aks_state_name(mkb) : "");
+ 	return ret;
+ }
++/*
++ * 0261: unlock by fingerprint (SweetQsee.cpp kern.sweet_qsee op 27). Only when a passcode is set,
++ * the device has been unlocked with it since boot, it is locked now, and SweetQsee matched an
++ * enrolled finger less than 3 s ago (the match is used up). Then exactly what a good passcode
++ * does: unlocked, failures and back-off cleared, the same interest messages.
++ * 0 ok, EPERM conditions not met, EAGAIN no recent match.
++ */
++extern "C" bool sweet_qsee_last_match(uint64_t *age_ms, uint32_t *fid, bool consume);   /* SweetQsee.cpp */
++
++extern "C" uint32_t
++sweet_aks_passcode_unlocks(void)
++{
++	return sweet_aks_pass_ok;
++}
++
++extern "C" int
++sweet_aks_biometric_unlock(void)
++{
++	uint32_t post = 0, fid = 0;
++	uint64_t age = 0;
++	const char *why = NULL;
++
++	if (sweet_aks_lock == NULL) {
++		IOLog("SWEET AKS: fingerprint unlock: no key store\n");
++		return EPERM;
++	}
++	IOLockLock(sweet_aks_lock);
++	if (!sa.has_pass) {
++		why = "no passcode set";
++	} else if (!sa.been_unlocked) {
++		why = "not unlocked with the passcode since boot";
++	} else if (!sa.locked) {
++		why = "not locked";
++	}
++	if (why == NULL && !sweet_qsee_last_match(&age, &fid, false)) {
++		IOLockUnlock(sweet_aks_lock);
++		IOLog("SWEET AKS: fingerprint unlock: no fingerprint match in the last 3 s\n");
++		return EAGAIN;
++	}
++	if (why == NULL) {
++		(void)sweet_qsee_last_match(&age, &fid, true);
++		sa.failed = 0;
++		sa.backoff_until = 0;
++		sweet_aks_unlock_locked(&post);
++	}
++	IOLockUnlock(sweet_aks_lock);
++	if (why != NULL) {
++		IOLog("SWEET AKS: fingerprint unlock refused: %s\n", why);
++		return EPERM;
++	}
++	sweet_aks_post(post);
++	IOLog("SWEET AKS: unlocked by fingerprint (finger %u, matched %llu ms ago)\n", fid, age);
++	return 0;
++}
+ #endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetQsee.cpp b/iokit/Kernel/arm/SweetQsee.cpp
+index 56d1c43..f62e211 100755
+--- a/iokit/Kernel/arm/SweetQsee.cpp
++++ b/iokit/Kernel/arm/SweetQsee.cpp
+@@ -56,6 +56,10 @@
+  * (1000-nit white circle), 23 local HBM off (back to normal), 24 global HBM on, 25 global HBM off,
+  * through SweetFramebuffer's DSI command path; kern.sweet_qsee_arg bit 8 (0x100) makes ops 15
+  * and 20 light the spot first (3 frames), and turn it off at the end.
++ * 0261: op 26 = lit auth while the finger is on the spot (kern.sweet_fod_press, sweet_touch.c):
++ * until a match, the finger lifted (> 150 ms) or 3 s; at most 5 failed attempts until the next
++ * good passcode. op 27 = unlock by the last match (< 3 s old) through SweetKeyStore. Both log one
++ * summary line per attempt (quiet: no per-command lines).
+  * A listener request from TrustZone (INCOMPLETE / BLOCKED_ON_LISTENER) is logged and answered
+  * with a failure: no listener is registered and nothing is ever written anywhere (persist holds
+  * the sensor's factory calibration).
+@@ -69,7 +73,7 @@
+  *   10 init with the file listener, 11 one capture, 12 cancel and sensor off, 13 = 11 at
+  *   exposure level 5, 14 enroll begin, 15 one enroll touch, 16 enroll finish, 17 untrusted auth,
+  *   18 untrusted auth with retries, 19 enumerate + authenticator id, 20 = 18 with kern.sweet_qsee_arg,
+- *   22/23 local HBM on/off, 24/25 global HBM on/off.
++ *   22/23 local HBM on/off, 24/25 global HBM on/off, 26 auth while pressed, 27 unlock by the match.
+  * Reading it gives the result of the last request (0 ok, else an errno).
+  *
+  * Memory: TrustZone reads what it is given by physical address, below 4 GB, physically
+@@ -101,7 +105,9 @@ extern "C" const char *topaz_fw_phone(void);
+ extern "C" int topaz_rpm_ldo(uint32_t id, uint32_t uv, uint32_t ma, uint32_t set);
+ extern "C" int topaz_rpm_vote(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
+ 
+-#define LOG(fmt, ...)       IOLog("qsee: " fmt "\n", ##__VA_ARGS__)
++static bool q_quiet;                            /* 0261: ops 26/27: only their summary lines */
++#define LOG(fmt, ...)       do { if (!q_quiet) IOLog("qsee: " fmt "\n", ##__VA_ARGS__); } while (0)
++#define LOGA(fmt, ...)      IOLog("qsee: " fmt "\n", ##__VA_ARGS__)
+ 
+ #define QSEE_POOL_PA        0xE8000000ull
+ #define QSEE_POOL_SIZE      0x01000000ull
+@@ -2153,7 +2159,7 @@ static const uint8_t hbm_off[] = {
+ 	0x51, 0x07, 0xff,
+ };
+ 
+-extern "C" int sweet_fb_dsi_seq(const uint8_t *seq, uint32_t len, const char *what);   /* SweetFramebuffer.cpp */
++extern "C" int sweet_fb_dsi_seq(const uint8_t *seq, uint32_t len, const char *what, int quiet);   /* SweetFramebuffer.cpp */
+ 
+ static int
+ panel_seq(int which)
+@@ -2164,7 +2170,7 @@ panel_seq(int which)
+ 		{ hbm_on, sizeof(hbm_on), "global HBM on" },
+ 		{ hbm_off, sizeof(hbm_off), "global HBM off" },
+ 	};
+-	int f = sweet_fb_dsi_seq(t[which].seq, t[which].len, t[which].what);
++	int f = sweet_fb_dsi_seq(t[which].seq, t[which].len, t[which].what, q_quiet);
+ 	LOG("panel: %s: %s (%d)", t[which].what, f == 0 ? "sent" : f == -1 ? "no DSI path" : f == -2 ? "panel off" : "NOT all done", f);
+ 	return f == 0 ? 0 : f == -2 ? EAGAIN : EIO;
+ }
+@@ -2500,6 +2506,120 @@ sweet_qsee_file_out(void *dst, uint32_t max)
+ 	return n;
+ }
+ 
++/* ---------------------------------------------------------------- 0261: fingerprint unlock */
++
++extern "C" int sweet_fod_press;                 /* bsd/dev/sweet_touch.c, kern.sweet_fod_press */
++extern "C" uint32_t sweet_aks_passcode_unlocks(void);   /* SweetKeyStore.cpp */
++extern "C" int sweet_aks_biometric_unlock(void);
++
++static volatile uint64_t q_match_abs;           /* mach_absolute_time of the last match (0: none) */
++static volatile uint32_t q_match_fid;
++static uint32_t q_fod_fails, q_fod_epoch;
++
++/* for SweetKeyStore: the last match if under 3 s old; consume: used up. No lock (op 27 holds q_lock). */
++extern "C" bool
++sweet_qsee_last_match(uint64_t *age_ms, uint32_t *fid, bool consume)
++{
++	uint64_t t = q_match_abs;
++	if (t == 0) {
++		return false;
++	}
++	uint64_t age = ms_since(t);
++	if (age >= 3000) {
++		return false;
++	}
++	*age_ms = age;
++	*fid = q_match_fid;
++	if (consume) {
++		q_match_abs = 0;
++	}
++	return true;
++}
++
++/*
++ * op 26: the spot lit (local HBM), then op 20's auth (type 1, UNTRUSTED_CFG 0, exposure 1, retries
++ * per SENSOR_INIT) again and again until a match, the finger off the spot for over 150 ms, or 3 s;
++ * the spot off on every exit. *value: the finger id (its 32 bits) on a match, -1008 no match,
++ * -EINTR the finger lifted first, else -error.
++ */
++static int
++fp_fod_auth(int *value)
++{
++	if (!q_inited || q_goodix_id == 0) {
++		LOGA("op 26: run op 10 first");
++		return EAGAIN;
++	}
++	uint32_t epoch = sweet_aks_passcode_unlocks();
++	if (epoch != q_fod_epoch) {
++		q_fod_epoch = epoch;
++		q_fod_fails = 0;
++	}
++	if (q_fod_fails >= 5) {
++		LOGA("op 26: %u failed fingerprint attempts: passcode required", q_fod_fails);
++		return EPERM;
++	}
++	const uint64_t t0 = mach_absolute_time();
++	unsigned tries = 0;
++	int v = -1008;
++	q_quiet = true;
++	(void)panel_seq(0);
++	IOSleep(50);
++	for (;;) {
++		int r1 = 0;
++		v = -1008;
++		int rr = fp_auth_retry(&r1, 0);
++		tries++;
++		if (rr != 0) {
++			v = -(rr > 0 ? rr : EIO);
++			break;
++		}
++		v = r1;
++		if (v != 0 && (v > 0 || v < -5000)) {
++			break;                              /* a finger id */
++		}
++		if (v == 0) {
++			v = -1008;
++		}
++		/* the finger still there? (lifted for over 150 ms: stop) */
++		unsigned off_ms = 0;
++		while (!sweet_fod_press && off_ms <= 150) {
++			IOSleep(10);
++			off_ms += 10;
++		}
++		if (!sweet_fod_press) {
++			v = -EINTR;
++			break;
++		}
++		if (ms_since(t0) >= 3000) {
++			break;
++		}
++	}
++	(void)panel_seq(1);
++	q_quiet = false;
++	bool match = v > 0 || v < -5000;
++	if (match) {
++		q_match_fid = (uint32_t)v;
++		q_match_abs = mach_absolute_time();
++		q_fod_fails = 0;
++	} else if (v == -1008 || v == -1011) {
++		q_fod_fails++;
++	}
++	*value = v;
++	LOGA("op 26: %s after %u tries, %llu ms (value %d, finger %u, %u failed attempts)", match ? "MATCH" :
++	    v == -EINTR ? "finger lifted" : v == -1008 ? "no match" : "error", tries, ms_since(t0), v,
++	    match ? (uint32_t)v : 0, q_fod_fails);
++	return 0;
++}
++
++/* op 27: unlock by the last match (SweetKeyStore decides) */
++static int
++fp_bio_unlock(void)
++{
++	int r = sweet_aks_biometric_unlock();
++	LOGA("op 27: fingerprint unlock: %s", r == 0 ? "UNLOCKED" : r == EAGAIN ? "no recent match" : "refused (see SWEET AKS)");
++	return r;
++}
++
+ /* op 12: AUTH_CANCEL, sensor off */
+ static int
+ fp_stop(void)
+@@ -2608,6 +2728,12 @@ sweet_qsee_op(int op)
+ 	case 25:
+ 		r = panel_seq(op - 22);
+ 		break;
++	case 26:
++		r = fp_fod_auth(&value);
++		break;
++	case 27:
++		r = fp_bio_unlock();
++		break;
+ 	case 12:
+ 		r = fp_stop();
+ 		break;
