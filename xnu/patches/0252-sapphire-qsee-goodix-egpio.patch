@@ -1,0 +1,41 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0252: Goodix probe: keep APPS the owner of the sensor GPIOs
+
+gpio_out() wrote CTL = 0x200 and so cleared the eGPIO enable bit (12) of
+gpio104 (boot value 0x1a01): the pin went to the LPASS island and the reset
+line stopped following our IO writes, leaving the sensor in reset (PRE_DETECT
+1043, chip id not correct). Keep bits >= 10 and set the enable bit when the
+pin is an eGPIO, as msm_pinmux_set_mux does for function gpio.
+---
+ iokit/Kernel/arm/SweetQsee.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SweetQsee.cpp b/iokit/Kernel/arm/SweetQsee.cpp
+index 743f6a1..7f1ed1b 100755
+--- a/iokit/Kernel/arm/SweetQsee.cpp
++++ b/iokit/Kernel/arm/SweetQsee.cpp
+@@ -112,6 +112,8 @@ extern "C" int topaz_rpm_vote(uint32_t set, uint32_t type, uint32_t id, uint32_t
+ #define GPIO_IRQ            83
+ #define TLMM_CTL_OE         (1u << 9)           /* + function 0 (GPIO), 2 mA, no pull */
+ #define TLMM_IO_OUT         (1u << 1)
++#define TLMM_EGPIO_PRESENT  (1u << 11)          /* the pin can belong to the LPASS island (read only) */
++#define TLMM_EGPIO_ENABLE   (1u << 12)          /* ...but APPS owns it: pinmux function gpio sets it */
+ 
+ /* goodix targets / commands (libgf_hal tables) */
+ #define GF_TARGET_SENSOR    1002
+@@ -427,9 +429,14 @@ gpio_out(unsigned gpio, bool high)
+ 		return false;
+ 	}
+ 	uint32_t ctl0 = g[0], io0 = g[1];
++	/* keep APPS the owner of an eGPIO (0x1a00 as Android's pinctrl leaves it), or the IO writes go nowhere */
++	uint32_t ctl = (ctl0 & ~0x3ffu) | TLMM_CTL_OE;
++	if (ctl0 & TLMM_EGPIO_PRESENT) {
++		ctl |= TLMM_EGPIO_ENABLE;
++	}
+ 	g[1] = high ? TLMM_IO_OUT : 0;              /* the level first, then the output enable */
+ 	mb();
+-	g[0] = TLMM_CTL_OE;
++	g[0] = ctl;
+ 	mb();
+ 	LOG("gpio%u: ctl %08x io %08x -> ctl %08x io %08x (%s)", gpio, ctl0, io0, g[0], g[1], high ? "high" : "low");
+ 	return true;
