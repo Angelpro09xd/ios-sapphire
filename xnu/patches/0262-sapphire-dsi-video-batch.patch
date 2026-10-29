@@ -1,0 +1,278 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0262: panel command batches in video mode (no black flash)
+
+Turning the local HBM on or off flashed the screen black: sweet_fb_dsi_seq
+sent each of the ~20 commands on its own through dsiSend, which switches the
+controller into command mode and back for every packet. In video mode the
+sequence now goes out as one batch (packets back to back, 4-byte padded,
+"last" on the final one) through command DMA in embedded mode with the
+software trigger, as Linux's dsi_ctrl does for a video-mode panel, leaving
+DSI_CTRL alone so the controller sends it in a blanking period; if that DMA
+does not complete, the batch is sent once more with CMD_MODE_EN set beside
+VID_MODE_EN, and if that fails too, one command at a time as before (logged).
+The brightness and display on/off writes are unchanged.
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 232 +++++++++++++++++++++++++++++-----
+ 1 file changed, 198 insertions(+), 34 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e90bff4..8b76fc1 100755
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1824,11 +1824,101 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	return ret;
+ }
+ /*
+- * 0260: a panel command sequence for SweetQsee.cpp (the fingerprint spot's local HBM), in the
+- * qcom dtsi format: per command {dtype, last, vc, flags, wait ms, len hi, len lo, payload}. Sent
+- * one by one through the same command-DMA path as the brightness (dsiSend, high speed), under the
+- * brightness lock; each one logged with its DMA-done result. Returns the commands not done, -1
+- * without a DSI path, -2 while the panel is off.
++ * 0262: DSI commands without leaving video mode, as Linux's dsi_ctrl does for a video-mode panel
++ * (dsi_ctrl_hw_cmn_kickoff_command): command DMA in embedded mode (DSI_COMMAND_MODE_DMA_CTRL bit
++ * 28, packet type bit 24 and WC_SEL bit 29 clear, bit 26 clear = high speed), the DMA FIFO
++ * watermarks off (DSI_DMA_FIFO_CTRL bits 16/20), the software trigger; DSI_CTRL is not touched,
++ * so the controller stays in video mode and sends the packets in the next blanking period; if the
++ * DMA does not complete that way, the batch is sent once more with CMD_MODE_EN set beside
++ * VID_MODE_EN for its duration (Linux's transfer_prepare/unprepare)
++ * (the n7 panel has no qcom,mdss-dsi-dma-schedule-line, so no scheduled line either). The
++ * registers it changes are put back afterwards. dsiSend() (0260) switched CMD_MODE_EN on for
++ * every packet: the screen went black for a moment at each local-HBM change.
++ */
++#define DSI_CTRL_REG            0x004
++#define DSI_DMA_CTRL            0x03c
++#define DSI_DMA_OFFSET          0x048
++#define DSI_DMA_LENGTH          0x04c
++#define DSI_DMA_FIFO_CTRL       0x050
++#define DSI_TRIG_CTRL           0x084
++#define DSI_DMA_SW_TRIGGER      0x090
++#define DSI_INT_CTRL            0x110
++#define DSI_BATCH_MAX           2048u
++
++static bool
++dsi_video_dma(AppleCLCD *fb, uint32_t size, uint32_t *waited_us, bool cmd_engine)
++{
++	volatile uint8_t *d = fb->fDsi;
++	uint32_t dma = dsi_rd(d, DSI_DMA_CTRL), fifo = dsi_rd(d, DSI_DMA_FIFO_CTRL), trig = dsi_rd(d, DSI_TRIG_CTRL);
++	uint32_t ctrl = dsi_rd(d, DSI_CTRL_REG);
++
++	if (cmd_engine && (ctrl & 4) == 0) {
++		dsi_wr(d, DSI_CTRL_REG, ctrl | 4);      /* CMD_MODE_EN beside VID_MODE_EN, as Linux's transfer_prepare */
++	}
++
++	if ((trig & 7) != 4) {
++		dsi_wr(d, DSI_TRIG_CTRL, (trig & ~7u) | 4);     /* DMA trigger: software */
++	}
++	dsi_wr(d, DSI_DMA_CTRL, (dma | (1u << 28)) & ~((1u << 24) | (1u << 29) | (1u << 26)));
++	dsi_wr(d, DSI_DMA_FIFO_CTRL, fifo | (1u << 20) | (1u << 16));
++	dsi_wr(d, DSI_INT_CTRL, dsi_rd(d, DSI_INT_CTRL) | 1);       /* clear CMD_DMA_DONE */
++	dsi_wr(d, DSI_DMA_OFFSET, (uint32_t)fb->fDsiBufPhys);
++	dsi_wr(d, DSI_DMA_LENGTH, size & 0xffffff);
++	dsi_wr(d, DSI_DMA_SW_TRIGGER, 1);
++	bool done = false;
++	uint32_t us = 0;
++	while (!done && us < 60000) {                    /* the next blanking: a frame is 8-17 ms */
++		done = (dsi_rd(d, DSI_INT_CTRL) & 1) != 0;
++		if (!done) {
++			IODelay(100);
++			us += 100;
++		}
++	}
++	dsi_wr(d, DSI_INT_CTRL, dsi_rd(d, DSI_INT_CTRL) | 1);
++	dsi_wr(d, DSI_DMA_FIFO_CTRL, fifo);
++	dsi_wr(d, DSI_DMA_CTRL, dma);
++	if (cmd_engine && (ctrl & 4) == 0) {
++		dsi_wr(d, DSI_CTRL_REG, ctrl);
++	}
++	if (trig != dsi_rd(d, DSI_TRIG_CTRL)) {
++		dsi_wr(d, DSI_TRIG_CTRL, trig);
++	}
++	*waited_us = us;
++	return done;
++}
++
++/* one command the 0260 way (command mode for the packet), with retries */
++static bool
++dsi_one_cmdmode(AppleCLCD *fb, uint8_t dt, const uint8_t *pl, uint32_t dl, bool *known)
++{
++	bool done = false;
++	*known = true;
++	for (int i = 0; i < 4 && !done; i++) {
++		if (dt == 0x39 || dt == 0x29) {
++			uint8_t hdr[4] = { (uint8_t)dl, (uint8_t)(dl >> 8), dt, 0xc0 };
++			done = fb->dsiSend(hdr, pl, dl);
++		} else if ((dt == 0x05 || dt == 0x15) && dl >= 1 && dl <= 2) {
++			uint8_t hdr[4] = { pl[0], (uint8_t)(dl > 1 ? pl[1] : 0), dt, 0x80 };
++			done = fb->dsiSend(hdr, NULL, 0);
++		} else {
++			*known = false;
++			return false;
++		}
++		if (!done) {
++			IODelay(2000);
++		}
++	}
++	return done;
++}
++
++/*
++ * 0260/0262: a panel command sequence for SweetQsee.cpp (the fingerprint spot's local HBM), in the
++ * qcom dtsi format: per command {dtype, last, vc, flags, wait ms, len hi, len lo, payload}. In
++ * video mode the commands up to the next wait go out as one batch (packets back to back, each
++ * 4-byte padded with 0xff, BIT(7) "last" on the final one, BIT(6) on long ones), in one blanking
++ * period like Android's batched local-HBM set; if that batch is not done, or the controller is
++ * not in video mode, each command goes the 0260 way. Returns the commands not done, -1 without a
++ * DSI path, -2 while the panel is off.
+  */
+ extern "C" int
+ sweet_fb_dsi_seq(const uint8_t *seq, uint32_t len, const char *what, int quiet)
+@@ -1843,46 +1933,120 @@ sweet_fb_dsi_seq(const uint8_t *seq, uint32_t len, const char *what, int quiet)
+ 		return -2;
+ 	}
+ 	int failed = 0;
+-	unsigned n = 0;
++	unsigned n = 0, batches = 0, fallbacks = 0;
+ 	IOLockLock(fb->fBlLock);
+-	if (!quiet) IOLog("SWEET FB: dsi %s: ctrl %#x, dma ctrl %#x, trigger %#x, int %#x\n", what, dsi_rd(fb->fDsi, 0x004),
+-	    dsi_rd(fb->fDsi, 0x03c), dsi_rd(fb->fDsi, 0x084), dsi_rd(fb->fDsi, 0x110));
+-	for (uint32_t o = 0; o + 7 <= len;) {
+-		uint8_t dt = seq[o], wait = seq[o + 4];
+-		uint32_t dl = ((uint32_t)seq[o + 5] << 8) | seq[o + 6];
+-		const uint8_t *pl = seq + o + 7;
+-		if (o + 7 + dl > len || dl > 60) {
+-			IOLog("SWEET FB: dsi %s: bad command at %u (len %u): stop\n", what, o, dl);
+-			failed++;
+-			break;
++	uint32_t ctrl = dsi_rd(fb->fDsi, DSI_CTRL_REG);
++	bool video = (ctrl & 2) != 0;                   /* VID_MODE_EN */
++	if (!quiet) {
++		IOLog("SWEET FB: dsi %s: ctrl %#x (%s), dma ctrl %#x, fifo %#x, trigger %#x, int %#x\n", what, ctrl,
++		    video ? "video mode: batched in the blanking" : "not video mode: one by one", dsi_rd(fb->fDsi, DSI_DMA_CTRL),
++		    dsi_rd(fb->fDsi, DSI_DMA_FIFO_CTRL), dsi_rd(fb->fDsi, DSI_TRIG_CTRL), dsi_rd(fb->fDsi, DSI_INT_CTRL));
++	}
++	uint32_t o = 0;
++	while (o + 7 <= len) {
++		/* the batch: from o up to and including the first command with a wait (or the end) */
++		uint32_t e = o, cnt = 0, size = 0;
++		bool ok = true;
++		uint8_t wait = 0;
++		while (e + 7 <= len) {
++			uint8_t dt = seq[e];
++			uint32_t dl = ((uint32_t)seq[e + 5] << 8) | seq[e + 6];
++			if (e + 7 + dl > len || dl > 60 || !(dt == 0x39 || dt == 0x29 || ((dt == 0x05 || dt == 0x15) && dl >= 1 && dl <= 2))) {
++				ok = false;
++				break;
++			}
++			uint32_t psize = dt == 0x39 || dt == 0x29 ? 4 + ((dl + 3) & ~3u) : 4;
++			if (size + psize > DSI_BATCH_MAX) {
++				break;
++			}
++			size += psize;
++			cnt++;
++			wait = seq[e + 4];
++			e += 7 + dl;
++			if (wait != 0) {
++				break;
++			}
+ 		}
+-		bool done = false, known = true;
+-		for (int i = 0; i < 4 && !done && known; i++) {
+-			if (dt == 0x39 || dt == 0x29) {
+-				uint8_t hdr[4] = { (uint8_t)dl, (uint8_t)(dl >> 8), dt, 0xc0 };
+-				done = fb->dsiSend(hdr, pl, dl);
+-			} else if ((dt == 0x05 || dt == 0x15) && dl >= 1 && dl <= 2) {
+-				uint8_t hdr[4] = { pl[0], (uint8_t)(dl > 1 ? pl[1] : 0), dt, 0x80 };
+-				done = fb->dsiSend(hdr, NULL, 0);
+-			} else {
+-				known = false;
++		bool sent = false;
++		if (video && ok && cnt > 0) {
++			uint8_t *p = (uint8_t *)fb->fDsiBuf->getBytesNoCopy();
++			uint32_t at = 0, i = 0;
++			memset(p, 0xff, size);
++			for (uint32_t c = o; c < e; i++) {
++				uint8_t dt = seq[c];
++				uint32_t dl = ((uint32_t)seq[c + 5] << 8) | seq[c + 6];
++				const uint8_t *pl = seq + c + 7;
++				uint8_t flags = (i + 1 == cnt) ? 0x80 : 0;
++				if (dt == 0x39 || dt == 0x29) {
++					p[at] = (uint8_t)dl;
++					p[at + 1] = (uint8_t)(dl >> 8);
++					p[at + 2] = dt;
++					p[at + 3] = flags | 0x40;
++					memcpy(p + at + 4, pl, dl);
++					at += 4 + ((dl + 3) & ~3u);
++				} else {
++					p[at] = pl[0];
++					p[at + 1] = dl > 1 ? pl[1] : 0;
++					p[at + 2] = dt;
++					p[at + 3] = flags;
++					at += 4;
++				}
++				c += 7 + dl;
++			}
++			sweet_dcache_clean((vm_offset_t)(uintptr_t)p, size);
++			/* first with the command engine left off; if the DMA never completes, once more with it on */
++			uint32_t us = 0, us2 = 0;
++			sent = dsi_video_dma(fb, size, &us, false);
++			bool engine = false;
++			if (!sent) {
++				engine = true;
++				sent = dsi_video_dma(fb, size, &us2, true);
+ 			}
+-			if (!done && known) {
+-				IODelay(2000);
++			batches++;
++			if (!quiet || !sent || engine) {
++				IOLog("SWEET FB: dsi %s: batch of %u commands (%u bytes) in video mode: %s (%u us; %s)\n", what, cnt, size,
++				    sent ? "done" : "NOT DONE, sent one by one instead", us + us2,
++				    engine ? "not done with the command engine off: retried with it on" : "command engine left off");
++			}
++			n += sent ? cnt : 0;
++		}
++		if (!sent) {
++			/* the 0260 way, command by command (also for anything the batch cannot carry) */
++			uint32_t stop = ok && cnt > 0 ? e : len;
++			fallbacks++;
++			for (uint32_t c = o; c + 7 <= stop;) {
++				uint8_t dt = seq[c], w = seq[c + 4];
++				uint32_t dl = ((uint32_t)seq[c + 5] << 8) | seq[c + 6];
++				if (c + 7 + dl > len || dl > 60) {
++					IOLog("SWEET FB: dsi %s: bad command at %u (len %u): stop\n", what, c, dl);
++					failed++;
++					e = len;
++					break;
++				}
++				bool known;
++				bool done = dsi_one_cmdmode(fb, dt, seq + c + 7, dl, &known);
++				if (!quiet || !done) {
++					IOLog("SWEET FB: dsi %s #%u: dt %02x len %u: %02x %02x: %s\n", what, n, dt, dl, dl > 0 ? seq[c + 7] : 0,
++					    dl > 1 ? seq[c + 8] : 0, !known ? "UNKNOWN TYPE, skipped" : done ? "done" : "NO DONE");
++				}
++				failed += done ? 0 : 1;
++				n++;
++				if (w != 0 && c + 7 + dl < stop) {
++					IOSleep(w);
++				}
++				c += 7 + dl;
++				e = c;
+ 			}
+ 		}
+-		if (!quiet || !done) IOLog("SWEET FB: dsi %s #%u: dt %02x len %u: %02x %02x %02x %02x: %s\n", what, n, dt, dl, dl > 0 ? pl[0] : 0,
+-		    dl > 1 ? pl[1] : 0, dl > 2 ? pl[2] : 0, dl > 3 ? pl[3] : 0, !known ? "UNKNOWN TYPE, skipped" : done ? "done" : "NO DONE");
+-		failed += done ? 0 : 1;
+-		n++;
+ 		if (wait != 0) {
+ 			IOSleep(wait);
+ 		}
+-		o += 7 + dl;
++		o = e;
+ 	}
+ 	IOLockUnlock(fb->fBlLock);
+ 	if (!quiet || failed != 0) {
+-		IOLog("SWEET FB: dsi %s: %u commands, %d not done\n", what, n, failed);
++		IOLog("SWEET FB: dsi %s: %u commands, %d not done (%u video batches, %u sent one by one)\n", what, n, failed,
++		    batches, fallbacks);
+ 	}
+ 	return failed;
+ }
