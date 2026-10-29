@@ -1,0 +1,1109 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0246: AppleKeyStore passcode state machine (real lock, verified passcode)
+
+SweetKeyStore keeps a real passcode without any kernel file I/O: a salted
+PBKDF2-HMAC-SHA256 verifier (20000 rounds) lives in the system keybag blob
+that keybagd saves (aks_save_bag, 3) as KeyBagKeys in
+/private/var/keybags/systembag.kb and loads back at boot: aks_get_system (14)
+answers kIOReturnNotFound once, to keybagd --init, whose next aks_load_bag (6)
+is the system bag (a foreign blob such as the image's "SWEET" placeholder is a
+bag without a passcode). With a passcode the device boots locked before first
+unlock, locks on aks_lock_device (8/32), unlocks only with the right passcode
+(9, 42), changes/removes it through keybagd's aks_change_secret path
+(15, 3, 5, 105, 4), counts failures with iOS back-off, reports MKB lock state
+3 without a passcode, and sends the kext's IOGeneralInterest messages
+(0xe3ffd00d lock state, 0xe3ffd00f first unlock) with no lock held. No lock is
+held across the KDF, logging, messageClients or thread calls.
+Key wrap/unwrap (10/11) unchanged. Boot-args: sweetaks_nopass=1 (ignore the
+stored passcode), sweetaks_grace=N.
+
+See research/passcode-aks.md.
+---
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index 66de894..c30fe0a 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -1,18 +1,49 @@
+ /*
+- * Built-in AppleKeyStore for SWEET: a device without a passcode whose
+- * system keybag is always loaded and unlocked.
++ * Built-in AppleKeyStore for SWEET: the device passcode state machine
++ * without a Secure Enclave.
+  *
+  * Apple's AppleKeyStore kext (closed, SEP-backed) owns the keybags behind
+- * data protection. libaks (AppleKeyStore.framework, statically in keybagd)
+- * opens IOServiceMatching("AppleKeyStore") with type 0, calls selector 0,
+- * then one selector per aks_* function (iOS 16.7 numbering below). keybagd
+- * --init asks for the system bag (14) and only loads systembag.kb when the
+- * answer is kIOReturnNotFound; answering with a handle is the path a
+- * userspace reboot takes, so no bag file is needed.
++ * data protection. libaks (AppleKeyStore.framework, statically in keybagd and
++ * in MobileKeyBag.framework) opens IOServiceMatching("AppleKeyStore") with
++ * type 0, calls selector 0, then one selector per aks_* function (iOS 16.7
++ * numbering below).
++ *
++ * There is no data-protection encryption on this port (HFS+ root without
++ * cprotect), so nothing here protects data. What it keeps correctly is the
++ * lock/passcode behaviour the system expects:
++ *  - the passcode (set in Settings: profiled -> keybagd -> aks_change_secret)
++ *    is kept as a salted PBKDF2-HMAC-SHA256 verifier, never the passcode, in
++ *    the system keybag blob. This kernel does no file I/O: keybagd stores the
++ *    blob we hand out from aks_save_bag (3) as KeyBagKeys in
++ *    /private/var/keybags/systembag.kb (plain plist: the ADT has
++ *    /defaults/no-effaceable-storage), and hands it back at boot:
++ *    keybagd --init load_devicebag asks aks_get_system (14), and only on
++ *    kIOReturnNotFound reads systembag.kb, aks_load_bag (6), aks_set_system (5),
++ *    aks_unload_bag (4), then aks_get_system again (must succeed: any failure
++ *    there is keybagd's FATAL KEYBAG ERROR, reboot into recovery). So 14 says
++ *    NotFound exactly once, to keybagd, and the next keybagd load (6) is the
++ *    system bag. A blob that is not ours (the image's "SWEET" placeholder) is
++ *    accepted as a bag without a passcode;
++ *  - with a passcode the device boots locked (before first unlock), locks on
++ *    aks_lock_device (SpringBoard, MKBLockDevice), and unlocks only with the
++ *    right passcode (aks_unlock_device from SpringBoard / profiled,
++ *    aks_verify_password); wrong ones are counted and backed off like iOS
++ *    (the count reaches the disk with the next bag save, otherwise it lives
++ *    until reboot);
++ *  - every lock state change is announced the way the kext does it, with an
++ *    IOGeneralInterest message (MobileKeyBag MKBEventsRegister, UserEventAgent
++ *    MobileKeyBagLockState -> com.apple.mobile.keybagd.lock_status/first_unlock),
++ *    sent with no lock held.
++ * Without a stored verifier the device reports "no passcode" (MKB lock state 3).
++ *
++ * Boot-args: sweetaks_nopass=1 ignores the stored passcode (recovery when
++ * locked out; the next bag save drops it), sweetaks_grace=N seconds of grace
++ * after a normal lock (default 0, iOS's "Require passcode immediately").
+  *
+  * Every call is logged (selector, caller, argument shapes, result) so the
+  * next selectors the system needs show up on the console; unknown ones fail
+- * with kIOReturnUnsupported.
++ * with kIOReturnUnsupported. Passcodes and verifiers are never logged, and
++ * nothing is logged with a lock held.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -21,43 +52,83 @@
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <libkern/c++/OSString.h>
++#include <pexpert/pexpert.h>
+ #include <sys/proc.h>
++#include <sys/param.h>
++#include <sys/systm.h>                  /* copyin */
++#include <sys/random.h>                 /* read_random */
++#include <mach/mach_time.h>
++#include <kern/clock.h>
++#include <kern/thread_call.h>
++extern "C" {
++#include <corecrypto/cc.h>              /* cc_cmp_safe, cc_clear */
++#include <corecrypto/cchmac.h>
++#include <corecrypto/ccsha2.h>
++}
+ 
+ /* libaks selectors (AppleKeyStore.framework, iOS 16.7). */
+ enum {
+ 	kAKSOpen             = 0,
+ 	kAKSCreateBag        = 2,
+-	kAKSSaveBag          = 3,
++	kAKSSaveBag          = 3,       /* aks_save_bag(handle) -> bag blob (out struct, 32 KB max) */
+ 	kAKSUnloadBag        = 4,
+-	kAKSSetSystem        = 5,
+-	kAKSLoadBag          = 6,
++	kAKSSetSystem        = 5,       /* aks_set_system[_with_passcode](new, old[, pass, len]) */
++	kAKSLoadBag          = 6,       /* aks_load_bag(blob) -> handle */
+ 	kAKSGetLockState     = 7,
+-	kAKSUnlockDevice     = 9,
++	kAKSLockDevice       = 8,       /* aks_lock_device(handle, now = false): honours the grace period */
++	kAKSUnlockDevice     = 9,       /* aks_unlock_device(handle, user ptr, len) */
+ 	kAKSWrapKey          = 10,
+ 	kAKSUnwrapKey        = 11,
+ 	kAKSUnlockBag        = 12,
+ 	kAKSLockBag          = 13,
+ 	kAKSGetSystem        = 14,
++	kAKSChangeSecret     = 15,      /* aks_change_secret_se: 11 scalars, 1 out (new handle) */
+ 	kAKSGetDeviceState   = 17,
+ 	kAKSGetExtDeviceState = 35,     /* aks_get_extended_device_state */
+ 	kAKSAssertHold       = 26,
+ 	kAKSAssertDrop       = 27,
++	kAKSLockDeviceNow    = 32,      /* aks_lock_device(handle, now = true): no grace period */
++	kAKSVerifyPassword   = 42,      /* aks_verify_password(handle; packed {passcode, ctx}) */
+ 	kAKSUnloadSessionBags = 55,
++	kAKSAssertConsume    = 101,     /* aks_assert_consume */
+ 	kAKSNotifyStateSet   = 102,
+ 	kAKSNotifyStateIsSet = 103,
+-	kAKSAssertConsume    = 101,     /* aks_assert_consume */
++	kAKSChangeSecretEpilogue = 105, /* aks_change_secret_epilogue(handle, new ptr, len) */
+ };
+ 
+-/* The system (device) bag handle. */
++/* Bag handles: the system (device) bag, the one keybagd's two-phase change gets back, a loaded one. */
+ #define SWEET_AKS_SYSTEM_HANDLE 0
++#define SWEET_AKS_NEW_HANDLE    1
++#define SWEET_AKS_LOADED_HANDLE 2
+ 
+ /*
+- * aks lock state bits (aks_get_lock_state): bit 2 is "unlocked since boot"
+- * (MobileKeyBag MKBDeviceUnlockedSinceBoot); clear lock bits = unlocked.
++ * aks lock state bits (aks_get_lock_state, also the device state's "ss"):
++ * Security's keybag_state_locked / no_pin / been_unlocked. MobileKeyBag's
++ * MKBDeviceUnlockedSinceBoot is bit 2. keybagd tests bit 13 (SE-bound
++ * passcode) and bit 22 (xART bag); both stay clear.
+  */
+-#define SWEET_AKS_LOCK_STATE    0x4
++#define SWEET_AKS_STATE_LOCKED          0x1
++#define SWEET_AKS_STATE_NO_PIN          0x2
++#define SWEET_AKS_STATE_BEEN_UNLOCKED   0x4
++
++/* MobileKeyBag lock states (MKBGetDeviceLockState = the device state's "sls"). */
++#define SWEET_MKB_UNLOCKED      0
++#define SWEET_MKB_LOCKED        1
++#define SWEET_MKB_LOCKING       2       /* grace period running */
++#define SWEET_MKB_DISABLED      3       /* no passcode */
++
++/* IOGeneralInterest messages the kext sends (MobileKeyBag aksNotificationCB, UserEventAgent). */
++#define SWEET_AKS_MSG_LOCK_STATE        0xe3ffd00dU
++#define SWEET_AKS_MSG_FIRST_UNLOCK      0xe3ffd00fU
++
++#define SWEET_AKS_PASS_MAX      256             /* longest passcode accepted */
++#define SWEET_AKS_ITERATIONS    20000           /* PBKDF2-HMAC-SHA256 rounds of a new verifier */
++#define SWEET_AKS_ITER_MIN      1000
++#define SWEET_AKS_ITER_MAX      1000000
++#define SWEET_AKS_FAILED_SHOWN  9               /* SpringBoard wipes/blocks for good at 10 */
+ 
+ class AppleKeyStore : public IOService {
+ 	OSDeclareDefaultStructors(AppleKeyStore);
+@@ -68,15 +139,592 @@ public:
+ 
+ OSDefineMetaClassAndStructors(AppleKeyStore, IOService);
+ 
++/* ------------------------------------------------------------------ state */
++
++/*
++ * The system bag blob (aks_save_bag / aks_load_bag), 104 bytes, little endian.
++ * check is an HMAC of the blob under a fixed key: it catches torn or foreign
++ * data, it is not a secret.
++ */
++struct sweet_aks_bag {
++	char     magic[8];              /* "SWAKSB1" */
++	uint32_t version;               /* 1 */
++	uint32_t flags;                 /* bit 0: a passcode is set */
++	uint32_t iterations;
++	uint32_t failed;                /* consecutive failed attempts */
++	uint8_t  salt[16];
++	uint8_t  verifier[32];          /* PBKDF2-HMAC-SHA256(passcode, salt, iterations) */
++	uint8_t  check[32];
++};
++static_assert(sizeof(struct sweet_aks_bag) == 104, "bag blob size");
++
++#define SWEET_AKS_BAG_MAGIC     "SWAKSB1"
++#define SWEET_AKS_BAG_VERSION   1
++#define SWEET_AKS_BAG_PASSCODE  0x1
++
++static const uint8_t sweet_aks_check_key[] = "SWEET AKS system bag v1";
++
++static IOLock *sweet_aks_lock;          /* the fields of sa; never held across anything that blocks */
++static AppleKeyStore *sweet_aks_service;
++static thread_call_t sweet_aks_grace_call;
++static uint32_t sweet_aks_grace_secs;
++static uint32_t sweet_aks_nopass;
++
++/* The verifier part of the state, copied out to run the KDF without the lock. */
++struct sweet_aks_secret {
++	uint32_t iterations;
++	uint8_t  salt[16];
++	uint8_t  verifier[32];
++};
++
++static struct {
++	uint32_t sys_state;             /* 0: no bag yet, 1: told keybagd NotFound, 2: system bag in place */
++	bool     has_pass;
++	bool     locked;
++	bool     locking;               /* grace period: unlocked until grace_deadline */
++	bool     been_unlocked;
++	bool     notify_state;          /* aks_notify_state_set (UserEventAgent first unlock) */
++	uint32_t failed;
++	uint32_t generation;            /* bumped when the verifier changes */
++	uint64_t grace_deadline;        /* mach_absolute_time */
++	uint64_t backoff_until;         /* mach_continuous_time */
++	struct sweet_aks_secret secret;
++} sa = {
++	.been_unlocked = true,          /* until a bag with a passcode is loaded */
++};
++
++#define SWEET_AKS_POST_LOCK_STATE       0x1
++#define SWEET_AKS_POST_FIRST_UNLOCK     0x2
++
++/* Tell MobileKeyBag/UserEventAgent clients. Never called with a lock held. */
++static void
++sweet_aks_post(uint32_t what)
++{
++	if (sweet_aks_service == NULL) {
++		return;
++	}
++	if (what & SWEET_AKS_POST_FIRST_UNLOCK) {
++		sweet_aks_service->messageClients(SWEET_AKS_MSG_FIRST_UNLOCK);
++	}
++	if (what & (SWEET_AKS_POST_LOCK_STATE | SWEET_AKS_POST_FIRST_UNLOCK)) {
++		sweet_aks_service->messageClients(SWEET_AKS_MSG_LOCK_STATE);
++	}
++}
++
++static uint32_t
++sweet_aks_backoff_secs(uint32_t failed)
++{
++	/* iOS: no delay for 4 failures, then 1 min, 5 min, 15 min, 15 min, 1 h (and 1 h from then on here) */
++	if (failed < 5) {
++		return 0;
++	}
++	switch (failed) {
++	case 5:
++		return 60;
++	case 6:
++		return 5 * 60;
++	case 7:
++	case 8:
++		return 15 * 60;
++	default:
++		return 60 * 60;
++	}
++}
++
++static void
++sweet_aks_arm_backoff_locked(void)
++{
++	uint32_t secs = sweet_aks_backoff_secs(sa.failed);
++	uint64_t abs;
++
++	if (secs == 0) {
++		sa.backoff_until = 0;
++		return;
++	}
++	nanoseconds_to_absolutetime((uint64_t)secs * NSEC_PER_SEC, &abs);
++	sa.backoff_until = mach_continuous_time() + abs;
++}
++
++/* Seconds of back-off left (the device state's "sb"; SpringBoard adds it to now). */
++static uint64_t
++sweet_aks_backoff_left_locked(void)
++{
++	uint64_t now = mach_continuous_time(), ns;
++
++	if (sa.backoff_until <= now) {
++		return 0;
++	}
++	absolutetime_to_nanoseconds(sa.backoff_until - now, &ns);
++	return (ns + NSEC_PER_SEC - 1) / NSEC_PER_SEC;
++}
++
++static uint32_t
++sweet_aks_lock_bits_locked(void)
++{
++	uint32_t s = 0;
++
++	if (!sa.has_pass) {
++		s |= SWEET_AKS_STATE_NO_PIN;
++	}
++	if (sa.locked) {
++		s |= SWEET_AKS_STATE_LOCKED;
++	}
++	if (sa.been_unlocked) {
++		s |= SWEET_AKS_STATE_BEEN_UNLOCKED;
++	}
++	return s;
++}
++
++static uint32_t
++sweet_aks_mkb_state_locked(void)
++{
++	if (!sa.has_pass) {
++		return SWEET_MKB_DISABLED;
++	}
++	if (sa.locked) {
++		return SWEET_MKB_LOCKED;
++	}
++	return sa.locking ? SWEET_MKB_LOCKING : SWEET_MKB_UNLOCKED;
++}
++
++static const char *
++sweet_aks_state_name(uint32_t mkb)
++{
++	static const char *const names[] = { "unlocked", "locked", "locking", "no passcode" };
++	return mkb < 4 ? names[mkb] : "?";
++}
++
++/* ------------------------------------------------------------------ crypto */
++
++/* HMAC-SHA256 context storage without a VLA (cchmac_di_size(sha256) is ~170 bytes). */
++typedef struct {
++	uint64_t b[64];
++} sweet_aks_hmac_ctx;
++
++/* PBKDF2-HMAC-SHA256 (RFC 8018) with a 32-byte output: a single block. No lock held. */
++static void
++sweet_aks_pbkdf2(const uint8_t *pass, size_t passlen, const uint8_t *salt, size_t saltlen,
++    uint32_t iterations, uint8_t out[32])
++{
++	const struct ccdigest_info *di = ccsha256_di();
++	sweet_aks_hmac_ctx keyed, work;
++	uint8_t u[32];
++	const uint8_t one[4] = { 0, 0, 0, 1 };
++
++	if (cchmac_di_size(di) > sizeof(keyed)) {
++		panic("SWEET AKS: HMAC context too small");
++	}
++	cchmac_init(di, (cchmac_ctx_t)&keyed, passlen, pass);
++
++	memcpy(&work, &keyed, sizeof(work));
++	cchmac_update(di, (cchmac_ctx_t)&work, saltlen, salt);
++	cchmac_update(di, (cchmac_ctx_t)&work, sizeof(one), one);
++	cchmac_final(di, (cchmac_ctx_t)&work, u);
++	memcpy(out, u, sizeof(u));
++	for (uint32_t i = 1; i < iterations; i++) {
++		memcpy(&work, &keyed, sizeof(work));
++		cchmac_update(di, (cchmac_ctx_t)&work, sizeof(u), u);
++		cchmac_final(di, (cchmac_ctx_t)&work, u);
++		for (unsigned int j = 0; j < sizeof(u); j++) {
++			out[j] ^= u[j];
++		}
++	}
++	cc_clear(sizeof(keyed), &keyed);
++	cc_clear(sizeof(work), &work);
++	cc_clear(sizeof(u), u);
++}
++
++static void
++sweet_aks_bag_check(const struct sweet_aks_bag *b, uint8_t check[32])
++{
++	cchmac(ccsha256_di(), sizeof(sweet_aks_check_key), sweet_aks_check_key,
++	    offsetof(struct sweet_aks_bag, check), b, check);
++}
++
++/* The blob keybagd saves: built from the current state. */
++static void
++sweet_aks_bag_build(struct sweet_aks_bag *b)
++{
++	bzero(b, sizeof(*b));
++	memcpy(b->magic, SWEET_AKS_BAG_MAGIC, sizeof(b->magic));
++	b->version = SWEET_AKS_BAG_VERSION;
++	IOLockLock(sweet_aks_lock);
++	if (sa.has_pass) {
++		b->flags = SWEET_AKS_BAG_PASSCODE;
++		b->iterations = sa.secret.iterations;
++		b->failed = sa.failed;
++		memcpy(b->salt, sa.secret.salt, sizeof(b->salt));
++		memcpy(b->verifier, sa.secret.verifier, sizeof(b->verifier));
++	}
++	IOLockUnlock(sweet_aks_lock);
++	sweet_aks_bag_check(b, b->check);
++}
++
++/*
++ * The system bag keybagd --init loaded from systembag.kb. Anything that is not
++ * a valid blob of ours (the image's "SWEET" placeholder, a torn file) is a bag
++ * without a passcode: refusing it would be keybagd's FATAL KEYBAG ERROR.
++ */
++static void
++sweet_aks_bag_adopt(const uint8_t *data, uint32_t len)
++{
++	struct sweet_aks_bag b;
++	uint8_t check[32];
++	bool ours = false, pass = false, ignored = false;
++	uint32_t failed = 0;
++
++	bzero(&b, sizeof(b));
++	if (len == sizeof(b)) {
++		memcpy(&b, data, sizeof(b));
++		sweet_aks_bag_check(&b, check);
++		ours = memcmp(b.magic, SWEET_AKS_BAG_MAGIC, sizeof(b.magic)) == 0 &&
++		    b.version == SWEET_AKS_BAG_VERSION &&
++		    cc_cmp_safe(sizeof(check), check, b.check) == 0;
++		cc_clear(sizeof(check), check);
++	}
++	if (ours && (b.flags & SWEET_AKS_BAG_PASSCODE) &&
++	    b.iterations >= SWEET_AKS_ITER_MIN && b.iterations <= SWEET_AKS_ITER_MAX) {
++		if (sweet_aks_nopass) {
++			ignored = true;
++		} else {
++			pass = true;
++			failed = b.failed;
++		}
++	}
++
++	IOLockLock(sweet_aks_lock);
++	sa.sys_state = 2;
++	sa.has_pass = pass;
++	sa.locked = pass;
++	sa.locking = false;
++	sa.been_unlocked = !pass;
++	sa.failed = failed;
++	sa.generation++;
++	bzero(&sa.secret, sizeof(sa.secret));
++	if (pass) {
++		sa.secret.iterations = b.iterations;
++		memcpy(sa.secret.salt, b.salt, sizeof(sa.secret.salt));
++		memcpy(sa.secret.verifier, b.verifier, sizeof(sa.secret.verifier));
++	}
++	sweet_aks_arm_backoff_locked();
++	IOLockUnlock(sweet_aks_lock);
++	cc_clear(sizeof(b), &b);
++
++	if (ignored) {
++		IOLog("SWEET AKS: system bag: passcode ignored (sweetaks_nopass)\n");
++	}
++	IOLog("SWEET AKS: system bag loaded (%u bytes, %s): %s, %u failed attempts\n", len,
++	    ours ? "ours" : "not ours", pass ? "passcode set, locked (before first unlock)" : "no passcode",
++	    failed);
++}
++
++/* ------------------------------------------------------------------ passcode checks */
++
++/* Copy a passcode the caller passed by address (aks_unlock_device, aks_change_secret). */
++static IOReturn
++sweet_aks_copyin_pass(uint64_t uaddr, uint64_t len, uint8_t *buf, size_t *outlen)
++{
++	*outlen = 0;
++	if (len == 0) {
++		return kIOReturnSuccess;
++	}
++	if (len > SWEET_AKS_PASS_MAX || uaddr == 0) {
++		return kIOReturnBadArgument;
++	}
++	if (copyin((user_addr_t)uaddr, buf, (vm_size_t)len) != 0) {
++		return kIOReturnBadArgument;
++	}
++	*outlen = (size_t)len;
++	return kIOReturnSuccess;
++}
++
++/*
++ * Check a passcode against the verifier, counting failures. No lock held on
++ * entry; the KDF runs unlocked on a copy of the secret. kIOReturnSuccess on a
++ * match (or with no passcode set), kIOReturnNotPermitted on a mismatch or while
++ * backing off. *post gets the notifications to send.
++ */
++static IOReturn
++sweet_aks_check(const uint8_t *pass, size_t len, uint32_t *post)
++{
++	struct sweet_aks_secret s;
++	uint8_t key[32];
++	uint32_t gen, failed = 0;
++	uint64_t left;
++	bool match;
++
++	IOLockLock(sweet_aks_lock);
++	if (!sa.has_pass) {
++		IOLockUnlock(sweet_aks_lock);
++		return kIOReturnSuccess;
++	}
++	left = sweet_aks_backoff_left_locked();
++	gen = sa.generation;
++	memcpy(&s, &sa.secret, sizeof(s));
++	IOLockUnlock(sweet_aks_lock);
++	if (left != 0) {
++		cc_clear(sizeof(s), &s);
++		IOLog("SWEET AKS: passcode refused, backing off for %llu s more\n", left);
++		return kIOReturnNotPermitted;
++	}
++
++	sweet_aks_pbkdf2(pass, len, s.salt, sizeof(s.salt), s.iterations, key);
++	match = cc_cmp_safe(sizeof(key), key, s.verifier) == 0;
++	cc_clear(sizeof(key), key);
++	cc_clear(sizeof(s), &s);
++
++	IOLockLock(sweet_aks_lock);
++	if (gen != sa.generation) {
++		/* the passcode changed meanwhile: neither a success nor a failure */
++		IOLockUnlock(sweet_aks_lock);
++		return kIOReturnNotPermitted;
++	}
++	if (match) {
++		sa.failed = 0;
++		sa.backoff_until = 0;
++	} else {
++		failed = ++sa.failed;
++		sweet_aks_arm_backoff_locked();
++		left = sweet_aks_backoff_left_locked();
++	}
++	IOLockUnlock(sweet_aks_lock);
++	if (match) {
++		return kIOReturnSuccess;
++	}
++	IOLog("SWEET AKS: wrong passcode, %u failed attempts, back-off %llu s\n", failed, left);
++	*post |= SWEET_AKS_POST_LOCK_STATE;
++	return kIOReturnNotPermitted;
++}
++
++/* Unlock after a good passcode (or none needed). sweet_aks_lock held. */
++static void
++sweet_aks_unlock_locked(uint32_t *post)
++{
++	if (!sa.been_unlocked) {
++		sa.been_unlocked = true;
++		*post |= SWEET_AKS_POST_FIRST_UNLOCK;
++	}
++	if (sa.locked || sa.locking) {
++		sa.locked = false;
++		sa.locking = false;
++		*post |= SWEET_AKS_POST_LOCK_STATE;
++	}
++}
++
++/* aks_unlock_device: scalars { handle, user address of the passcode, length }. */
++static IOReturn
++sweet_aks_unlock_device(IOExternalMethodArguments *args, uint32_t *post)
++{
++	uint8_t pass[SWEET_AKS_PASS_MAX];
++	size_t len;
++	IOReturn ret;
++	bool check = false;
++
++	if (args->scalarInputCount < 3) {
++		return kIOReturnBadArgument;
++	}
++	ret = sweet_aks_copyin_pass(args->scalarInput[1], args->scalarInput[2], pass, &len);
++	if (ret != kIOReturnSuccess) {
++		return ret;
++	}
++	IOLockLock(sweet_aks_lock);
++	if (!sa.has_pass) {
++		sweet_aks_unlock_locked(post);
++	} else if (len == 0) {
++		/* no passcode given: fine while unlocked or within the grace period */
++		if (sa.locked) {
++			ret = kIOReturnNotPermitted;
++		} else {
++			sweet_aks_unlock_locked(post);
++		}
++	} else {
++		check = true;
++	}
++	IOLockUnlock(sweet_aks_lock);
++	if (check) {
++		ret = sweet_aks_check(pass, len, post);
++		if (ret == kIOReturnSuccess) {
++			IOLockLock(sweet_aks_lock);
++			sweet_aks_unlock_locked(post);
++			IOLockUnlock(sweet_aks_lock);
++		}
++	}
++	cc_clear(sizeof(pass), pass);
++	return ret;
++}
++
++static IOByteCount sweet_aks_md_copy(IOMemoryDescriptor *md, void *buf, IOByteCount len, bool out);
++
++/* aks_verify_password: scalar handle; struct = packed { u32 n; n x { u32 len; bytes; pad 4 } }, item 0 the passcode. */
++static IOReturn
++sweet_aks_verify_password(IOExternalMethodArguments *args, uint32_t *post)
++{
++	uint8_t in[SWEET_AKS_PASS_MAX + 64];
++	uint32_t len = sizeof(in), n, plen;
++	IOReturn ret;
++
++	if (args->structureInputDescriptor != NULL) {
++		len = (uint32_t)args->structureInputDescriptor->getLength();
++		if (len > sizeof(in) || sweet_aks_md_copy(args->structureInputDescriptor, in, len, false) != len) {
++			return kIOReturnBadArgument;
++		}
++	} else {
++		len = args->structureInputSize;
++		if (len > sizeof(in) || (len > 0 && args->structureInput == NULL)) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(in, args->structureInput, len);
++	}
++	if (len < 8) {
++		cc_clear(sizeof(in), in);
++		return kIOReturnBadArgument;
++	}
++	memcpy(&n, in, 4);
++	memcpy(&plen, in + 4, 4);
++	if (n < 1 || plen > len - 8) {
++		cc_clear(sizeof(in), in);
++		return kIOReturnBadArgument;
++	}
++	ret = sweet_aks_check(in + 8, plen, post);
++	cc_clear(sizeof(in), in);
++	return ret;
++}
++
++/*
++ * aks_change_secret (keybagd KBChangeSystemNonSeSecret, for profiled's
++ * MKBKeyBagChangeSystemSecret): scalars { handle, generation flags, 0xff,
++ * old ptr, old len, new ptr, new len, 0, 0, 0, 0 }; one scalar out, the new
++ * bag keybagd then saves (3: our blob, written to systembag.kb), makes the
++ * system bag (5), finishes (105) and unloads (4). An empty new secret removes
++ * the passcode. Only memory changes here; keybagd's save persists it.
++ */
++static IOReturn
++sweet_aks_change_secret(IOExternalMethodArguments *args, uint32_t *post)
++{
++	uint8_t oldp[SWEET_AKS_PASS_MAX], newp[SWEET_AKS_PASS_MAX];
++	size_t oldlen, newlen;
++	struct sweet_aks_secret s;
++	bool had_pass;
++	IOReturn ret;
++
++	if (args->scalarInputCount < 7) {
++		return kIOReturnBadArgument;
++	}
++	ret = sweet_aks_copyin_pass(args->scalarInput[3], args->scalarInput[4], oldp, &oldlen);
++	if (ret == kIOReturnSuccess) {
++		ret = sweet_aks_copyin_pass(args->scalarInput[5], args->scalarInput[6], newp, &newlen);
++	}
++	if (ret != kIOReturnSuccess) {
++		cc_clear(sizeof(oldp), oldp);
++		args->scalarOutputCount = 0;
++		return ret;
++	}
++
++	IOLockLock(sweet_aks_lock);
++	had_pass = sa.has_pass;
++	IOLockUnlock(sweet_aks_lock);
++	/* with no verifier any old secret goes: a passcode "set" before this kernel was never kept */
++	ret = had_pass ? sweet_aks_check(oldp, oldlen, post) : kIOReturnSuccess;
++	if (ret == kIOReturnSuccess) {
++		bzero(&s, sizeof(s));
++		if (newlen != 0) {
++			s.iterations = SWEET_AKS_ITERATIONS;
++			read_random(s.salt, sizeof(s.salt));
++			sweet_aks_pbkdf2(newp, newlen, s.salt, sizeof(s.salt), s.iterations, s.verifier);
++		}
++		IOLockLock(sweet_aks_lock);
++		sa.has_pass = newlen != 0;
++		memcpy(&sa.secret, &s, sizeof(sa.secret));
++		sa.generation++;
++		sa.failed = 0;
++		sa.backoff_until = 0;
++		sweet_aks_unlock_locked(post);
++		IOLockUnlock(sweet_aks_lock);
++		cc_clear(sizeof(s), &s);
++		*post |= SWEET_AKS_POST_LOCK_STATE;
++		IOLog("SWEET AKS: passcode %s (kept when keybagd saves the bag)\n",
++		    newlen == 0 ? "removed" : had_pass ? "changed" : "set");
++	}
++	cc_clear(sizeof(oldp), oldp);
++	cc_clear(sizeof(newp), newp);
++	if (ret == kIOReturnSuccess && args->scalarOutputCount >= 1) {
++		args->scalarOutput[0] = SWEET_AKS_NEW_HANDLE;   /* keybagd wants a bag != the old one */
++		args->scalarOutputCount = 1;
++	} else {
++		args->scalarOutputCount = 0;
++	}
++	return ret;
++}
++
++/* The grace period ran out: locked now. Thread call context, no lock held on entry. */
++static void
++sweet_aks_grace_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	bool changed = false;
++
++	IOLockLock(sweet_aks_lock);
++	if (sa.locking && mach_absolute_time() >= sa.grace_deadline) {
++		sa.locking = false;
++		sa.locked = true;
++		changed = true;
++	}
++	IOLockUnlock(sweet_aks_lock);
++	if (changed) {
++		IOLog("SWEET AKS: grace period over: locked\n");
++		sweet_aks_post(SWEET_AKS_POST_LOCK_STATE);
++	}
++}
++
++/* aks_lock_device: SpringBoard when the screen locks (8), or "lock now" (32). */
++static IOReturn
++sweet_aks_lock_device(bool now, uint32_t *post)
++{
++	uint64_t deadline = 0;
++	bool arm = false;
++
++	if (!now && sweet_aks_grace_secs != 0) {
++		clock_interval_to_deadline(sweet_aks_grace_secs, kSecondScale, &deadline);
++	}
++	IOLockLock(sweet_aks_lock);
++	if (sa.has_pass && !sa.locked) {
++		if (deadline != 0) {
++			if (!sa.locking) {
++				sa.locking = true;
++				sa.grace_deadline = deadline;
++				arm = true;
++				*post |= SWEET_AKS_POST_LOCK_STATE;
++			}
++		} else {
++			sa.locking = false;
++			sa.locked = true;
++			*post |= SWEET_AKS_POST_LOCK_STATE;
++		}
++	}
++	IOLockUnlock(sweet_aks_lock);
++	if (arm) {
++		thread_call_enter_delayed(sweet_aks_grace_call, deadline);
++	}
++	return kIOReturnSuccess;
++}
++
+ bool
+ AppleKeyStore::start(IOService *provider)
+ {
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++	sweet_aks_lock = IOLockAlloc();
++	sweet_aks_grace_call = thread_call_allocate(sweet_aks_grace_fire, NULL);
++	if (sweet_aks_lock == NULL || sweet_aks_grace_call == NULL) {
++		return false;
++	}
++	(void)PE_parse_boot_argn("sweetaks_nopass", &sweet_aks_nopass, sizeof(sweet_aks_nopass));
++	(void)PE_parse_boot_argn("sweetaks_grace", &sweet_aks_grace_secs, sizeof(sweet_aks_grace_secs));
++	sweet_aks_service = this;
+ 	setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
+ 	registerService();
+-	IOLog("SWEET AKS: AppleKeyStore registered (no passcode, unlocked)\n");
++	IOLog("SWEET AKS: AppleKeyStore registered (passcode state in the system bag%s, grace %u s)\n",
++	    sweet_aks_nopass ? ", sweetaks_nopass" : "", sweet_aks_grace_secs);
+ 	return true;
+ }
+ 
+@@ -99,15 +747,31 @@ AppleKeyStoreUserClient::clientClose(void)
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * A large structure comes as a memory descriptor of the caller's memory, not wired yet: readBytes /
++ * writeBytes on it unprepared panicked ("IOGMD: not wired for the IODMACommand", keybagd's save of the
++ * bag after a passcode change, sel 3). Wired for the copy, then released.
++ */
++static IOByteCount
++sweet_aks_md_copy(IOMemoryDescriptor *md, void *buf, IOByteCount len, bool out)
++{
++	if (md->prepare() != kIOReturnSuccess) {
++		return 0;
++	}
++	IOByteCount n = out ? md->writeBytes(0, buf, len) : md->readBytes(0, buf, len);
++	md->complete();
++	return n;
++}
++
+ /* Copy len bytes to the caller's output structure (inband or descriptor). */
+ static IOReturn
+ sweet_aks_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
+ {
+ 	if (args->structureOutputDescriptor != NULL) {
+-		if (len > args->structureOutputDescriptor->getLength()) {
++		if (len > args->structureOutputDescriptor->getLength() ||
++		    sweet_aks_md_copy(args->structureOutputDescriptor, (void *)buf, len, true) != len) {
+ 			return kIOReturnNoSpace;
+ 		}
+-		args->structureOutputDescriptor->writeBytes(0, buf, len);
+ 		args->structureOutputDescriptorSize = len;
+ 		return kIOReturnSuccess;
+ 	}
+@@ -119,47 +783,77 @@ sweet_aks_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t
+ 	return kIOReturnSuccess;
+ }
+ 
+-/* Append SEQUENCE { UTF8String key, INTEGER value } (short forms only). */
++/* Append SEQUENCE { UTF8String key, INTEGER value } (DER, short lengths). */
+ static uint32_t
+-sweet_aks_der_pair(uint8_t *p, const char *key, uint8_t value)
++sweet_aks_der_pair(uint8_t *p, const char *key, uint64_t value)
+ {
+ 	uint32_t klen = (uint32_t)strlen(key);
+-	uint32_t n = 0;
++	uint8_t num[9];
++	uint32_t nlen = 0, n = 0;
++	int i = 7;
++
++	while (i > 0 && ((value >> (i * 8)) & 0xff) == 0) {
++		i--;
++	}
++	if ((value >> (i * 8)) & 0x80) {
++		num[nlen++] = 0;                /* stay non-negative */
++	}
++	for (; i >= 0; i--) {
++		num[nlen++] = (uint8_t)(value >> (i * 8));
++	}
+ 	p[n++] = 0x30;
+-	p[n++] = (uint8_t)(2 + klen + 3);
++	p[n++] = (uint8_t)(2 + klen + 2 + nlen);
+ 	p[n++] = 0x0c;
+ 	p[n++] = (uint8_t)klen;
+ 	memcpy(p + n, key, klen);
+ 	n += klen;
+ 	p[n++] = 0x02;
+-	p[n++] = 0x01;
+-	p[n++] = value;
++	p[n++] = (uint8_t)nlen;
++	memcpy(p + n, num, nlen);
++	n += nlen;
+ 	return n;
+ }
+ 
+ /*
+- * Device state (selector 17): a DER SET of key/INTEGER pairs that libaks
+- * decode_extended_state reads: ss state, sls lock state (MKBGetDeviceLockState:
+- * 0 = unlocked), sb backoff, sfa failed attempts, sgs generation, sas
+- * assertions, sgpe grace period, srcd recovery countdown.
++ * Device state (selectors 17 and 35): a DER SET of key/INTEGER pairs that libaks
++ * decode_extended_state reads into { u32 ss state (the lock state bits),
++ * u32 sls (MKBGetDeviceLockState: 0 unlocked, 1 locked, 2 locking, 3 no passcode),
++ * u64 sb back-off seconds left, u32 sfa failed attempts, u32 sgs generation,
++ * u8 sas assertions, u8 sgpe grace period enabled, u64 srcd recovery countdown }.
+  */
+ static IOReturn
+ sweet_aks_device_state(IOExternalMethodArguments *args)
+ {
+-	static const struct {
++	struct {
+ 		const char *key;
+-		uint8_t value;
++		uint64_t value;
+ 	} fields[] = {
+-		{ "ss", SWEET_AKS_LOCK_STATE }, { "sls", 0 }, { "sb", 0 }, { "sfa", 0 },
++		{ "ss", 0 }, { "sls", 0 }, { "sb", 0 }, { "sfa", 0 },
+ 		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
+ 	};
+-	uint8_t buf[128];
+-	uint32_t n = 2;
++	uint8_t buf[256];
++	uint32_t n = 3, body;
++
++	IOLockLock(sweet_aks_lock);
++	fields[0].value = sweet_aks_lock_bits_locked();
++	fields[1].value = sweet_aks_mkb_state_locked();
++	fields[2].value = sa.has_pass ? sweet_aks_backoff_left_locked() : 0;
++	fields[3].value = sa.has_pass ? MIN(sa.failed, SWEET_AKS_FAILED_SHOWN) : 0;
++	fields[6].value = sa.has_pass && sweet_aks_grace_secs != 0;
++	IOLockUnlock(sweet_aks_lock);
++
+ 	for (unsigned int i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+ 		n += sweet_aks_der_pair(buf + n, fields[i].key, fields[i].value);
+ 	}
++	body = n - 3;
++	if (body < 0x80) {
++		buf[1] = 0x31;
++		buf[2] = (uint8_t)body;
++		return sweet_aks_struct_out(args, buf + 1, n - 1);
++	}
+ 	buf[0] = 0x31;
+-	buf[1] = (uint8_t)(n - 2);
++	buf[1] = 0x81;
++	buf[2] = (uint8_t)body;
+ 	return sweet_aks_struct_out(args, buf, n);
+ }
+ 
+@@ -195,7 +889,7 @@ sweet_aks_read_in(IOExternalMethodArguments *args, uint8_t *buf, uint32_t *len)
+ 
+ 	if (args->structureInputDescriptor != NULL) {
+ 		n = (uint32_t)args->structureInputDescriptor->getLength();
+-		if (n > *len || args->structureInputDescriptor->readBytes(0, buf, n) != n) {
++		if (n > *len || sweet_aks_md_copy(args->structureInputDescriptor, buf, n, false) != n) {
+ 			return kIOReturnBadArgument;
+ 		}
+ 	} else {
+@@ -214,7 +908,7 @@ sweet_aks_write_out(IOExternalMethodArguments *args, const uint8_t *buf, uint32_
+ {
+ 	if (args->structureOutputDescriptor != NULL) {
+ 		if (args->structureOutputDescriptor->getLength() < len ||
+-		    args->structureOutputDescriptor->writeBytes(0, buf, len) != len) {
++		    sweet_aks_md_copy(args->structureOutputDescriptor, (void *)buf, len, true) != len) {
+ 			return kIOReturnNoSpace;
+ 		}
+ 		args->structureOutputDescriptorSize = len;
+@@ -271,6 +965,73 @@ sweet_aks_wrap(IOExternalMethodArguments *args, bool wrap)
+ 	return ret;
+ }
+ 
++#define SWEET_AKS_BAG_IN_MAX    4096    /* systembag.kb's KeyBagKeys: ours is 104 bytes */
++
++/*
++ * aks_get_system: kIOReturnNotFound once, to keybagd (--init's load_devicebag),
++ * so that it loads systembag.kb; a handle to everyone else and from then on.
++ */
++static IOReturn
++sweet_aks_get_system(IOExternalMethodArguments *args, const char *name)
++{
++	bool notfound = false;
++
++	if (args->scalarOutputCount < 1) {
++		return kIOReturnBadArgument;
++	}
++	if (strcmp(name, "keybagd") == 0) {
++		IOLockLock(sweet_aks_lock);
++		if (sa.sys_state == 0) {
++			sa.sys_state = 1;
++			notfound = true;
++		}
++		IOLockUnlock(sweet_aks_lock);
++	}
++	if (notfound) {
++		args->scalarOutputCount = 0;
++		return kIOReturnNotFound;
++	}
++	args->scalarOutput[0] = SWEET_AKS_SYSTEM_HANDLE;
++	args->scalarOutputCount = 1;
++	return kIOReturnSuccess;
++}
++
++/* aks_load_bag: struct in = the bag, one scalar out = its handle. Only the system bag is supported. */
++static IOReturn
++sweet_aks_load_bag(IOExternalMethodArguments *args, const char *name)
++{
++	uint8_t *data;
++	uint32_t len = SWEET_AKS_BAG_IN_MAX;
++	bool system = false;
++	IOReturn ret;
++
++	if (args->scalarOutputCount < 1) {
++		return kIOReturnBadArgument;
++	}
++	if (strcmp(name, "keybagd") == 0) {
++		IOLockLock(sweet_aks_lock);
++		system = sa.sys_state == 1;
++		IOLockUnlock(sweet_aks_lock);
++	}
++	if (!system) {
++		return kIOReturnUnsupported;    /* backup / user bags: as before */
++	}
++	data = (uint8_t *)IOMallocData(SWEET_AKS_BAG_IN_MAX);
++	if (data == NULL) {
++		return kIOReturnNoMemory;
++	}
++	ret = sweet_aks_read_in(args, data, &len);
++	if (ret != kIOReturnSuccess) {
++		len = 0;                        /* unreadable: still the system bag, without a passcode */
++	}
++	sweet_aks_bag_adopt(data, len);
++	cc_clear(SWEET_AKS_BAG_IN_MAX, data);
++	IOFreeData(data, SWEET_AKS_BAG_IN_MAX);
++	args->scalarOutput[0] = SWEET_AKS_LOADED_HANDLE;
++	args->scalarOutputCount = 1;
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -283,44 +1044,54 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	uint32_t out_scalars = args->scalarOutputCount;
+ 	uint32_t out_struct = sweet_aks_struct_out_size(args);
+ 	uint64_t arg0 = in_scalars > 0 ? args->scalarInput[0] : 0;
++	uint32_t post = 0, mkb = 0;
++	char name[32];
++
++	proc_selfname(name, sizeof(name));
+ 
+ 	switch (selector) {
+ 	case kAKSOpen:
+ 	case kAKSUnloadBag:
+ 	case kAKSSetSystem:
+-	case kAKSUnlockDevice:
+ 	case kAKSUnlockBag:
+ 	case kAKSLockBag:
+ 	case kAKSAssertHold:
+ 	case kAKSAssertDrop:
+ 	case kAKSAssertConsume:
+ 	case kAKSUnloadSessionBags:
++	case kAKSChangeSecretEpilogue:
++		args->scalarOutputCount = 0;
++		break;
+ 	case kAKSNotifyStateSet:
++		IOLockLock(sweet_aks_lock);
++		sa.notify_state = true;
++		IOLockUnlock(sweet_aks_lock);
+ 		args->scalarOutputCount = 0;
+ 		break;
+ 	case kAKSGetSystem:
+-		if (out_scalars < 1) {
+-			ret = kIOReturnBadArgument;
+-			break;
+-		}
+-		args->scalarOutput[0] = SWEET_AKS_SYSTEM_HANDLE;
+-		args->scalarOutputCount = 1;
++		ret = sweet_aks_get_system(args, name);
++		break;
++	case kAKSLoadBag:
++		ret = sweet_aks_load_bag(args, name);
+ 		break;
+ 	case kAKSGetLockState:
+ 		if (out_scalars < 1) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+-		args->scalarOutput[0] = SWEET_AKS_LOCK_STATE;
++		IOLockLock(sweet_aks_lock);
++		args->scalarOutput[0] = sweet_aks_lock_bits_locked();
++		IOLockUnlock(sweet_aks_lock);
+ 		args->scalarOutputCount = 1;
+ 		break;
+ 	case kAKSNotifyStateIsSet:
+-		/* Nothing was ever set: answer "not set". */
+ 		if (out_scalars < 1) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+-		args->scalarOutput[0] = 0;
++		IOLockLock(sweet_aks_lock);
++		args->scalarOutput[0] = sa.notify_state;
++		IOLockUnlock(sweet_aks_lock);
+ 		args->scalarOutputCount = 1;
+ 		break;
+ 	case kAKSGetDeviceState:
+@@ -328,6 +1099,31 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		args->scalarOutputCount = 0;
+ 		ret = sweet_aks_device_state(args);
+ 		break;
++	case kAKSLockDevice:
++	case kAKSLockDeviceNow:
++		args->scalarOutputCount = 0;
++		ret = sweet_aks_lock_device(selector == kAKSLockDeviceNow, &post);
++		break;
++	case kAKSUnlockDevice:
++		args->scalarOutputCount = 0;
++		ret = sweet_aks_unlock_device(args, &post);
++		break;
++	case kAKSVerifyPassword:
++		args->scalarOutputCount = 0;
++		ret = sweet_aks_verify_password(args, &post);
++		break;
++	case kAKSChangeSecret:
++		ret = sweet_aks_change_secret(args, &post);
++		break;
++	case kAKSSaveBag: {
++		struct sweet_aks_bag b;
++
++		args->scalarOutputCount = 0;
++		sweet_aks_bag_build(&b);
++		ret = sweet_aks_struct_out(args, &b, sizeof(b));
++		cc_clear(sizeof(b), &b);
++		break;
++	}
+ 	case kAKSWrapKey:
+ 		ret = sweet_aks_wrap(args, true);
+ 		break;
+@@ -339,10 +1135,16 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		break;
+ 	}
+ 
+-	char name[32];
+-	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	if (post != 0) {
++		IOLockLock(sweet_aks_lock);
++		mkb = sweet_aks_mkb_state_locked();
++		IOLockUnlock(sweet_aks_lock);
++		sweet_aks_post(post);
++	}
++
++	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x%s%s\n", name, selector,
++	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret,
++	    post != 0 ? ", now " : "", post != 0 ? sweet_aks_state_name(mkb) : "");
+ 	return ret;
+ }
+ #endif /* SWEET */
