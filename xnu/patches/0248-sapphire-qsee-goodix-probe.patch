@@ -1,0 +1,887 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0248: QSEE client, Goodix fingerprint probe (milestone 1)
+
+Boot-arg qsee=1 enables sysctl kern.sweet_qsee (1 run, 2 sensor GPIOs off,
+3 APP_SHUTDOWN goodixfp). Op 1: QSEE version and whitelist feature, APP_LOOKUP
+keymaster64 and goodixfp, the sensor powered (RPM ldoa9 1.8 V, gpio65 high,
+gpio104 reset pulse), APP_START goodixfp (mdt + b00..b07 from modem_a, at
+0xE8000000: 16 MB of the unmanaged low-bank hole), then SENSOR PRE_DETECT and
+DETECT_SENSOR through libgf_hal's envelope with SEND_DATA(_WHITELIST).
+Listener requests are logged and answered FAILURE; nothing is written to any
+partition. TopazModem exports its modem-partition file reader and an RPM LDO
+vote. Without qsee=1 nothing new runs.
+---
+ bsd/conf/files                  |   1 +
+ bsd/dev/sweet_qsee_ctl.c        |  31 ++
+ iokit/Kernel/arm/SweetQsee.cpp  | 715 ++++++++++++++++++++++++++++++++++++++++
+ iokit/Kernel/arm/TopazModem.cpp |  53 +++
+ iokit/conf/files.arm64          |   1 +
+ 5 files changed, 801 insertions(+)
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 8453865..cd110c2 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -124,6 +124,7 @@ bsd/dev/sweet_reboot.c			standard
+ bsd/dev/sweet_inject.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_pdp.c			standard
++bsd/dev/sweet_qsee_ctl.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_qsee_ctl.c b/bsd/dev/sweet_qsee_ctl.c
+new file mode 100755
+index 0000000..7c19bac
+--- /dev/null
++++ b/bsd/dev/sweet_qsee_ctl.c
+@@ -0,0 +1,31 @@
++/*
++ * kern.sweet_qsee: the QSEE / Goodix fingerprint probe (iokit/Kernel/arm/SweetQsee.cpp), only
++ * with boot-arg qsee=1 (otherwise every request answers ENODEV and nothing runs).
++ * Write an op, it runs in the writer's thread; reading gives the last result (0 ok, else an
++ * errno, -1 nothing run yet):
++ *   1 milestone 1 (QSEE version, whitelist, lookups, sensor power, APP_START goodixfp,
++ *     PRE_DETECT + DETECT_SENSOR), 2 the sensor's GPIOs off, 3 APP_SHUTDOWN goodixfp
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/kernel.h>
++#include <sys/sysctl.h>
++#include <sys/errno.h>
++
++int sweet_qsee_op(int op);
++
++static int
++sysctl_sweet_qsee SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = sweet_qsee_op(-1);
++	int err = sysctl_io_number(req, v, sizeof(v), &v, NULL);
++	if (err != 0 || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	return v < 0 ? EINVAL : sweet_qsee_op(v);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_qsee, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_qsee, "I", "QSEE / goodixfp probe: 1 run, 2 sensor off, 3 unload (boot-arg qsee=1)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetQsee.cpp b/iokit/Kernel/arm/SweetQsee.cpp
+new file mode 100755
+index 0000000..023ec20
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetQsee.cpp
+@@ -0,0 +1,715 @@
++/*
++ * sapphire 0248: the QSEE (TrustZone app OS) client, milestone 1 of the Goodix in-display
++ * fingerprint sensor (research/fingerprint-goodix-tz.md, fingerprint-hw.md).
++ *
++ * The legacy QSEECom SCM calls, as Linux qseecom.c issues them through qcom_scm_qseecom_call():
++ *   QSEE version (SIP 0x42000603, feature 10) and the whitelist feature (feature 15);
++ *   APP_LOOKUP "keymaster64" (loaded by UEFI: proves the QSEOS call path) and "goodixfp";
++ *   the sensor powered (PM6125 L9 vote, gpio65 high, gpio104 reset pulse, xiaomi_fp.ko timing);
++ *   APP_START goodixfp from the modem partition (goodixfp.mdt + b00..b07 back to back, ~11.3 MB);
++ *   SENSOR PRE_DETECT (1002,0) and DETECT_SENSOR (1002,1) through libgf_hal's 64-byte envelope.
++ * A listener request from TrustZone (INCOMPLETE / BLOCKED_ON_LISTENER) is logged and answered
++ * with a failure: no listener is registered and nothing is ever written anywhere (persist holds
++ * the sensor's factory calibration).
++ *
++ * Only with boot-arg qsee=1, and only when asked: sysctl kern.sweet_qsee (bsd/dev/sweet_qsee_ctl.c)
++ *   1 the milestone, 2 the sensor's GPIOs off, 3 APP_SHUTDOWN goodixfp (if it is loaded).
++ * Reading it gives the result of the last request (0 ok, else an errno).
++ *
++ * Memory: TrustZone reads what it is given by physical address, below 4 GB, physically
++ * contiguous, and (no SHM bridge: SHM_BRIDGE_ENABLE is never called) as plain non-secure RAM.
++ * Kernel RAM is above 4 GB (mkadt.py --highmem), so a contiguous allocation below 4 GB cannot
++ * succeed (0233); the modem pool (0xE0000000, 16 MB) is nearly full. This takes its own 16 MB of
++ * the same unmanaged low-bank hole: modem pool 0xE0000000, GPU 0xE1000000 (+5 MB), framebuffer
++ * 0xE2000000 (+48 MB, to 0xE5000000), this 0xE8000000-0xE9000000, below 0xF0000000 like the
++ * others. Mapped write-combined (Normal NC): TrustZone sees every write after a dsb.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <sys/errno.h>
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern unsigned long gPhysBase, gPhysSize;
++
++/* TopazModem.cpp */
++extern "C" int64_t topaz_fw_file_size(const char *path);
++extern "C" int topaz_fw_file_read(const char *path, uint64_t off, void *dst, uint64_t n);
++extern "C" const char *topaz_fw_phone(void);
++extern "C" int topaz_rpm_ldo(uint32_t id, uint32_t uv, uint32_t ma, uint32_t set);
++extern "C" int topaz_rpm_vote(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++
++#define LOG(fmt, ...)       IOLog("qsee: " fmt "\n", ##__VA_ARGS__)
++
++#define QSEE_POOL_PA        0xE8000000ull
++#define QSEE_POOL_SIZE      0x01000000ull
++#define OFF_IMG             0x000000u           /* the TA image, 12 MB */
++#define IMG_MAX             0xC00000u
++#define OFF_CMD             0xC00000u           /* the gf_cmd buffer (libgf_hal: 2 MB dmabuf) */
++#define CMD_SIZE            0x200000u
++#define OFF_SB              0xE00000u           /* the 64-byte envelope (libgf_hal: the 4 KB sb) */
++#define OFF_NAME            0xE01000u           /* APP_LOOKUP's name */
++#define OFF_EXT             0xE02000u           /* SMC arguments past the fourth */
++#define OFF_SGL             0xE03000u           /* the whitelist table */
++
++/* SMC function ids: SMC64 standard calls; owner 2 SIP, 50 QSEE OS, 48 TZ apps */
++#define FN_FEAT_VERSION     0x42000603u
++#define FN_APP_START        0x72000101u
++#define FN_APP_SHUTDOWN     0x72000102u
++#define FN_APP_LOOKUP       0x72000103u
++#define FN_LISTENER_RSP     0x72000203u
++#define FN_CONTINUE_LEGACY  0x72000204u
++#define FN_CONTINUE_SMCINV  0x72000207u
++#define FN_SEND_DATA        0x70000001u
++#define FN_SEND_DATA_WL     0x70000006u
++#define FN_WAITQ_ACK        0x42002401u
++#define FN_WAITQ_RESUME     0x42002402u
++
++#define SCM_INTERRUPTED     1
++#define SCM_WAITQ_SLEEP     2
++#define SCM_WAITQ_WAKE      3
++#define SCM_EBUSY           (-12)
++#define QSEE_APP_BUSY       (-315)
++
++#define RES_SUCCESS         0u
++#define RES_INCOMPLETE      1u
++#define RES_BLOCKED         2u
++#define RES_FAILURE         0xFFFFFFFFu
++#define RESP_APP_ID         0xEE01u
++#define RESP_LISTENER_ID    0xEE02u
++
++/* the sensor (fingerprint-hw.md): vfp PM6125 L9 (RPM "ldoa" 9, 1.8 V), power gpio65, reset gpio104, irq gpio83 */
++#define FP_LDO              9
++#define FP_LDO_UV           1800000
++#define FP_LDO_MA           100
++#define GPIO_PWR            65
++#define GPIO_RST            104
++#define GPIO_IRQ            83
++#define TLMM_CTL_OE         (1u << 9)           /* + function 0 (GPIO), 2 mA, no pull */
++#define TLMM_IO_OUT         (1u << 1)
++
++/* goodix targets / commands (libgf_hal tables) */
++#define GF_TARGET_SENSOR    1002
++#define GF_SENSOR_PRE_DETECT 0
++#define GF_SENSOR_DETECT    1
++
++static IOLock *q_lock;
++static IOMemoryMap *q_map;
++static uint8_t *q_va;
++static int q_last = -1;                         /* what reading the sysctl answers */
++static uint64_t q_version;
++static bool q_whitelist, q_powered;
++static uint32_t q_goodix_id, q_seq;
++
++static inline void mb(void) { __asm__ volatile ("dsb sy" ::: "memory"); }
++
++static uint64_t
++ms_since(uint64_t t0)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return ns / 1000000;
++}
++
++/* ---------------------------------------------------------------- the pool */
++
++static bool
++pool_map(void)
++{
++	if (q_va != NULL) {
++		return true;
++	}
++	/* never RAM the kernel manages */
++	if (QSEE_POOL_PA < gPhysBase + gPhysSize && QSEE_POOL_PA + QSEE_POOL_SIZE > gPhysBase) {
++		LOG("pool %llx-%llx overlaps kernel RAM %lx-%lx: stop", QSEE_POOL_PA, QSEE_POOL_PA + QSEE_POOL_SIZE,
++		    gPhysBase, gPhysBase + gPhysSize);
++		return false;
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(QSEE_POOL_PA, QSEE_POOL_SIZE, kIODirectionInOut);
++	if (md == NULL) {
++		LOG("pool: no descriptor");
++		return false;
++	}
++	q_map = md->map(kIOMapWriteCombineCache);
++	md->release();
++	if (q_map == NULL) {
++		LOG("pool: mapping %llx failed", QSEE_POOL_PA);
++		return false;
++	}
++	q_va = (uint8_t *)q_map->getVirtualAddress();
++	LOG("pool %llx-%llx mapped write-combined (kernel RAM %lx-%lx)", QSEE_POOL_PA, QSEE_POOL_PA + QSEE_POOL_SIZE,
++	    gPhysBase, gPhysBase + gPhysSize);
++	return true;
++}
++
++/* ---------------------------------------------------------------- SCM */
++
++static void
++smc8(uint64_t a[8])
++{
++	register uint64_t x0 __asm__("x0") = a[0], x1 __asm__("x1") = a[1], x2 __asm__("x2") = a[2],
++	    x3 __asm__("x3") = a[3], x4 __asm__("x4") = a[4], x5 __asm__("x5") = a[5], x6 __asm__("x6") = a[6],
++	    x7 __asm__("x7") = a[7];
++	__asm__ volatile ("smc #0"
++            : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++            :
++            : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	a[0] = x0; a[1] = x1; a[2] = x2; a[3] = x3; a[4] = x4; a[5] = x5; a[6] = x6; a[7] = x7;
++}
++
++/*
++ * One SCM call the way Linux's __scm_smc_call() makes it: x2..x5 the first four arguments, or with
++ * more than four x2..x4 the first three and x5 the physical address of the rest (u64 each).
++ * INTERRUPTED is resumed (x0 = 1, x6 the session), WAITQ sleep/wake answered, EBUSY and the
++ * QSEE "app busy" result retried 20 times 30 ms apart. Returns x0 (0 ok, < 0 an SCM error, or
++ * -1000 for a timeout); ret = x1..x3 = { result, resp_type, data }.
++ */
++static int64_t
++scm_call(uint32_t fn, uint32_t arginfo, const uint64_t *args, unsigned n, uint64_t ret[3])
++{
++	uint64_t a[8];
++	unsigned busy = 0, resumes = 0, waits = 0;
++	const uint64_t t0 = mach_absolute_time();
++
++	ret[0] = ret[1] = ret[2] = 0;
++	for (;;) {
++		bzero(a, sizeof(a));
++		a[0] = fn;
++		a[1] = arginfo;
++		if (n <= 4) {
++			for (unsigned i = 0; i < n; i++) {
++				a[2 + i] = args[i];
++			}
++		} else {
++			uint64_t *ext = (uint64_t *)(q_va + OFF_EXT);
++			bzero(ext, 7 * sizeof(uint64_t));
++			for (unsigned i = 0; i < 3; i++) {
++				a[2 + i] = args[i];
++			}
++			for (unsigned i = 3; i < n && i < 10; i++) {
++				ext[i - 3] = args[i];
++			}
++			mb();
++			a[5] = QSEE_POOL_PA + OFF_EXT;
++		}
++		const uint64_t orig[6] = { a[0], a[1], a[2], a[3], a[4], a[5] };
++		smc8(a);
++		while ((a[0] == SCM_INTERRUPTED || a[0] == SCM_WAITQ_SLEEP || a[0] == SCM_WAITQ_WAKE) &&
++		    ms_since(t0) < 30000) {
++			if (a[0] == SCM_INTERRUPTED) {
++				uint64_t s = a[6];
++				resumes++;
++				bzero(a, sizeof(a));
++				a[0] = SCM_INTERRUPTED;
++				for (unsigned i = 1; i < 6; i++) {
++					a[i] = orig[i];
++				}
++				a[6] = s;
++			} else {
++				/* x1 wq_ctx, x2 smc_call_ctx: nobody else waits here, so resume (or ack) at once */
++				uint64_t ctx = a[2];
++				bool sleep = a[0] == SCM_WAITQ_SLEEP;
++				if (waits++ < 4) {
++					LOG("  scm %08x: WAITQ %s (wq %llu, ctx %llu)", fn, sleep ? "sleep" : "wake", a[1], ctx);
++				}
++				if (sleep) {
++					IOSleep(1);
++				}
++				bzero(a, sizeof(a));
++				a[0] = sleep ? FN_WAITQ_RESUME : FN_WAITQ_ACK;
++				a[1] = 1;
++				a[2] = ctx;
++			}
++			smc8(a);
++		}
++		if (a[0] == SCM_INTERRUPTED || a[0] == SCM_WAITQ_SLEEP || a[0] == SCM_WAITQ_WAKE) {
++			LOG("  scm %08x: still x0=%lld after 30 s (%u resumes, %u waits): given up", fn, (int64_t)a[0], resumes, waits);
++			return -1000;
++		}
++		if (((int64_t)a[0] == SCM_EBUSY || (a[0] == 0 && (int32_t)a[1] == QSEE_APP_BUSY)) && busy < 20) {
++			busy++;
++			IOSleep(30);
++			continue;
++		}
++		break;
++	}
++	ret[0] = a[1];
++	ret[1] = a[2];
++	ret[2] = a[3];
++	if (resumes > 0 || busy > 0) {
++		LOG("  scm %08x: %u resumes, %u busy retries, %llu ms", fn, resumes, busy, ms_since(t0));
++	}
++	return (int64_t)a[0];
++}
++
++static const char *
++result_name(uint32_t r)
++{
++	return r == RES_SUCCESS ? "SUCCESS" : r == RES_INCOMPLETE ? "INCOMPLETE" : r == RES_BLOCKED ? "BLOCKED_ON_LISTENER" :
++	       r == 3 ? "CBACK_REQUEST" : r == RES_FAILURE ? "FAILURE" : "?";
++}
++
++/*
++ * After a QSEOS call: TrustZone may want a listener (file system 10, time 11, RPMB 0x2000...).
++ * None is registered: each request is answered "failure" (LISTENER_RSP status -1), a blocked
++ * session is told to continue. At most 16 rounds. True when the call ended in SUCCESS.
++ */
++static bool
++qsee_finish(const char *what, int64_t x0, uint64_t ret[3], uint32_t app_id)
++{
++	for (unsigned round = 0; round < 16; round++) {
++		uint32_t res = (uint32_t)ret[0], type = (uint32_t)ret[1], data = (uint32_t)ret[2];
++		if (x0 != 0) {
++			LOG("%s: SCM error %lld (x1 %llx x2 %llx x3 %llx)", what, x0, ret[0], ret[1], ret[2]);
++			return false;
++		}
++		LOG("%s: result %d %s, resp_type %x, data %u (0x%x)", what, (int32_t)res, result_name(res), type, data, data);
++		if (res == RES_SUCCESS) {
++			return true;
++		}
++		if (res == RES_INCOMPLETE) {
++			LOG("%s: TrustZone asks listener %u (0x%x)%s: answered FAILURE (no listeners in milestone 1)", what, data, data,
++			    data == 10 ? " = file system" : data == 11 ? " = time" : data == 0x2000 ? " = RPMB" :
++			    data == 0x7000 ? " = GP fs" : "");
++			uint64_t a[2] = { data, RES_FAILURE };
++			x0 = scm_call(FN_LISTENER_RSP, 0x2, a, 2, ret);
++			continue;
++		}
++		if (res == RES_BLOCKED) {
++			LOG("%s: blocked on listener %u (session %u): CONTINUE_BLOCKED", what, data, type);
++			uint64_t a[1] = { type };
++			x0 = scm_call(FN_CONTINUE_SMCINV, 0x1, a, 1, ret);
++			if (x0 != 0) {
++				LOG("%s: CONTINUE_BLOCKED (smcinvoke) x0 %lld: the legacy one with app %u", what, x0, app_id);
++				a[0] = app_id;
++				x0 = scm_call(FN_CONTINUE_LEGACY, 0x1, a, 1, ret);
++			}
++			continue;
++		}
++		return false;
++	}
++	LOG("%s: still not done after 16 listener rounds: given up", what);
++	return false;
++}
++
++/* SIP feature version (Linux: qseecom_init_control, qseecom_check_whitelist_feature) */
++static bool
++qsee_feature(uint32_t feature, uint64_t *version)
++{
++	uint64_t a[1] = { feature }, ret[3];
++	int64_t x0 = scm_call(FN_FEAT_VERSION, 0x1, a, 1, ret);
++	*version = ret[0];
++	LOG("feature %u: x0 %lld, version %llx (%llu.%llu.%llu)", feature, x0, ret[0], (ret[0] >> 22) & 0x3ff,
++	    (ret[0] >> 12) & 0x3ff, ret[0] & 0xfff);
++	return x0 == 0;
++}
++
++/* APP_LOOKUP: the app id, 0 when the app is not loaded, -1 on an error */
++static int64_t
++qsee_lookup(const char *name)
++{
++	char *buf = (char *)(q_va + OFF_NAME);
++	uint64_t ret[3];
++
++	bzero(buf, 0x1000);
++	strlcpy(buf, name, 0x100);
++	mb();
++	uint64_t a[2] = { QSEE_POOL_PA + OFF_NAME, strlen(name) };
++	int64_t x0 = scm_call(FN_APP_LOOKUP, 0x22, a, 2, ret);
++	if (x0 != 0) {
++		LOG("lookup %s: SCM error %lld", name, x0);
++		return -1;
++	}
++	if ((uint32_t)ret[0] == RES_FAILURE) {
++		LOG("lookup %s: not loaded (result FAILURE)", name);
++		return 0;
++	}
++	if ((uint32_t)ret[0] == RES_SUCCESS && (uint32_t)ret[1] == RESP_APP_ID) {
++		LOG("lookup %s: app id %u", name, (uint32_t)ret[2]);
++		return (uint32_t)ret[2];
++	}
++	LOG("lookup %s: unexpected result %d resp_type %x data %u", name, (int32_t)ret[0], (uint32_t)ret[1], (uint32_t)ret[2]);
++	return -1;
++}
++
++/* ---------------------------------------------------------------- the sensor's power */
++
++static volatile uint32_t *
++tlmm(unsigned gpio)
++{
++	/* the TLMM tile of each GPIO (pinctrl-sm6115.c, as TopazModem's tlmm_tile): S 0x900000, E 0xd00000, W 0x500000 */
++	static const char tile[] = "WWWWWWWWEEEEWWWWWWEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEWWWWWWWSSSSSSSSWWWWWWWEEWEEWWWWWWSSSSSSSSSSSSSSS";
++	if (gpio >= sizeof(tile) - 1) {
++		return NULL;
++	}
++	uint64_t base = tile[gpio] == 'S' ? 0x00900000ull : tile[gpio] == 'E' ? 0x00D00000ull : 0x00500000ull;
++	return (volatile uint32_t *)ml_io_map(base + gpio * 0x1000ull, 0x1000);
++}
++
++static bool
++gpio_out(unsigned gpio, bool high)
++{
++	volatile uint32_t *g = tlmm(gpio);
++	if (g == NULL) {
++		LOG("gpio%u: no mapping", gpio);
++		return false;
++	}
++	uint32_t ctl0 = g[0], io0 = g[1];
++	g[1] = high ? TLMM_IO_OUT : 0;              /* the level first, then the output enable */
++	mb();
++	g[0] = TLMM_CTL_OE;
++	mb();
++	LOG("gpio%u: ctl %08x io %08x -> ctl %08x io %08x (%s)", gpio, ctl0, io0, g[0], g[1], high ? "high" : "low");
++	return true;
++}
++
++static void
++fp_power_off(void)
++{
++	LOG("sensor off (it was %s)", q_powered ? "powered by this" : "not powered by this");
++	gpio_out(GPIO_RST, false);
++	gpio_out(GPIO_PWR, false);
++	q_powered = false;
++	/* L9 also feeds BT vdd-io, the codec's vddpx/rxtx and a vddio: it stays on */
++	LOG("sensor off: reset and power GPIOs low (L9 left on: shared with BT and the codec)");
++}
++
++static bool
++fp_power_on(void)
++{
++	int act = topaz_rpm_ldo(FP_LDO, FP_LDO_UV, FP_LDO_MA, 0);
++	LOG("sensor: RPM ldoa%u %u uV %u mA, active set: %d (0: taken)", FP_LDO, FP_LDO_UV, FP_LDO_MA, act);
++	if (act != 0) {
++		return false;
++	}
++	IOSleep(2);
++	if (!gpio_out(GPIO_PWR, true)) {
++		return false;
++	}
++	q_powered = true;
++	IOSleep(10);
++	/* fp_hw_reset(): reset_low, 5 ms, reset_high, then the caller's delay */
++	if (!gpio_out(GPIO_RST, false)) {
++		return false;
++	}
++	IOSleep(5);
++	if (!gpio_out(GPIO_RST, true)) {
++		return false;
++	}
++	IOSleep(60);
++	volatile uint32_t *irq = tlmm(GPIO_IRQ);
++	if (irq != NULL) {
++		LOG("sensor: on; irq gpio%u ctl %08x io %08x (level %u)", GPIO_IRQ, irq[0], irq[1], irq[1] & 1);
++	}
++	return true;
++}
++
++/* ---------------------------------------------------------------- the TA */
++
++static const char *const ta_files[] = {
++	"image/goodixfp.mdt", "image/goodixfp.b00", "image/goodixfp.b01", "image/goodixfp.b02", "image/goodixfp.b03",
++	"image/goodixfp.b04", "image/goodixfp.b05", "image/goodixfp.b06", "image/goodixfp.b07",
++};
++
++/* goodixfp.mdt ‖ b00 ‖ ... ‖ b(e_phnum-1), back to back (qseecom.c __qseecom_get_fw_data) */
++static bool
++ta_image(uint32_t *mdt_len, uint32_t *img_len)
++{
++	uint8_t *img = q_va + OFF_IMG;
++	uint64_t off = 0;
++	const uint64_t t0 = mach_absolute_time();
++
++	*mdt_len = *img_len = 0;
++	int64_t sz = topaz_fw_file_size(ta_files[0]);
++	LOG("TA: firmware table %s, %s %lld bytes", topaz_fw_phone(), ta_files[0], sz);
++	if (sz <= 64 || sz > 0x10000) {
++		LOG("TA: no usable %s (-2: the partition is not readable yet)", ta_files[0]);
++		return false;
++	}
++	if (topaz_fw_file_read(ta_files[0], 0, img, (uint64_t)sz) != 0) {
++		LOG("TA: reading %s failed", ta_files[0]);
++		return false;
++	}
++	if (img[0] != 0x7f || img[1] != 'E' || img[2] != 'L' || img[3] != 'F' || img[4] != 2) {
++		LOG("TA: %s is not ELF64 (%02x %02x %02x %02x class %u)", ta_files[0], img[0], img[1], img[2], img[3], img[4]);
++		return false;
++	}
++	uint16_t phnum = *(uint16_t *)(img + 0x38);
++	LOG("TA: mdt ELF64, %u program headers", phnum);
++	if (phnum == 0 || phnum > sizeof(ta_files) / sizeof(ta_files[0]) - 1) {
++		LOG("TA: %u segments, this knows b00..b07", phnum);
++		return false;
++	}
++	*mdt_len = (uint32_t)sz;
++	off = (uint64_t)sz;
++	for (unsigned i = 1; i <= phnum; i++) {
++		sz = topaz_fw_file_size(ta_files[i]);
++		if (sz < 0 || off + (uint64_t)sz > IMG_MAX) {
++			LOG("TA: %s: size %lld at %llu does not fit %u", ta_files[i], sz, off, IMG_MAX);
++			return false;
++		}
++		if (sz > 0 && topaz_fw_file_read(ta_files[i], 0, img + off, (uint64_t)sz) != 0) {
++			LOG("TA: reading %s failed", ta_files[i]);
++			return false;
++		}
++		off += (uint64_t)sz;
++	}
++	mb();
++	*img_len = (uint32_t)off;
++	LOG("TA: image %u bytes (mdt %u) at %llx, read in %llu ms", *img_len, *mdt_len, QSEE_POOL_PA + OFF_IMG, ms_since(t0));
++	return true;
++}
++
++static int64_t
++ta_start(void)
++{
++	uint32_t mdt_len, img_len;
++	uint64_t ret[3];
++
++	if (!ta_image(&mdt_len, &img_len)) {
++		return -1;
++	}
++	uint64_t a[3] = { mdt_len, img_len, QSEE_POOL_PA + OFF_IMG };
++	const uint64_t t0 = mach_absolute_time();
++	int64_t x0 = scm_call(FN_APP_START, 0x3, a, 3, ret);
++	LOG("APP_START goodixfp: x0 %lld after %llu ms", x0, ms_since(t0));
++	if (!qsee_finish("APP_START goodixfp", x0, ret, 0)) {
++		return -1;
++	}
++	if ((uint32_t)ret[1] != RESP_APP_ID || (uint32_t)ret[2] == 0) {
++		LOG("APP_START goodixfp: no app id (resp_type %x data %u)", (uint32_t)ret[1], (uint32_t)ret[2]);
++		return -1;
++	}
++	return (uint32_t)ret[2];
++}
++
++/*
++ * One goodix command (CaEntry::sendCommand): the gf_cmd in the 2 MB buffer, the 64-byte envelope
++ * at the start of the sb, SEND_DATA with request = response = the envelope. The 32-bit PA at
++ * envelope +0 is what qseecom's modfd path patches in; the whitelist entry names it (offset 0,
++ * single buffer, 32-bit, the buffer's length), so the TA may map it.
++ */
++static bool
++gf_send(uint32_t app_id, uint8_t *cmd, uint32_t len, const char *name)
++{
++	uint8_t *buf = q_va + OFF_CMD, *sb = q_va + OFF_SB;
++	uint32_t *sgl = (uint32_t *)(q_va + OFF_SGL);
++	clock_sec_t sec;
++	clock_usec_t usec;
++	uint64_t ret[3];
++	int64_t x0;
++
++	clock_get_calendar_microtime(&sec, &usec);
++	memcpy(buf, cmd, len);
++	bzero(sb, 0x40);
++	*(uint32_t *)(sb + 0x00) = (uint32_t)(QSEE_POOL_PA + OFF_CMD);
++	*(uint32_t *)(sb + 0x08) = len;
++	*(uint32_t *)(sb + 0x0c) = ++q_seq;
++	*(uint64_t *)(sb + 0x10) = (uint64_t)sec * 1000 + usec / 1000;
++	bzero(sgl, 32);
++	sgl[0] = 0x80000000u | 0;                   /* single address, 32-bit, at offset 0 */
++	sgl[1] = CMD_SIZE;
++	mb();
++	const uint64_t t0 = mach_absolute_time();
++	if (q_whitelist) {
++		uint64_t a[7] = { app_id, QSEE_POOL_PA + OFF_SB, 0x40, QSEE_POOL_PA + OFF_SB, 0x40, QSEE_POOL_PA + OFF_SGL, 32 };
++		x0 = scm_call(FN_SEND_DATA_WL, 0x8887, a, 7, ret);
++	} else {
++		uint64_t a[5] = { app_id, QSEE_POOL_PA + OFF_SB, 0x40, QSEE_POOL_PA + OFF_SB, 0x40 };
++		x0 = scm_call(FN_SEND_DATA, 0x885, a, 5, ret);
++	}
++	LOG("%s: SEND_DATA%s x0 %lld after %llu ms", name, q_whitelist ? "_WHITELIST" : "", x0, ms_since(t0));
++	bool ok = qsee_finish(name, x0, ret, app_id);
++	mb();
++	memcpy(cmd, buf, len);
++	uint32_t status = *(uint32_t *)(sb + 0x1c);
++	LOG("%s: envelope TEE status %u, gf result %u (0x%x), reset_flag %u, seq %u", name, status, *(uint32_t *)(cmd + 0x0c),
++	    *(uint32_t *)(cmd + 0x0c), cmd[0], *(uint32_t *)(sb + 0x0c));
++	for (uint32_t i = 0; i < len; i += 16) {
++		char line[64] = "";
++		size_t n = 0;
++		for (uint32_t j = i; j + 4 <= len && j < i + 16; j += 4) {
++			n += snprintf(line + n, sizeof(line) - n, " %08x", *(uint32_t *)(cmd + j));
++		}
++		LOG("%s:   +%02x%s", name, i, line);
++	}
++	return ok && status == 0;
++}
++
++static void
++gf_header(uint8_t *c, uint32_t len, uint32_t target, uint32_t cmd)
++{
++	bzero(c, len);
++	*(uint32_t *)(c + 0x04) = target;
++	*(uint32_t *)(c + 0x08) = cmd;
++}
++
++static bool
++sensor_probe(uint32_t app_id)
++{
++	uint8_t c[0x40];
++	clock_sec_t sec;
++	clock_usec_t usec;
++	bool pre = false;
++
++	for (unsigned i = 0; i < 4 && !pre; i++) {     /* SensorDetector::init: up to 4 tries */
++		gf_header(c, 0x28, GF_TARGET_SENSOR, GF_SENSOR_PRE_DETECT);
++		clock_get_calendar_microtime(&sec, &usec);
++		*(uint64_t *)(c + 0x20) = (uint64_t)sec;
++		if (!gf_send(app_id, c, 0x28, "PRE_DETECT")) {
++			LOG("PRE_DETECT: the call itself failed: stop");
++			return false;
++		}
++		pre = *(uint32_t *)(c + 0x0c) == 0;
++		if (!pre) {
++			IOSleep(10);
++		}
++	}
++	if (!pre) {
++		LOG("PRE_DETECT: gf error after 4 tries: stop");
++		return false;
++	}
++	gf_header(c, 0x2c, GF_TARGET_SENSOR, GF_SENSOR_DETECT);
++	if (!gf_send(app_id, c, 0x2c, "DETECT_SENSOR")) {
++		LOG("DETECT_SENSOR: the call failed");
++		return false;
++	}
++	uint32_t err = *(uint32_t *)(c + 0x0c);
++	const uint32_t *info = (const uint32_t *)(c + 0x1c);
++	LOG("DETECT_SENSOR: gf result %u, sensor info %08x %08x %08x %08x%s", err, info[0], info[1], info[2], info[3],
++	    err == 0 ? ": TZ talks to the sensor" : "");
++	return err == 0;
++}
++
++/* ---------------------------------------------------------------- the milestone */
++
++static int
++milestone(void)
++{
++	uint64_t wl = 0;
++	const uint64_t t0 = mach_absolute_time();
++
++	LOG("milestone 1 begins");
++	if (!pool_map()) {
++		return ENOMEM;
++	}
++	if (!qsee_feature(10, &q_version)) {
++		LOG("no QSEE version: stop");
++		return EIO;
++	}
++	q_whitelist = qsee_feature(15, &wl) && wl >= (1ull << 22);
++	LOG("QSEE version %llx, whitelist %s (%llx)", q_version, q_whitelist ? "supported" : "NOT supported", wl);
++
++	int64_t km = qsee_lookup("keymaster64");
++	LOG("keymaster64: %s %lld", km > 0 ? "loaded, app id" : km == 0 ? "not loaded" : "lookup failed", km);
++	if (km < 0) {
++		return EIO;
++	}
++	int64_t id = qsee_lookup("goodixfp");
++	if (id < 0) {
++		return EIO;
++	}
++
++	/* the crypto engine's clock, as qseecom votes it (core_clk_src: RPM "ce" 0, ce-opp-freq 192 MHz) */
++	int ce = topaz_rpm_vote(0, 0x00006563, 0, 0x007a484b, 192000);
++	LOG("RPM ce clock 192 MHz, active set: %d (0: taken)", ce);
++
++	if (!fp_power_on()) {
++		LOG("sensor power-up failed: stop");
++		fp_power_off();
++		return EIO;
++	}
++	if (id == 0) {
++		id = ta_start();
++		if (id <= 0) {
++			LOG("goodixfp did not start: stop");
++			fp_power_off();
++			return ENOEXEC;
++		}
++		LOG("goodixfp started: app id %lld", id);
++	} else {
++		LOG("goodixfp already loaded: app id %lld", id);
++	}
++	q_goodix_id = (uint32_t)id;
++	if (!sensor_probe((uint32_t)id)) {
++		fp_power_off();
++		LOG("milestone 1 failed at the sensor (%llu ms); goodixfp stays loaded (op 3 unloads it)", ms_since(t0));
++		return EIO;
++	}
++	LOG("milestone 1 done in %llu ms: sensor powered, goodixfp app %u (op 2 powers the sensor off)", ms_since(t0), q_goodix_id);
++	return 0;
++}
++
++static int
++shutdown_app(void)
++{
++	uint64_t ret[3];
++
++	if (!pool_map()) {
++		return ENOMEM;
++	}
++	int64_t id = qsee_lookup("goodixfp");
++	if (id <= 0) {
++		return id == 0 ? ENOENT : EIO;
++	}
++	uint64_t a[1] = { (uint64_t)id };
++	int64_t x0 = scm_call(FN_APP_SHUTDOWN, 0x1, a, 1, ret);
++	bool ok = qsee_finish("APP_SHUTDOWN goodixfp", x0, ret, (uint32_t)id);
++	if (ok) {
++		q_goodix_id = 0;
++	}
++	return ok ? 0 : EIO;
++}
++
++/* kern.sweet_qsee (bsd/dev/sweet_qsee_ctl.c); op < 0: the last result */
++extern "C" int
++sweet_qsee_op(int op)
++{
++	static int enabled = -1;
++	int r;
++
++	if (enabled < 0) {
++		int v = 0;
++		enabled = PE_parse_boot_argn("qsee", &v, sizeof(v)) && v != 0;
++	}
++	if (op < 0) {
++		return q_last;
++	}
++	if (!enabled) {
++		return ENODEV;
++	}
++	if (q_lock == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (!OSCompareAndSwapPtr(NULL, l, (void * volatile *)&q_lock)) {
++			IOLockFree(l);
++		}
++	}
++	IOLockLock(q_lock);
++	switch (op) {
++	case 1:
++		r = milestone();
++		break;
++	case 2:
++		fp_power_off();
++		r = 0;
++		break;
++	case 3:
++		r = shutdown_app();
++		LOG("APP_SHUTDOWN goodixfp: %d", r);
++		break;
++	default:
++		r = EINVAL;
++		break;
++	}
++	q_last = r;
++	IOLockUnlock(q_lock);
++	return r;
++}
++
++#else
++extern "C" int sweet_qsee_op(int op) { (void)op; return 19; /* ENODEV */ }
++#endif
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 3822f7c..1ffd0f1 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -240,6 +240,7 @@ static const struct { const char *phone; const struct fw_file *files; unsigned n
+ static const struct fw_file *fw_files = fw_topaz;
+ static unsigned fw_phone;                   /* index into fw_tables */
+ static unsigned fw_count = sizeof(fw_topaz) / sizeof(fw_topaz[0]);
++static bool fw_picked;                      /* fw_pick() ran (0248: SweetQsee.cpp may run it) */
+ 
+ static int
+ fw_find(const char *name)
+@@ -269,6 +270,7 @@ fw_pick(void)
+ 	if (mdt == NULL) {
+ 		return;
+ 	}
++	fw_picked = true;
+ 	for (unsigned t = 0; t < sizeof(fw_tables) / sizeof(fw_tables[0]); t++) {
+ 		const struct fw_file *m = &fw_tables[t].files[fw_tables[t].n - 1];
+ 		if (m->size > max || sweet_ufs_read_part(fw_part, m->off, mdt, m->size) != 0) {
+@@ -3819,6 +3821,41 @@ fw_all_read(int i, uint64_t off, void *dst, uint64_t n)
+ 	return done == n;
+ }
+ 
++/*
++ * 0248: the modem partition's files for SweetQsee.cpp (the goodixfp TrustZone app). fw_pick()
++ * runs here first when the modem thread has not run it (no modem= / audio=). Size: bytes, -1 not
++ * in the table, -2 the partition not readable (yet).
++ */
++extern "C" int64_t
++topaz_fw_file_size(const char *path)
++{
++	if (!fw_picked) {
++		uint8_t probe[16];
++		if (sweet_ufs_read_part(fw_part, 0, probe, sizeof(probe)) != 0) {
++			return -2;
++		}
++		fw_pick();
++	}
++	int i = fw_all_find(path);
++	return i < 0 ? -1 : (int64_t)fw_all[i].size;
++}
++
++extern "C" int
++topaz_fw_file_read(const char *path, uint64_t off, void *dst, uint64_t n)
++{
++	int i = fw_picked ? fw_all_find(path) : -1;
++	if (i < 0 || off > fw_all[i].size || n > fw_all[i].size - off) {
++		return EINVAL;
++	}
++	return fw_all_read(i, off, dst, n) ? 0 : EIO;
++}
++
++extern "C" const char *
++topaz_fw_phone(void)
++{
++	return fw_picked ? fw_tables[fw_phone].phone : "(not picked)";
++}
++
+ /* QMI */
+ struct qmsg { uint8_t b[512]; uint32_t n; };
+ 
+@@ -10822,6 +10859,22 @@ topaz_rpm_vote(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t
+ 	return r;
+ }
+ 
++/* 0248: an LDO on at uv for ma (SweetQsee.cpp: the fingerprint sensor's L9); set 0 active, 1 sleep */
++extern "C" int
++topaz_rpm_ldo(uint32_t id, uint32_t uv, uint32_t ma, uint32_t set)
++{
++	if (rpm_lock == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (!OSCompareAndSwapPtr(NULL, l, (void * volatile *)&rpm_lock)) {
++			IOLockFree(l);
++		}
++	}
++	IOLockLock(rpm_lock);
++	int r = rpm_ensure() ? rpm_ldo(id, uv, ma, set) : -5;
++	IOLockUnlock(rpm_lock);
++	return r;
++}
++
+ /* ---------------- the codec: from the RX macro to the speaker (audio=2) */
+ 
+ /*
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 613db57..6de3e65 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -21,6 +21,7 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetQsee.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
