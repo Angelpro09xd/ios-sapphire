@@ -1,0 +1,238 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0255: Goodix TA files through the GP file service (listener 0x7000)
+
+Listener 10 only sees the TA's existence probes (open + close): the contents
+go through qsee_fts_read_file, the GP file service, listener 0x7000. Op 10
+registers it too (0x72000206, falling back to 0x72000201) with its own
+0x7e000-byte buffer at pool offset 0xE30000, before SENSOR_INIT, and serves
+it from the same RAM store (minkipc gpfs_msg.h): reads clamped to the buffer
+with short reads at EOF and err -2 for a missing file; writes, removes and
+renames go to the RAM overlay and are logged; version 2; anything else err
+-1. One log line per request. Every other listener id TrustZone asks for is
+logged and answered FAILURE as before.
+---
+ iokit/Kernel/arm/SweetQsee.cpp | 169 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 166 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetQsee.cpp b/iokit/Kernel/arm/SweetQsee.cpp
+index 4cef109..e56cc16 100755
+--- a/iokit/Kernel/arm/SweetQsee.cpp
++++ b/iokit/Kernel/arm/SweetQsee.cpp
+@@ -33,6 +33,10 @@
+  * nothing in between is pointed out. Op 11 follows FingerprintCore::onAuthDownEvt: AUTHENTICATE,
+  * WAKEUP, SET_EXPO (level 1; op 13: 5), CAPTURE_IMG, ALGO_AUTHENTICATE with the HAL's fields,
+  * the returned struct logged, ALGO_KPI, AUTH_CANCEL. ALGO_INIT +0x24 is logged as the SPMT flag.
++ * 0255: listener 10 only probes existence (open + close); the contents go through
++ * qsee_fts_read_file, i.e. the GP file service, listener 0x7000 (minkipc gpfs_msg.h). Op 10 now
++ * registers it too (its own 0x7e000-byte buffer) and serves its reads from the same RAM store
++ * (writes, removes, renames: RAM overlay, logged). Every other listener id TZ asks for is logged.
+  * A listener request from TrustZone (INCOMPLETE / BLOCKED_ON_LISTENER) is logged and answered
+  * with a failure: no listener is registered and nothing is ever written anywhere (persist holds
+  * the sensor's factory calibration).
+@@ -98,6 +102,9 @@ extern "C" int topaz_rpm_vote(uint32_t set, uint32_t type, uint32_t id, uint32_t
+ #define FN_REG_LISTENER_OLD 0x72000201u         /* TZ_OS_REGISTER_LISTENER_ID */
+ #define FS_LISTENER         10u
+ #define FS_MAX_DATA         20000u
++#define OFF_GSB             0xE30000u           /* 0255: listener 0x7000's buffer, to 0xEAE000 (pool: 0x1000000) */
++#define GSB_SIZE            0x7e000u            /* GPFILE_SERVICE_BUF_LEN */
++#define GPFS_LISTENER       0x7000u
+ #define QF_MAX_FILES        8
+ #define QF_FILE_MAX         (5u << 20)
+ #define QF_TOTAL_MAX        (12u << 20)
+@@ -366,6 +373,8 @@ static bool q_log_tried, q_log_ok;
+ static unsigned q_settle_ms = 20, q_reset_ms = 60;
+ static bool q_lsnr_ok;                          /* 0253: listener 10 registered */
+ static void fs_serve(void);
++static bool q_gp_ok;                            /* 0255: listener 0x7000 registered */
++static void gp_serve(void);
+ 
+ /* bsd/dev/sweet_spmi.c: the SPMI observer, reads only */
+ extern "C" int sweet_spmi_init(void);
+@@ -542,6 +551,13 @@ qsee_finish(const char *what, int64_t x0, uint64_t ret[3], uint32_t app_id)
+ 			x0 = scm_call(FN_LISTENER_RSP, 0x2, a, 2, ret);
+ 			continue;
+ 		}
++		if (res == RES_INCOMPLETE && data == GPFS_LISTENER && q_gp_ok) {
++			gp_serve();
++			served++;
++			uint64_t a[2] = { GPFS_LISTENER, RES_SUCCESS };
++			x0 = scm_call(FN_LISTENER_RSP, 0x2, a, 2, ret);
++			continue;
++		}
+ 		LOG("%s: result %d %s, resp_type %x, data %u (0x%x)%s", what, (int32_t)res, result_name(res), type, data, data,
+ 		    served > 0 ? " (after file requests)" : "");
+ 		if (res == RES_SUCCESS) {
+@@ -551,9 +567,10 @@ qsee_finish(const char *what, int64_t x0, uint64_t ret[3], uint32_t app_id)
+ 			return true;
+ 		}
+ 		if (res == RES_INCOMPLETE) {
+-			LOG("%s: TrustZone asks listener %u (0x%x)%s: answered FAILURE (not served)", what, data, data,
+-			    data == 10 ? " = file system" : data == 11 ? " = time" : data == 0x2000 ? " = RPMB" :
+-			    data == 0x7000 ? " = GP fs" : "");
++			/* not registered here: TZ has no buffer of ours for it, so there is no request to show */
++			LOG("%s: TrustZone asks listener %u (0x%x)%s, not registered here (no request buffer to show): answered FAILURE",
++			    what, data, data, data == 10 ? " = file system" : data == 11 ? " = time" : data == 0x2000 ? " = RPMB" :
++			    data == 0x7000 ? " = GP fs" : data == 0x3000 ? " = SSD" : data == 0x2001 ? " = GPT" : "");
+ 			uint64_t a[2] = { data, RES_FAILURE };
+ 			x0 = scm_call(FN_LISTENER_RSP, 0x2, a, 2, ret);
+ 			continue;
+@@ -1715,6 +1732,148 @@ fs_register(void)
+ 	return q_lsnr_ok;
+ }
+ 
++/* listener 0x7000 (GP file service, minkipc gpfs_msg.h): requests answered in place */
++static void
++gp_serve(void)
++{
++	uint8_t *b = q_va + OFF_GSB;
++	char name[64], name2[64];
++	uint32_t cmd = get32(b, 0);
++	int32_t err = -1;
++	uint32_t n = 0;
++
++	mb();
++	q_fs_reqs++;
++	switch (cmd) {
++	case 4:                                     /* DATA_FILE_READ */
++	case 8: {                                   /* PERSIST_FILE_READ {path; off@260; count@264} -> {err@4; n@8; data@12} */
++		qf_basename(b + 4, name);
++		int32_t off = (int32_t)get32(b, 260);
++		uint32_t count = get32(b, 264);
++		int i = qf_find(name);
++		if (i < 0) {
++			err = -2;
++		} else if (off < 0) {
++			err = -22;
++		} else {
++			struct qfile *f = &q_files[i];
++			count = MIN(count, GSB_SIZE - 12);
++			n = (uint32_t)off < f->len ? MIN(count, f->len - (uint32_t)off) : 0;
++			if (n > 0) {
++				memcpy(b + 12, f->data + off, n);
++			}
++			err = 0;
++		}
++		put32(b, 4, (uint32_t)err);
++		put32(b, 8, n);
++		LOG("gpfs read(%u) %s @%d %u -> err %d, %u bytes", cmd, name, off, get32(b, 264), err, n);
++		break;
++	}
++	case 5:                                     /* DATA_FILE_WRITE */
++	case 9: {                                   /* PERSIST_FILE_WRITE {path; off@260; count@264; backup@268; data@272} */
++		qf_basename(b + 4, name);
++		int32_t off = (int32_t)get32(b, 260);
++		uint32_t count = get32(b, 264), backup = get32(b, 268);
++		int i = qf_find(name);
++		if (off < 0 || count > GSB_SIZE - 272) {
++			err = -22;
++		} else {
++			if (i < 0) {
++				i = qf_create(name);
++			}
++			if (i < 0 || !qf_reserve(i, (uint32_t)off + count, false)) {
++				err = -28;
++			} else {
++				struct qfile *f = &q_files[i];
++				if ((uint32_t)off > f->len) {
++					bzero(f->data + f->len, (uint32_t)off - f->len);
++				}
++				memcpy(f->data + off, b + 272, count);
++				f->len = MAX(f->len, (uint32_t)off + count);
++				f->dirty = true;
++				n = count;
++				err = 0;
++			}
++		}
++		put32(b, 4, (uint32_t)err);
++		put32(b, 8, n);
++		LOG("gpfs write(%u) %s @%d %u backup %u -> err %d, %u bytes (RAM only)", cmd, name, off, count, backup, err, n);
++		break;
++	}
++	case 6:                                     /* DATA_FILE_REMOVE */
++	case 10: {                                  /* PERSIST_FILE_REMOVE {path} -> {err} */
++		qf_basename(b + 4, name);
++		int i = qf_find(name);
++		if (i < 0) {
++			err = -2;
++		} else {
++			qf_free(i);
++			err = 0;
++		}
++		put32(b, 4, (uint32_t)err);
++		LOG("gpfs remove(%u) %s -> err %d (RAM only)", cmd, name, err);
++		break;
++	}
++	case 7:                                     /* DATA_FILE_RENAME */
++	case 11: {                                  /* PERSIST_FILE_RENAME {from[256]; to[256]} -> {err} */
++		qf_basename(b + 4, name);
++		qf_basename(b + 260, name2);
++		int i = qf_find(name), j = qf_find(name2);
++		if (i < 0 || name2[0] == 0) {
++			err = -2;
++		} else {
++			if (j >= 0 && j != i) {
++				qf_free(j);
++			}
++			strlcpy(q_files[i].name, name2, sizeof(q_files[i].name));
++			q_files[i].dirty = true;
++			err = 0;
++		}
++		put32(b, 4, (uint32_t)err);
++		LOG("gpfs rename(%u) %s -> %s: err %d (RAM only)", cmd, name, name2, err);
++		break;
++	}
++	case 12:                                    /* GPFS_VERSION -> {version; err} */
++		put32(b, 4, 2);                         /* GP_FS_VERSION */
++		put32(b, 8, 0);
++		err = 0;
++		LOG("gpfs version -> 2");
++		break;
++	default:
++		put32(b, 4, (uint32_t)-1);
++		LOG("gpfs: unknown request %u (%08x %08x %08x %08x) -> err -1", cmd, get32(b, 0), get32(b, 4), get32(b, 8),
++		    get32(b, 12));
++		break;
++	}
++	mb();
++}
++
++/* listener 0x7000 with its 0x7e000-byte buffer in the pool (once per boot) */
++static bool
++gp_register(void)
++{
++	static bool tried;
++	uint64_t ret[3];
++
++	if (q_gp_ok || tried) {
++		return q_gp_ok;
++	}
++	tried = true;
++	bzero(q_va + OFF_GSB, GSB_SIZE);
++	mb();
++	uint64_t a[3] = { GPFS_LISTENER, QSEE_POOL_PA + OFF_GSB, GSB_SIZE };
++	int64_t x0 = scm_call(FN_REG_LISTENER, 0x83, a, 3, ret);
++	LOG("listener 0x%x: REGISTER (smcinvoke id) buffer %llx %u bytes: x0 %lld, result %d", GPFS_LISTENER,
++	    QSEE_POOL_PA + OFF_GSB, GSB_SIZE, x0, (int32_t)ret[0]);
++	if (x0 != 0) {
++		x0 = scm_call(FN_REG_LISTENER_OLD, 0x83, a, 3, ret);
++		LOG("listener 0x%x: REGISTER (legacy id): x0 %lld, result %d", GPFS_LISTENER, x0, (int32_t)ret[0]);
++	}
++	q_gp_ok = x0 == 0 && (uint32_t)ret[0] == RES_SUCCESS;
++	LOG("listener 0x%x (GP file service): %s", GPFS_LISTENER, q_gp_ok ? "registered" : "NOT registered");
++	return q_gp_ok;
++}
++
+ /* ---------------------------------------------------------------- 0253: init and one capture */
+ 
+ /* q_cmd with the caller's fields; the gf result, or ~0u when the call itself failed */
+@@ -1749,6 +1908,10 @@ fp_init(void)
+ 		LOG("op 10: no file listener: stop");
+ 		return EIO;
+ 	}
++	if (!gp_register()) {
++		LOG("op 10: no GP file listener: stop");
++		return EIO;
++	}
+ 	int r = milestone(true, false);
+ 	if (r != 0) {
+ 		return r;
