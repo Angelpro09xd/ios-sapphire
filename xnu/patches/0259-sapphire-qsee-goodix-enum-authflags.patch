@@ -1,0 +1,199 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0259: Goodix enumerate / authenticator id, auth variants
+
+Op 18 always ends NOT_MATCH with the same match score. To see what the TA
+holds and to try the auth variants: op 19 = ENUMERATE (1000,7; non-zero
+gid/fid slots logged) and GET_ID (1000,5), which op 10 and op 16 now also
+call at their end as the HAL does; op 20 = op 18 driven by the new int sysctl
+kern.sweet_qsee_arg: bits 0-3 auth type (0 = 1), bit 4 no UNTRUSTED_CFG(auth),
+bit 5 UNTRUSTED_CFG(enroll) first, bit 6 exposure level 5, bit 7 no
+AUTHENTICATE; the decoded argument is logged first.
+---
+ bsd/dev/sweet_qsee_ctl.c       |  9 ++++-
+ iokit/Kernel/arm/SweetQsee.cpp | 75 ++++++++++++++++++++++++++++++++++++------
+ 2 files changed, 73 insertions(+), 11 deletions(-)
+
+diff --git a/bsd/dev/sweet_qsee_ctl.c b/bsd/dev/sweet_qsee_ctl.c
+index 77f2a65..e2b9e69 100755
+--- a/bsd/dev/sweet_qsee_ctl.c
++++ b/bsd/dev/sweet_qsee_ctl.c
+@@ -11,7 +11,9 @@
+  *   the file listener, 11 one capture, 12 cancel and sensor off, 13 one capture at exposure 5,
+  *   14 enroll begin, 15 one enroll touch (then reads: samples remaining, or -gf error),
+  *   16 enroll finish, 17 untrusted auth (then reads: the matched finger id, or -gf error),
+- *   18 untrusted auth with retries (reads as 17)
++ *   18 untrusted auth with retries (reads as 17), 19 enumerate + authenticator id, 20 = 18 with
++ *   kern.sweet_qsee_arg (bits 0-3 auth type, 4 no UNTRUSTED_CFG(auth), 5 UNTRUSTED_CFG(enroll)
++ *   first, 6 exposure 5, 7 no AUTHENTICATE)
+  * kern.sweet_qsee_filesel (write a name) + kern.sweet_qsee_fileout (read: that store file's bytes)
+  * kern.sweet_qsee_file (write only): "name\0bytes" puts a file the TA may read into the kernel's
+  * RAM store (empty bytes drop it); kern.sweet_qsee_files lists the store.
+@@ -112,6 +114,11 @@ sysctl_sweet_qsee_files SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_qsee_files, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_qsee_files, "A", "the goodix TA's RAM file store: name size dirty source");
+ 
++/* 0259: kern.sweet_qsee_arg, an argument for the ops that take one (op 20) */
++int sweet_qsee_arg;
++SYSCTL_INT(_kern, OID_AUTO, sweet_qsee_arg, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_qsee_arg, 0,
++    "argument for kern.sweet_qsee ops (op 20: auth flags)");
++
+ /* 0258: a store file back to user space (its templates, kept by user space across boots) */
+ int sweet_qsee_file_select(const char *name);
+ int64_t sweet_qsee_file_out(void *dst, uint32_t max);
+diff --git a/iokit/Kernel/arm/SweetQsee.cpp b/iokit/Kernel/arm/SweetQsee.cpp
+index f550002..d95f3b4 100755
+--- a/iokit/Kernel/arm/SweetQsee.cpp
++++ b/iokit/Kernel/arm/SweetQsee.cpp
+@@ -49,6 +49,9 @@
+  * index in +0x1c, up to SENSOR_INIT's +0x40 retries, while the TA answers NOT_MATCH or
+  * PREPROCESS_FAILED with +0x9c bit 0 set); kern.sweet_qsee_filesel + kern.sweet_qsee_fileout
+  * hand a store file back to user space (templates kept across boots by user space, not persist).
++ * 0259: op 19 = ENUMERATE + GET_ID (also at the end of op 10 and op 16, as the HAL does); op 20 =
++ * op 18 driven by kern.sweet_qsee_arg (bits 0-3 auth type, 4 no UNTRUSTED_CFG 0, 5 UNTRUSTED_CFG
++ * 1 first, 6 exposure 5, 7 no AUTHENTICATE).
+  * A listener request from TrustZone (INCOMPLETE / BLOCKED_ON_LISTENER) is logged and answered
+  * with a failure: no listener is registered and nothing is ever written anywhere (persist holds
+  * the sensor's factory calibration).
+@@ -61,7 +64,7 @@
+  *   8 register the QSEE log buffer (only), 9 copy it for kern.sweet_qsee_log (stalls: never),
+  *   10 init with the file listener, 11 one capture, 12 cancel and sensor off, 13 = 11 at
+  *   exposure level 5, 14 enroll begin, 15 one enroll touch, 16 enroll finish, 17 untrusted auth,
+- *   18 untrusted auth with retries.
++ *   18 untrusted auth with retries, 19 enumerate + authenticator id, 20 = 18 with kern.sweet_qsee_arg.
+  * Reading it gives the result of the last request (0 ok, else an errno).
+  *
+  * Memory: TrustZone reads what it is given by physical address, below 4 GB, physically
+@@ -1216,6 +1219,7 @@ static int q_errno;
+ static uint32_t q_fs_reqs;
+ static bool q_lsnr_tried, q_inited;
+ static uint32_t q_auth_retries;                 /* 0258: SENSOR_INIT out +0x40 */
++static int fp_enum(const char *when);           /* 0259 */
+ static char q_file_sel[64];                     /* 0258: kern.sweet_qsee_filesel */
+ static uint8_t q_cmd[0x400];                    /* the biggest command here: SENSOR_INIT, 0x2c0 */
+ 
+@@ -2009,6 +2013,7 @@ fp_init(void)
+ 		goto fail;
+ 	}
+ 	q_inited = true;
++	(void)fp_enum("op 10");
+ 	LOG("op 10: init done in %llu ms (%u file requests so far; sensor awake, op 11 captures, op 12 stops)", ms_since(t0),
+ 	    q_fs_reqs);
+ 	return 0;
+@@ -2206,6 +2211,7 @@ fp_enroll_finish(void)
+ 	uint32_t gs = gf_cmd(1000, 9, 0x24, "SAVE_TEMPLATES");
+ 	bzero(q_cmd, 0x1c);
+ 	uint32_t gp = gf_cmd(1000, 4, 0x1c, "POST_ENROLL");
++	(void)fp_enum("op 16");
+ 	for (unsigned i = 0; i < QF_MAX_FILES; i++) {
+ 		if (q_files[i].used) {
+ 			LOG("store: %s %u bytes %s %s", q_files[i].name, q_files[i].len, q_files[i].dirty ? "dirty" : "clean",
+@@ -2236,6 +2242,33 @@ fp_auth_untrusted(int *value)
+ 	return r;
+ }
+ 
++/* ENUMERATE (1000,7) and GET_ID (1000,5), as the HAL calls them after init and after an enroll */
++static int
++fp_enum(const char *when)
++{
++	if (q_goodix_id == 0 || q_va == NULL) {
++		LOG("%s: enumerate: no TA", when);
++		return EAGAIN;
++	}
++	bzero(q_cmd, 0x70);
++	uint32_t ge = gf_cmd(1000, 7, 0x70, "ENUMERATE");
++	const uint32_t cnt = ge == 0 ? get32(q_cmd, 0x1c) : 0;
++	unsigned n = 0;
++	for (unsigned i = 0; i < 10 && ge == 0; i++) {
++		uint32_t gid = get32(q_cmd, 0x20 + 4 * i), fid = get32(q_cmd, 0x48 + 4 * i);
++		if (gid != 0 || fid != 0) {
++			LOG("%s: enumerate slot %u: gid %u, finger id %u", when, i, gid, fid);
++			n++;
++		}
++	}
++	bzero(q_cmd, 0x28);
++	uint32_t gi = gf_cmd(1000, 5, 0x28, "GET_ID");
++	LOG("%s: enumerate %u %s (%u non-zero slots, +0x1c %u), authenticator id %08x%08x (%u %s)", when, ge,
++	    ge == ~0u ? "-" : gf_err_name(ge), n, cnt, get32(q_cmd, 0x24), get32(q_cmd, 0x20), gi,
++	    gi == ~0u ? "-" : gf_err_name(gi));
++	return ge == ~0u || gi == ~0u ? EIO : 0;
++}
++
+ /* ---------------------------------------------------------------- 0258: auth with retries, file out */
+ 
+ /*
+@@ -2244,8 +2277,10 @@ fp_auth_untrusted(int *value)
+  * the result is NOT_MATCH / PREPROCESS_FAILED with +0x9c bit 0 (the TA's retry flag) set.
+  * *value = the matched finger id, or -gf error.
+  */
++extern "C" int sweet_qsee_arg;                /* bsd/dev/sweet_qsee_ctl.c, kern.sweet_qsee_arg */
++
+ static int
+-fp_auth_retry(int *value)
++fp_auth_retry(int *value, uint32_t arg)
+ {
+ 	static uint8_t auth[0xa4];
+ 	uint32_t r = ~0u;
+@@ -2255,11 +2290,25 @@ fp_auth_retry(int *value)
+ 		return EAGAIN;
+ 	}
+ 	uint32_t max = q_auth_retries == 0 ? 2 : MIN(q_auth_retries, 5u);
+-	uint32_t gu = untrusted_cfg(0);
+-	bzero(q_cmd, 0x30);
+-	put32(q_cmd, 0x1c, 0);
+-	put64(q_cmd, 0x20, 1);
+-	uint32_t g = gf_cmd(1000, 1, 0x30, "AUTHENTICATE");
++	const uint32_t atype = (arg & 0xf) == 0 ? 1 : (arg & 0xf);
++	const uint8_t expo = (arg & 0x40) != 0 ? 5 : 1;
++	LOG("auth: arg 0x%x: auth type %u, %s, %s, exposure %u, %s", arg, atype,
++	    (arg & 0x10) != 0 ? "no UNTRUSTED_CFG(auth)" : "UNTRUSTED_CFG(auth)",
++	    (arg & 0x20) != 0 ? "UNTRUSTED_CFG(enroll) first" : "no UNTRUSTED_CFG(enroll)", expo,
++	    (arg & 0x80) != 0 ? "no AUTHENTICATE" : "AUTHENTICATE");
++	uint32_t gu = 0, g = 0;
++	if ((arg & 0x10) == 0) {
++		gu = untrusted_cfg(0);
++	}
++	if ((arg & 0x20) != 0 && gu != ~0u) {
++		gu = untrusted_cfg(1);
++	}
++	if ((arg & 0x80) == 0) {
++		bzero(q_cmd, 0x30);
++		put32(q_cmd, 0x1c, 0);
++		put64(q_cmd, 0x20, 1);
++		g = gf_cmd(1000, 1, 0x30, "AUTHENTICATE");
++	}
+ 	bzero(q_cmd, 0x20);
+ 	q_cmd[0x1d] = 0xff;
+ 	uint32_t gw = gf_cmd(1002, 9, 0x20, "WAKEUP");
+@@ -2272,7 +2321,7 @@ fp_auth_retry(int *value)
+ 		for (uint32_t retry = 0; retry <= max; retry++) {
+ 			if (retry == 0) {
+ 				bzero(q_cmd, 0x1c);
+-				q_cmd[0x10] = 1;
++				q_cmd[0x10] = expo;
+ 				(void)gf_cmd(1002, 14, 0x1c, "SET_EXPO");
+ 			}
+ 			bzero(q_cmd, 0x28);
+@@ -2287,7 +2336,7 @@ fp_auth_retry(int *value)
+ 			memcpy(q_cmd, auth, sizeof(auth));     /* retry 0: zeros; later: what the TA returned */
+ 			put32(q_cmd, 0x0c, 0);
+ 			put32(q_cmd, 0x1c, retry);
+-			put32(q_cmd, 0x24, 1);
++			put32(q_cmd, 0x24, atype);
+ 			q_cmd[0x3c] = 0;
+ 			q_cmd[0x58] = 2;
+ 			if (retry == 0) {
+@@ -2453,7 +2502,13 @@ sweet_qsee_op(int op)
+ 		r = fp_auth_untrusted(&value);
+ 		break;
+ 	case 18:
+-		r = fp_auth_retry(&value);
++		r = fp_auth_retry(&value, 0);
++		break;
++	case 19:
++		r = fp_enum("op 19");
++		break;
++	case 20:
++		r = fp_auth_retry(&value, (uint32_t)sweet_qsee_arg);
+ 		break;
+ 	case 12:
+ 		r = fp_stop();
