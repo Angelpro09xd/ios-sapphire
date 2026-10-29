@@ -1,0 +1,432 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0263: ADSP QMI for sensor streams; the vibration motor
+
+The ADSP's sensor client (SNS_CLIENT, QMI over QRTR node 5) is reached from
+user space through /dev/redwood-qmi. The ADSP edge is now written safely from
+both threads that use it: a lock for its GLINK TX FIFO and one for the send
+queues and the ADSP's receive-buffer table; the queues hold 128 packets (32)
+and drop the oldest when full, counted and logged. The services the ADSP
+announces go into the QMI lookup table like the modem's.
+
+The vibration motor, the PM7250B LDO vibrator (SPMI SID 3, 0x5300): new
+bsd/dev/sweet_vibrate.c with kern.sweet_vibrate (on for N ms, at most 2000,
+0 stops; a new request replaces the running one) and kern.sweet_vibrate_pattern
+("on,off,on,..." ms, up to 10 steps). 3000 mV is set once, EN_CTL bit 7 turns
+it on (VREG_READY polled, bounded) and a thread call turns it off; the first
+vibration logs the registers. sweet_spmi_write also allows SID 3 0x53xx.
+---
+ bsd/conf/files                  |   1 +
+ bsd/dev/sweet_spmi.c            |   4 +-
+ bsd/dev/sweet_vibrate.c         | 211 ++++++++++++++++++++++++++++++++++++++++
+ iokit/Kernel/arm/TopazModem.cpp |  89 +++++++++++++++--
+ 4 files changed, 295 insertions(+), 10 deletions(-)
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index cd110c2..c29da8d 100755
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
++bsd/dev/sweet_vibrate.c			standard
+ bsd/dev/sweet_audio_ctl.c		standard
+ bsd/dev/sweet_audio_dev.c		standard
+ bsd/dev/sweet_qmi_dev.c			standard
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 4c5aa0b..f0a6cf6 100755
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -165,7 +165,9 @@ int
+ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
+ {
+ 	unsigned peripheral = addr >> 8;
+-	if (!(sid == 0 && peripheral == 0x08) && !(sid == 2 && peripheral >= 0x10 && peripheral <= 0x16)) {
++	/* 0263: + SID 3 0x5300-0x53ff, the PM7250B LDO vibrator (sweet_vibrate.c) */
++	if (!(sid == 0 && peripheral == 0x08) && !(sid == 2 && peripheral >= 0x10 && peripheral <= 0x16) &&
++	    !(sid == 3 && peripheral == 0x53)) {
+ 		return -1;
+ 	}
+ 	if (!sp_ready && sweet_spmi_init() != 0) {
+diff --git a/bsd/dev/sweet_vibrate.c b/bsd/dev/sweet_vibrate.c
+new file mode 100755
+index 0000000..6e46e20
+--- /dev/null
++++ b/bsd/dev/sweet_vibrate.c
+@@ -0,0 +1,211 @@
++/*
++ * sapphire 0263: the vibration motor. PM7250B LDO vibrator (dtbo 045 fragment 15,
++ * qcom,qpnp-vibrator-ldo): SPMI SID 3, peripheral 0x5300; VSET 0x5340/0x5341 in mV (3000 mV =
++ * 0x0bb8, qcom,vib-ldo-volt-uv), EN_CTL 0x5346 bit 7, STATUS1 0x5308 bit 7 VREG_READY
++ * (leds-qpnp-vibrator-ldo.c). Overdrive is disabled on this board: just on and off.
++ *   kern.sweet_vibrate = N: on for N ms (cap 2000), 0 stops; a new write replaces the running one.
++ *   kern.sweet_vibrate_pattern = "on,off,on,..." (ms, up to 10 steps, each capped at 2000):
++ *     iOS-like patterns; an empty string stops.
++ * The motor is turned off by a thread call; a generation number keeps a stale one from acting.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/errno.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <kern/thread_call.h>
++#include <libkern/OSAtomic.h>
++#include "sweet_spmi.h"
++
++extern void IODelay(unsigned microseconds);
++int sweet_spmi_read_any(unsigned sid, unsigned addr, uint8_t *out);
++
++#define VIB_SID         3
++#define VIB_STATUS1     0x5308
++#define VIB_VSET_LB     0x5340
++#define VIB_VSET_UB     0x5341
++#define VIB_EN_CTL      0x5346
++#define VIB_MAX_MS      2000
++#define VIB_STEPS       10
++
++static LCK_GRP_DECLARE(sweet_vib_grp, "sweet_vibrate");
++static LCK_MTX_DECLARE(sweet_vib_mtx, &sweet_vib_grp);
++static thread_call_t vib_call;
++static uint64_t vib_gen;
++static bool vib_vset_done, vib_logged, vib_on;
++static int vib_ms;
++static char vib_pattern[96];
++static uint32_t vib_steps[VIB_STEPS], vib_nsteps, vib_step;
++
++/* the motor on or off; sweet_vib_mtx held */
++static int
++vib_set(bool on)
++{
++	int r = 0;
++	if (on && !vib_vset_done) {
++		r = sweet_spmi_write(VIB_SID, VIB_VSET_LB, 0xb8);
++		if (r == 0) {
++			r = sweet_spmi_write(VIB_SID, VIB_VSET_UB, 0x0b);
++		}
++		if (r != 0) {
++			printf("SWEET VIB: setting 3000 mV failed: %d\n", r);
++			return r;
++		}
++		vib_vset_done = true;
++	}
++	uint8_t en = 0;
++	if (sweet_spmi_read_any(VIB_SID, VIB_EN_CTL, &en) != 0) {
++		printf("SWEET VIB: EN_CTL not readable\n");
++		return -1;
++	}
++	r = sweet_spmi_write(VIB_SID, VIB_EN_CTL, on ? (en | 0x80) : (en & 0x7f));
++	if (r == 0 && on) {
++		uint8_t st = 0;
++		for (int i = 0; i < 20; i++) {          /* VREG_READY, bounded (the driver polls ~100 us steps) */
++			if (sweet_spmi_read_any(VIB_SID, VIB_STATUS1, &st) == 0 && (st & 0x80)) {
++				break;
++			}
++			IODelay(100);
++		}
++		if (!vib_logged) {
++			uint8_t lb = 0, ub = 0, en2 = 0;
++			(void)sweet_spmi_read_any(VIB_SID, VIB_VSET_LB, &lb);
++			(void)sweet_spmi_read_any(VIB_SID, VIB_VSET_UB, &ub);
++			(void)sweet_spmi_read_any(VIB_SID, VIB_EN_CTL, &en2);
++			printf("SWEET VIB: first vibration: vset %u mV, en_ctl %#x -> %#x, status1 %#x (ready %u)\n",
++			    lb | (unsigned)ub << 8, en, en2, st, st >> 7);
++			vib_logged = true;
++		}
++	}
++	if (r != 0) {
++		printf("SWEET VIB: motor %s: SPMI write failed %d\n", on ? "on" : "off", r);
++	}
++	vib_on = on && r == 0;
++	return r;
++}
++
++static void
++vib_arm(uint32_t ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	thread_call_enter1_delayed(vib_call, (thread_call_param_t)(uintptr_t)vib_gen, deadline);
++}
++
++/* the end of a step: off, or the next pattern step */
++static void
++vib_fire(thread_call_param_t p0 __unused, thread_call_param_t p1)
++{
++	lck_mtx_lock(&sweet_vib_mtx);
++	if ((uint64_t)(uintptr_t)p1 == vib_gen) {
++		if (vib_nsteps != 0 && vib_step + 1 < vib_nsteps) {
++			vib_step++;
++			bool on = (vib_step & 1) == 0;
++			(void)vib_set(on);
++			vib_arm(vib_steps[vib_step]);
++		} else {
++			(void)vib_set(false);
++			vib_nsteps = 0;
++		}
++	}
++	lck_mtx_unlock(&sweet_vib_mtx);
++}
++
++/* a new request: the running one (if any) ends; steps[0] on, steps[1] off, ... */
++static int
++vib_start(const uint32_t *steps, uint32_t n)
++{
++	int r = 0;
++	if (sweet_spmi_init() != 0) {
++		return ENODEV;
++	}
++	if (vib_call == NULL) {
++		thread_call_t c = thread_call_allocate(vib_fire, NULL);
++		if (c == NULL) {
++			return ENOMEM;
++		}
++		if (!OSCompareAndSwapPtr(NULL, c, (void * volatile *)&vib_call)) {
++			thread_call_free(c);
++		}
++	}
++	lck_mtx_lock(&sweet_vib_mtx);
++	vib_gen++;
++	(void)thread_call_cancel(vib_call);
++	vib_nsteps = 0;
++	if (n == 0 || steps[0] == 0) {
++		if (vib_on || n == 0) {
++			r = vib_set(false);
++		}
++	} else {
++		memcpy(vib_steps, steps, n * sizeof(steps[0]));
++		vib_nsteps = n;
++		vib_step = 0;
++		r = vib_set(true);
++		if (r == 0) {
++			vib_arm(steps[0]);
++		} else {
++			vib_nsteps = 0;
++		}
++	}
++	lck_mtx_unlock(&sweet_vib_mtx);
++	return r == 0 ? 0 : EIO;
++}
++
++static int
++sysctl_sweet_vibrate SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int ms = vib_ms;
++	int err = sysctl_io_number(req, ms, sizeof(ms), &ms, NULL);
++	if (err != 0 || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	ms = ms < 0 ? 0 : ms > VIB_MAX_MS ? VIB_MAX_MS : ms;
++	vib_ms = ms;
++	uint32_t s = (uint32_t)ms;
++	return vib_start(&s, ms == 0 ? 0 : 1);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_vibrate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_vibrate, "I", "vibrate for N ms (max 2000), 0 stops");
++
++static int
++sysctl_sweet_vibrate_pattern SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[sizeof(vib_pattern)];
++	strlcpy(buf, vib_pattern, sizeof(buf));
++	int err = sysctl_handle_string(oidp, buf, sizeof(buf), req);
++	if (err != 0 || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	uint32_t steps[VIB_STEPS], n = 0;
++	const char *p = buf;
++	while (*p != 0 && n < VIB_STEPS) {
++		uint32_t v = 0;
++		bool digits = false;
++		while (*p >= '0' && *p <= '9') {
++			v = v * 10 + (uint32_t)(*p - '0');
++			v = v > VIB_MAX_MS ? VIB_MAX_MS : v;
++			digits = true;
++			p++;
++		}
++		if (!digits) {
++			return EINVAL;
++		}
++		steps[n++] = v;
++		if (*p == ',') {
++			p++;
++		} else if (*p != 0) {
++			return EINVAL;
++		}
++	}
++	strlcpy(vib_pattern, buf, sizeof(vib_pattern));
++	return vib_start(steps, n);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_vibrate_pattern, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_vibrate_pattern, "A", "vibration pattern: on,off,on,... ms (max 10 steps)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 1ffd0f1..4712fb7 100755
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -9350,7 +9350,7 @@ struct a_chan {
+ 	unsigned ri_count;
+ 	uint8_t buf[OUR_INTENT_SIZE];
+ 	uint32_t len;
+-	struct { void *p; uint32_t len; } q[32];
++	struct { void *p; uint32_t len; } q[128];   /* 0263: 128 (was 32): sensor streams */
+ 	unsigned qh, qt, drops;
+ 	void (*rx)(const uint8_t *p, uint32_t len);
+ };
+@@ -9410,8 +9410,39 @@ a_tx_put(uint32_t head, const void *src, uint32_t n)
+ 	return head >= GLINK_TX_SIZE ? head - GLINK_TX_SIZE : head;
+ }
+ 
++/*
++ * 0263: the ADSP edge is written from two threads (the ADSP thread: GPR, RESUME_TX, servreg; the
++ * modem thread: user QMI through qrtr_send) -> a lock for the TX FIFO, and one for the send
++ * queues and the ADSP's receive-buffer table (taken first when both are needed).
++ */
++static IOLock *a_fifo_lock, *a_q_lock;
++
++static IOLock *
++a_lock_get(IOLock **l)
++{
++	if (*l == NULL) {
++		IOLock *n = IOLockAlloc();
++		if (!OSCompareAndSwapPtr(NULL, n, (void * volatile *)l)) {
++			IOLockFree(n);
++		}
++	}
++	return *l;
++}
++
++static bool a_tx_write_locked(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen);
++
+ static bool
+ a_tx_write(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
++{
++	IOLock *l = a_lock_get(&a_fifo_lock);
++	IOLockLock(l);
++	bool r = a_tx_write_locked(hdr, hlen, data, dlen);
++	IOLockUnlock(l);
++	return r;
++}
++
++static bool
++a_tx_write_locked(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
+ {
+ 	uint32_t head = 0, tail = 0, avail = 0;
+ 	int n;
+@@ -9513,28 +9544,52 @@ a_try_send(struct a_chan *c, const void *data, uint32_t len)
+ 	return a_tx_write(&h, sizeof(h), data, len);
+ }
+ 
++#define A_TXQ 128
++
++/* a_q_lock held */
+ static void
+-a_pump(struct a_chan *c)
++a_pump_locked(struct a_chan *c)
+ {
+-	while (c->qh != c->qt && a_up(c) && a_try_send(c, c->q[c->qh % 32].p, c->q[c->qh % 32].len)) {
+-		IOFree(c->q[c->qh % 32].p, c->q[c->qh % 32].len);
++	while (c->qh != c->qt && a_up(c) && a_try_send(c, c->q[c->qh % A_TXQ].p, c->q[c->qh % A_TXQ].len)) {
++		IOFree(c->q[c->qh % A_TXQ].p, c->q[c->qh % A_TXQ].len);
+ 		c->qh++;
+ 	}
+ }
+ 
++static void
++a_pump(struct a_chan *c)
++{
++	IOLock *l = a_lock_get(&a_q_lock);
++	IOLockLock(l);
++	a_pump_locked(c);
++	IOLockUnlock(l);
++}
++
++/* queued, then sent as the ADSP's receive buffers allow; full: the oldest packet goes (counted) */
+ static void
+ a_send(struct a_chan *c, const void *data, uint32_t len)
+ {
+-	void *p;
+-	if (c->qt - c->qh >= 32 || (p = IOMalloc(len)) == NULL) {
++	void *p = IOMalloc(len);
++	if (p == NULL) {
+ 		c->drops++;
+ 		return;
+ 	}
+ 	memcpy(p, data, len);
+-	c->q[c->qt % 32].p = p;
+-	c->q[c->qt % 32].len = len;
++	IOLock *l = a_lock_get(&a_q_lock);
++	IOLockLock(l);
++	if (c->qt - c->qh >= A_TXQ) {
++		IOFree(c->q[c->qh % A_TXQ].p, c->q[c->qh % A_TXQ].len);
++		c->qh++;
++		c->drops++;
++		if (c->drops == 1 || (c->drops % 100) == 0) {
++			LOG("adsp: \"%s\": send queue full (%u): the oldest packet dropped, %u so far", c->name, A_TXQ, c->drops);
++		}
++	}
++	c->q[c->qt % A_TXQ].p = p;
++	c->q[c->qt % A_TXQ].len = len;
+ 	c->qt++;
+-	a_pump(c);
++	a_pump_locked(c);
++	IOLockUnlock(l);
+ }
+ 
+ static struct a_chan *
+@@ -9639,6 +9694,7 @@ a_rx_one(void)
+ 			return false;
+ 		}
+ 		c = a_by_rcid(m.p1);
++		IOLockLock(a_lock_get(&a_q_lock));
+ 		for (uint32_t i = 0; i < m.p2; i++) {
+ 			uint32_t pair[2];
+ 			a_rx_peek(8 + 8 * i, pair, 8);
+@@ -9649,6 +9705,7 @@ a_rx_one(void)
+ 				c->ri_count++;
+ 			}
+ 		}
++		IOLockUnlock(a_lock_get(&a_q_lock));
+ 		a_rx_advance(n);
+ 		if (c != NULL) {
+ 			c->intent_req_sent = false;
+@@ -9658,6 +9715,7 @@ a_rx_one(void)
+ 	case CMD_RX_DONE_W_REUSE:
+ 		a_rx_advance(8);
+ 		if ((c = a_by_rcid(m.p1)) != NULL) {
++			IOLockLock(a_lock_get(&a_q_lock));
+ 			for (unsigned i = 0; i < c->ri_count; i++) {
+ 				if (c->ri[i].id == m.p2) {
+ 					if (m.cmd == CMD_RX_DONE_W_REUSE) {
+@@ -9668,6 +9726,7 @@ a_rx_one(void)
+ 					break;
+ 				}
+ 			}
++			IOLockUnlock(a_lock_get(&a_q_lock));
+ 		}
+ 		break;
+ 	case CMD_RX_INTENT_REQ:
+@@ -9804,6 +9863,18 @@ a_qrtr_rx(const uint8_t *p, uint32_t len)
+ 	case QRTR_TYPE_NEW_SERVER:
+ 		a_srv_count++;
+ 		if (c->a != 0) {
++			/* 0263: in the lookup table too (SWEET_QMI_LOOKUP), like the modem's: e.g. SNS_CLIENT 0x190 */
++			bool known = false;
++			for (unsigned k = 0; k < q_srv_count; k++) {
++				known |= q_srv[k].svc == c->a && q_srv[k].inst == c->b && q_srv[k].node == c->c && q_srv[k].port == c->d;
++			}
++			if (!known && q_srv_count < sizeof(q_srv) / sizeof(q_srv[0])) {
++				q_srv[q_srv_count].svc = c->a;
++				q_srv[q_srv_count].inst = c->b;
++				q_srv[q_srv_count].node = c->c;
++				q_srv[q_srv_count].port = c->d;
++				q_srv_count++;
++			}
+ 			LOG("adsp: t=%u ms: service %x:%x node %u port %x %s", a_ms, c->a, c->b, c->c, c->d, svc_name(c->a));
+ 		}
+ 		break;
