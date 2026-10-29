@@ -1,0 +1,316 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0257: Goodix untrusted enroll and auth ops
+
+ALGO_AUTHENTICATE returns BAD_PARAMS because no finger is enrolled. Enroll
+and authenticate without an Android HAT, the factory "untrusted" mode
+(SZProductTest): op 14 = UNTRUSTED_CFG (1003,3) enroll, PRE_ENROLL, ENROLL
+(gid 0); op 15 = one touch (WAKEUP, SET_EXPO 1, CAPTURE_IMG op 1, ALGO_ENROLL
+with gid / finger id / samples remaining logged, KPI), after which
+kern.sweet_qsee reads the samples remaining or -gf error; op 16 =
+SAVE_TEMPLATES and POST_ENROLL, then the RAM store listed; op 17 =
+UNTRUSTED_CFG auth and op 11's capture, the finger {gid, fid} read from the
+returned auth struct at +0x2c (notifyAuthSuccess), after which
+kern.sweet_qsee reads the matched finger id or -gf error. The GP file
+service takes this TZ's 0-based command ids (1 write, 2 remove, 3 rename)
+and dumps the first three requests of each command raw; a write-numbered
+request that does not fit is answered written = count with nothing stored.
+---
+ bsd/dev/sweet_qsee_ctl.c       |   4 +-
+ iokit/Kernel/arm/SweetQsee.cpp | 204 +++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 197 insertions(+), 11 deletions(-)
+
+diff --git a/bsd/dev/sweet_qsee_ctl.c b/bsd/dev/sweet_qsee_ctl.c
+index b983446..cbd7869 100755
+--- a/bsd/dev/sweet_qsee_ctl.c
++++ b/bsd/dev/sweet_qsee_ctl.c
+@@ -8,7 +8,9 @@
+  *   3 APP_SHUTDOWN goodixfp, 4 goodixfp shutdown + start only, 5 op 1 reusing a loaded goodixfp,
+  *   6 op 1 with slow power timings, 7 L9's PMIC registers (read only), 8 register the QSEE log
+  *   buffer, 9 copy it for kern.sweet_qsee_log (read only, opaque: the raw 32 KB), 10 init with
+- *   the file listener, 11 one capture, 12 cancel and sensor off, 13 one capture at exposure 5
++ *   the file listener, 11 one capture, 12 cancel and sensor off, 13 one capture at exposure 5,
++ *   14 enroll begin, 15 one enroll touch (then reads: samples remaining, or -gf error),
++ *   16 enroll finish, 17 untrusted auth (then reads: the matched finger id, or -gf error)
+  * kern.sweet_qsee_file (write only): "name\0bytes" puts a file the TA may read into the kernel's
+  * RAM store (empty bytes drop it); kern.sweet_qsee_files lists the store.
+  */
+diff --git a/iokit/Kernel/arm/SweetQsee.cpp b/iokit/Kernel/arm/SweetQsee.cpp
+index 9444cfe..7c8003f 100755
+--- a/iokit/Kernel/arm/SweetQsee.cpp
++++ b/iokit/Kernel/arm/SweetQsee.cpp
+@@ -37,6 +37,14 @@
+  * qsee_fts_read_file, i.e. the GP file service, listener 0x7000 (minkipc gpfs_msg.h). Op 10 now
+  * registers it too (its own 0x7e000-byte buffer) and serves its reads from the same RAM store
+  * (writes, removes, renames: RAM overlay, logged). Every other listener id TZ asks for is logged.
++ * 0257: this TZ numbers the GP file commands from 0 (0 read, 1 write, 2 remove, 3 rename, as
++ * DATA_FILE_* used to be); the first three requests of each command id are dumped raw. Enroll
++ * and auth without an Android HAT (the factory "untrusted" mode, SZProductTest): op 14 enroll
++ * begin (UNTRUSTED_CFG 1, PRE_ENROLL, ENROLL), op 15 one touch (WAKEUP, SET_EXPO, CAPTURE_IMG
++ * op 1, ALGO_ENROLL, KPI; kern.sweet_qsee then reads the samples remaining, or -gf error), op 16
++ * finish (SAVE_TEMPLATES, POST_ENROLL: the template lands in the RAM store), op 17 untrusted
++ * auth (UNTRUSTED_CFG 0 + op 11's sequence; kern.sweet_qsee then reads the matched finger id,
++ * or -gf error).
+  * A listener request from TrustZone (INCOMPLETE / BLOCKED_ON_LISTENER) is logged and answered
+  * with a failure: no listener is registered and nothing is ever written anywhere (persist holds
+  * the sensor's factory calibration).
+@@ -48,7 +56,7 @@
+  *   power timings (100 ms settle, 120 ms after reset), 7 L9's PMIC registers (read only),
+  *   8 register the QSEE log buffer (only), 9 copy it for kern.sweet_qsee_log (stalls: never),
+  *   10 init with the file listener, 11 one capture, 12 cancel and sensor off, 13 = 11 at
+- *   exposure level 5.
++ *   exposure level 5, 14 enroll begin, 15 one enroll touch, 16 enroll finish, 17 untrusted auth.
+  * Reading it gives the result of the last request (0 ok, else an errno).
+  *
+  * Memory: TrustZone reads what it is given by physical address, below 4 GB, physically
+@@ -1745,10 +1753,11 @@ gp_serve(void)
+ 	mb();
+ 	q_fs_reqs++;
+ 	{
+-		/* the first requests raw, before anything is answered in place */
+-		static unsigned dumps;
+-		if (dumps < 3) {
+-			dumps++;
++		/* the first three requests of each command id raw, before anything is answered in place */
++		static uint8_t dumps[16];
++		if (cmd < 16 && dumps[cmd] < 3) {
++			dumps[cmd]++;
++			LOG("gpfs raw request, command %u:", cmd);
+ 			LOG("gpfs raw +000: %08x %08x %08x %08x %08x %08x %08x %08x", get32(b, 0), get32(b, 4), get32(b, 8),
+ 			    get32(b, 12), get32(b, 16), get32(b, 20), get32(b, 24), get32(b, 28));
+ 			LOG("gpfs raw +256: %08x %08x %08x %08x %08x %08x %08x %08x", get32(b, 256), get32(b, 260), get32(b, 264),
+@@ -1760,6 +1769,24 @@ gp_serve(void)
+ 		LOG("gpfs: command 0 with a read's shape (offset %d count %u): served as PERSIST_FILE_READ", (int32_t)get32(b, 260),
+ 		    get32(b, 264));
+ 		cmd = 8;
++	} else if (cmd == 1 || cmd == 5 || cmd == 9) {
++		/* 0257: command 1 = the old DATA_FILE_WRITE ({path; offset; count; backup; data@272}) */
++		uint32_t count = get32(b, 264);
++		if (count > GSB_SIZE - 272) {
++			/* not a write's shape: take it, store nothing */
++			put32(b, 4, 0);
++			put32(b, 8, count);
++			LOG("gpfs: command %u with count %u does not fit: answered err 0, written %u, NOTHING stored", cmd, count, count);
++			mb();
++			return;
++		}
++		if (cmd == 1) {
++			LOG("gpfs: command 1 (old DATA_FILE_WRITE) served as a write");
++			cmd = 9;
++		}
++	} else if (cmd == 2 || cmd == 3) {
++		LOG("gpfs: command %u (old DATA_FILE_%s) served as such", cmd, cmd == 2 ? "REMOVE" : "RENAME");
++		cmd = cmd == 2 ? 10 : 11;
+ 	}
+ 	switch (cmd) {
+ 	case 4:                                     /* DATA_FILE_READ */
+@@ -1990,7 +2017,7 @@ fail:
+  * returned struct, ALGO_KPI, AUTH_CANCEL.
+  */
+ static int
+-fp_capture(uint8_t expo)
++fp_capture(uint8_t expo, int *value)
+ {
+ 	uint32_t gw = ~0u, ge = ~0u, ga = ~0u, gc = ~0u, gk = ~0u;
+ 
+@@ -2036,6 +2063,14 @@ fp_capture(uint8_t expo)
+ 				}
+ 				LOG("auth image:   +%02x%s", i, line);
+ 			}
++			/* FingerprintCore::notifyAuthSuccess: the finger {gid, fid} at +0x2c, the HAT from +0x3c */
++			LOG("auth result: %u %s, gid %u, finger id %u", ga, ga == ~0u ? "-" : gf_err_name(ga), get32(q_cmd, 0x2c),
++			    get32(q_cmd, 0x30));
++			if (value != NULL && ga != ~0u) {
++				*value = ga == 0 ? (int)get32(q_cmd, 0x30) : -(int)ga;
++			}
++		} else if (value != NULL && gc != ~0u) {
++			*value = -(int)gc;
+ 		}
+ 		bzero(q_cmd, 0xbc);
+ 		gk = gf_cmd(1001, 4, 0xbc, "ALGO_KPI");
+@@ -2056,6 +2091,142 @@ fp_capture(uint8_t expo)
+ 	return 0;
+ }
+ 
++/* ---------------------------------------------------------------- 0257: untrusted enroll / auth */
++
++static uint32_t q_enroll_fid;
++static unsigned q_enroll_left = ~0u;
++
++/* (1003,3) UNTRUSTED_CFG, 0x120: +0x1c 1 enroll / 0 auth, +0x20 path (none) */
++static uint32_t
++untrusted_cfg(uint32_t enroll)
++{
++	bzero(q_cmd, 0x120);
++	put32(q_cmd, 0x1c, enroll);
++	return gf_cmd(1003, 3, 0x120, enroll ? "UNTRUSTED_CFG(enroll)" : "UNTRUSTED_CFG(auth)");
++}
++
++/* op 14: UNTRUSTED_CFG 1, PRE_ENROLL, ENROLL (gid 0, no HAT) */
++static int
++fp_enroll_begin(void)
++{
++	if (!q_inited || q_goodix_id == 0) {
++		LOG("op 14: run op 10 first");
++		return EAGAIN;
++	}
++	uint32_t gu = untrusted_cfg(1);
++	bzero(q_cmd, 0x28);
++	uint32_t gp = gf_cmd(1000, 2, 0x28, "PRE_ENROLL");
++	LOG("PRE_ENROLL: challenge %08x%08x", get32(q_cmd, 0x24), get32(q_cmd, 0x20));
++	bzero(q_cmd, 0x6c);
++	put32(q_cmd, 0x1c, 0);
++	uint32_t ge = gf_cmd(1000, 3, 0x6c, "ENROLL");
++	q_enroll_fid = 0;
++	q_enroll_left = ~0u;
++	LOG("op 14: untrusted cfg %u %s, pre_enroll %u %s, enroll %u %s", gu, gu == ~0u ? "-" : gf_err_name(gu), gp,
++	    gp == ~0u ? "-" : gf_err_name(gp), ge, ge == ~0u ? "-" : gf_err_name(ge));
++	return gu == ~0u || gp == ~0u || ge == ~0u ? EIO : 0;
++}
++
++/* op 15: one touch; *value = samples remaining, or -gf error */
++static int
++fp_enroll_touch(int *value)
++{
++	if (!q_inited || q_goodix_id == 0) {
++		LOG("op 15: run op 10 and 14 first");
++		return EAGAIN;
++	}
++	bzero(q_cmd, 0x20);
++	q_cmd[0x1d] = 0xff;
++	uint32_t gw = gf_cmd(1002, 9, 0x20, "WAKEUP");
++	bzero(q_cmd, 0x1c);
++	q_cmd[0x10] = 1;
++	uint32_t ge = gf_cmd(1002, 14, 0x1c, "SET_EXPO");
++	bzero(q_cmd, 0x28);
++	put32(q_cmd, 0x1c, 0);                      /* retry */
++	put32(q_cmd, 0x20, 1);                      /* op: enroll */
++	uint32_t gc = gf_cmd(1002, 3, 0x28, "CAPTURE_IMG");
++	if (gw == ~0u || ge == ~0u || gc == ~0u) {
++		return EIO;
++	}
++	if (gc != 0) {
++		*value = -(int)gc;
++		LOG("op 15: capture %u %s: no enroll step", gc, gf_err_name(gc));
++		return 0;
++	}
++	bzero(q_cmd, 0x38);
++	uint32_t ga = gf_cmd(1001, 1, 0x38, "ALGO_ENROLL");
++	if (ga == ~0u) {
++		return EIO;
++	}
++	uint32_t gid = get32(q_cmd, 0x1c), fid = get32(q_cmd, 0x20);
++	uint16_t left;
++	memcpy(&left, q_cmd + 0x28, 2);
++	LOG("ALGO_ENROLL: %u %s, gid %u, finger id %u, samples remaining %u", ga, gf_err_name(ga), gid, fid, left);
++	if (ga == 0) {
++		q_enroll_fid = fid;
++		q_enroll_left = left;
++		*value = left;
++	} else {
++		*value = -(int)ga;
++	}
++	bzero(q_cmd, 0xbc);
++	uint32_t gk = gf_cmd(1001, 4, 0xbc, "ALGO_KPI");
++	if (gk == 0) {
++		LOG("KPI: quality %u, valid area %u, match score %u, study %u, key points %u, increase rate %u, overlay %u",
++		    get32(q_cmd, 0x1c), get32(q_cmd, 0x20), get32(q_cmd, 0x24), get32(q_cmd, 0x28), get32(q_cmd, 0x2c),
++		    get32(q_cmd, 0x30), get32(q_cmd, 0x34));
++	}
++	LOG("op 15: enroll step %u %s, finger %u, %u samples to go", ga, gf_err_name(ga), q_enroll_fid, q_enroll_left);
++	return 0;
++}
++
++/* op 16: SAVE_TEMPLATES (gid 0, the enrolled finger), POST_ENROLL; the store afterwards */
++static int
++fp_enroll_finish(void)
++{
++	if (!q_inited || q_goodix_id == 0) {
++		LOG("op 16: run op 10 first");
++		return EAGAIN;
++	}
++	if (q_enroll_fid == 0 || q_enroll_left != 0) {
++		LOG("op 16: finger %u has %u samples to go: saving anyway", q_enroll_fid, q_enroll_left);
++	}
++	bzero(q_cmd, 0x24);
++	put32(q_cmd, 0x1c, 0);
++	put32(q_cmd, 0x20, q_enroll_fid);
++	uint32_t gs = gf_cmd(1000, 9, 0x24, "SAVE_TEMPLATES");
++	bzero(q_cmd, 0x1c);
++	uint32_t gp = gf_cmd(1000, 4, 0x1c, "POST_ENROLL");
++	for (unsigned i = 0; i < QF_MAX_FILES; i++) {
++		if (q_files[i].used) {
++			LOG("store: %s %u bytes %s %s", q_files[i].name, q_files[i].len, q_files[i].dirty ? "dirty" : "clean",
++			    q_files[i].from_user ? "user" : "ta");
++		}
++	}
++	LOG("op 16: save %u %s, post_enroll %u %s (finger %u)", gs, gs == ~0u ? "-" : gf_err_name(gs), gp,
++	    gp == ~0u ? "-" : gf_err_name(gp), q_enroll_fid);
++	return gs == ~0u || gp == ~0u ? EIO : 0;
++}
++
++/* op 17: UNTRUSTED_CFG 0, then op 11's capture; *value = the matched finger id, or -gf error */
++static int
++fp_auth_untrusted(int *value)
++{
++	if (!q_inited || q_goodix_id == 0) {
++		LOG("op 17: run op 10 first");
++		return EAGAIN;
++	}
++	uint32_t gu = untrusted_cfg(0);
++	if (gu == ~0u) {
++		return EIO;
++	}
++	*value = 0;
++	int r = fp_capture(1, value);
++	LOG("op 17: untrusted cfg %u %s, capture path %d, result value %d (finger id, or -gf error)", gu, gf_err_name(gu), r,
++	    *value);
++	return r;
++}
++
+ /* op 12: AUTH_CANCEL, sensor off */
+ static int
+ fp_stop(void)
+@@ -2074,7 +2245,7 @@ fp_stop(void)
+ extern "C" int
+ sweet_qsee_op(int op)
+ {
+-	int r;
++	int r, value = INT32_MIN;
+ 
+ 	if (op < 0) {
+ 		return q_last;
+@@ -2124,10 +2295,22 @@ sweet_qsee_op(int op)
+ 		r = fp_init();
+ 		break;
+ 	case 11:
+-		r = fp_capture(1);
++		r = fp_capture(1, NULL);
+ 		break;
+ 	case 13:
+-		r = fp_capture(5);
++		r = fp_capture(5, NULL);
++		break;
++	case 14:
++		r = fp_enroll_begin();
++		break;
++	case 15:
++		r = fp_enroll_touch(&value);
++		break;
++	case 16:
++		r = fp_enroll_finish();
++		break;
++	case 17:
++		r = fp_auth_untrusted(&value);
+ 		break;
+ 	case 12:
+ 		r = fp_stop();
+@@ -2136,7 +2319,8 @@ sweet_qsee_op(int op)
+ 		r = EINVAL;
+ 		break;
+ 	}
+-	q_last = r;
++	/* ops 15 and 17 leave a value (remaining samples / finger id, or -gf error) for the next read */
++	q_last = r == 0 && value != INT32_MIN ? value : r;
+ 	IOLockUnlock(q_lock);
+ 	return r;
+ }
