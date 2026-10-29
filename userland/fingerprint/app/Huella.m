@@ -852,7 +852,7 @@ sensor_ring(UIView *v)
 
 /* ================================================================== main list */
 
-enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_SENSORS, S_STATUS, S_COUNT };
+enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_VIB, S_SENSORS, S_STATUS, S_COUNT };
 
 @interface MainVC : UITableViewController
 @end
@@ -918,7 +918,8 @@ enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_SENSORS, S_STATUS, S_COUNT };
 	case S_USE: return 2;
 	case S_LOOK: return 7;
 	case S_OFF: return 2;
-	case S_SENSORS: return 2;
+	case S_VIB: return 5;
+	case S_SENSORS: return 1;
 	case S_STATUS: return 6;
 	}
 	return 0;
@@ -927,8 +928,8 @@ enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_SENSORS, S_STATUS, S_COUNT };
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s
 {
 	(void)tv;
-	NSArray *t = @[ @"Huellas", @"Usar huella para", @"Icono en la pantalla bloqueada", @"Pantalla apagada", @"Sensores",
-		        @"Estado" ];
+	NSArray *t = @[ @"Huellas", @"Usar huella para", @"Icono en la pantalla bloqueada", @"Pantalla apagada", @"Vibración",
+		        @"Sensores", @"Estado" ];
 	return t[(NSUInteger)s];
 }
 
@@ -943,8 +944,11 @@ enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_SENSORS, S_STATUS, S_COUNT };
 	case S_OFF:
 		return @"Experimental: funciona si el panel táctil sigue informando con la pantalla apagada (se ve en el "
 		       @"Registro). El indicador con la pantalla apagada aún no tiene efecto: el panel está apagado.";
+	case S_VIB:
+		return @"El motor de este iPhone da pulsos cortos: la respuesta háptica se imita con toques breves. "
+		       @"Las llamadas y notificaciones siguen los ajustes de vibrar en modo sonido / silencio.";
 	case S_SENSORS:
-		return @"Requieren sensores de movimiento y el motor de vibración, que aún no funcionan en este iPhone.";
+		return @"Requiere los sensores de movimiento, que aún no funcionan en este iPhone.";
 	}
 	return nil;
 }
@@ -1068,11 +1072,16 @@ enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_SENSORS, S_STATUS, S_COUNT };
 			return [self switchCell:@"Desbloquear tocando con la pantalla apagada" key:@"screenOffWake" dflt:NO enabled:YES];
 		}
 		return [self switchCell:@"Indicador con la pantalla apagada" key:@"alwaysOnIndicator" dflt:NO enabled:YES];
-	case S_SENSORS:
-		if (r == 0) {
-			return [self switchCell:@"Mostrar solo al mover el iPhone (requiere sensores)" key:@"raiseToShow" dflt:NO enabled:NO];
+	case S_VIB:
+		switch (r) {
+		case 0: return [self switchCell:@"Vibrar al reconocer o fallar la huella" key:@"haptics" dflt:YES enabled:YES];
+		case 1: return [self switchCell:@"Respuesta háptica del sistema" key:@"uiHaptics" dflt:YES enabled:YES];
+		case 2: return [self switchCell:@"Vibración del teclado" key:@"keyboardHaptics" dflt:NO enabled:YES];
+		case 3: return [self switchCell:@"Vibrar con llamadas y notificaciones" key:@"alertVibration" dflt:YES enabled:YES];
+		default: return [self valueCell:@"Probar vibración" value:@"" link:YES];
 		}
-		return [self switchCell:@"Vibración al acertar o fallar (requiere vibración)" key:@"haptics" dflt:NO enabled:NO];
+	case S_SENSORS:
+		return [self switchCell:@"Mostrar solo al mover el iPhone (requiere sensores)" key:@"raiseToShow" dflt:NO enabled:NO];
 	case S_STATUS: {
 		NSDictionary *st = _status;
 		switch (r) {
@@ -1220,6 +1229,21 @@ enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_SENSORS, S_STATUS, S_COUNT };
 		} else if (r == 4) {
 			[self pick:@"Al tocar" options:anim_options() key:@"pressAnimation" dflt:@"pulse"];
 		}
+	} else if (ip.section == S_VIB && r == 4) {
+		UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Probar vibración" message:nil
+		    preferredStyle:UIAlertControllerStyleActionSheet];
+		NSArray *opts = @[ @[ @"selection", @"Selección" ], @[ @"light", @"Toque suave" ], @[ @"medium", @"Toque medio" ],
+				   @[ @"heavy", @"Toque fuerte" ], @[ @"success", @"Éxito" ], @[ @"warning", @"Aviso" ],
+				   @[ @"error", @"Error" ], @[ @"notify", @"Notificación" ], @[ @"long", @"Larga" ] ];
+		for (NSArray *o in opts) {
+			NSString *name = [@"com.sapphire.vib." stringByAppendingString:o[0]];
+			[a addAction:[UIAlertAction actionWithTitle:o[1] style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+				(void)x;
+				notify_post(name.UTF8String);
+			}]];
+		}
+		[a addAction:[UIAlertAction actionWithTitle:@"Cancelar" style:UIAlertActionStyleCancel handler:nil]];
+		[self presentViewController:a animated:YES completion:nil];
 	} else if (ip.section == S_STATUS) {
 		if (r == 4) {
 			[self.navigationController pushViewController:[TestVC new] animated:YES];

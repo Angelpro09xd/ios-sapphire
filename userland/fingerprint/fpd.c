@@ -41,7 +41,8 @@
  * Lock-screen authentication pauses while enrolling or testing.
  *
  * Files: /var/root/fp/fingers.plist {slot: {name, fid, created}}; prefs read from
- * /var/mobile/Library/Preferences/com.sapphire.fingerprint.plist (unlockEnabled, screenOffWake);
+ * /var/mobile/Library/Preferences/com.sapphire.fingerprint.plist (unlockEnabled, screenOffWake, haptics: vibd
+ * presets success on unlock, error on no match, long on lockout, light / warning per enroll touch);
  * /var/root/fp/fpd.noscreen = ignore the screen state.
  * Log: os_log (subsystem com.sapphire.fpd) and /var/root/fp/fpd.log (256 KB, then fpd.log.1).
  */
@@ -667,7 +668,18 @@ names_remove(int slot)
 
 /* ------------------------------------------------------------------ prefs */
 
-static bool pref_unlock = true, pref_screen_off = false;
+static bool pref_unlock = true, pref_screen_off = false, pref_haptics = true;
+
+/* a vibd preset (com.sapphire.vib.NAME, userland/haptics/vibd.c), if the haptics pref is on */
+static void
+haptic(const char *name)
+{
+	if (pref_haptics) {
+		char n[64];
+		snprintf(n, sizeof n, "com.sapphire.vib.%s", name);
+		notify_post(n);
+	}
+}
 
 static bool
 dict_bool(CFDictionaryRef d, CFStringRef k, bool dflt)
@@ -690,11 +702,12 @@ dict_bool(CFDictionaryRef d, CFStringRef k, bool dflt)
 static void
 prefs_load(void)
 {
-	bool u = true, s = false;
+	bool u = true, s = false, h = true;
 	CFPropertyListRef p = plist_read(PREFS_PATH, kCFPropertyListImmutable);
 	if (p != NULL) {
 		u = dict_bool(p, CFSTR("unlockEnabled"), true);
 		s = dict_bool(p, CFSTR("screenOffWake"), false);
+		h = dict_bool(p, CFSTR("haptics"), true);
 		CFRelease(p);
 	}
 	if (u != pref_unlock || s != pref_screen_off) {
@@ -702,6 +715,7 @@ prefs_load(void)
 	}
 	pref_unlock = u;
 	pref_screen_off = s;
+	pref_haptics = h;
 }
 
 static time_t
@@ -868,6 +882,7 @@ authenticate(int seq, int press)
 		LOG("press %d: fingerprints locked out until the next passcode unlock", seq);
 		lockedout = true;
 		st_lockouts++;
+		haptic("long");
 		post(N_LOCKED_OUT);
 		reevaluate("lockout");
 		return;
@@ -876,6 +891,7 @@ authenticate(int seq, int press)
 		st_nomatch++;
 		set_fails(fails + 1);
 		LOG("press %d (down %d): no match (%d failed)", seq, press, fails);
+		haptic("error");
 		post(N_NOMATCH);
 		return;
 	}
@@ -900,6 +916,7 @@ authenticate(int seq, int press)
 	}
 	st_unlocks++;
 	LOG("keybag unlocked by fingerprint");
+	haptic("success");
 	post(N_UNLOCKED);
 	schedule_save();
 	reevaluate("unlocked");
@@ -1073,6 +1090,7 @@ enroll_done(void)
 	}
 	names_set(slot, enroll_name, true);
 	LOG("enrollment complete: slot %d \"%s\", %d touches", slot, enroll_name, enroll_steps);
+	haptic("success");
 	send_line(c, "DONE %d", slot);
 	enroll_stop();
 }
@@ -1108,12 +1126,14 @@ enroll_tick(void)
 			enroll_first = v + 1;
 		}
 		LOG("enroll touch %d: %d samples to go", enroll_steps, v);
+		haptic("light");
 		send_line(enroll_c, "PROGRESS %d 0 %d", v, enroll_first);
 		if (v == 0) {
 			enroll_done();
 		}
 	} else {
 		LOG("enroll touch %d: error %d", enroll_steps, -v);
+		haptic("warning");
 		send_line(enroll_c, "PROGRESS -1 %d %d", -v, enroll_first);
 	}
 }
