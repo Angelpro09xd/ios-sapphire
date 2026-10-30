@@ -1,0 +1,736 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0281: Bluetooth: /dev/qcabt ioctls, high baud rates, boot stubs
+
+/dev/qcabt gets the ioctls of userland/bluetooth/qcabt.h: QCABT_POWER (1: the
+op 1 bring-up, 0: UART off, rails stay voted), QCABT_SETBAUD (1200..4000000),
+QCABT_FLOW (off: CTS ignored, RTS held asserted), QCABT_FLUSH, QCABT_SWCTRL
+(GPIO 87) and QCABT_DRAIN (TX FIFO empty, bounded 1 s), plus select(). The node
+opens without the UART up (POWER through the ioctl) and write() takes 2 KB.
+
+Baud rates: gcc-khaje.ko's SE3 table only has 7.3728 MHz, so without DFS the
+RCG is programmed from GPLL0 even (300 MHz) with M/N to the lowest of 7.3728,
+14.7456, 48 (4/25), 51.2 (64/375), 64, 96 or 102.4 MHz whose divider is within
+1.5 % (3 Mbaud x 16 = 48 MHz, 3.2 Mbaud x 16 = 51.2 MHz); with DFS the first
+level that fits. TX finishes and RX is stopped (cancel, then abort) around the
+change; each RCG register is logged before it is written.
+
+Throughput: four bytes per FIFO word both ways (geni_se_config_packing(8, 4)),
+the partial last RX word read from RX_FIFO_STATUS bits 31/30:28; the polling
+thread polls every ~50 us while bytes flow and sleeps 1 ms after ~2 ms idle; a
+long TX polls RX while it waits. RX FIFO overruns, parity/framing errors, breaks
+and ring drops are counted, logged (at 1, 2, 4, 8 ...) and shown at close.
+
+Boot: only device nodes are made, from sweet_ufs.c, no hardware touched:
+/dev/qcabt and the stubs /dev/uart.bluetooth and /dev/cu.bluetooth (open answers
+ENXIO; bluetoothd only checks that the node exists). Boot-arg bt=0 skips them.
+Nothing else runs at boot.
+---
+ bsd/dev/sweet_bt.c  | 491 ++++++++++++++++++++++++++++++++++++++++++----------
+ bsd/dev/sweet_ufs.c |   2 +
+ 2 files changed, 403 insertions(+), 90 deletions(-)
+
+diff --git a/bsd/dev/sweet_bt.c b/bsd/dev/sweet_bt.c
+index c116a9c..0619137 100755
+--- a/bsd/dev/sweet_bt.c
++++ b/bsd/dev/sweet_bt.c
+@@ -11,9 +11,18 @@
+  *   kern.sweet_bt_log: the log of the last request (also in the kernel log, "SWEET BT:").
+  *   /dev/qcabt: raw H4 bytes both ways (write = to the controller; read = what it sent), filled
+  *     by a polling thread while the node is open; ops 2/3 answer EBUSY meanwhile.
++ *     0281: the ioctls of userland/bluetooth/qcabt.h (POWER, SETBAUD 1200..4000000, FLOW, FLUSH,
++ *     SWCTRL, DRAIN) and select(). Four bytes per FIFO word both ways (as Linux's GENI serial
++ *     driver); the polling thread polls every ~50 us while bytes flow and sleeps 1 ms once idle;
++ *     RX FIFO overruns, parity/framing errors, breaks and ring drops are counted and logged.
++ *   At boot (0281) only device nodes are made, no hardware is touched: /dev/qcabt and two stubs,
++ *     /dev/uart.bluetooth and /dev/cu.bluetooth, whose open answers ENXIO (bluetoothd only checks
++ *     that the node exists). Boot-arg bt=0 skips them.
+  * UART clock: SE3's RCG is in DFS mode on Qualcomm boards (its levels set by the boot loader):
+- * the first level within 1.5 % of 115200 and 2400 x oversampling is picked (GENI_CLK_SEL), else the RCG
+- * is programmed to 7.3728 MHz (GPLL0 even 300 MHz x 384/15625, the kernel's own table entry).
++ * for each baud rate the first level within 1.5 % of baud x oversampling is picked (GENI_CLK_SEL).
++ * Without DFS the RCG is programmed from GPLL0 even (300 MHz) with M/N: 7.3728 MHz (384/15625, the
++ * kernel's own table entry), 14.7456, 48 (4/25), 51.2 (64/375), 64 (16/75), 96 (8/25) or 102.4 MHz
++ * (128/375), the lowest one that fits (3 Mbaud x 16 = 48 MHz, 3.2 Mbaud x 16 = 51.2 MHz).
+  * Every wait bounded, every step logged.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -28,6 +37,9 @@
+ #include <sys/proc.h>
+ #include <sys/sysctl.h>
+ #include <sys/vnode.h>
++#include <sys/select.h>
++#include <sys/ioccom.h>
++#include <pexpert/pexpert.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
+@@ -121,6 +133,21 @@ static size_t bt_loglen;
+ static uint8_t bt_ring[BT_RING];
+ static volatile uint32_t bt_rhead, bt_rtail;
+ static uint32_t bt_rdrops;
++static bool bt_dfs;
++static uint64_t bt_dfs_hz[8];
++static uint32_t bt_baud_now, bt_ovr, bt_par, bt_brk;
++static bool bt_flow_on = true;
++static struct selinfo bt_sel;
++static uint8_t bt_wbuf[2048];                   /* write(): under sweet_bt_mtx */
++#define S_RX_FIFO_WR_ERR (1u << 25)
++#define S_GP_PARITY     ((1u << 9) | (1u << 10))
++#define S_GP_BREAK      ((1u << 11) | (1u << 12))
++#define QCABT_POWER     _IOW('q', 1, int)
++#define QCABT_SETBAUD   _IOW('q', 2, uint32_t)
++#define QCABT_FLOW      _IOW('q', 3, int)
++#define QCABT_FLUSH     _IO('q', 4)
++#define QCABT_SWCTRL    _IOR('q', 5, int)
++#define QCABT_DRAIN     _IO('q', 6)
+ static int bt_major = -1;
+ 
+ static void
+@@ -135,6 +162,9 @@ btlog(const char *fmt, ...)
+ 		return;
+ 	}
+ 	printf("SWEET BT: %s\n", line);
++	if (bt_loglen + strlen(line) + 2 >= sizeof(bt_logbuf)) {
++		bt_loglen = (size_t)snprintf(bt_logbuf, sizeof(bt_logbuf), "(log wrapped)\n");
++	}
+ 	if (bt_loglen + strlen(line) + 2 < sizeof(bt_logbuf)) {
+ 		bt_loglen += (size_t)snprintf(bt_logbuf + bt_loglen, sizeof(bt_logbuf) - bt_loglen, "%s\n", line);
+ 	}
+@@ -226,79 +256,177 @@ bt_clocks(void)
+ 	return false;
+ }
+ 
+-/* the SE clock: a DFS level that gives 115200 exactly, else the RCG at 7.3728 MHz */
++/* the SE clock source: the DFS levels are read and kept; without DFS the RCG is programmed per baud */
+ static bool
+ bt_clock_rate(void)
+ {
+ 	static const uint64_t parent[8] = { 19200000, 600000000, 300000000, 0, 0, 0, 0, 0 };
+ 	uint32_t rcg = BT_RCG & 0xfff;
+ 	uint32_t dfs = rd(bt_gcc1f, rcg + RCG_DFSR);
+-	btlog("RCG DFS register %#x (%s)", dfs, (dfs & 1) ? "DFS on" : "DFS off");
+-	if (dfs & 1) {
+-		int best = -1;
+-		uint64_t best_rate = 0;
+-		for (unsigned l = 0; l < 8; l++) {
+-			uint32_t cfg = rd(bt_gcc1f, rcg + RCG_PERF(l)), src = (cfg >> 8) & 7, hid = cfg & 0x1f, mode = (cfg >> 12) & 3;
+-			uint64_t rate = parent[src];
+-			uint32_t m = 0, n = 0;
+-			if (mode != 0) {
+-				m = rd(bt_gcc1f, rcg + RCG_PERF_M(l)) & 0xffff;
+-				n = ((~rd(bt_gcc1f, rcg + RCG_PERF_N(l))) & 0xffff) + m;
+-				n &= 0xffff;
+-				rate = n ? rate * m / n : 0;
+-			}
+-			if (hid != 0) {
+-				rate = rate * 2 / (hid + 1);
+-			}
+-			btlog("DFS level %u: cfg %#x (src %u, div %u, mode %u, m %u n %u) = %llu Hz", l, cfg, src, hid, mode, m, n, rate);
+-			/* both 115200 and 2400 within 1.5 % (integer divider, 12 bits) */
+-			uint64_t d1 = rate / (115200ull * bt_samp), d2 = rate / (2400ull * bt_samp);
+-			bool fits = rate != 0 && d1 != 0 && d2 != 0 && d2 <= 0xfff &&
+-			    (rate - d1 * 115200ull * bt_samp) * 1000 / rate < 15 && (rate - d2 * 2400ull * bt_samp) * 1000 / rate < 15;
+-			if (best < 0 && fits) {
+-				best = (int)l;
+-				best_rate = rate;
+-			}
++	btlog("RCG DFS register %#x (%s), cmd %#x cfg %#x", dfs, (dfs & 1) ? "DFS on" : "DFS off", rd(bt_gcc1f, rcg),
++	    rd(bt_gcc1f, rcg + 4));
++	bt_dfs = (dfs & 1) != 0;
++	bt_clk_hz = 0;                                  /* without DFS: unknown until programmed */
++	if (!bt_dfs) {
++		return true;
++	}
++	for (unsigned l = 0; l < 8; l++) {
++		uint32_t cfg = rd(bt_gcc1f, rcg + RCG_PERF(l)), src = (cfg >> 8) & 7, hid = cfg & 0x1f, mode = (cfg >> 12) & 3;
++		uint64_t rate = parent[src];
++		uint32_t m = 0, n = 0;
++		if (mode != 0) {
++			m = rd(bt_gcc1f, rcg + RCG_PERF_M(l)) & 0xffff;
++			n = ((~rd(bt_gcc1f, rcg + RCG_PERF_N(l))) & 0xffff) + m;
++			n &= 0xffff;
++			rate = n ? rate * m / n : 0;
+ 		}
+-		if (best < 0) {
+-			btlog("no DFS level gives 115200 x %u: stop", bt_samp);
+-			return false;
++		if (hid != 0) {
++			rate = rate * 2 / (hid + 1);
+ 		}
+-		bt_level = (unsigned)best;
+-		bt_clk_hz = best_rate;
+-		btlog("DFS level %u: %llu Hz", bt_level, bt_clk_hz);
+-		return true;
++		bt_dfs_hz[l] = rate;
++		btlog("DFS level %u: cfg %#x (src %u, div %u, mode %u, m %u n %u) = %llu Hz", l, cfg, src, hid, mode, m, n, rate);
++	}
++	return true;
++}
++
++/* the divider for baud at rate, 0 if it is more than 1.5 % off (or out of the 12-bit range) */
++static uint32_t
++bt_div_for(uint64_t rate, uint32_t baud)
++{
++	uint64_t unit = (uint64_t)baud * bt_samp;
++	if (rate == 0 || unit == 0) {
++		return 0;
++	}
++	uint64_t div = (rate + unit / 2) / unit;
++	if (div == 0 || div > 0xfff) {
++		return 0;
+ 	}
+-	/* 7.3728 MHz: GPLL0 even (source 2) x 384 / 15625, dual-edge M/N, no pre-divider */
+-	wr(bt_gcc1f, rcg + 0x8, 384);
+-	wr(bt_gcc1f, rcg + 0xC, (~(15625u - 384u)) & 0xffff);
+-	wr(bt_gcc1f, rcg + 0x10, (~15625u) & 0xffff);
++	uint64_t got = rate / div, err = got > unit ? got - unit : unit - got;
++	return err * 1000 / unit < 15 ? (uint32_t)div : 0;
++}
++
++static const struct { uint32_t hz, m, n; } bt_rates[] = {
++	{ 7372800, 384, 15625 }, { 14745600, 768, 15625 }, { 48000000, 4, 25 }, { 51200000, 64, 375 },
++	{ 64000000, 16, 75 }, { 96000000, 8, 25 }, { 102400000, 128, 375 },
++};
++
++/* GPLL0 even (source 2) x m / n, dual-edge M/N, no pre-divider (D = ~n: 50 % duty, clk-rcg2.c) */
++static bool
++bt_rcg_set(unsigned i)
++{
++	uint32_t rcg = BT_RCG & 0xfff, m = bt_rates[i].m, n = bt_rates[i].n;
++	btlog("RCG before: cmd %#x cfg %#x m %#x n %#x d %#x", rd(bt_gcc1f, rcg), rd(bt_gcc1f, rcg + 4), rd(bt_gcc1f, rcg + 8),
++	    rd(bt_gcc1f, rcg + 0xC), rd(bt_gcc1f, rcg + 0x10));
++	wr(bt_gcc1f, rcg + 0x8, m);
++	wr(bt_gcc1f, rcg + 0xC, (~(n - m)) & 0xffff);
++	wr(bt_gcc1f, rcg + 0x10, (~n) & 0xffff);
+ 	wr(bt_gcc1f, rcg + 0x4, (2u << 12) | (2u << 8) | 1u);
+ 	wr(bt_gcc1f, rcg, rd(bt_gcc1f, rcg) | 1);
+-	for (int i = 0; i < 100 && (rd(bt_gcc1f, rcg) & 1); i++) {
++	for (int k = 0; k < 100 && (rd(bt_gcc1f, rcg) & 1); k++) {
+ 		IODelay(10);
+ 	}
+-	btlog("RCG programmed: cmd %#x cfg %#x m %#x n %#x d %#x", rd(bt_gcc1f, rcg), rd(bt_gcc1f, rcg + 4), rd(bt_gcc1f, rcg + 8),
+-	    rd(bt_gcc1f, rcg + 0xC), rd(bt_gcc1f, rcg + 0x10));
++	btlog("RCG %u Hz: cmd %#x cfg %#x m %#x n %#x d %#x", bt_rates[i].hz, rd(bt_gcc1f, rcg), rd(bt_gcc1f, rcg + 4),
++	    rd(bt_gcc1f, rcg + 8), rd(bt_gcc1f, rcg + 0xC), rd(bt_gcc1f, rcg + 0x10));
+ 	if (rd(bt_gcc1f, rcg) & 1) {
+-		btlog("RCG update did not complete: stop");
++		btlog("RCG update did not complete");
++		bt_clk_hz = 0;
+ 		return false;
+ 	}
+-	bt_level = 0;
+-	bt_clk_hz = 7372800;
++	bt_clk_hz = bt_rates[i].hz;
+ 	return true;
+ }
+ 
+-static void
+-bt_baud(uint32_t baud, bool flow)
++static unsigned bt_rx_poll(void);
++static void bt_rx_start(void);
++static int bt_drain(unsigned ms);
++
++static int
++bt_set_baud(uint32_t baud)
+ {
+-	uint32_t div = (uint32_t)(bt_clk_hz / ((uint64_t)baud * bt_samp));
++	if (baud < 1200 || baud > 4000000) {
++		btlog("baud %u: out of range", baud);
++		return EINVAL;
++	}
++	int pick = -1;
++	uint32_t div = 0;
++	uint64_t hz = 0;
++	if (bt_dfs) {
++		for (unsigned l = 0; l < 8 && pick < 0; l++) {
++			if ((div = bt_div_for(bt_dfs_hz[l], baud)) != 0) {
++				pick = (int)l;
++				hz = bt_dfs_hz[l];
++			}
++		}
++	} else {
++		/* the current rate if it fits, else the lowest table rate that does */
++		if (bt_clk_hz != 0 && (div = bt_div_for(bt_clk_hz, baud)) != 0) {
++			hz = bt_clk_hz;
++			for (unsigned i = 0; i < sizeof(bt_rates) / sizeof(bt_rates[0]); i++) {
++				if (bt_rates[i].hz == hz) {
++					pick = (int)i;
++				}
++			}
++		}
++		for (unsigned i = 0; i < sizeof(bt_rates) / sizeof(bt_rates[0]) && pick < 0; i++) {
++			if ((div = bt_div_for(bt_rates[i].hz, baud)) != 0) {
++				pick = (int)i;
++				hz = bt_rates[i].hz;
++			}
++		}
++	}
++	if (pick < 0) {
++		btlog("baud %u: no SE clock gives it (oversampling %u)", baud, bt_samp);
++		return ENOTSUP;
++	}
++	/* TX finished, what RX holds into the ring, RX stopped (cancel, then abort), bounded */
++	if (bt_baud_now != 0) {
++		(void)bt_drain(200);
++	}
++	(void)bt_rx_poll();
++	if (rd(bt_se, GENI_STATUS) & S_CMD_ACTIVE) {
++		wr(bt_se, S_CMD_CTRL, 1u << 2);
++		for (int k = 0; k < 100 && (rd(bt_se, GENI_STATUS) & S_CMD_ACTIVE); k++) {
++			IODelay(10);
++		}
++		if (rd(bt_se, GENI_STATUS) & S_CMD_ACTIVE) {
++			wr(bt_se, S_CMD_CTRL, 1u << 1);
++			for (int k = 0; k < 100 && (rd(bt_se, GENI_STATUS) & S_CMD_ACTIVE); k++) {
++				IODelay(10);
++			}
++		}
++	}
++	if (!bt_dfs && hz != bt_clk_hz && !bt_rcg_set((unsigned)pick)) {
++		return EIO;
++	}
++	bt_level = bt_dfs ? (unsigned)pick : 0;
++	bt_clk_hz = hz;
+ 	wr(bt_se, GENI_CLK_SEL, bt_level);
+ 	wr(bt_se, GENI_M_CLK_CFG, (div << 4) | 1);
+ 	wr(bt_se, GENI_S_CLK_CFG, (div << 4) | 1);
+-	wr(bt_se, UART_TX_CFG, flow ? 0 : 2);           /* bit 1: ignore CTS */
+-	wr(bt_se, UART_MANUAL_RFR, 0);                  /* RFR by the hardware */
+-	btlog("UART %u baud (clock %llu Hz / %u / %u), flow control %s", baud, bt_clk_hz, div, bt_samp, flow ? "on" : "off");
++	wr(bt_se, S_IRQ_CLEAR, 0xffffffffu);
++	bt_rx_start();
++	bt_baud_now = baud;
++	btlog("UART %u baud (%s %u: %llu Hz / %u / %u = %llu)", baud, bt_dfs ? "DFS level" : "rate", (unsigned)pick, hz, div,
++	    bt_samp, hz / ((uint64_t)div * bt_samp));
++	return 0;
++}
++
++/* flow on: CTS gates TX, RFR by the hardware; off: CTS ignored, RFR as given (0: the hardware's) */
++static void
++bt_flow(bool on, uint32_t rfr)
++{
++	wr(bt_se, UART_TX_CFG, on ? 0 : 2);             /* bit 1: ignore CTS */
++	wr(bt_se, UART_MANUAL_RFR, on ? 0 : rfr);
++	bt_flow_on = on;
++	btlog("flow control %s (manual RFR %#x)", on ? "on" : "off", rd(bt_se, UART_MANUAL_RFR));
++}
++
++static int
++bt_baud(uint32_t baud, bool flow)
++{
++	int r = bt_set_baud(baud);
++	bt_flow(flow, 0);
++	return r;
+ }
+ 
+ static void
+@@ -342,7 +470,7 @@ bt_init(void)
+ 	bt_tx_depth = (rd(bt_se, SE_HW_PARAM_0) >> 16) & 0x3f;
+ 	uint32_t rxd = (rd(bt_se, SE_HW_PARAM_1) >> 16) & 0x3f;
+ 	bt_tx_depth = bt_tx_depth ? bt_tx_depth : 16;
+-	/* FIFO mode, polled; one byte per FIFO word both ways */
++	/* FIFO mode, polled; four bytes per FIFO word both ways (geni_se_config_packing(8, 4)) */
+ 	wr(bt_se, M_CMD_CTRL, 1u << 1);                 /* abort anything left */
+ 	wr(bt_se, S_CMD_CTRL, 1u << 1);
+ 	IODelay(100);
+@@ -356,10 +484,10 @@ bt_init(void)
+ 	wr(bt_se, GENI_OUTPUT_CTRL, 0x7f);
+ 	wr(bt_se, GENI_FORCE_DEFAULT, 1);
+ 	wr(bt_se, SE_BYTE_GRAN, 0);
+-	wr(bt_se, TX_PACK0, 0xF);
+-	wr(bt_se, TX_PACK1, 0);
+-	wr(bt_se, RX_PACK0, 0xF);
+-	wr(bt_se, RX_PACK1, 0);
++	wr(bt_se, TX_PACK0, 0x20E4380Eu);
++	wr(bt_se, TX_PACK1, 0x30Fu);
++	wr(bt_se, RX_PACK0, 0x20E4380Eu);
++	wr(bt_se, RX_PACK1, 0x30Fu);
+ 	wr(bt_se, TX_WATERMARK, 0);
+ 	wr(bt_se, RX_WATERMARK, 0);
+ 	wr(bt_se, RX_RFR_WM, rxd > 2 ? rxd - 2 : 1);
+@@ -372,8 +500,12 @@ bt_init(void)
+ 	wr(bt_se, UART_TX_PARITY, 0);
+ 	wr(bt_se, UART_RX_PARITY, 0);
+ 	wr(bt_se, M_IRQ_EN, (1u << 0) | 0x3eu | (1u << 30));
+-	wr(bt_se, S_IRQ_EN, (1u << 0) | (1u << 26) | (1u << 27));
+-	bt_baud(115200, true);
++	wr(bt_se, S_IRQ_EN, (1u << 0) | (1u << 26) | (1u << 27) | S_RX_FIFO_WR_ERR | S_GP_PARITY | S_GP_BREAK);
++	bt_baud_now = 0;
++	if (bt_baud(115200, true) != 0) {
++		btlog("115200 not possible: stop");
++		return EIO;
++	}
+ 	bt_rx_start();
+ 	bt_up = true;
+ 	btlog("UART up: tx fifo %u words, rx fifo %u words, status %#x", bt_tx_depth, rxd, rd(bt_se, GENI_STATUS));
+@@ -382,36 +514,63 @@ bt_init(void)
+ 
+ /* ---------------------------------------------------------------- bytes */
+ 
+-/* what the RX FIFO holds into the ring (bt_rx_mtx not needed by the single reader of the FIFO) */
++static void
++bt_count(const char *what, uint32_t *c)
++{
++	++*c;
++	if ((*c & (*c - 1)) == 0) {                     /* 1, 2, 4, 8 ...: not a log line per error */
++		btlog("rx: %s, %u so far (overrun %u, parity/framing %u, break %u, ring drops %u)", what, *c, bt_ovr, bt_par,
++		    bt_brk, bt_rdrops);
++	}
++}
++
++/*
++ * what the RX FIFO holds into the ring. Four bytes per word; the last word may be partial (stale
++ * timeout): RX_FIFO_STATUS bit 31 with the valid byte count in bits 30:28 (qcom_geni_serial.c).
++ */
+ static unsigned
+ bt_rx_poll(void)
+ {
+ 	unsigned got = 0;
+ 	for (int k = 0; k < 64; k++) {
+-		uint32_t wc = rd(bt_se, RX_FIFO_STATUS) & 0x1ffffffu;
++		uint32_t st = rd(bt_se, RX_FIFO_STATUS), wc = st & 0x1ffffffu;
+ 		if (wc == 0) {
+ 			break;
+ 		}
++		unsigned lastb = (st >> 31) ? (st >> 28) & 7 : 0;
++		lck_mtx_lock(&sweet_bt_rxmtx);
+ 		for (uint32_t i = 0; i < wc; i++) {
+-			uint8_t b = (uint8_t)rd(bt_se, RX_FIFO);
+-			lck_mtx_lock(&sweet_bt_rxmtx);
+-			if (bt_rhead - bt_rtail < BT_RING) {
+-				bt_ring[bt_rhead % BT_RING] = b;
+-				bt_rhead++;
+-			} else {
+-				bt_rdrops++;
++			uint32_t w = rd(bt_se, RX_FIFO);
++			unsigned nb = (i + 1 == wc && lastb != 0) ? lastb : 4;
++			for (unsigned b = 0; b < nb; b++) {
++				if (bt_rhead - bt_rtail < BT_RING) {
++					bt_ring[bt_rhead % BT_RING] = (uint8_t)(w >> (8 * b));
++					bt_rhead++;
++				} else {
++					bt_rdrops++;
++				}
++				got++;
+ 			}
+-			lck_mtx_unlock(&sweet_bt_rxmtx);
+-			got++;
+ 		}
++		lck_mtx_unlock(&sweet_bt_rxmtx);
+ 	}
+ 	uint32_t s = rd(bt_se, S_IRQ_STATUS);
+ 	if (s) {
+ 		wr(bt_se, S_IRQ_CLEAR, s);
++		if (s & S_RX_FIFO_WR_ERR) {
++			bt_count("RX FIFO overrun", &bt_ovr);
++		}
++		if (s & S_GP_PARITY) {
++			bt_count("parity/framing error", &bt_par);
++		}
++		if (s & S_GP_BREAK) {
++			bt_count("break", &bt_brk);
++		}
+ 	}
+ 	bt_rx_start();
+ 	if (got) {
+ 		wakeup(bt_ring);
++		selwakeup(&bt_sel);
+ 	}
+ 	return got;
+ }
+@@ -420,6 +579,7 @@ static int
+ bt_tx(const uint8_t *p, uint32_t n)
+ {
+ 	for (int i = 0; i < 500 && (rd(bt_se, GENI_STATUS) & M_CMD_ACTIVE); i++) {
++		(void)bt_rx_poll();
+ 		IODelay(100);
+ 	}
+ 	if (rd(bt_se, GENI_STATUS) & M_CMD_ACTIVE) {
+@@ -430,32 +590,65 @@ bt_tx(const uint8_t *p, uint32_t n)
+ 	wr(bt_se, M_IRQ_CLEAR, 0xffffffffu);
+ 	wr(bt_se, UART_TX_LEN, n);
+ 	wr(bt_se, M_CMD0, 1u << 27);                    /* UART_START_TX */
+-	for (uint32_t i = 0; i < n; i++) {
++	uint32_t words = (n + 3) / 4;
++	for (uint32_t i = 0; i < words; i++) {
+ 		int w = 0;
+ 		while ((rd(bt_se, TX_FIFO_STATUS) & 0x0fffffffu) >= bt_tx_depth && w < 2000) {
++			if ((w & 3) == 0) {
++				(void)bt_rx_poll();             /* the controller may talk while we wait */
++			}
+ 			IODelay(50);
+ 			w++;
+ 		}
+ 		if (w >= 2000) {
+-			btlog("tx: the FIFO stays full after %u of %u bytes (CTS low?): aborted", i, n);
++			btlog("tx: the FIFO stays full after %u of %u bytes (CTS low?): aborted", i * 4, n);
+ 			wr(bt_se, M_CMD_CTRL, 1u << 1);
+ 			return ETIMEDOUT;
+ 		}
+-		wr(bt_se, TX_FIFO, p[i]);
++		uint32_t v = 0;
++		for (uint32_t b = 0; b < 4 && i * 4 + b < n; b++) {
++			v |= (uint32_t)p[i * 4 + b] << (8 * b);
++		}
++		wr(bt_se, TX_FIFO, v);
+ 	}
+-	for (int i = 0; i < 2000; i++) {
++	/* the FIFO's last bytes at this baud, plus 20 ms */
++	uint32_t baud = bt_baud_now ? bt_baud_now : 115200;
++	uint32_t ms = 20 + (uint32_t)(((uint64_t)(bt_tx_depth + 1) * 4 * 10 * 1000) / baud);
++	for (uint32_t i = 0; i < ms * 10; i++) {
+ 		uint32_t s = rd(bt_se, M_IRQ_STATUS);
+ 		if (s & 1) {
+ 			wr(bt_se, M_IRQ_CLEAR, s);
+ 			return 0;
+ 		}
++		if ((i & 3) == 0) {
++			(void)bt_rx_poll();
++		}
+ 		IODelay(100);
+ 	}
+-	btlog("tx: no done in 200 ms (m irq %#x, status %#x): aborted", rd(bt_se, M_IRQ_STATUS), rd(bt_se, GENI_STATUS));
++	btlog("tx: no done in %u ms (m irq %#x, status %#x): aborted", ms, rd(bt_se, M_IRQ_STATUS), rd(bt_se, GENI_STATUS));
+ 	wr(bt_se, M_CMD_CTRL, 1u << 1);
+ 	return ETIMEDOUT;
+ }
+ 
++/* TX FIFO empty and no TX command running, then one character time; bounded by ms */
++static int
++bt_drain(unsigned ms)
++{
++	for (unsigned i = 0; i < ms * 10; i++) {
++		if ((rd(bt_se, GENI_STATUS) & M_CMD_ACTIVE) == 0 && (rd(bt_se, TX_FIFO_STATUS) & 0x0fffffffu) == 0) {
++			uint32_t baud = bt_baud_now ? bt_baud_now : 115200;
++			IODelay(10 * 1000000u / baud + 10);
++			return 0;
++		}
++		if ((i & 3) == 0) {
++			(void)bt_rx_poll();
++		}
++		IODelay(100);
++	}
++	btlog("drain: TX still busy after %u ms (status %#x, tx fifo %#x)", ms, rd(bt_se, GENI_STATUS), rd(bt_se, TX_FIFO_STATUS));
++	return ETIMEDOUT;
++}
++
+ static void
+ bt_ring_clear(void)
+ {
+@@ -608,13 +801,23 @@ bt_off(void)
+ static void
+ bt_rx_thread(void *arg __unused, wait_result_t wres __unused)
+ {
++	unsigned idle = 0;
+ 	while (bt_rx_run) {
++		unsigned got = 0;
+ 		lck_mtx_lock(&sweet_bt_mtx);
+ 		if (bt_up) {
+-			(void)bt_rx_poll();
++			got = bt_rx_poll();
+ 		}
+ 		lck_mtx_unlock(&sweet_bt_mtx);
+-		IOSleep(1);
++		/* 3 Mbaud is ~300 bytes/ms: every ~50 us while bytes flow (RFR holds the rest), 1 ms once idle */
++		if (got != 0) {
++			idle = 0;
++			IODelay(50);
++		} else if (++idle < 40) {
++			IODelay(50);
++		} else {
++			IOSleep(1);
++		}
+ 	}
+ 	bt_rx_alive = false;
+ 	wakeup(bt_ring);
+@@ -629,10 +832,6 @@ qcabt_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unuse
+ 		lck_mtx_unlock(&sweet_bt_mtx);
+ 		return EBUSY;
+ 	}
+-	if (!bt_up) {
+-		lck_mtx_unlock(&sweet_bt_mtx);
+-		return ENXIO;
+-	}
+ 	lck_mtx_lock(&sweet_bt_rxmtx);
+ 	bt_rtail = bt_rhead;
+ 	lck_mtx_unlock(&sweet_bt_rxmtx);
+@@ -658,6 +857,9 @@ qcabt_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unus
+ 		IOSleep(1);
+ 	}
+ 	bt_open_flag = false;
++	lck_mtx_lock(&sweet_bt_mtx);
++	btlog("/dev/qcabt closed: rx overrun %u, parity/framing %u, break %u, ring drops %u", bt_ovr, bt_par, bt_brk, bt_rdrops);
++	lck_mtx_unlock(&sweet_bt_mtx);
+ 	return 0;
+ }
+ 
+@@ -693,24 +895,93 @@ qcabt_read(__unused dev_t dev, struct uio *uio, int ioflag)
+ static int
+ qcabt_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+-	uint8_t buf[260];
+ 	user_ssize_t n = uio_resid(uio);
+-	if (n <= 0 || n > (user_ssize_t)sizeof(buf)) {
++	if (n <= 0 || n > (user_ssize_t)sizeof(bt_wbuf)) {
+ 		return EINVAL;
+ 	}
+-	int err = uiomove((char *)buf, (int)n, uio);
+-	if (err != 0) {
+-		return err;
+-	}
+ 	lck_mtx_lock(&sweet_bt_mtx);
+-	err = bt_up ? bt_tx(buf, (uint32_t)n) : ENXIO;
++	int err = uiomove((char *)bt_wbuf, (int)n, uio);
++	if (err == 0) {
++		err = bt_up ? bt_tx(bt_wbuf, (uint32_t)n) : ENXIO;
++	}
+ 	lck_mtx_unlock(&sweet_bt_mtx);
+ 	return err;
+ }
+ 
++static int
++qcabt_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
++{
++	int r = 0;
++	lck_mtx_lock(&sweet_bt_mtx);
++	switch (cmd) {
++	case QCABT_POWER:
++		btlog("ioctl POWER %d", *(int *)data);
++		if (*(int *)data) {
++			r = bt_up ? 0 : bt_init();
++		} else {
++			r = bt_off();
++		}
++		break;
++	case QCABT_SETBAUD:
++		r = bt_up ? bt_set_baud(*(uint32_t *)data) : ENXIO;
++		break;
++	case QCABT_FLOW:
++		if (bt_up) {
++			bt_flow(*(int *)data != 0, 0x80000001u);    /* off: RTS held asserted (manual RFR, ready) */
++		} else {
++			r = ENXIO;
++		}
++		break;
++	case QCABT_FLUSH:
++		if (bt_up) {
++			(void)bt_rx_poll();
++		}
++		lck_mtx_lock(&sweet_bt_rxmtx);
++		bt_rtail = bt_rhead;
++		lck_mtx_unlock(&sweet_bt_rxmtx);
++		break;
++	case QCABT_SWCTRL:
++		if (bt_map()) {
++			*(int *)data = (int)(((volatile uint32_t *)bt_sw)[1] & 1);
++		} else {
++			r = ENOMEM;
++		}
++		break;
++	case QCABT_DRAIN:
++		r = bt_up ? bt_drain(1000) : ENXIO;
++		break;
++	default:
++		r = ENOTTY;
++		break;
++	}
++	if (r != 0 && cmd != (u_long)QCABT_POWER) {
++		btlog("ioctl %#lx: %d", cmd, r);
++	}
++	lck_mtx_unlock(&sweet_bt_mtx);
++	return r;
++}
++
++static int
++qcabt_select(__unused dev_t dev, int which, void *wql, struct proc *p)
++{
++	if (which == FWRITE) {
++		return 1;
++	}
++	if (which != FREAD) {
++		return 0;
++	}
++	lck_mtx_lock(&sweet_bt_rxmtx);
++	int ready = bt_rhead != bt_rtail || !bt_rx_alive;
++	if (!ready) {
++		selrecord(p, &bt_sel, wql);
++	}
++	lck_mtx_unlock(&sweet_bt_rxmtx);
++	return ready;
++}
++
+ static const struct cdevsw qcabt_cdevsw = {
+-	.d_open = qcabt_open, .d_close = qcabt_close, .d_read = qcabt_read, .d_write = qcabt_write, .d_ioctl = eno_ioctl,
+-	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select, .d_mmap = eno_mmap,
++	.d_open = qcabt_open, .d_close = qcabt_close, .d_read = qcabt_read, .d_write = qcabt_write, .d_ioctl = qcabt_ioctl,
++	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = qcabt_select, .d_mmap = eno_mmap,
+ 	.d_strategy = eno_strat, .d_type = 0,
+ };
+ 
+@@ -732,6 +1003,46 @@ qcabt_node(void)
+ 	}
+ }
+ 
++/*
++ * bluetoothd's start gate: it checks that /dev/uart.bluetooth exists (the transport is btshim's).
++ * These nodes only exist: open answers ENXIO.
++ */
++static int
++btstub_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return ENXIO;
++}
++
++static const struct cdevsw btstub_cdevsw = {
++	.d_open = btstub_open, .d_close = eno_opcl, .d_read = eno_rdwrt, .d_write = eno_rdwrt, .d_ioctl = eno_ioctl,
++	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select, .d_mmap = eno_mmap,
++	.d_strategy = eno_strat, .d_type = 0,
++};
++
++/* at boot (bsd/dev/sweet_ufs.c): device nodes only, no hardware; boot-arg bt=0 skips it */
++void sweet_bt_boot_init(void);
++void
++sweet_bt_boot_init(void)
++{
++	int on = 1;
++	(void)PE_parse_boot_argn("bt", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	lck_mtx_lock(&sweet_bt_mtx);
++	qcabt_node();
++	int major = cdevsw_add(-1, &btstub_cdevsw);
++	if (major >= 0) {
++		void *a = devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "uart.bluetooth");
++		void *b = devfs_make_node(makedev(major, 1), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "cu.bluetooth");
++		btlog("boot: /dev/uart.bluetooth %s, /dev/cu.bluetooth %s (stubs, major %d)", a ? "made" : "FAILED",
++		    b ? "made" : "FAILED", major);
++	} else {
++		btlog("boot: no major for the uart.bluetooth stubs");
++	}
++	lck_mtx_unlock(&sweet_bt_mtx);
++}
++
+ /* ---------------------------------------------------------------- sysctls */
+ 
+ static int
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index f5eb5ca..42ed7df 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void sweet_bt_boot_init(void);   /* bsd/dev/sweet_bt.c: device nodes only */
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -821,6 +822,7 @@ sweet_ufs_init(void)
+ 	 */
+ 	sweet_touch_init();
+ 	sweet_keys_init();
++	sweet_bt_boot_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }

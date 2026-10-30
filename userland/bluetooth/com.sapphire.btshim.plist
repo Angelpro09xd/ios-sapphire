@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.sapphire.btshim: the WCN3988 bring-up and the H4 bridge for bluetoothd (btshim.c, qca.c). Put into
+  launchd's cache under /System/Library/LaunchDaemons/com.sapphire.btshim.plist by bt-launchd.py (install.sh;
+  the cache before the first install: launchd.plist.pre-btshim), like vibd/fpd/camd: /var/jb/Library/LaunchDaemons
+  is not loaded at boot here. install.sh fills in ProgramArguments (real: "daemon"; recording: "daemon -F -v -w 0")
+  and BT_DEVICE_ADDRESS. The daemon makes its FIFOs at once and runs the bring-up once the boot is 120 s old.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.sapphire.btshim</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/btshim</string>
+		<string>daemon</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>BT_DEVICE_ADDRESS</key>
+		<string>00:00:00:00:00:00</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>EnablePressuredExit</key>
+	<false/>
+	<key>EnableTransactions</key>
+	<false/>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>JetsamProperties</key>
+	<dict>
+		<key>JetsamPriority</key>
+		<integer>18</integer>
+		<key>JetsamMemoryLimit</key>
+		<integer>32</integer>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>UserName</key>
+	<string>root</string>
+	<key>POSIXSpawnType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>/var/tmp/btshim.out</string>
+	<key>StandardErrorPath</key>
+	<string>/var/tmp/btshim.out</string>
+</dict>
+</plist>

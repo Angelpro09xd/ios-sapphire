@@ -11,6 +11,7 @@
  *     -I  keep in-band sleep / deep sleep enabled in the NVM
  *     -2  send only the type-2 NVM entry of the type-4 container (if the SoC refuses the whole file)
  *     -v  hex dump of every packet      -V  only the version query (no download)
+ *     -A  print the BD address (derived or -a) and exit, no hardware (install.sh uses it)
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <CommonCrypto/CommonDigest.h>
@@ -79,8 +80,8 @@ main(int argc, char **argv)
 	const char *dir = "/var/root/btfw", *ramp = NULL, *nvm = NULL;
 	uint32_t speed = 0;
 	uint8_t addr[6];
-	int have_addr = 0, power = 1, only_version = 0, c;
-	while ((c = getopt(argc, argv, "d:r:n:s:a:NI2vV")) != -1) {
+	int have_addr = 0, power = 1, only_version = 0, only_addr = 0, c;
+	while ((c = getopt(argc, argv, "d:r:n:s:a:NI2vVA")) != -1) {
 		switch (c) {
 		case 'd': dir = optarg; break;
 		case 'r': ramp = optarg; break;
@@ -98,14 +99,19 @@ main(int argc, char **argv)
 		case '2': qca_nvm_inner = 1; break;
 		case 'v': qca_verbose = 1; break;
 		case 'V': only_version = 1; break;
+		case 'A': only_addr = 1; break;
 		default:
-			fprintf(stderr, "usage: qcabtfw [-d dir] [-r tlv] [-n nvm] [-s speed] [-a addr] [-N] [-I] [-v] [-V]\n");
+			fprintf(stderr, "usage: qcabtfw [-d dir] [-r tlv] [-n nvm] [-s speed] [-a addr] [-N] [-I] [-2] [-v] [-V] [-A]\n");
 			return 2;
 		}
 	}
 	if (!have_addr && derived_addr(addr) < 0) {
 		say("no IOPlatformUUID: pass -a");
 		return 1;
+	}
+	if (only_addr) {
+		printf("%02x:%02x:%02x:%02x:%02x:%02x\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+		return 0;
 	}
 	say("BD address %02x:%02x:%02x:%02x:%02x:%02x", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
 	if (qca_open(power) < 0)
