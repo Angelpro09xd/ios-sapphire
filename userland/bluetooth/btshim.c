@@ -1,0 +1,706 @@
+/*
+ * btshim: Apple's bluetoothd on the sapphire's Qualcomm WCN3988 (research/bluetooth.md).
+ *
+ * How bluetoothd (iOS 16.7, 20H392) reaches its controller, from its disassembly:
+ *  - BT_HCI_TRANSPORT="<transport>:<driver>:<options>" in the environment overrides the device
+ *    tree. Transports: USB H4DS H4BC H4 H5 APPLEBT VIRT PCIE PCIESW. Drivers: USB POSIX APPLEBT
+ *    VIRT PCIE PCIESW. On a real iPhone X the device tree gives transport-encoding 3 = H4BC over
+ *    the POSIX driver, which is NOT a tty: it is the AppleSerialShim Skywalk nexus (kernel
+ *    control "com.apple.uart.sk.bluetooth" + os_channel). /dev/uart.bluetooth is only access()ed.
+ *  - The VIRT driver ("VirtualCTRL") opens <options>-in O_WRONLY (host -> controller bytes) and
+ *    <options>-out O_RDONLY|O_NONBLOCK (controller -> host bytes), and a thread select()s and
+ *    read()s the second one. With the H4 transport the bytes are plain H4 (type byte + packet).
+ *  So bluetoothd runs with BT_HCI_TRANSPORT=H4:VIRT:/var/run/btshim/hci, and this program owns
+ *  the two FIFOs /var/run/btshim/hci-in and hci-out.
+ *  - bluetoothd starts only if the local address is non-zero (BT_DEVICE_ADDRESS=aa:bb:.. in the
+ *    environment, else the device tree's local-mac-address) and if /dev/cu.bluetooth or
+ *    /dev/uart.bluetooth exists or an IOService is named "marconi-bt" or "bluetooth"
+ *    ("No bluetooth on this device." otherwise).
+ *  - Before HCI, bluetoothd asks com.apple.BlueTool (XPC, mach service) to run its "boot" /
+ *    "init" / "deepsleep" scripts: {kMsgId: "RunBuiltinScript", kMsgArgs: {script, btaddress}}
+ *    -> reply {result: int64 (0 = ok), manufacturer: int64, firmware: string}, and
+ *    {kMsgId: "RunCommand", kMsgArgs: {command}} -> {result, output}. Apple's BlueTool only knows
+ *    Broadcom/ACI chips, so "btshim bluetool" replaces it (same mach service name) and forwards
+ *    the script names to the daemon over /var/run/btshim/ctl.
+ *  - Then the standard HCI init chain (every step fatal on error except Reset and Read BD_ADDR):
+ *    Reset, Read Local Version, Read Local Supported Commands, Read BD_ADDR, Read Local Features,
+ *    Read Local Extended Features, LE Read Local Features, Set Event Mask (+ Page 2), LE Set Event
+ *    Mask, Write Simple Pairing Mode, Write LE Host Support, LE Read Buffer Size (v2 or v1), LE
+ *    Read Supported States, LE Read Filter Accept List Size, Read Buffer Size, LE Read Periodic
+ *    Advertiser List Size, LE Set Host Feature, LE Set Default Subrate, Host Buffer Size, Set
+ *    Controller To Host Flow Control, Write Default Erroneous Data Reporting; then the Broadcom
+ *    vendor commands of bcm_vsc.c (the chipset family comes from the platform, not from HCI, so
+ *    an iPhone10,3 always gets the Broadcom set).
+ *
+ * Modes:
+ *   btshim daemon [opts]   the bridge (launchd job, root). Real controller on /dev/qcabt.
+ *   btshim daemon -F       fake controller, no hardware: answers like a BCM4357B1 and logs every
+ *                          packet, to record what bluetoothd sends.
+ *   btshim bluetool        the com.apple.BlueTool replacement (launchd job, MachServices).
+ * The Qualcomm bring-up itself is qca.c (shared with the standalone qcabtfw).
+ * Options: -d fw-dir (/var/root/btfw)  -r rampatch.tlv  -n nvm.bin  -a aa:bb:cc:dd:ee:ff
+ *          -s speed (default 115200; faster needs QCABT_SETBAUD)  -p fifo-prefix  -v  -I
+ * Log: /var/tmp/btshim.log (and stderr).
+ */
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/un.h>
+#include <time.h>
+#include <unistd.h>
+#include <dispatch/dispatch.h>
+
+/* libxpc (libSystem): the SDK in use ships no xpc headers, so the few calls are declared here */
+typedef void *xpc_object_t;
+typedef void *xpc_connection_t;
+typedef const struct _xpc_type_s *xpc_type_t;
+typedef void (^xpc_handler_t)(xpc_object_t);
+extern const struct _xpc_type_s _xpc_type_connection, _xpc_type_dictionary;
+#define XPC_TYPE_CONNECTION (&_xpc_type_connection)
+#define XPC_TYPE_DICTIONARY (&_xpc_type_dictionary)
+#define XPC_CONNECTION_MACH_SERVICE_LISTENER (1 << 0)
+extern xpc_connection_t xpc_connection_create_mach_service(const char *, dispatch_queue_t, uint64_t);
+extern void xpc_connection_set_event_handler(xpc_connection_t, xpc_handler_t);
+extern void xpc_connection_resume(xpc_connection_t);
+extern void xpc_connection_send_message(xpc_connection_t, xpc_object_t);
+extern xpc_type_t xpc_get_type(xpc_object_t);
+extern const char *xpc_dictionary_get_string(xpc_object_t, const char *);
+extern xpc_object_t xpc_dictionary_get_value(xpc_object_t, const char *);
+extern xpc_object_t xpc_dictionary_create_reply(xpc_object_t);
+extern void xpc_dictionary_set_int64(xpc_object_t, const char *, int64_t);
+extern void xpc_dictionary_set_string(xpc_object_t, const char *, const char *);
+extern void xpc_release(xpc_object_t);
+#include "qcabt.h"
+
+#define RUN_DIR         "/var/run/btshim"
+#define CTL_SOCK        RUN_DIR "/ctl"
+#define DEF_PREFIX      RUN_DIR "/hci"
+#define LOG_PATH        "/var/tmp/btshim.log"
+#define FW_DIR          "/var/root/btfw"
+
+#include "qca.c"
+
+/* ---------------------------------------------------------------- options, log */
+
+static const char *opt_dir = FW_DIR, *opt_ramp, *opt_nvm;   /* NULL: picked from the version */
+static const char *opt_prefix = DEF_PREFIX;
+static uint32_t opt_speed = 115200;
+static uint8_t opt_bdaddr[6] = { 0x02, 0x5a, 0x50, 0x48, 0x52, 0x45 };  /* MSB first as printed */
+static int opt_have_addr, opt_fake, opt_verbose;
+static int log_fd = -1;
+
+void
+say(const char *fmt, ...)
+{
+	char buf[1024];
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	int n = snprintf(buf, sizeof(buf), "%ld.%03d [%d] ", (long)tv.tv_sec, (int)(tv.tv_usec / 1000), getpid());
+	va_list ap;
+	va_start(ap, fmt);
+	n += vsnprintf(buf + n, sizeof(buf) - (size_t)n - 2, fmt, ap);
+	va_end(ap);
+	if (n > (int)sizeof(buf) - 2)
+		n = (int)sizeof(buf) - 2;
+	buf[n++] = '\n';
+	if (log_fd < 0)
+		log_fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
+	if (log_fd >= 0)
+		(void)write(log_fd, buf, (size_t)n);
+	(void)write(2, buf, (size_t)n);
+}
+
+static void
+hexdump(const char *tag, const uint8_t *p, size_t n)
+{
+	char line[3 * 64 + 8];
+	size_t i = 0;
+	while (i < n) {
+		size_t k = 0, j;
+		for (j = 0; j < 48 && i < n; j++, i++)
+			k += (size_t)snprintf(line + k, sizeof(line) - k, "%02x ", p[i]);
+		say("%s %s", tag, line);
+		tag = "  ";
+	}
+}
+
+static void
+msleep(unsigned ms)
+{
+	usleep(ms * 1000);
+}
+
+static int
+parse_addr(const char *s, uint8_t a[6])
+{
+	unsigned v[6];
+	if (sscanf(s, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6)
+		return -1;
+	for (int i = 0; i < 6; i++)
+		a[i] = (uint8_t)v[i];
+	return 0;
+}
+
+/* ---------------------------------------------------------------- H4 framing */
+
+struct h4 {
+	uint8_t buf[4 + 65536];
+	size_t have, need;      /* need: total length once the header is known, 0 = still unknown */
+};
+
+/* feeds bytes; calls fn for every complete packet (buf[0] = H4 type) */
+static void
+h4_feed(struct h4 *h, const uint8_t *p, size_t n, void (*fn)(const uint8_t *, size_t))
+{
+	while (n) {
+		if (h->have == 0 && (p[0] < 1 || p[0] > 5)) {
+			say("h4: junk byte %02x dropped", p[0]);
+			p++, n--;
+			continue;
+		}
+		h->buf[h->have++] = *p++;
+		n--;
+		uint8_t t = h->buf[0];
+		size_t hl = (t == 1 || t == 3) ? 3 : (t == 4 ? 2 : 4);
+		if (h->need == 0 && h->have == 1 + hl) {
+			size_t pl;
+			if (t == 1 || t == 3)
+				pl = h->buf[3];
+			else if (t == 4)
+				pl = h->buf[2];
+			else if (t == 2)
+				pl = (size_t)(h->buf[3] | (h->buf[4] << 8));
+			else
+				pl = (size_t)(h->buf[3] | ((h->buf[4] & 0x3f) << 8));
+			h->need = 1 + hl + pl;
+		}
+		if (h->need && h->have == h->need) {
+			fn(h->buf, h->have);
+			h->have = h->need = 0;
+		}
+	}
+}
+
+/* ---------------------------------------------------------------- the host side (bluetoothd) */
+
+static int host_rd = -1, host_wr = -1;  /* we read <prefix>-in, write <prefix>-out */
+
+static void
+to_host(const uint8_t *p, size_t n)
+{
+	if (opt_verbose)
+		hexdump("C>H", p, n);
+	while (n) {
+		ssize_t w = write(host_wr, p, n);
+		if (w < 0) {
+			if (errno == EINTR)
+				continue;
+			if (errno == EAGAIN) {
+				msleep(1);
+				continue;
+			}
+			say("host write: %s", strerror(errno));
+			return;
+		}
+		p += w, n -= (size_t)w;
+	}
+}
+
+static void
+host_cc(uint16_t op, const uint8_t *ret, size_t rlen)
+{
+	uint8_t e[3 + 3 + 255];
+	if (rlen > 252)
+		rlen = 252;
+	e[0] = 4, e[1] = 0x0e, e[2] = (uint8_t)(3 + rlen);
+	e[3] = 1, e[4] = op & 0xff, e[5] = op >> 8;
+	memcpy(e + 6, ret, rlen);
+	to_host(e, 6 + rlen);
+}
+
+static void
+host_cs(uint16_t op, uint8_t status)
+{
+	uint8_t e[7] = { 4, 0x0f, 4, status, 1, (uint8_t)(op & 0xff), (uint8_t)(op >> 8) };
+	to_host(e, sizeof(e));
+}
+
+/* ---------------------------------------------------------------- the controller (qca.c) */
+
+static struct h4 c_h4;                  /* controller -> us */
+static int controller_up, ctl_notify[2] = { -1, -1 };
+
+static int
+c_write(const uint8_t *p, size_t n)
+{
+	if (opt_verbose)
+		hexdump("H>C", p, n);
+	return qca_raw_write(p, n);
+}
+
+static int
+controller_bringup(void)
+{
+	if (controller_up)
+		return 0;
+	if (qca_open(1) < 0)
+		return -1;
+	if (qca_bringup(opt_dir, opt_ramp, opt_nvm, opt_speed, opt_bdaddr) < 0)
+		return -1;
+	qca_print_identity();
+	if (ctl_notify[0] < 0 && pipe(ctl_notify) == 0) {
+		fcntl(ctl_notify[0], F_SETFL, O_NONBLOCK);
+		fcntl(ctl_notify[1], F_SETFL, O_NONBLOCK);
+	}
+	qca_rx_notify_fd = ctl_notify[1];
+	controller_up = 1;
+	return 0;
+}
+
+/* ---------------------------------------------------------------- what bluetoothd is told */
+
+/* identity reported to bluetoothd (Broadcom, like the iPhone X's BCM4357B1); adjust after a
+ * capture of a real D22's Read Local Version if the stack turns out to check it */
+#define ID_HCI_VER      0x09            /* 5.0 */
+#define ID_HCI_REV      0x0000
+#define ID_LMP_VER      0x09
+#define ID_MANUF        0x000f          /* Broadcom */
+#define ID_LMP_SUBVER   0x2209
+
+static const uint8_t fake_features[8] = { 0xff, 0xfe, 0x8f, 0xfe, 0xd8, 0x3f, 0x5b, 0x87 };
+static const uint8_t fake_le_features[8] = { 0xff, 0x01, 0, 0, 0, 0, 0, 0 };
+
+/* a reply to a command bluetoothd sent while no controller answers it (fake mode), or the
+ * Broadcom vendor commands that must never reach the Qualcomm chip (both modes) */
+static void
+answer_locally(uint16_t op, const uint8_t *par, size_t plen)
+{
+	uint8_t r[256];
+	size_t n = 1;
+	memset(r, 0, sizeof(r));
+	uint8_t ogf = (uint8_t)(op >> 10);
+	switch (op) {
+	case 0x1001:    /* Read Local Version */
+		r[1] = ID_HCI_VER, r[2] = ID_HCI_REV & 0xff, r[3] = ID_HCI_REV >> 8, r[4] = ID_LMP_VER;
+		r[5] = ID_MANUF & 0xff, r[6] = ID_MANUF >> 8, r[7] = ID_LMP_SUBVER & 0xff, r[8] = ID_LMP_SUBVER >> 8;
+		n = 9;
+		break;
+	case 0x1002:    /* Read Local Supported Commands: everything but LE Read Buffer Size v2 (41.5) */
+		memset(r + 1, 0xff, 64);
+		r[1 + 41] &= (uint8_t)~0x20;
+		n = 65;
+		break;
+	case 0x1003:
+		memcpy(r + 1, fake_features, 8);
+		n = 9;
+		break;
+	case 0x1004:    /* Read Local Extended Features (page) */
+		r[1] = plen ? par[0] : 0, r[2] = 2;
+		if (r[1] == 0)
+			memcpy(r + 3, fake_features, 8);
+		else if (r[1] == 1)
+			r[3] = 0x0f;
+		n = 11;
+		break;
+	case 0x1005:    /* Read Buffer Size: ACL 1021 x 8, SCO 64 x 12 */
+		r[1] = 0xfd, r[2] = 0x03, r[3] = 64, r[4] = 8, r[5] = 0, r[6] = 12, r[7] = 0;
+		n = 8;
+		break;
+	case 0x1009:    /* Read BD_ADDR */
+		for (int i = 0; i < 6; i++)
+			r[1 + i] = opt_bdaddr[5 - i];
+		n = 7;
+		break;
+	case 0x2002:    /* LE Read Buffer Size v1 */
+		r[1] = 0xfb, r[2] = 0, r[3] = 8;
+		n = 4;
+		break;
+	case 0x2060:    /* LE Read Buffer Size v2 */
+		r[1] = 0xfb, r[2] = 0, r[3] = 8;
+		n = 7;
+		break;
+	case 0x2003:
+		memcpy(r + 1, fake_le_features, 8);
+		n = 9;
+		break;
+	case 0x200f:    /* LE Read Filter Accept List Size */
+		r[1] = 16;
+		n = 2;
+		break;
+	case 0x201c:    /* LE Read Supported States */
+		memset(r + 1, 0xff, 8);
+		n = 9;
+		break;
+	case 0x204a:    /* LE Read Periodic Advertiser List Size */
+		r[1] = 8;
+		n = 2;
+		break;
+	case 0x200b: case 0x2036: case 0x2041:  /* LE scan / adv params: status only */
+		break;
+	case 0x0c14:    /* Read Local Name */
+		strcpy((char *)r + 1, "BCM4357B1 37.4MHz Hercules-E USI");
+		n = 249;
+		break;
+	case 0xfc79:    /* BCM Read Verbose Config Version Info: chip id, target, build base, build num */
+		r[1] = 0x57, r[2] = 0x07, r[3] = 0x13, r[4] = 0x00, r[5] = 0x10, r[6] = 0x01;
+		n = 7;
+		break;
+	default:
+		break;
+	}
+	/* link control commands and the LE connection-type ones answer with Command Status */
+	if (ogf == 0x01 && op != 0x0402 && op != 0x040b && op != 0x040c && op != 0x040d && op != 0x040e &&
+	    op != 0x041a && op != 0x0434) {
+		host_cs(op, 0);
+		say("fake: Command Status for %#06x (len %zu)", op, plen);
+		return;
+	}
+	if (op == 0x200d || op == 0x2016 || op == 0x2019 || op == 0x2025 || op == 0x2026 || op == 0x2043 ||
+	    op == 0x2032 || op == 0x2013) {
+		host_cs(op, 0);
+		say("fake: Command Status for %#06x (len %zu)", op, plen);
+		return;
+	}
+	host_cc(op, r, n);
+	if (opt_verbose || ogf == 0x3f)
+		say("%s: Command Complete for %#06x (ogf %#x ocf %#x, %zu param bytes in, %zu out)",
+		    opt_fake ? "fake" : "vsc", op, ogf, op & 0x3ff, plen, n);
+}
+
+/* real mode: Broadcom vendor commands with a Qualcomm meaning */
+static int
+translate_vsc(uint16_t op, const uint8_t *par, size_t plen)
+{
+	switch (op) {
+	case 0xfc01:    /* BCM Write_BD_ADDR (LE order) -> QCA 0xFC14 */
+		if (plen >= 6) {
+			for (int i = 0; i < 6; i++)
+				opt_bdaddr[5 - i] = par[i];
+			if (qca_cmd(0xfc14, par, 6) < 0)
+				return -1;
+			say("vsc: Write_BD_ADDR -> QCA 0xFC14");
+		}
+		answer_locally(op, par, plen);
+		return 0;
+	default:
+		answer_locally(op, par, plen);
+		return 0;
+	}
+}
+
+/* the opcode of a Command Complete / Status we must not pass on (answers to our own commands) */
+static int drop_vendor_events = 1;
+
+static void
+from_controller(const uint8_t *p, size_t n)
+{
+	if (p[0] == 4 && p[1] == 0xff && drop_vendor_events) {
+		if (opt_verbose)
+			hexdump("drop VSE", p, n);
+		return;
+	}
+	if (p[0] == 4 && p[1] == 0x0e && n >= 6) {
+		uint16_t op = (uint16_t)(p[4] | (p[5] << 8));
+		if (op >= 0xfc00) {             /* our 0xFC14 etc. */
+			if (opt_verbose)
+				hexdump("drop CC", p, n);
+			return;
+		}
+		if (op == 0x1001 && n >= 15) {  /* Read Local Version: report the Broadcom identity */
+			uint8_t q[16];
+			memcpy(q, p, 15);
+			/* 04 0e 0c 01 01 10 | status hci_ver rev(2) lmp_ver manufacturer(2) subversion(2) */
+			say("Read Local Version from the WCN: manufacturer %u subversion %#x -> reported as Broadcom",
+			    q[11] | (q[12] << 8), q[13] | (q[14] << 8));
+			q[11] = ID_MANUF & 0xff, q[12] = ID_MANUF >> 8;
+			q[13] = ID_LMP_SUBVER & 0xff, q[14] = ID_LMP_SUBVER >> 8;
+			to_host(q, 15);
+			return;
+		}
+	}
+	to_host(p, n);
+}
+
+static void
+from_host(const uint8_t *p, size_t n)
+{
+	if (opt_verbose || opt_fake)
+		hexdump("H>  ", p, n);
+	if (p[0] == 1 && n >= 4) {
+		uint16_t op = (uint16_t)(p[1] | (p[2] << 8));
+		const uint8_t *par = p + 4;
+		size_t plen = n - 4;
+		if (opt_fake) {
+			answer_locally(op, par, plen);
+			return;
+		}
+		if (!controller_up) {
+			say("command %#06x before the controller is up: answered locally", op);
+			answer_locally(op, par, plen);
+			return;
+		}
+		if ((op >> 10) == 0x3f) {
+			translate_vsc(op, par, plen);
+			return;
+		}
+	}
+	if (opt_fake || !controller_up)
+		return;         /* ACL/SCO/ISO to nowhere */
+	c_write(p, n);
+}
+
+/* ---------------------------------------------------------------- daemon */
+
+static struct h4 h_h4;
+
+static int
+make_fifo(const char *path)
+{
+	if (mkfifo(path, 0666) < 0 && errno != EEXIST) {
+		say("mkfifo %s: %s", path, strerror(errno));
+		return -1;
+	}
+	chmod(path, 0666);
+	/* O_RDWR: a FIFO opened this way never blocks and always has a reader and a writer, so
+	 * bluetoothd's O_WRONLY open does not hang and its reader never sees EOF */
+	int fd = open(path, O_RDWR | O_NONBLOCK);
+	if (fd < 0)
+		say("open %s: %s", path, strerror(errno));
+	return fd;
+}
+
+static int
+ctl_listen(void)
+{
+	unlink(CTL_SOCK);
+	int s = socket(AF_UNIX, SOCK_STREAM, 0);
+	struct sockaddr_un a;
+	memset(&a, 0, sizeof(a));
+	a.sun_family = AF_UNIX;
+	strlcpy(a.sun_path, CTL_SOCK, sizeof(a.sun_path));
+	if (s < 0 || bind(s, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(s, 4) < 0) {
+		say("control socket: %s", strerror(errno));
+		return -1;
+	}
+	chmod(CTL_SOCK, 0666);
+	return s;
+}
+
+/* one request line from "btshim bluetool": boot | init | deepsleep | reset | cmd <text> */
+static void
+ctl_serve(int s)
+{
+	int c = accept(s, NULL, NULL);
+	if (c < 0)
+		return;
+	char line[256];
+	ssize_t n = read(c, line, sizeof(line) - 1);
+	if (n <= 0) {
+		close(c);
+		return;
+	}
+	line[n] = 0;
+	line[strcspn(line, "\r\n")] = 0;
+	int result = 0;
+	if (!strcmp(line, "boot") || !strcmp(line, "init")) {
+		if (!opt_fake)
+			result = controller_bringup() == 0 ? 0 : 1;
+	} else if (!strcmp(line, "reset")) {
+		controller_up = 0;
+		if (!opt_fake)
+			result = controller_bringup() == 0 ? 0 : 1;
+	}
+	/* deepsleep and RunCommand text: nothing to do yet */
+	say("bluetool request \"%s\" -> %d", line, result);
+	char out[32];
+	int k = snprintf(out, sizeof(out), "%d\n", result);
+	(void)write(c, out, (size_t)k);
+	close(c);
+}
+
+static int
+daemon_main(void)
+{
+	char in[256], out[256];
+	mkdir(RUN_DIR, 0755);
+	chmod(RUN_DIR, 0755);
+	snprintf(in, sizeof(in), "%s-in", opt_prefix);
+	snprintf(out, sizeof(out), "%s-out", opt_prefix);
+	host_rd = make_fifo(in);
+	host_wr = make_fifo(out);
+	int ls = ctl_listen();
+	if (host_rd < 0 || host_wr < 0 || ls < 0)
+		return 1;
+	/* bluetoothd's start gate: one of these must exist (it only calls access()) */
+	if (access("/dev/uart.bluetooth", F_OK) < 0 && access("/dev/cu.bluetooth", F_OK) < 0)
+		say("note: neither /dev/uart.bluetooth nor /dev/cu.bluetooth exists; bluetoothd also accepts an "
+		    "IOService named \"bluetooth\"");
+	say("btshim daemon: %s mode, host FIFOs %s / %s, speed %u", opt_fake ? "FAKE" : "real", in, out, opt_speed);
+	signal(SIGPIPE, SIG_IGN);
+	uint8_t buf[4096];
+	for (;;) {
+		fd_set r;
+		FD_ZERO(&r);
+		FD_SET(host_rd, &r);
+		FD_SET(ls, &r);
+		int mx = host_rd > ls ? host_rd : ls;
+		if (controller_up && ctl_notify[0] >= 0) {
+			FD_SET(ctl_notify[0], &r);
+			if (ctl_notify[0] > mx)
+				mx = ctl_notify[0];
+		}
+		int k = select(mx + 1, &r, NULL, NULL, NULL);
+		if (k < 0) {
+			if (errno == EINTR)
+				continue;
+			say("select: %s", strerror(errno));
+			return 1;
+		}
+		if (FD_ISSET(ls, &r))
+			ctl_serve(ls);
+		if (FD_ISSET(host_rd, &r)) {
+			ssize_t n = read(host_rd, buf, sizeof(buf));
+			if (n > 0)
+				h4_feed(&h_h4, buf, (size_t)n, from_host);
+		}
+		if (controller_up && ctl_notify[0] >= 0 && FD_ISSET(ctl_notify[0], &r)) {
+			while (read(ctl_notify[0], buf, sizeof(buf)) > 0)
+				;
+			size_t n;
+			while ((n = qca_rx_take(buf, sizeof(buf))) > 0)
+				h4_feed(&c_h4, buf, n, from_controller);
+		}
+	}
+}
+
+/* ---------------------------------------------------------------- com.apple.BlueTool */
+
+static int
+ask_daemon(const char *req)
+{
+	int s = socket(AF_UNIX, SOCK_STREAM, 0);
+	struct sockaddr_un a;
+	memset(&a, 0, sizeof(a));
+	a.sun_family = AF_UNIX;
+	strlcpy(a.sun_path, CTL_SOCK, sizeof(a.sun_path));
+	if (s < 0 || connect(s, (struct sockaddr *)&a, sizeof(a)) < 0) {
+		say("bluetool: daemon not reachable: %s", strerror(errno));
+		if (s >= 0)
+			close(s);
+		return 1;
+	}
+	(void)write(s, req, strlen(req));
+	(void)write(s, "\n", 1);
+	char b[32] = { 0 };
+	struct timeval tv = { 60, 0 };  /* a download takes a few seconds */
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	ssize_t n = read(s, b, sizeof(b) - 1);
+	close(s);
+	return n > 0 ? atoi(b) : 1;
+}
+
+static void
+bluetool_message(xpc_connection_t peer, xpc_object_t msg)
+{
+	const char *id = xpc_dictionary_get_string(msg, "kMsgId");
+	xpc_object_t args = xpc_dictionary_get_value(msg, "kMsgArgs");
+	xpc_object_t reply = xpc_dictionary_create_reply(msg);
+	if (!reply)
+		return;
+	if (id && !strcmp(id, "RunBuiltinScript")) {
+		const char *script = args ? xpc_dictionary_get_string(args, "script") : NULL;
+		const char *addr = args ? xpc_dictionary_get_string(args, "btaddress") : NULL;
+		say("bluetool: RunBuiltinScript \"%s\" btaddress %s", script ? script : "?", addr ? addr : "-");
+		int r = script ? ask_daemon(script) : 1;
+		xpc_dictionary_set_int64(reply, "result", r);
+		xpc_dictionary_set_int64(reply, "manufacturer", 0);
+		xpc_dictionary_set_string(reply, "firmware", "QCA WCN3988 apbtfw (btshim)");
+	} else if (id && !strcmp(id, "RunCommand")) {
+		const char *cmd = args ? xpc_dictionary_get_string(args, "command") : NULL;
+		say("bluetool: RunCommand \"%s\"", cmd ? cmd : "?");
+		xpc_dictionary_set_int64(reply, "result", 0);
+		xpc_dictionary_set_string(reply, "output", "");
+	} else {
+		say("bluetool: message %s ignored", id ? id : "(no kMsgId)");
+		xpc_dictionary_set_int64(reply, "result", 0);
+	}
+	xpc_connection_send_message(peer, reply);
+	xpc_release(reply);
+}
+
+static int
+bluetool_main(void)
+{
+	xpc_connection_t l = xpc_connection_create_mach_service("com.apple.BlueTool", NULL,
+	    XPC_CONNECTION_MACH_SERVICE_LISTENER);
+	xpc_connection_set_event_handler(l, ^(xpc_object_t peer) {
+		if (xpc_get_type(peer) != XPC_TYPE_CONNECTION)
+			return;
+		xpc_connection_set_event_handler(peer, ^(xpc_object_t m) {
+			if (xpc_get_type(m) == XPC_TYPE_DICTIONARY)
+				bluetool_message(peer, m);
+		});
+		xpc_connection_resume(peer);
+	});
+	xpc_connection_resume(l);
+	say("bluetool: listening as com.apple.BlueTool");
+	dispatch_main();
+}
+
+/* ---------------------------------------------------------------- main */
+
+static void
+usage(void)
+{
+	fprintf(stderr, "usage: btshim daemon [-F] | bluetool | probe | up   [-r tlv] [-n nvm] [-a addr] [-s speed] "
+	    "[-p fifo-prefix] [-v] [-I] [-k]\n");
+	exit(2);
+}
+
+int
+main(int argc, char **argv)
+{
+	if (argc < 2)
+		usage();
+	const char *mode = argv[1];
+	const char *env = getenv("BT_DEVICE_ADDRESS");
+	if (env && parse_addr(env, opt_bdaddr) == 0)
+		opt_have_addr = 1;
+	int c;
+	optind = 2;
+	while ((c = getopt(argc, argv, "Fd:r:n:a:s:p:vI")) != -1) {
+		switch (c) {
+		case 'F': opt_fake = 1; break;
+		case 'd': opt_dir = optarg; break;
+		case 'r': opt_ramp = optarg; break;
+		case 'n': opt_nvm = optarg; break;
+		case 'a':
+			if (parse_addr(optarg, opt_bdaddr) < 0)
+				usage();
+			opt_have_addr = 1;
+			break;
+		case 's': opt_speed = (uint32_t)strtoul(optarg, NULL, 0); break;
+		case 'p': opt_prefix = optarg; break;
+		case 'v': opt_verbose = qca_verbose = 1; break;
+		case 'I': qca_keep_ibs = 1; break;
+		default: usage();
+		}
+	}
+	if (!strcmp(mode, "daemon"))
+		return daemon_main();
+	if (!strcmp(mode, "bluetool"))
+		return bluetool_main();
+	usage();
+	return 2;
+}
