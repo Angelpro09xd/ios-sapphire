@@ -3,7 +3,7 @@
  * which has no bluetooth node yet), so Settings shows no Bluetooth row and Control Center no toggle. This ElleKit
  * tweak hooks MGGetBoolAnswer / MGCopyAnswer and answers
  *   "bluetooth" (obfuscated XSLlJd/8sMyXO0qtvvUTBQ)        -> true
- *   "BluetoothAddress" (k5lVWbXuiZHLA17KGiVUAA)            -> the address bluetoothd uses (/var/root/btfw/bdaddr,
+ *   "BluetoothAddress" (k5lVWbXuiZHLA17KGiVUAA)            -> the address bluetoothd uses (/redwood/share/btshim/bdaddr, readable by mobile:
  *                                                             written by install.sh; else nothing)
  * and, for BluetoothManager ("Could not get bluetooth address": it reads local-mac-address from the IOService
  * named "bluetooth", which the kernel does not publish yet), the same IOKit answers as btbridge.dylib gives
@@ -34,7 +34,7 @@ bt_address(void)
 {
 	static CFStringRef a;
 	if (!a) {
-		NSString *s = [NSString stringWithContentsOfFile:@"/var/root/btfw/bdaddr" encoding:NSUTF8StringEncoding error:nil];
+		NSString *s = [NSString stringWithContentsOfFile:@"/redwood/share/btshim/bdaddr" encoding:NSUTF8StringEncoding error:nil];
 		s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 		if (s.length == 17)
 			a = CFStringCreateCopy(NULL, (__bridge CFStringRef)s);
