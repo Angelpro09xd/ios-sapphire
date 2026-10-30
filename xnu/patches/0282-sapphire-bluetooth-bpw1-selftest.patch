@@ -1,0 +1,228 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0282: Bluetooth: one byte per FIFO word again, op 4 self-test
+
+0281's four-byte FIFO packing broke op 2 on the phone: HCI_Reset's TX never
+completed ("no done in 25 ms", status 0x41041) and the replies came back
+garbled. Back to 0280's one byte per FIFO word both ways (pack cfg 0xF / 0),
+which worked, now as BT_BPW. To keep up at 3 Mbaud the polling thread polls
+every ~20 us while bytes flow (RFR stops the controller at the FIFO watermark)
+and sleeps 1 ms after ~2 ms idle. The TX done wait is twice the FIFO's drain
+time at the current baud plus 50 ms.
+
+kern.sweet_bt = 4: a self-test, HCI_Reset + HCI_Read_Local_Version 20 times;
+each failure is logged (no event / wrong event), then the counts and the new
+RX overruns, parity/framing errors and ring drops. EBUSY while /dev/qcabt is
+open, like ops 2/3/9.
+---
+ bsd/dev/sweet_bt.c | 101 ++++++++++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 77 insertions(+), 24 deletions(-)
+
+diff --git a/bsd/dev/sweet_bt.c b/bsd/dev/sweet_bt.c
+index 0619137..e2aec2f 100755
+--- a/bsd/dev/sweet_bt.c
++++ b/bsd/dev/sweet_bt.c
+@@ -12,9 +12,12 @@
+  *   /dev/qcabt: raw H4 bytes both ways (write = to the controller; read = what it sent), filled
+  *     by a polling thread while the node is open; ops 2/3 answer EBUSY meanwhile.
+  *     0281: the ioctls of userland/bluetooth/qcabt.h (POWER, SETBAUD 1200..4000000, FLOW, FLUSH,
+- *     SWCTRL, DRAIN) and select(). Four bytes per FIFO word both ways (as Linux's GENI serial
+- *     driver); the polling thread polls every ~50 us while bytes flow and sleeps 1 ms once idle;
+- *     RX FIFO overruns, parity/framing errors, breaks and ring drops are counted and logged.
++ *     SWCTRL, DRAIN) and select(). The polling thread polls every ~20 us while bytes flow and
++ *     sleeps 1 ms once idle; RX FIFO overruns, parity/framing errors, breaks and ring drops are
++ *     counted and logged.
++ *     0282: back to one byte per FIFO word both ways (0281's four-byte packing broke TX and RX;
++ *     0280's one byte per word worked): BT_BPW. op 4: a self-test, HCI_Reset +
++ *     HCI_Read_Local_Version 20 times, failures counted.
+  *   At boot (0281) only device nodes are made, no hardware is touched: /dev/qcabt and two stubs,
+  *     /dev/uart.bluetooth and /dev/cu.bluetooth, whose open answers ENXIO (bluetoothd only checks
+  *     that the node exists). Boot-arg bt=0 skips them.
+@@ -140,6 +143,7 @@ static bool bt_flow_on = true;
+ static struct selinfo bt_sel;
+ static uint8_t bt_wbuf[2048];                   /* write(): under sweet_bt_mtx */
+ #define S_RX_FIFO_WR_ERR (1u << 25)
++#define BT_BPW          1u                      /* bytes per FIFO word (pack cfg 0xF / 0) */
+ #define S_GP_PARITY     ((1u << 9) | (1u << 10))
+ #define S_GP_BREAK      ((1u << 11) | (1u << 12))
+ #define QCABT_POWER     _IOW('q', 1, int)
+@@ -470,7 +474,7 @@ bt_init(void)
+ 	bt_tx_depth = (rd(bt_se, SE_HW_PARAM_0) >> 16) & 0x3f;
+ 	uint32_t rxd = (rd(bt_se, SE_HW_PARAM_1) >> 16) & 0x3f;
+ 	bt_tx_depth = bt_tx_depth ? bt_tx_depth : 16;
+-	/* FIFO mode, polled; four bytes per FIFO word both ways (geni_se_config_packing(8, 4)) */
++	/* FIFO mode, polled; one byte per FIFO word both ways (as 0280) */
+ 	wr(bt_se, M_CMD_CTRL, 1u << 1);                 /* abort anything left */
+ 	wr(bt_se, S_CMD_CTRL, 1u << 1);
+ 	IODelay(100);
+@@ -484,10 +488,10 @@ bt_init(void)
+ 	wr(bt_se, GENI_OUTPUT_CTRL, 0x7f);
+ 	wr(bt_se, GENI_FORCE_DEFAULT, 1);
+ 	wr(bt_se, SE_BYTE_GRAN, 0);
+-	wr(bt_se, TX_PACK0, 0x20E4380Eu);
+-	wr(bt_se, TX_PACK1, 0x30Fu);
+-	wr(bt_se, RX_PACK0, 0x20E4380Eu);
+-	wr(bt_se, RX_PACK1, 0x30Fu);
++	wr(bt_se, TX_PACK0, 0xF);
++	wr(bt_se, TX_PACK1, 0);
++	wr(bt_se, RX_PACK0, 0xF);
++	wr(bt_se, RX_PACK1, 0);
+ 	wr(bt_se, TX_WATERMARK, 0);
+ 	wr(bt_se, RX_WATERMARK, 0);
+ 	wr(bt_se, RX_RFR_WM, rxd > 2 ? rxd - 2 : 1);
+@@ -525,8 +529,8 @@ bt_count(const char *what, uint32_t *c)
+ }
+ 
+ /*
+- * what the RX FIFO holds into the ring. Four bytes per word; the last word may be partial (stale
+- * timeout): RX_FIFO_STATUS bit 31 with the valid byte count in bits 30:28 (qcom_geni_serial.c).
++ * what the RX FIFO holds into the ring, BT_BPW bytes per word; with more than one, the last word may
++ * be partial (stale timeout): RX_FIFO_STATUS bit 31 with the valid byte count in bits 30:28.
+  */
+ static unsigned
+ bt_rx_poll(void)
+@@ -537,11 +541,11 @@ bt_rx_poll(void)
+ 		if (wc == 0) {
+ 			break;
+ 		}
+-		unsigned lastb = (st >> 31) ? (st >> 28) & 7 : 0;
++		unsigned lastb = (BT_BPW > 1 && (st >> 31)) ? (st >> 28) & 7 : 0;
+ 		lck_mtx_lock(&sweet_bt_rxmtx);
+ 		for (uint32_t i = 0; i < wc; i++) {
+ 			uint32_t w = rd(bt_se, RX_FIFO);
+-			unsigned nb = (i + 1 == wc && lastb != 0) ? lastb : 4;
++			unsigned nb = (i + 1 == wc && lastb != 0) ? lastb : BT_BPW;
+ 			for (unsigned b = 0; b < nb; b++) {
+ 				if (bt_rhead - bt_rtail < BT_RING) {
+ 					bt_ring[bt_rhead % BT_RING] = (uint8_t)(w >> (8 * b));
+@@ -590,7 +594,7 @@ bt_tx(const uint8_t *p, uint32_t n)
+ 	wr(bt_se, M_IRQ_CLEAR, 0xffffffffu);
+ 	wr(bt_se, UART_TX_LEN, n);
+ 	wr(bt_se, M_CMD0, 1u << 27);                    /* UART_START_TX */
+-	uint32_t words = (n + 3) / 4;
++	uint32_t words = (n + BT_BPW - 1) / BT_BPW;
+ 	for (uint32_t i = 0; i < words; i++) {
+ 		int w = 0;
+ 		while ((rd(bt_se, TX_FIFO_STATUS) & 0x0fffffffu) >= bt_tx_depth && w < 2000) {
+@@ -601,19 +605,19 @@ bt_tx(const uint8_t *p, uint32_t n)
+ 			w++;
+ 		}
+ 		if (w >= 2000) {
+-			btlog("tx: the FIFO stays full after %u of %u bytes (CTS low?): aborted", i * 4, n);
++			btlog("tx: the FIFO stays full after %u of %u bytes (CTS low?): aborted", i * BT_BPW, n);
+ 			wr(bt_se, M_CMD_CTRL, 1u << 1);
+ 			return ETIMEDOUT;
+ 		}
+ 		uint32_t v = 0;
+-		for (uint32_t b = 0; b < 4 && i * 4 + b < n; b++) {
+-			v |= (uint32_t)p[i * 4 + b] << (8 * b);
++		for (uint32_t b = 0; b < BT_BPW && i * BT_BPW + b < n; b++) {
++			v |= (uint32_t)p[i * BT_BPW + b] << (8 * b);
+ 		}
+ 		wr(bt_se, TX_FIFO, v);
+ 	}
+-	/* the FIFO's last bytes at this baud, plus 20 ms */
++	/* twice the FIFO's last bytes at this baud, plus 50 ms */
+ 	uint32_t baud = bt_baud_now ? bt_baud_now : 115200;
+-	uint32_t ms = 20 + (uint32_t)(((uint64_t)(bt_tx_depth + 1) * 4 * 10 * 1000) / baud);
++	uint32_t ms = 50 + (uint32_t)(((uint64_t)(bt_tx_depth + 1) * BT_BPW * 10 * 1000 * 2) / baud);
+ 	for (uint32_t i = 0; i < ms * 10; i++) {
+ 		uint32_t s = rd(bt_se, M_IRQ_STATUS);
+ 		if (s & 1) {
+@@ -781,6 +785,49 @@ bt_info(void)
+ 	return n ? 0 : EIO;
+ }
+ 
++/* op 4: HCI_Reset + HCI_Read_Local_Version, 20 rounds; only failures are logged */
++static bool
++bt_expect_cc(const uint8_t *cmd, unsigned n, uint16_t opcode, unsigned round, const char *what)
++{
++	uint8_t ev[64];
++	if (bt_tx(cmd, n) != 0) {
++		btlog("round %u %s: tx failed", round, what);
++		return false;
++	}
++	unsigned got = bt_event(ev, sizeof(ev), 500);
++	if (got >= 7 && ev[1] == 0x0E && (ev[4] | ev[5] << 8) == opcode && ev[6] == 0) {
++		return true;
++	}
++	if (got == 0) {
++		btlog("round %u %s: no event in 500 ms", round, what);
++	} else {
++		char t[40];
++		snprintf(t, sizeof(t), "round %u %s: wrong event", round, what);
++		bt_hex(t, ev, got);
++	}
++	return false;
++}
++
++static int
++bt_selftest(void)
++{
++	if (!bt_up) {
++		btlog("op 4: UART not up (op 1 first)");
++		return EAGAIN;
++	}
++	static const uint8_t reset[] = { 0x01, 0x03, 0x0C, 0x00 }, lv[] = { 0x01, 0x01, 0x10, 0x00 };
++	unsigned fr = 0, fv = 0;
++	uint32_t o0 = bt_ovr, p0 = bt_par, d0 = bt_rdrops;
++	bt_ring_clear();
++	for (unsigned i = 0; i < 20; i++) {
++		fr += !bt_expect_cc(reset, sizeof(reset), 0x0C03, i, "HCI_Reset");
++		fv += !bt_expect_cc(lv, sizeof(lv), 0x1001, i, "Read_Local_Version");
++	}
++	btlog("self-test at %u baud: HCI_Reset %u/20 failed, Read_Local_Version %u/20 failed; new rx overruns %u, "
++	    "parity/framing %u, ring drops %u", bt_baud_now, fr, fv, bt_ovr - o0, bt_par - p0, bt_rdrops - d0);
++	return (fr || fv) ? EIO : 0;
++}
++
+ static int
+ bt_off(void)
+ {
+@@ -809,12 +856,15 @@ bt_rx_thread(void *arg __unused, wait_result_t wres __unused)
+ 			got = bt_rx_poll();
+ 		}
+ 		lck_mtx_unlock(&sweet_bt_mtx);
+-		/* 3 Mbaud is ~300 bytes/ms: every ~50 us while bytes flow (RFR holds the rest), 1 ms once idle */
++		/*
++		 * 3 Mbaud is ~300 bytes/ms, a byte per FIFO word: every ~20 us while bytes flow (RFR stops
++		 * the controller at the watermark), 1 ms after ~2 ms idle
++		 */
+ 		if (got != 0) {
+ 			idle = 0;
+-			IODelay(50);
+-		} else if (++idle < 40) {
+-			IODelay(50);
++			IODelay(20);
++		} else if (++idle < 100) {
++			IODelay(20);
+ 		} else {
+ 			IOSleep(1);
+ 		}
+@@ -1059,7 +1109,7 @@ sysctl_sweet_bt SYSCTL_HANDLER_ARGS
+ 	bt_logbuf[0] = 0;
+ 	btlog("op %d", v);
+ 	int r;
+-	if (bt_open_flag && (v == 2 || v == 3 || v == 9)) {
++	if (bt_open_flag && (v == 2 || v == 3 || v == 4 || v == 9)) {
+ 		btlog("op %d: /dev/qcabt is open", v);
+ 		r = EBUSY;
+ 	} else {
+@@ -1076,6 +1126,9 @@ sysctl_sweet_bt SYSCTL_HANDLER_ARGS
+ 		case 3:
+ 			r = bt_info();
+ 			break;
++		case 4:
++			r = bt_selftest();
++			break;
+ 		case 9:
+ 			r = bt_off();
+ 			break;
+@@ -1091,7 +1144,7 @@ sysctl_sweet_bt SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_bt, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+-    0, 0, sysctl_sweet_bt, "I", "Bluetooth UART: 1 up, 2 power pulse + reset + version, 3 local version + BD_ADDR, 9 off");
++    0, 0, sysctl_sweet_bt, "I", "Bluetooth UART: 1 up, 2 power pulse + reset + version, 3 local version + BD_ADDR, 4 self-test, 9 off");
+ 
+ static int
+ sysctl_sweet_bt_log SYSCTL_HANDLER_ARGS
