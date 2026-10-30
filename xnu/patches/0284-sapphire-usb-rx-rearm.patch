@@ -1,0 +1,74 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0284: usb: re-arm a silent RX endpoint, retry a refused RX start
+
+Under sustained host->phone traffic RX stopped for good: its TRB still armed, no event, the
+phone's own frames still going out, the host's cdc_ether timing out every 5 s until usbipd
+dropped the device (a few MB per transfer at most). The watchdog re-arms RX after 2 s of
+silence, and an RX start the controller refuses is ended and retried. kern.sweet_usb_stats
+counts the re-arms.
+---
+ bsd/dev/sweet_usb.c | 29 ++++++++++++++++++++++++++---
+ 1 file changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 19d1b23..42f0f18 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -229,6 +229,7 @@ static struct {
+ 	uint32_t    resets;
+ 	/* transfers the controller finished without an event reaching us (ud_watch) */
+ 	uint32_t    lost_rx, lost_tx, stale_rx;
++	uint32_t    rx_rearms;      /* RX armed but silent, ended and armed again (ud_watch) */
+ 	uint64_t    watch_rx, watch_tx;
+ } ud;
+ 
+@@ -516,7 +517,12 @@ ud_setup(void)
+ static void
+ ud_rx_arm(void)
+ {
+-	ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, UD_FRAME_MAX, TRBCTL_NORMAL);
++	/* refused (a transfer still held by the controller): end it and arm again, or RX is dead for good */
++	if (ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, UD_FRAME_MAX, TRBCTL_NORMAL) != 0) {
++		ud.xfer_active[EP_RX] = true;
++		ud_end_transfer(EP_RX);
++		(void)ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, UD_FRAME_MAX, TRBCTL_NORMAL);
++	}
+ }
+ 
+ static void
+@@ -849,6 +855,23 @@ ud_watch(void)
+ 		rx_idle = false;
+ 	}
+ 	rx_seen = rx_idle;
++	/*
++	 * RX armed (HWO still set) and not a frame in 2 s: the link died that way under load too --
++	 * the host's bulk OUT never completing, its cdc_ether "transmit queue timed out" every 5 s,
++	 * until usbipd gave the device up, while the phone's own frames kept going out. End the
++	 * transfer and arm it again; on a link that is merely idle that costs nothing.
++	 */
++	static unsigned rx_silent;
++	if (ud.xfer_active[EP_RX] && (rt[3] & TRB_HWO) && ud.rx_frames == ud.watch_rx) {
++		if (++rx_silent >= 4) {
++			rx_silent = 0;
++			ud.rx_rearms++;
++			ud_end_transfer(EP_RX);
++			ud_rx_arm();
++		}
++	} else {
++		rx_silent = 0;
++	}
+ 	ud.watch_rx = ud.rx_frames;
+ 
+ 	lck_mtx_lock(ud.lock);
+@@ -882,9 +905,9 @@ sysctl_sweet_usb_stats SYSCTL_HANDLER_ARGS
+ 		dsts = dwc_rd(DSTS);
+ 	}
+ 	snprintf(buf, sizeof(buf), "configured %d events %u resets %u; rx %llu frames (trb %08x, active %d) tx %llu "
+-	    "frames (trb %08x, busy %d, queue %u); without event: rx %u tx %u, late rx %u; DSTS %08x",
++	    "frames (trb %08x, busy %d, queue %u); without event: rx %u tx %u, late rx %u; rx rearms %u; DSTS %08x",
+ 	    ud.configured, ud.events, ud.resets, ud.rx_frames, rx3, ud.xfer_active[EP_RX], ud.tx_frames, tx3,
+-	    ud.tx_busy, ud.txq_count, ud.lost_rx, ud.lost_tx, ud.stale_rx, dsts);
++	    ud.tx_busy, ud.txq_count, ud.lost_rx, ud.lost_tx, ud.stale_rx, ud.rx_rearms, dsts);
+ 	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_usb_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,

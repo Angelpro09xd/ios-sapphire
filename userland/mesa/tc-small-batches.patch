@@ -1,0 +1,23 @@
+threaded context: small batches, so freedreno's driver thread works while the frame is recorded
+(1536 slots held a whole CoreAnimation frame: the driver thread started only at glFlush)
+
+--- a/src/gallium/auxiliary/util/u_threaded_context.h
++++ b/src/gallium/auxiliary/util/u_threaded_context.h
+@@ -242,7 +242,7 @@
+  * so that the queue isn't stalled too often for not having enough idle batch
+  * slots.
+  */
+-#define TC_MAX_BATCHES        10
++#define TC_MAX_BATCHES        32
+ 
+ /* The size of one batch. Non-trivial calls (i.e. not setting a CSO pointer)
+  * can occupy multiple call slots.
+@@ -250,7 +250,7 @@
+  * The idea is to have batches as small as possible but large enough so that
+  * the queuing and mutex overhead is negligible.
+  */
+-#define TC_SLOTS_PER_BATCH    1536
++#define TC_SLOTS_PER_BATCH    384
+ 
+ /* The buffer list queue is much deeper than the batch queue because buffer
+  * lists need to stay around until the driver internally flushes its command

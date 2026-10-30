@@ -263,6 +263,7 @@ struct image {
 	unsigned quiet, look_again;     /* ... looks in a row that found no change, and the frame of the next one */
 	GLenum to, internal, format, type;
 	uint32_t plane, seed;
+	unsigned seed_frame;            /* the frame whose binds already asked the surface's seed (my_glBindTexture) */
 	GLsizei width, height;
 };
 
@@ -287,7 +288,8 @@ struct eagl {
 	GLuint reader;                  /* a framebuffer of ours, to read a texture back */
 	GLuint writer;                  /* ... and one to copy a frame into its surface with (blit_targets) */
 	GLuint program;                 /* the one in use, as CoreAnimation has it */
-	GLuint plain, lookup;           /* programs of ours for when that is none (plain_draw_begin()) */
+	GLuint gl_program;              /* ... and the one bound in the library now (use_program()) */
+	GLuint plain, lookup;          /* programs of ours for when that is none (plain_draw_begin()) */
 	GLint plain_matrix, plain_textured, lookup_matrix;
 	GLuint vibrant, masking;        /* two more: what a colour matrix does to what is behind, and to the layer */
 	int blended;                    /* blending is off for such a draw, to be put back after it */
@@ -351,7 +353,23 @@ struct eagl {
 	unsigned plain_said;
 };
 
-static unsigned trace_first, trace_last;        /* the frames whose calls are written down */
+/*
+ * A program change is the dearest state change for the library (its validation at the next draw):
+ * CoreAnimation sets the same program again and again, and every draw of ours with no program of
+ * CoreAnimation's swapped one in and back out. The program bound is remembered per context and
+ * only a different one is handed on. Every glUseProgram in this file goes through here.
+ */
+static inline void
+use_program(struct eagl *e, GLuint program)
+{
+	if (e->gl_program != program) {
+		e->gl_program = program;
+		glUseProgram(program);
+	}
+}
+#define glUseProgram(p) use_program(e, (p))
+
+static unsigned trace_first, trace_last;       /* the frames whose calls are written down */
 static uint64_t trace_at;                       /* ... or the first frame from this time on (now_us()) */
 static unsigned trace_draws;                    /* ... or the first frame after one of so many draws */
 static unsigned trace_frames = 1, trace_left;   /* ... and how many frames from there on */
@@ -1968,8 +1986,13 @@ my_glBindTexture(void *context, GLenum target, GLuint texture)
 	if (target == GL_TEXTURE_2D && e->unit < 8) {
 		e->bound[e->unit] = texture;
 	}
+	/*
+	 * The seed is asked once a frame per picture: CoreAnimation binds the same ones many times in
+	 * a frame, and every IOSurfaceGetSeed was a trip into the kernel (~20 us a bind, glprofile).
+	 */
 	if (texture != 0 && e->image_count != 0 && (image = image_of(e, texture)) != NULL && !image->shared &&
-	    (!image->target ? IOSurfaceGetSeed(image->surface) != image->seed || surface_changed(e, image) :
+	    (!image->target ? (image->seed_frame != e->frames + 1 && (image->seed_frame = e->frames + 1,
+	    IOSurfaceGetSeed(image->surface) != image->seed)) || surface_changed(e, image) :
 	    image->wrapped && !image->painted && surface_changed(e, image))) {
 		surface_to_texture(e, image);
 	}
@@ -3795,7 +3818,7 @@ plain_draw_end(struct eagl *e, const GLint enabled[4])
 		glActiveTexture(GL_TEXTURE0 + e->unit);
 		e->vblur_bound = false;
 	}
-	glUseProgram(0);
+	/* (our program stays bound: the next such draw needs it again; any other draw binds CoreAnimation's first) */
 	if (e->blended) {
 		glEnable(GL_BLEND);
 		e->blended = 0;
@@ -3891,6 +3914,9 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 		group_draw_end(e, enabled);
 	} else {
 		plain = plain_draw_begin(e, enabled);
+		if (!plain) {
+			use_program(e, e->program);     /* (a draw of ours before may have left its program bound) */
+		}
 		glDrawArrays(mode, first, count);
 		if (plain) {
 			plain_draw_end(e, enabled);
@@ -3931,6 +3957,9 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 		group_draw_end(e, enabled);
 	} else {
 		plain = plain_draw_begin(e, enabled);
+		if (!plain) {
+			use_program(e, e->program);     /* (see my_glDrawArrays) */
+		}
 		glDrawElements(mode, count, type, indices);
 		if (plain) {
 			plain_draw_end(e, enabled);

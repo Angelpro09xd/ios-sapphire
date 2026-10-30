@@ -1,0 +1,73 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0283: framebuffer: 90/120 Hz vsync and published mode (sweetfb_hz)
+
+The panel (n7_38_0c_0a) has a single 120 Hz timing and the INTF already scans 120 frames a
+second; iOS was told 60 Hz and got a 60 Hz vsync. sweetfb_hz=90 or 120 now publishes that rate
+in TimingElements and ticks the vsync notification on an absolute grid at it.
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 8b76fc1..38a56b7 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -226,6 +226,7 @@ public:
+ 	bool          directPresent(const uint8_t *rec);
+ 	void          scanFrom(uint64_t pa, uint32_t stride);
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
++	uint32_t      fRateHz;        /* vsync and published refresh rate: 60, 90 or 120 (sweetfb_hz) */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fPowerOns;      /* 0236: display-on requests so far, up to 2 (the second: the UI is up) */
+ 	uint64_t      fStartAbs;      /* mach_absolute_time() at start */
+@@ -539,7 +540,13 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	/*
++	 * The panel's only timing is 120 Hz (dfps by the vertical front porch, the INTF counts 120
++	 * frames a second): with sweetfb_hz=90/120 CoreAnimation is told that rate and the vsync ticks
++	 * at it, so frames that are ready sooner are shown sooner. Below 60, ticks stay at 60.
++	 */
++	fRateHz = hz >= 120 ? 120 : hz >= 90 ? 90 : 60;
++	fVsync->setTimeoutUS(1000000 / fRateHz);
+ 
+ 	publishModes();
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -581,7 +588,7 @@ AppleCLCD::publishModes(void)
+ 	OSDictionary *color = OSDictionary::withCapacity(8);
+ 	OSArray *timings = OSArray::withCapacity(1);
+ 	OSArray *colors = OSArray::withCapacity(1);
+-	const uint32_t rate = 60u << 16;        /* 16.16 */
++	const uint32_t rate = fRateHz << 16;    /* 16.16 */
+ 
+ 	if (timing != NULL && horizontal != NULL && vertical != NULL && color != NULL && timings != NULL && colors != NULL) {
+ 		sweet_set_number(color, "ID", SWEET_FB_COLOR_ID);
+@@ -611,7 +618,7 @@ AppleCLCD::publishModes(void)
+ 		timings->setObject(timing);
+ 		setProperty("TimingElements", timings);
+ 		setProperty("ColorElements", colors);
+-		IOLog("SWEET FB: modes published: %ux%u at 60 Hz\n", fLogicalW, fLogicalH);
++		IOLog("SWEET FB: modes published: %ux%u at %u Hz\n", fLogicalW, fLogicalH, fRateHz);
+ 	}
+ 	OSSafeReleaseNULL(timings);
+ 	OSSafeReleaseNULL(colors);
+@@ -639,7 +646,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+-	if (fb->fIntf1 != NULL && (count % 300) == 0) {
++	if (fb->fIntf1 != NULL && (count % (5 * fb->fRateHz)) == 0) {
+ 		uint32_t frames = fb->fIntf1[(0x800 + 0x0ac) / 4];
+ 		IOLog("SWEET INTF1: %u frames in 5 s (line %u, te_en %#x)\n",
+ 		    frames - fb->fIntfFrames, fb->fIntf1[(0x800 + 0x0b0) / 4], fb->fIntf1[0x800 / 4]);
+@@ -781,7 +788,7 @@ void
+ AppleCLCD::armVsync(IOTimerEventSource *t)
+ {
+ 	uint64_t period, now = mach_absolute_time();
+-	nanoseconds_to_absolutetime(16666667ull, &period);
++	nanoseconds_to_absolutetime(1000000000ull / (fRateHz ? fRateHz : 60), &period);
+ 	if (fNextVsync == 0 || now > fNextVsync + period) {
+ 		fNextVsync = now;
+ 	}
