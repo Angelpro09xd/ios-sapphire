@@ -1,0 +1,78 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0285: touch: read every 4 ms while a finger is down
+
+The poll loop slept 10 ms after each read and every read of the contacts slept a flat 2 ms
+for ~0.25 ms of I2C: ~75 reads a second, unevenly spaced, so a dragged page moved in uneven
+steps on the 120 Hz panel. While a contact is down the IC is now read on an absolute 4 ms grid
+(a read with no new frame is just the header); idle stays at 10 ms. The in-transfer sleep is
+sized by the bytes read.
+---
+ bsd/dev/sweet_touch.c | 34 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 67d4cc8..4ffbaf1 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -125,6 +125,21 @@ touch_wait(unsigned ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++static void
++touch_wait_until(uint64_t deadline)
++{
++	(void)assert_wait_deadline(&touch_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++touch_wait_us(unsigned us)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
++	touch_wait_until(deadline);
++}
++
+ static bool
+ touch_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
+ {
+@@ -255,7 +270,11 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ 	touch_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
+ 	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
+ 	if (nr > 8 && !st.probing) {
+-		touch_wait(2); /* sleep, do not spin, through most of the transfer */
++		/*
++		 * Sleep, do not spin, through most of the transfer: ~22 us a byte at 400 kHz. It was
++		 * a flat 2 ms -- for the 10 bytes of one contact, 0.25 ms of bus -- in every poll.
++		 */
++		touch_wait_us(nr * 18u);
+ 	}
+ 	int err = ETIMEDOUT;
+ 	for (unsigned i = 0; i < 5000; ++i) {
+@@ -753,6 +772,15 @@ touch_thread(void *arg, wait_result_t result)
+ 	printf("SWEET TOUCH: selected %s, 1080x2400, poll=10ms irq-hint=%d\n",
+ 	    goodix ? "GT9896 Yellowstone" : "Focaltech 54:52", st.irq_hint);
+ 	unsigned errors = 0, ticks = 0, polls = 0;
++	uint64_t next = 0, period_down, period_up;
++	/*
++	 * While a finger is down the IC is read every 4 ms on an absolute grid (250 Hz; a read that
++	 * finds no new frame is the 8-byte header alone). It was 10 ms after the read, ~13 ms a poll
++	 * in all (~75 Hz, irregular): a page dragged on the 120 Hz panel moved in uneven steps.
++	 * With no finger down, 10 ms as before.
++	 */
++	nanoseconds_to_absolutetime(4 * NSEC_PER_MSEC, &period_down);
++	nanoseconds_to_absolutetime(10 * NSEC_PER_MSEC, &period_up);
+ 	while (!st.dead) {
+ 		if (st.diag == 2 && ++polls == 3000) {  /* ~30 s at 10 ms */
+ 			panic("SWEET TOUCH stats: frames=%u errs=%u lasterr=%d maxn=%u hid down=%u up=%u last=%d,%d | "
+@@ -780,7 +808,9 @@ touch_thread(void *arg, wait_result_t result)
+ 				errors = 0;
+ 			}
+ 		}
+-		touch_wait(10);
++		uint64_t period = st.active ? period_down : period_up, now = mach_absolute_time();
++		next = (next == 0 || now > next + period) ? now + period : next + period;
++		touch_wait_until(next);
+ 	}
+ 	touch_report(0, st.x, st.y);
+ out:
