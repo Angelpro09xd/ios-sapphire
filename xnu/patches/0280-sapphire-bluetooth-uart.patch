@@ -1,0 +1,840 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0280: Bluetooth phase 1: WCN3988 UART on QUP0 SE3
+
+A first look at the Bluetooth controller (research/bluetooth.md, phase 1). New
+bsd/dev/sweet_bt.c, nothing runs at boot:
+  kern.sweet_bt = 1: RPM votes for L9/L16/L17/L23 (shared with Wi-Fi and the
+    fingerprint sensor: never turned off), the SE3 clocks (GCC vote 0x7900c bit
+    13, CBCR 0x1f4d4, RCG 0x1f4d8, read from gcc-khaje.ko; each register logged
+    before it is written), then SE3's FW_REVISION: protocol (bits 15:8) must be 2
+    (UART) before anything else is touched. Then GPIO 8-11 to qup3 (function 1 in
+    pinctrl-khaje.ko, eGPIO bit kept), the SE clock rate (a DFS level that fits,
+    else the RCG at 7.3728 MHz) and the GENI UART in FIFO mode, polled, 115200
+    8N1 with RTS/CTS.
+  = 2: the power pulse (0xFC at 2400 baud, no flow control), back to 115200,
+    HCI_Reset (expects 04 0E 04 01 03 0C 00) and EDL_PATCH_VER_REQ (0xFC00 sub-op
+    0x19), every reply byte logged.
+  = 3: HCI_Read_Local_Version and HCI_Read_BD_ADDR.
+  = 9: the UART stopped; the rails stay voted.
+kern.sweet_bt_log holds the last request's log (also in the kernel log).
+/dev/qcabt (made at op 1): raw H4 bytes both ways, a polling thread fills an
+8 KB ring only while the node is open. Every wait is bounded.
+ bsd/conf/files     |   1 +
+ bsd/dev/sweet_bt.c | 797 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 798 insertions(+)
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 8f82666..afd499d 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -118,6 +118,7 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_vibrate.c			standard
+ bsd/dev/sweet_cam.c			standard
++bsd/dev/sweet_bt.c			standard
+ bsd/dev/sweet_audio_ctl.c		standard
+ bsd/dev/sweet_audio_dev.c		standard
+ bsd/dev/sweet_qmi_dev.c			standard
+diff --git a/bsd/dev/sweet_bt.c b/bsd/dev/sweet_bt.c
+new file mode 100755
+index 0000000..c116a9c
+--- /dev/null
++++ b/bsd/dev/sweet_bt.c
+@@ -0,0 +1,797 @@
++/*
++ * sapphire 0280: Bluetooth phase 1 (research/bluetooth.md): the WCN3988's BT side on its UART,
++ * QUP0 SE3 (0x04a8c000) in GENI FIFO mode, polled. Nothing runs at boot.
++ *   kern.sweet_bt = op: 1 rails (RPM votes L9/L16/L17/L23, never off), SE3 clocks (vote 0x7900c
++ *     bit 13, CBCR 0x1f4d4, RCG 0x1f4d8: gcc-khaje.ko), the SE's protocol checked (FW_REVISION
++ *     0x68 bits 15:8 == 2, UART) before anything else, GPIO 8-11 to qup3 (function 1,
++ *     pinctrl-khaje.ko), then the UART at 115200 8N1 with RTS/CTS; 2 the power pulse (0xFC at 2400
++ *     baud, no flow control), HCI_Reset and the Qualcomm version request (0xFC00 sub-op 0x19);
++ *     3 HCI_Read_Local_Version and HCI_Read_BD_ADDR; 9 off (UART stopped, rails stay voted: they
++ *     feed Wi-Fi and the fingerprint sensor too). Reading it gives the last result.
++ *   kern.sweet_bt_log: the log of the last request (also in the kernel log, "SWEET BT:").
++ *   /dev/qcabt: raw H4 bytes both ways (write = to the controller; read = what it sent), filled
++ *     by a polling thread while the node is open; ops 2/3 answer EBUSY meanwhile.
++ * UART clock: SE3's RCG is in DFS mode on Qualcomm boards (its levels set by the boot loader):
++ * the first level within 1.5 % of 115200 and 2400 x oversampling is picked (GENI_CLK_SEL), else the RCG
++ * is programmed to 7.3728 MHz (GPLL0 even 300 MHz x 384/15625, the kernel's own table entry).
++ * Every wait bounded, every step logged.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <stdbool.h>
++#include <stdarg.h>
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <sys/vnode.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void IODelay(unsigned microseconds);
++extern void IOSleep(unsigned milliseconds);
++extern kern_return_t thread_terminate(thread_t);
++extern int topaz_rpm_ldo(uint32_t id, uint32_t uv, uint32_t ma, uint32_t set);
++
++#define BT_SE_PA        0x04a8c000u
++#define BT_QUP_PA       0x04ac0000u             /* QUPv3_0 wrapper: hw version at +0x4 */
++#define GCC_PA          0x01400000u
++#define GCC_VOTE        0x7900cu                /* 0x79000 window */
++#define BT_VOTE_BITS    0x23C0u                 /* m_ahb 6, s_ahb 7, core 8, core_2x 9, s3 13 */
++#define BT_CBCR         0x1f4d4u                /* gcc_qupv3_wrap0_s3_clk (0x1f000 window) */
++#define BT_RCG          0x1f4d8u                /* its clk_src: CMD, CFG +4, M +8, N +0xC, D +0x10 */
++#define RCG_DFSR        0x14u
++#define RCG_PERF(l)     (0x1Cu + 4u * (l))
++#define RCG_PERF_M(l)   (0x5Cu + 4u * (l))
++#define RCG_PERF_N(l)   (0x9Cu + 4u * (l))
++static const unsigned bt_pins[4] = { 8, 9, 10, 11 };   /* CTS, RTS, TX, RX */
++#define BT_SWCTRL       87
++
++/* GENI (qcom-geni-se.h, qcom_geni_serial.c) */
++#define GENI_FORCE_DEFAULT 0x020
++#define GENI_OUTPUT_CTRL 0x024
++#define GENI_CGC_CTRL   0x028
++#define GENI_STATUS     0x040
++#define GENI_M_CLK_CFG  0x048
++#define GENI_S_CLK_CFG  0x04C
++#define GENI_FW_REV     0x068
++#define GENI_CLK_SEL    0x07C
++#define UART_LOOPBACK   0x22C
++#define SE_BYTE_GRAN    0x254
++#define SE_DMA_MODE_EN  0x258
++#define UART_TX_CFG     0x25C
++#define TX_PACK0        0x260
++#define TX_PACK1        0x264
++#define UART_TX_WORDLEN 0x268
++#define UART_TX_STOPLEN 0x26C
++#define UART_TX_LEN     0x270
++#define UART_RX_CFG     0x280
++#define RX_PACK0        0x284
++#define RX_PACK1        0x288
++#define UART_RX_WORDLEN 0x28C
++#define UART_RX_STALE   0x294
++#define UART_TX_PARITY  0x2A4
++#define UART_RX_PARITY  0x2A8
++#define UART_MANUAL_RFR 0x2AC
++#define M_CMD0          0x600
++#define M_CMD_CTRL      0x604
++#define M_IRQ_STATUS    0x610
++#define M_IRQ_EN        0x614
++#define M_IRQ_CLEAR     0x618
++#define S_CMD0          0x630
++#define S_CMD_CTRL      0x634
++#define S_IRQ_STATUS    0x640
++#define S_IRQ_EN        0x644
++#define S_IRQ_CLEAR     0x648
++#define TX_FIFO         0x700
++#define RX_FIFO         0x780
++#define TX_FIFO_STATUS  0x800
++#define RX_FIFO_STATUS  0x804
++#define TX_WATERMARK    0x80C
++#define RX_WATERMARK    0x810
++#define RX_RFR_WM       0x814
++#define SE_GSI_EVENT_EN 0xE18
++#define SE_IRQ_EN       0xE1C
++#define SE_HW_PARAM_0   0xE24
++#define SE_HW_PARAM_1   0xE28
++#define SE_DMA_GENERAL  0xE30
++#define M_CMD_ACTIVE    (1u << 0)
++#define S_CMD_ACTIVE    (1u << 12)
++
++static LCK_GRP_DECLARE(sweet_bt_grp, "sweet_bt");
++static LCK_MTX_DECLARE(sweet_bt_mtx, &sweet_bt_grp);       /* the hardware */
++static LCK_MTX_DECLARE(sweet_bt_rxmtx, &sweet_bt_grp);     /* the RX ring */
++static vm_offset_t bt_se, bt_gcc1f, bt_gcc79, bt_qup, bt_pin[4], bt_sw;
++static bool bt_up, bt_open_flag;
++static volatile bool bt_rx_run, bt_rx_alive;
++static int bt_last = -1;
++static unsigned bt_samp = 32, bt_level = 0, bt_tx_depth = 16;
++static uint64_t bt_clk_hz;
++static char bt_logbuf[8192];
++static size_t bt_loglen;
++#define BT_RING 8192
++static uint8_t bt_ring[BT_RING];
++static volatile uint32_t bt_rhead, bt_rtail;
++static uint32_t bt_rdrops;
++static int bt_major = -1;
++
++static void
++btlog(const char *fmt, ...)
++{
++	char line[256];
++	va_list ap;
++	va_start(ap, fmt);
++	int n = vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++	if (n < 0) {
++		return;
++	}
++	printf("SWEET BT: %s\n", line);
++	if (bt_loglen + strlen(line) + 2 < sizeof(bt_logbuf)) {
++		bt_loglen += (size_t)snprintf(bt_logbuf + bt_loglen, sizeof(bt_logbuf) - bt_loglen, "%s\n", line);
++	}
++}
++
++static inline uint32_t rd(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void wr(vm_offset_t b, uint32_t o, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(b + o) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static vm_offset_t
++pin_map(unsigned gpio)
++{
++	static const char tile[] = "WWWWWWWWEEEEWWWWWWEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEWWWWWWWSSSSSSSSWWWWWWWEEWEEWWWWWWSSSSSSSSSSSSSSS";
++	uint64_t base = tile[gpio] == 'S' ? 0x00900000ull : tile[gpio] == 'E' ? 0x00D00000ull : 0x00500000ull;
++	return ml_io_map(base + gpio * 0x1000ull, 0x1000);
++}
++
++/* everything mapped once */
++static bool
++bt_map(void)
++{
++	if (bt_se != 0) {
++		return true;
++	}
++	bt_gcc1f = ml_io_map(GCC_PA + 0x1f000, 0x1000);
++	bt_gcc79 = ml_io_map(GCC_PA + 0x79000, 0x1000);
++	bt_qup = ml_io_map(BT_QUP_PA, 0x1000);
++	for (unsigned i = 0; i < 4; i++) {
++		bt_pin[i] = pin_map(bt_pins[i]);
++	}
++	bt_sw = pin_map(BT_SWCTRL);
++	bt_se = ml_io_map(BT_SE_PA, 0x4000);
++	return bt_se && bt_gcc1f && bt_gcc79 && bt_qup && bt_pin[0] && bt_pin[1] && bt_pin[2] && bt_pin[3] && bt_sw;
++}
++
++/* ---------------------------------------------------------------- op 1 */
++
++static bool
++bt_rails(void)
++{
++	static const struct { uint32_t id, uv, ma; const char *name; } r[4] = {
++		{ 9, 1800000, 15, "L9 vdd-io 1.8 V" }, { 16, 1800000, 80, "L16 vdd-xtal 1.8 V" },
++		{ 17, 1304000, 300, "L17 vdd-core 1.304 V" }, { 23, 3200000, 450, "L23 vdd-pa 3.2 V" },
++	};
++	bool ok = true;
++	for (unsigned i = 0; i < 4; i++) {
++		int v = topaz_rpm_ldo(r[i].id, r[i].uv, r[i].ma, 0);
++		btlog("rail %s (%u mA), active set: %d (0: taken)", r[i].name, r[i].ma, v);
++		ok = ok && v == 0;
++	}
++	return ok;
++}
++
++static void
++bt_pins_mux(void)
++{
++	/* CTS, RTS, TX: qup3 (function 1), 2 mA, no pull; RX: pull-up (the line idles high) */
++	for (unsigned i = 0; i < 4; i++) {
++		volatile uint32_t *g = (volatile uint32_t *)bt_pin[i];
++		uint32_t ctl = g[0], io = g[1];
++		uint32_t nv = (1u << 2) | (i == 3 ? 3u : 0u) | ((ctl & (1u << 11)) ? (1u << 12) : 0);
++		g[0] = nv;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		btlog("gpio%u: ctl %#x io %#x -> ctl %#x io %#x", bt_pins[i], ctl, io, g[0], g[1]);
++	}
++	volatile uint32_t *s = (volatile uint32_t *)bt_sw;
++	btlog("gpio%u (SW_CTRL, input): ctl %#x level %u", BT_SWCTRL, s[0], s[1] & 1);
++}
++
++static bool
++bt_clocks(void)
++{
++	uint32_t vote = rd(bt_gcc79, GCC_VOTE & 0xfff), cbcr = rd(bt_gcc1f, BT_CBCR & 0xfff);
++	btlog("GCC QUP vote %#x, s3 CBCR %#x, RCG cmd %#x cfg %#x", vote, cbcr, rd(bt_gcc1f, BT_RCG & 0xfff),
++	    rd(bt_gcc1f, (BT_RCG + 4) & 0xfff));
++	wr(bt_gcc79, GCC_VOTE & 0xfff, vote | BT_VOTE_BITS);
++	for (int i = 0; i < 100; i++) {
++		if ((rd(bt_gcc1f, BT_CBCR & 0xfff) >> 31) == 0) {
++			btlog("SE3 clock on: vote %#x CBCR %#x", rd(bt_gcc79, GCC_VOTE & 0xfff), rd(bt_gcc1f, BT_CBCR & 0xfff));
++			return true;
++		}
++		IODelay(10);
++	}
++	btlog("SE3 clock still off after 1 ms (CBCR %#x): stop", rd(bt_gcc1f, BT_CBCR & 0xfff));
++	return false;
++}
++
++/* the SE clock: a DFS level that gives 115200 exactly, else the RCG at 7.3728 MHz */
++static bool
++bt_clock_rate(void)
++{
++	static const uint64_t parent[8] = { 19200000, 600000000, 300000000, 0, 0, 0, 0, 0 };
++	uint32_t rcg = BT_RCG & 0xfff;
++	uint32_t dfs = rd(bt_gcc1f, rcg + RCG_DFSR);
++	btlog("RCG DFS register %#x (%s)", dfs, (dfs & 1) ? "DFS on" : "DFS off");
++	if (dfs & 1) {
++		int best = -1;
++		uint64_t best_rate = 0;
++		for (unsigned l = 0; l < 8; l++) {
++			uint32_t cfg = rd(bt_gcc1f, rcg + RCG_PERF(l)), src = (cfg >> 8) & 7, hid = cfg & 0x1f, mode = (cfg >> 12) & 3;
++			uint64_t rate = parent[src];
++			uint32_t m = 0, n = 0;
++			if (mode != 0) {
++				m = rd(bt_gcc1f, rcg + RCG_PERF_M(l)) & 0xffff;
++				n = ((~rd(bt_gcc1f, rcg + RCG_PERF_N(l))) & 0xffff) + m;
++				n &= 0xffff;
++				rate = n ? rate * m / n : 0;
++			}
++			if (hid != 0) {
++				rate = rate * 2 / (hid + 1);
++			}
++			btlog("DFS level %u: cfg %#x (src %u, div %u, mode %u, m %u n %u) = %llu Hz", l, cfg, src, hid, mode, m, n, rate);
++			/* both 115200 and 2400 within 1.5 % (integer divider, 12 bits) */
++			uint64_t d1 = rate / (115200ull * bt_samp), d2 = rate / (2400ull * bt_samp);
++			bool fits = rate != 0 && d1 != 0 && d2 != 0 && d2 <= 0xfff &&
++			    (rate - d1 * 115200ull * bt_samp) * 1000 / rate < 15 && (rate - d2 * 2400ull * bt_samp) * 1000 / rate < 15;
++			if (best < 0 && fits) {
++				best = (int)l;
++				best_rate = rate;
++			}
++		}
++		if (best < 0) {
++			btlog("no DFS level gives 115200 x %u: stop", bt_samp);
++			return false;
++		}
++		bt_level = (unsigned)best;
++		bt_clk_hz = best_rate;
++		btlog("DFS level %u: %llu Hz", bt_level, bt_clk_hz);
++		return true;
++	}
++	/* 7.3728 MHz: GPLL0 even (source 2) x 384 / 15625, dual-edge M/N, no pre-divider */
++	wr(bt_gcc1f, rcg + 0x8, 384);
++	wr(bt_gcc1f, rcg + 0xC, (~(15625u - 384u)) & 0xffff);
++	wr(bt_gcc1f, rcg + 0x10, (~15625u) & 0xffff);
++	wr(bt_gcc1f, rcg + 0x4, (2u << 12) | (2u << 8) | 1u);
++	wr(bt_gcc1f, rcg, rd(bt_gcc1f, rcg) | 1);
++	for (int i = 0; i < 100 && (rd(bt_gcc1f, rcg) & 1); i++) {
++		IODelay(10);
++	}
++	btlog("RCG programmed: cmd %#x cfg %#x m %#x n %#x d %#x", rd(bt_gcc1f, rcg), rd(bt_gcc1f, rcg + 4), rd(bt_gcc1f, rcg + 8),
++	    rd(bt_gcc1f, rcg + 0xC), rd(bt_gcc1f, rcg + 0x10));
++	if (rd(bt_gcc1f, rcg) & 1) {
++		btlog("RCG update did not complete: stop");
++		return false;
++	}
++	bt_level = 0;
++	bt_clk_hz = 7372800;
++	return true;
++}
++
++static void
++bt_baud(uint32_t baud, bool flow)
++{
++	uint32_t div = (uint32_t)(bt_clk_hz / ((uint64_t)baud * bt_samp));
++	wr(bt_se, GENI_CLK_SEL, bt_level);
++	wr(bt_se, GENI_M_CLK_CFG, (div << 4) | 1);
++	wr(bt_se, GENI_S_CLK_CFG, (div << 4) | 1);
++	wr(bt_se, UART_TX_CFG, flow ? 0 : 2);           /* bit 1: ignore CTS */
++	wr(bt_se, UART_MANUAL_RFR, 0);                  /* RFR by the hardware */
++	btlog("UART %u baud (clock %llu Hz / %u / %u), flow control %s", baud, bt_clk_hz, div, bt_samp, flow ? "on" : "off");
++}
++
++static void
++bt_rx_start(void)
++{
++	if ((rd(bt_se, GENI_STATUS) & S_CMD_ACTIVE) == 0) {
++		wr(bt_se, S_IRQ_CLEAR, 0xffffffffu);
++		wr(bt_se, S_CMD0, 1u << 27);                /* UART_START_READ */
++	}
++}
++
++static int
++bt_init(void)
++{
++	if (!bt_map()) {
++		btlog("mappings failed");
++		return ENOMEM;
++	}
++	if (!bt_rails()) {
++		btlog("a rail was not taken: stop");
++		return EIO;
++	}
++	IOSleep(10);
++	if (!bt_clocks()) {
++		return EIO;
++	}
++	uint32_t fw = rd(bt_se, GENI_FW_REV), st = rd(bt_se, GENI_STATUS);
++	btlog("SE3 FW_REVISION %#x (protocol %u), status %#x, hw param0 %#x param1 %#x", fw, (fw >> 8) & 0xff, st,
++	    rd(bt_se, SE_HW_PARAM_0), rd(bt_se, SE_HW_PARAM_1));
++	if (((fw >> 8) & 0xff) != 2) {
++		btlog("SE3 is not a UART (protocol %u): stop", (fw >> 8) & 0xff);
++		return ENODEV;
++	}
++	bt_pins_mux();
++	uint32_t ver = rd(bt_qup, 0x4);
++	bt_samp = ver >= 0x20050000u ? 16 : 32;
++	btlog("QUP hw version %#x: oversampling %u", ver, bt_samp);
++	if (!bt_clock_rate()) {
++		return EIO;
++	}
++	bt_tx_depth = (rd(bt_se, SE_HW_PARAM_0) >> 16) & 0x3f;
++	uint32_t rxd = (rd(bt_se, SE_HW_PARAM_1) >> 16) & 0x3f;
++	bt_tx_depth = bt_tx_depth ? bt_tx_depth : 16;
++	/* FIFO mode, polled; one byte per FIFO word both ways */
++	wr(bt_se, M_CMD_CTRL, 1u << 1);                 /* abort anything left */
++	wr(bt_se, S_CMD_CTRL, 1u << 1);
++	IODelay(100);
++	wr(bt_se, SE_GSI_EVENT_EN, 0);
++	wr(bt_se, SE_IRQ_EN, 0xF);
++	wr(bt_se, M_IRQ_CLEAR, 0xffffffffu);
++	wr(bt_se, S_IRQ_CLEAR, 0xffffffffu);
++	wr(bt_se, SE_DMA_MODE_EN, 0);
++	wr(bt_se, GENI_CGC_CTRL, rd(bt_se, GENI_CGC_CTRL) | 0x7f);
++	wr(bt_se, SE_DMA_GENERAL, rd(bt_se, SE_DMA_GENERAL) | 0x0f);
++	wr(bt_se, GENI_OUTPUT_CTRL, 0x7f);
++	wr(bt_se, GENI_FORCE_DEFAULT, 1);
++	wr(bt_se, SE_BYTE_GRAN, 0);
++	wr(bt_se, TX_PACK0, 0xF);
++	wr(bt_se, TX_PACK1, 0);
++	wr(bt_se, RX_PACK0, 0xF);
++	wr(bt_se, RX_PACK1, 0);
++	wr(bt_se, TX_WATERMARK, 0);
++	wr(bt_se, RX_WATERMARK, 0);
++	wr(bt_se, RX_RFR_WM, rxd > 2 ? rxd - 2 : 1);
++	wr(bt_se, UART_LOOPBACK, 0);
++	wr(bt_se, UART_TX_WORDLEN, 8);
++	wr(bt_se, UART_TX_STOPLEN, 0);
++	wr(bt_se, UART_RX_CFG, 0);
++	wr(bt_se, UART_RX_WORDLEN, 8);
++	wr(bt_se, UART_RX_STALE, 160);
++	wr(bt_se, UART_TX_PARITY, 0);
++	wr(bt_se, UART_RX_PARITY, 0);
++	wr(bt_se, M_IRQ_EN, (1u << 0) | 0x3eu | (1u << 30));
++	wr(bt_se, S_IRQ_EN, (1u << 0) | (1u << 26) | (1u << 27));
++	bt_baud(115200, true);
++	bt_rx_start();
++	bt_up = true;
++	btlog("UART up: tx fifo %u words, rx fifo %u words, status %#x", bt_tx_depth, rxd, rd(bt_se, GENI_STATUS));
++	return 0;
++}
++
++/* ---------------------------------------------------------------- bytes */
++
++/* what the RX FIFO holds into the ring (bt_rx_mtx not needed by the single reader of the FIFO) */
++static unsigned
++bt_rx_poll(void)
++{
++	unsigned got = 0;
++	for (int k = 0; k < 64; k++) {
++		uint32_t wc = rd(bt_se, RX_FIFO_STATUS) & 0x1ffffffu;
++		if (wc == 0) {
++			break;
++		}
++		for (uint32_t i = 0; i < wc; i++) {
++			uint8_t b = (uint8_t)rd(bt_se, RX_FIFO);
++			lck_mtx_lock(&sweet_bt_rxmtx);
++			if (bt_rhead - bt_rtail < BT_RING) {
++				bt_ring[bt_rhead % BT_RING] = b;
++				bt_rhead++;
++			} else {
++				bt_rdrops++;
++			}
++			lck_mtx_unlock(&sweet_bt_rxmtx);
++			got++;
++		}
++	}
++	uint32_t s = rd(bt_se, S_IRQ_STATUS);
++	if (s) {
++		wr(bt_se, S_IRQ_CLEAR, s);
++	}
++	bt_rx_start();
++	if (got) {
++		wakeup(bt_ring);
++	}
++	return got;
++}
++
++static int
++bt_tx(const uint8_t *p, uint32_t n)
++{
++	for (int i = 0; i < 500 && (rd(bt_se, GENI_STATUS) & M_CMD_ACTIVE); i++) {
++		IODelay(100);
++	}
++	if (rd(bt_se, GENI_STATUS) & M_CMD_ACTIVE) {
++		btlog("tx: the previous transfer is still running: aborted");
++		wr(bt_se, M_CMD_CTRL, 1u << 1);
++		IODelay(100);
++	}
++	wr(bt_se, M_IRQ_CLEAR, 0xffffffffu);
++	wr(bt_se, UART_TX_LEN, n);
++	wr(bt_se, M_CMD0, 1u << 27);                    /* UART_START_TX */
++	for (uint32_t i = 0; i < n; i++) {
++		int w = 0;
++		while ((rd(bt_se, TX_FIFO_STATUS) & 0x0fffffffu) >= bt_tx_depth && w < 2000) {
++			IODelay(50);
++			w++;
++		}
++		if (w >= 2000) {
++			btlog("tx: the FIFO stays full after %u of %u bytes (CTS low?): aborted", i, n);
++			wr(bt_se, M_CMD_CTRL, 1u << 1);
++			return ETIMEDOUT;
++		}
++		wr(bt_se, TX_FIFO, p[i]);
++	}
++	for (int i = 0; i < 2000; i++) {
++		uint32_t s = rd(bt_se, M_IRQ_STATUS);
++		if (s & 1) {
++			wr(bt_se, M_IRQ_CLEAR, s);
++			return 0;
++		}
++		IODelay(100);
++	}
++	btlog("tx: no done in 200 ms (m irq %#x, status %#x): aborted", rd(bt_se, M_IRQ_STATUS), rd(bt_se, GENI_STATUS));
++	wr(bt_se, M_CMD_CTRL, 1u << 1);
++	return ETIMEDOUT;
++}
++
++static void
++bt_ring_clear(void)
++{
++	(void)bt_rx_poll();
++	lck_mtx_lock(&sweet_bt_rxmtx);
++	bt_rtail = bt_rhead;
++	lck_mtx_unlock(&sweet_bt_rxmtx);
++}
++
++/* one HCI event (H4 0x04, code, len, payload) within ms; returns its length, 0 if none */
++static unsigned
++bt_event(uint8_t *out, unsigned max, unsigned ms)
++{
++	for (unsigned t = 0; t <= ms; t++) {
++		(void)bt_rx_poll();
++		lck_mtx_lock(&sweet_bt_rxmtx);
++		uint32_t avail = bt_rhead - bt_rtail;
++		while (avail > 0 && bt_ring[bt_rtail % BT_RING] != 0x04) {
++			bt_rtail++;                             /* not an event start: skip */
++			avail--;
++		}
++		if (avail >= 3) {
++			unsigned len = 3u + bt_ring[(bt_rtail + 2) % BT_RING];
++			if (avail >= len) {
++				unsigned n = len < max ? len : max;
++				for (unsigned i = 0; i < n; i++) {
++					out[i] = bt_ring[(bt_rtail + i) % BT_RING];
++				}
++				bt_rtail += len;
++				lck_mtx_unlock(&sweet_bt_rxmtx);
++				return n;
++			}
++		}
++		lck_mtx_unlock(&sweet_bt_rxmtx);
++		IOSleep(1);
++	}
++	return 0;
++}
++
++static void
++bt_hex(const char *what, const uint8_t *p, unsigned n)
++{
++	char line[200];
++	size_t k = 0;
++	for (unsigned i = 0; i < n && k + 4 < sizeof(line); i++) {
++		k += (size_t)snprintf(line + k, sizeof(line) - k, "%02x ", p[i]);
++	}
++	line[k] = 0;
++	btlog("%s (%u bytes): %s", what, n, line);
++}
++
++/* an HCI command and its event(s), logged */
++static unsigned
++bt_cmd(const char *what, const uint8_t *cmd, unsigned n, uint8_t *ev, unsigned max, unsigned ms)
++{
++	bt_hex(what, cmd, n);
++	if (bt_tx(cmd, n) != 0) {
++		return 0;
++	}
++	unsigned got = bt_event(ev, max, ms);
++	if (got == 0) {
++		btlog("%s: no event in %u ms", what, ms);
++	} else {
++		bt_hex("  event", ev, got);
++	}
++	return got;
++}
++
++/* ---------------------------------------------------------------- ops 2, 3, 9 */
++
++static int
++bt_power_reset(void)
++{
++	uint8_t ev[96];
++	if (!bt_up) {
++		btlog("op 2: UART not up (op 1 first)");
++		return EAGAIN;
++	}
++	bt_ring_clear();
++	/* the power pulse: 0xFC at 2400 baud, no flow control (hci_qca qca_send_power_pulse) */
++	bt_baud(2400, false);
++	uint8_t pulse = 0xFC;
++	int r = bt_tx(&pulse, 1);
++	btlog("power pulse 0xfc at 2400 baud: %d", r);
++	IOSleep(5);
++	bt_baud(115200, true);
++	IOSleep(100);
++	volatile uint32_t *s = (volatile uint32_t *)bt_sw;
++	btlog("SW_CTRL gpio%u level %u", BT_SWCTRL, s[1] & 1);
++	bt_ring_clear();
++	static const uint8_t reset[] = { 0x01, 0x03, 0x0C, 0x00 };
++	unsigned n = bt_cmd("HCI_Reset", reset, sizeof(reset), ev, sizeof(ev), 500);
++	bool ok = n >= 7 && ev[1] == 0x0E && ev[4] == 0x03 && ev[5] == 0x0C && ev[6] == 0x00;
++	btlog("HCI_Reset: %s", ok ? "Command Complete, status 0" : n ? "unexpected answer" : "NO ANSWER");
++	static const uint8_t ver[] = { 0x01, 0x00, 0xFC, 0x01, 0x19 };
++	n = bt_cmd("EDL_PATCH_VER_REQ (0xfc00 / 0x19)", ver, sizeof(ver), ev, sizeof(ev), 500);
++	if (n != 0 && ev[1] != 0xFF) {
++		unsigned n2 = bt_event(ev, sizeof(ev), 300);      /* a Command Complete first, the vendor event after */
++		if (n2) {
++			bt_hex("  event", ev, n2);
++			n = n2;
++		}
++	}
++	if (n >= 3 && ev[1] == 0xFF) {
++		/* hci_qca / btqca: vendor event, then product id, patch version, rom version, soc id (LE) */
++		bt_hex("  version payload", ev + 3, n - 3);
++	}
++	return ok ? 0 : EIO;
++}
++
++static int
++bt_info(void)
++{
++	uint8_t ev[96];
++	if (!bt_up) {
++		return EAGAIN;
++	}
++	bt_ring_clear();
++	static const uint8_t lv[] = { 0x01, 0x01, 0x10, 0x00 };
++	unsigned n = bt_cmd("HCI_Read_Local_Version", lv, sizeof(lv), ev, sizeof(ev), 500);
++	if (n >= 15 && ev[1] == 0x0E && ev[6] == 0) {
++		btlog("  HCI %u rev %#x, LMP %u, manufacturer %u, LMP subversion %#x", ev[7], ev[8] | ev[9] << 8, ev[10],
++		    ev[11] | ev[12] << 8, ev[13] | ev[14] << 8);
++	}
++	static const uint8_t ba[] = { 0x01, 0x09, 0x10, 0x00 };
++	n = bt_cmd("HCI_Read_BD_ADDR", ba, sizeof(ba), ev, sizeof(ev), 500);
++	if (n >= 13 && ev[1] == 0x0E && ev[6] == 0) {
++		btlog("  BD_ADDR %02x:%02x:%02x:%02x:%02x:%02x", ev[12], ev[11], ev[10], ev[9], ev[8], ev[7]);
++	}
++	return n ? 0 : EIO;
++}
++
++static int
++bt_off(void)
++{
++	if (bt_se != 0 && bt_up) {
++		wr(bt_se, M_CMD_CTRL, 1u << 1);
++		wr(bt_se, S_CMD_CTRL, 1u << 1);
++		IODelay(100);
++		wr(bt_se, M_IRQ_CLEAR, 0xffffffffu);
++		wr(bt_se, S_IRQ_CLEAR, 0xffffffffu);
++	}
++	bt_up = false;
++	btlog("UART stopped (the rails stay voted: Wi-Fi and the fingerprint sensor share them)");
++	return 0;
++}
++
++/* ---------------------------------------------------------------- /dev/qcabt */
++
++static void
++bt_rx_thread(void *arg __unused, wait_result_t wres __unused)
++{
++	while (bt_rx_run) {
++		lck_mtx_lock(&sweet_bt_mtx);
++		if (bt_up) {
++			(void)bt_rx_poll();
++		}
++		lck_mtx_unlock(&sweet_bt_mtx);
++		IOSleep(1);
++	}
++	bt_rx_alive = false;
++	wakeup(bt_ring);
++	thread_terminate(current_thread());
++}
++
++static int
++qcabt_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	lck_mtx_lock(&sweet_bt_mtx);
++	if (bt_open_flag || bt_rx_alive) {
++		lck_mtx_unlock(&sweet_bt_mtx);
++		return EBUSY;
++	}
++	if (!bt_up) {
++		lck_mtx_unlock(&sweet_bt_mtx);
++		return ENXIO;
++	}
++	lck_mtx_lock(&sweet_bt_rxmtx);
++	bt_rtail = bt_rhead;
++	lck_mtx_unlock(&sweet_bt_rxmtx);
++	bt_open_flag = true;
++	bt_rx_run = true;
++	bt_rx_alive = true;
++	thread_t th;
++	if (kernel_thread_start(bt_rx_thread, NULL, &th) != KERN_SUCCESS) {
++		bt_open_flag = bt_rx_run = bt_rx_alive = false;
++		lck_mtx_unlock(&sweet_bt_mtx);
++		return ENOMEM;
++	}
++	thread_deallocate(th);
++	lck_mtx_unlock(&sweet_bt_mtx);
++	return 0;
++}
++
++static int
++qcabt_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	bt_rx_run = false;
++	for (int i = 0; i < 200 && bt_rx_alive; i++) {
++		IOSleep(1);
++	}
++	bt_open_flag = false;
++	return 0;
++}
++
++static int
++qcabt_read(__unused dev_t dev, struct uio *uio, int ioflag)
++{
++	uint8_t buf[256];
++	lck_mtx_lock(&sweet_bt_rxmtx);
++	while (bt_rhead == bt_rtail) {
++		if ((ioflag & IO_NDELAY) || !bt_rx_alive) {
++			lck_mtx_unlock(&sweet_bt_rxmtx);
++			return bt_rx_alive ? EWOULDBLOCK : 0;
++		}
++		struct timespec ts = { 0, 100 * 1000 * 1000 };
++		int err = msleep(bt_ring, &sweet_bt_rxmtx, PCATCH | PZERO, "qcabt", &ts);
++		if (err != 0 && err != EWOULDBLOCK) {
++			lck_mtx_unlock(&sweet_bt_rxmtx);
++			return err;
++		}
++	}
++	uint32_t n = bt_rhead - bt_rtail;
++	user_ssize_t want = uio_resid(uio);
++	n = n > sizeof(buf) ? (uint32_t)sizeof(buf) : n;
++	n = (user_ssize_t)n > want ? (uint32_t)want : n;
++	for (uint32_t i = 0; i < n; i++) {
++		buf[i] = bt_ring[(bt_rtail + i) % BT_RING];
++	}
++	bt_rtail += n;
++	lck_mtx_unlock(&sweet_bt_rxmtx);
++	return uiomove((char *)buf, (int)n, uio);
++}
++
++static int
++qcabt_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	uint8_t buf[260];
++	user_ssize_t n = uio_resid(uio);
++	if (n <= 0 || n > (user_ssize_t)sizeof(buf)) {
++		return EINVAL;
++	}
++	int err = uiomove((char *)buf, (int)n, uio);
++	if (err != 0) {
++		return err;
++	}
++	lck_mtx_lock(&sweet_bt_mtx);
++	err = bt_up ? bt_tx(buf, (uint32_t)n) : ENXIO;
++	lck_mtx_unlock(&sweet_bt_mtx);
++	return err;
++}
++
++static const struct cdevsw qcabt_cdevsw = {
++	.d_open = qcabt_open, .d_close = qcabt_close, .d_read = qcabt_read, .d_write = qcabt_write, .d_ioctl = eno_ioctl,
++	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select, .d_mmap = eno_mmap,
++	.d_strategy = eno_strat, .d_type = 0,
++};
++
++static void
++qcabt_node(void)
++{
++	if (bt_major >= 0) {
++		return;
++	}
++	bt_major = cdevsw_add(-1, &qcabt_cdevsw);
++	if (bt_major < 0) {
++		btlog("/dev/qcabt: no major");
++		return;
++	}
++	if (devfs_make_node(makedev(bt_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "qcabt") == NULL) {
++		btlog("/dev/qcabt: devfs node failed");
++	} else {
++		btlog("/dev/qcabt ready (major %d)", bt_major);
++	}
++}
++
++/* ---------------------------------------------------------------- sysctls */
++
++static int
++sysctl_sweet_bt SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = bt_last;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, NULL);
++	if (err != 0 || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	lck_mtx_lock(&sweet_bt_mtx);
++	bt_loglen = 0;
++	bt_logbuf[0] = 0;
++	btlog("op %d", v);
++	int r;
++	if (bt_open_flag && (v == 2 || v == 3 || v == 9)) {
++		btlog("op %d: /dev/qcabt is open", v);
++		r = EBUSY;
++	} else {
++		switch (v) {
++		case 1:
++			r = bt_init();
++			if (r == 0) {
++				qcabt_node();
++			}
++			break;
++		case 2:
++			r = bt_power_reset();
++			break;
++		case 3:
++			r = bt_info();
++			break;
++		case 9:
++			r = bt_off();
++			break;
++		default:
++			r = EINVAL;
++			break;
++		}
++	}
++	btlog("op %d: %d (rx drops %u)", v, r, bt_rdrops);
++	bt_last = r;
++	lck_mtx_unlock(&sweet_bt_mtx);
++	return r;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_bt, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_bt, "I", "Bluetooth UART: 1 up, 2 power pulse + reset + version, 3 local version + BD_ADDR, 9 off");
++
++static int
++sysctl_sweet_bt_log SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	lck_mtx_lock(&sweet_bt_mtx);
++	int err = SYSCTL_OUT(req, bt_logbuf, bt_loglen + 1);
++	lck_mtx_unlock(&sweet_bt_mtx);
++	return err;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_bt_log, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_bt_log, "A", "the log of the last Bluetooth request");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
