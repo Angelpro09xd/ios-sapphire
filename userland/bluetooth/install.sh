@@ -63,6 +63,8 @@ rmdir $N 2>/dev/null; true
 EOF
 addr=${BT_ADDR:-$(ssh $O $P /redwood/bin/qcabtfw -A | tr -d '\r')}
 echo "BD address $addr"
+# for the SapphireBTCapability tweak (userland/tweaks/btcapability): MobileGestalt BluetoothAddress, local-mac-address
+ssh $O $P "echo $addr > /var/root/btfw/bdaddr; chmod 755 /var/root/btfw; chmod 644 /var/root/btfw/bdaddr"
 
 bk=$HOME/ios-build/launchd-backups
 mkdir -p "$bk"
