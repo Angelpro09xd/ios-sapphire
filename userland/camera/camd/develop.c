@@ -32,7 +32,7 @@ static void say(int fd, const char *fmt, ...) __attribute__((format(printf, 2, 3
 static void say(int fd, const char *fmt, ...)
 {
 	if (fd < 0) return;
-	char b[128];
+	char b[256];
 	va_list ap;
 	va_start(ap, fmt);
 	int n = vsnprintf(b, sizeof b, fmt, ap);
@@ -175,10 +175,14 @@ int develop_run(const DevJob *j)
 	g_jpeg_app1_len = j->app1_len;
 	sinks[ns++] = sink_jpeg(rgb, j->jpeg, j->quality > 0 ? j->quality : 92, tone);
 
-	stages_alloc(g_chunk);
+	size_t ring = stages_alloc(g_chunk);
+	double t0 = now_sec();
 	sinks_run(sinks, ns);
 	g_done = 1;
 	pthread_join(pt, NULL);
+	say(g_pfd, "T %dx%d cell %d, %d threads, chunk %d, rings %.0f MB, pipeline %.1f s, peak RSS %ld MB\n", r.w, r.h, r.geo.n,
+	    pool_threads(), g_chunk, ring / 1048576.0, now_sec() - t0, peak_rss_kb() / 1024);
+	stages_report(stderr); /* per-stage times: camd's stderr (/var/tmp/camd.out) */
 	say(g_pfd, "P 100\n");
 	return 0;
 }
