@@ -1,5 +1,5 @@
 #!/bin/bash
-# install.sh [--fake] [--no-start] [PHONE]: Bluetooth onto the phone (root@192.168.7.2, key ~/.ssh/sapphire_phone),
+# install.sh [--fake] [--verbose] [--no-start] [PHONE]: Bluetooth onto the phone (root@192.168.7.2, key ~/.ssh/sapphire_phone),
 # from WSL; rerun = update or switch mode.
 #   /redwood/bin/btshim, /redwood/bin/qcabtfw, firmware /var/root/btfw/apbtfw11.tlv + apnv11.bin (if missing; from
 #   ~/ios-build/bt/fw/img/image), and three jobs in launchd's cache (bt-launchd.py; the cache before the first
@@ -16,16 +16,18 @@
 # Then (unless --no-start) the three jobs are (re)started now: btshim, BlueTool, bluetoothd. A reboot also works.
 set -e
 cd "$(dirname "$0")"
-fake=0 start=1
+fake=0 start=1 verbose=0
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--fake) fake=1; shift ;;
 	--no-start) start=0; shift ;;
+	--verbose) verbose=1; shift ;;
 	*) break ;;
 	esac
 done
 P=${1:-root@192.168.7.2}
-O="-o ConnectTimeout=6 -i $HOME/.ssh/sapphire_phone"
+O="-o ConnectTimeout=6 -o ServerAliveInterval=5 -o ServerAliveCountMax=4 -i $HOME/.ssh/sapphire_phone"
+. ./xfer.sh
 ORIG=${ORIG:-$HOME/ios-build/bt/System/Library/LaunchDaemons}
 FW=${FW:-$HOME/ios-build/bt/fw/img/image}
 for f in "$ORIG/com.apple.bluetoothd.plist" "$ORIG/com.apple.BlueTool.plist"; do
@@ -65,10 +67,10 @@ echo "BD address $addr"
 bk=$HOME/ios-build/launchd-backups
 mkdir -p "$bk"
 stamp=$(date +%Y%m%d-%H%M%S)
-scp -q $O $P:/System/Library/xpc/launchd.plist "$bk/launchd.plist.before-btshim-install.$stamp"
+pull /System/Library/xpc/launchd.plist "$bk/launchd.plist.before-btshim-install.$stamp"
 python3 -I bt-launchd.py install "$bk/launchd.plist.before-btshim-install.$stamp" "$out/launchd.plist" \
-	--orig "$ORIG" --job com.sapphire.btshim.plist --addr "$addr" $( [ $fake = 1 ] && echo --fake ) --jobs-out "$out/jobs"
-scp -q $O "$out/launchd.plist" $P:/System/Library/xpc/launchd.plist.btshim-new
+	--orig "$ORIG" --job com.sapphire.btshim.plist --addr "$addr" $( [ $fake = 1 ] && echo --fake ) $( [ $verbose = 1 ] && echo --verbose ) --jobs-out "$out/jobs"
+push "$out/launchd.plist" /System/Library/xpc/launchd.plist.btshim-new
 scp -q $O "$out"/jobs/*.plist $P:/redwood/share/btshim/
 sum=$(sha256sum "$out/launchd.plist" | cut -d' ' -f1)
 ssh $O $P /var/jb/bin/bash -s "$sum" "$start" "$fake" <<'EOF'

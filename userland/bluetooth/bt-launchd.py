@@ -50,6 +50,7 @@ def main():
     ap.add_argument('--job')
     ap.add_argument('--addr')
     ap.add_argument('--fake', action='store_true')
+    ap.add_argument('--verbose', action='store_true')
     ap.add_argument('--jobs-out')
     a = ap.parse_args()
 
@@ -71,7 +72,7 @@ def main():
         if not a.job or not a.addr or not re.fullmatch(r'([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', a.addr):
             sys.exit('install needs --job and --addr aa:bb:cc:dd:ee:ff')
         sh = plistlib.load(open(a.job, 'rb'))
-        sh['ProgramArguments'] = ['/redwood/bin/btshim', 'daemon'] + (['-F', '-v', '-w', '0'] if a.fake else [])
+        sh['ProgramArguments'] = ['/redwood/bin/btshim', 'daemon'] + (['-F', '-v', '-w', '0'] if a.fake else (['-v'] if a.verbose else []))
         sh.setdefault('EnvironmentVariables', {})['BT_DEVICE_ADDRESS'] = a.addr.lower()
         d[k_sh] = sh
 

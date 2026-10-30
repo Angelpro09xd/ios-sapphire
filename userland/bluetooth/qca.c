@@ -292,15 +292,54 @@ qca_open(int power_on)
 {
 	if (qfd >= 0)
 		return 0;
-	if (power_on && (sweet_bt_op(1) < 0 || sweet_bt_op(2) < 0))
-		return -1;
+	if (power_on) {
+		if (sweet_bt_op(1) < 0)
+			return -1;
+		/* the BT side may still run from an earlier bring-up (a patched SoC does not take a second
+		 * download): the power-off pulse first (Linux qca_power_off: 0xC0 at 2400 baud, no flow
+		 * control), then op 2 sends the power-on pulse 0xFC and HCI_Reset from the ROM */
+		int fd = open(QCABT_DEV, O_RDWR);
+		if (fd >= 0) {
+			uint32_t slow = 2400, norm = 115200;
+			int off = 0, on = 1;
+			uint8_t c = 0xc0;
+			if (ioctl(fd, QCABT_FLOW, &off) == 0 && ioctl(fd, QCABT_SETBAUD, &slow) == 0) {
+				(void)write(fd, &c, 1);
+				ioctl(fd, QCABT_DRAIN);
+				usleep(20000);
+				ioctl(fd, QCABT_SETBAUD, &norm);
+				ioctl(fd, QCABT_FLOW, &on);
+				ioctl(fd, QCABT_FLUSH);
+				say("qca: power-off pulse 0xC0 sent");
+				usleep(100000);
+			} else {
+				say("qca: no baud ioctl, no power-off pulse (%s)", strerror(errno));
+			}
+			close(fd);
+		}
+		if (sweet_bt_op(2) < 0)
+			return -1;
+	}
 	qfd = open(QCABT_DEV, O_RDWR);
 	if (qfd < 0) {
 		say("open %s: %s (run sysctl kern.sweet_bt=1 first)", QCABT_DEV, strerror(errno));
 		return -1;
 	}
+	rx_head = rx_tail = 0;
 	pthread_create(&rx_tid, NULL, rx_thread, NULL);
 	return 0;
+}
+
+/* after a failed bring-up: stop the reader, close, so the next qca_open(1) power-cycles again */
+void
+qca_close(void)
+{
+	if (qfd < 0)
+		return;
+	pthread_cancel(rx_tid);
+	close(qfd);
+	pthread_join(rx_tid, NULL);
+	qfd = -1;
 }
 
 int

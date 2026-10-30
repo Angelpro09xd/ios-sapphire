@@ -12,21 +12,22 @@ cd "$(dirname "$0")"
 rollback=0
 [ "$1" = --rollback ] && { rollback=1; shift; }
 P=${1:-root@192.168.7.2}
-O="-o ConnectTimeout=6 -i $HOME/.ssh/sapphire_phone"
+O="-o ConnectTimeout=6 -o ServerAliveInterval=5 -o ServerAliveCountMax=4 -i $HOME/.ssh/sapphire_phone"
+. ./xfer.sh
 ORIG=${ORIG:-$HOME/ios-build/bt/System/Library/LaunchDaemons}
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 bk=$HOME/ios-build/launchd-backups
 mkdir -p "$bk"
 stamp=$(date +%Y%m%d-%H%M%S)
-scp -q $O $P:/System/Library/xpc/launchd.plist "$bk/launchd.plist.before-btshim-uninstall.$stamp"
+pull /System/Library/xpc/launchd.plist "$bk/launchd.plist.before-btshim-uninstall.$stamp"
 if [ $rollback = 1 ]; then
-	scp -q $O $P:/System/Library/xpc/launchd.plist.pre-btshim "$out/launchd.plist"
+	pull /System/Library/xpc/launchd.plist.pre-btshim "$out/launchd.plist"
 	echo "rollback: launchd.plist.pre-btshim"
 else
 	python3 -I bt-launchd.py uninstall "$bk/launchd.plist.before-btshim-uninstall.$stamp" "$out/launchd.plist" --orig "$ORIG"
 fi
-scp -q $O "$out/launchd.plist" $P:/System/Library/xpc/launchd.plist.btshim-new
+push "$out/launchd.plist" /System/Library/xpc/launchd.plist.btshim-new
 sum=$(sha256sum "$out/launchd.plist" | cut -d' ' -f1)
 ssh $O $P /var/jb/bin/bash -s "$sum" <<'EOF'
 export PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin
