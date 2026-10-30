@@ -260,9 +260,19 @@ controller_bringup(void)
 		return 0;
 	if (qca_open(1) < 0)
 		return -1;
-	if (qca_bringup(opt_dir, opt_ramp, opt_nvm, opt_speed, opt_bdaddr) < 0)
+	if (qca_bringup(opt_dir, opt_ramp, opt_nvm, opt_speed, opt_bdaddr) < 0) {
+		qca_close();    /* the next try power-cycles the BT side again */
 		return -1;
+	}
 	qca_print_identity();
+	/* the SoC's own debug log arrives as ACL on handle 0x2EDC; turn it off as Linux does for WCN399x
+	 * (QCA_DISABLE_LOGGING 0xFC17 [0x14 0x00]); from_controller drops what still comes */
+	{
+		uint8_t off[2] = { 0x14, 0x00 };
+		qca_cmd(0xfc17, off, 2);
+		int st = qca_wait_cc(0xfc17, 500, NULL, NULL);
+		say("SoC logging off (0xFC17) -> %d", st);
+	}
 	if (ctl_notify[0] < 0 && pipe(ctl_notify) == 0) {
 		fcntl(ctl_notify[0], F_SETFL, O_NONBLOCK);
 		fcntl(ctl_notify[1], F_SETFL, O_NONBLOCK);
@@ -337,6 +347,9 @@ answer_locally(uint16_t op, const uint8_t *par, size_t plen)
 	case 0x2003:
 		memcpy(r + 1, fake_le_features, 8);
 		n = 9;
+		break;
+	case 0x0c5a:    /* Read Default Erroneous Data Reporting: [status][mode 0] */
+		n = 2;
 		break;
 	case 0x200f:    /* LE Read Filter Accept List Size */
 		r[1] = 16;
@@ -428,12 +441,122 @@ translate_vsc(uint16_t op, const uint8_t *par, size_t plen)
 /* the opcode of a Command Complete / Status we must not pass on (answers to our own commands) */
 static int drop_vendor_events = 1;
 
+/* "scan N" on the control socket: btshim's own passive LE scan for N seconds, straight to the WCN (a radio
+ * test independent of bluetoothd): its Command Completes and the advertising reports are kept from
+ * bluetoothd and counted */
+static int scan_test;
+static time_t scan_end;
+static unsigned scan_reports, scan_devs;
+static uint8_t scan_seen[64][6];
+
+static int scan_ext;     /* legacy LE scan commands answered 0x0C (Command Disallowed): use the extended ones */
+
+static void
+scan_cmd(int on)
+{
+	if (scan_ext) {
+		if (on) {
+			/* LE Set Extended Scan Parameters: public, accept all, 1M PHY, passive, 60 ms / 60 ms */
+			uint8_t sp[8] = { 0x00, 0x00, 0x01, 0x00, 0x60, 0x00, 0x60, 0x00 };
+			qca_cmd(0x2041, sp, 8);
+			usleep(50000);
+		}
+		uint8_t se[6] = { (uint8_t)on, 0x00, 0, 0, 0, 0 };
+		qca_cmd(0x2042, se, 6);
+		return;
+	}
+	if (on) {
+		/* LE Set Scan Parameters: passive, interval = window = 0x60 (60 ms), public, accept all */
+		uint8_t sp[7] = { 0x00, 0x60, 0x00, 0x60, 0x00, 0x00, 0x00 };
+		qca_cmd(0x200b, sp, 7);
+		usleep(50000);
+	}
+	uint8_t se[2] = { (uint8_t)on, 0x00 };
+	qca_cmd(0x200c, se, 2);
+}
+
+static void
+scan_seen_add(const uint8_t *addr, unsigned type, int rssi)
+{
+	scan_reports++;
+	for (unsigned k = 0; k < scan_devs; k++)
+		if (!memcmp(scan_seen[k], addr, 6))
+			return;
+	if (scan_devs < 64) {
+		memcpy(scan_seen[scan_devs++], addr, 6);
+		say("scan test: device %u, address type %u, rssi %d dBm", scan_devs, type, rssi);
+	}
+}
+
 static void
 from_controller(const uint8_t *p, size_t n)
 {
+	if (scan_test) {
+		uint16_t cop = (uint16_t)(p[4] | (p[5] << 8));
+		if (p[0] == 4 && p[1] == 0x0e && n >= 7 && (cop == 0x200b || cop == 0x200c || cop == 0x2041 || cop == 0x2042)) {
+			say("scan test: %#06x -> status %#x", cop, p[6]);
+			if (p[6] == 0x0c && (cop == 0x200b || cop == 0x200c) && scan_test == 1 && !scan_ext) {
+				say("scan test: legacy scan disallowed, switching to extended scanning");
+				scan_ext = 1;
+				scan_cmd(1);
+			}
+			return;
+		}
+		if (p[0] == 4 && p[1] == 0x3e && n >= 5 && p[3] == 0x0d) {      /* LE Extended Advertising Report */
+			unsigned nr = p[4];
+			const uint8_t *r = p + 5;
+			for (unsigned i = 0; i < nr && r + 24 <= p + n; i++) {
+				scan_seen_add(r + 3, r[2], (int8_t)r[13]);
+				r += 24 + r[23];
+			}
+			return;
+		}
+		if (p[0] == 4 && p[1] == 0x3e && n >= 5 && p[3] == 0x02) {      /* LE Advertising Report */
+			unsigned nr = p[4];
+			const uint8_t *r = p + 5;
+			for (unsigned i = 0; i < nr && r + 9 <= p + n; i++) {
+				unsigned dl = r[8];
+				int8_t rssi = (r + 9 + dl < p + n) ? (int8_t)r[9 + dl] : 0;
+				scan_seen_add(r + 2, r[1], rssi);
+				r += 10 + dl;
+			}
+			return;
+		}
+	}
+
 	if (p[0] == 4 && p[1] == 0xff && drop_vendor_events) {
 		if (opt_verbose)
 			hexdump("drop VSE", p, n);
+		return;
+	}
+	if (p[0] == 2 && n >= 5) {
+		unsigned h = (unsigned)(p[1] | (p[2] << 8)) & 0x0fff;
+		if (h == 0x2edc || h == 0x2edd) {       /* QCA_DEBUG_HANDLE / memdump: not for bluetoothd */
+			static unsigned dropped;
+			if (dropped++ % 100 == 0)
+				say("dropped SoC debug ACL (handle %#x), %u so far", h, dropped);
+			return;
+		}
+	}
+	if (p[0] == 4 && p[1] == 0x0f && n >= 7 && p[3] != 0) {
+		/* Command Status with an error: an OGF 3 (controller & baseband) or OGF 8 (LE) command the WCN
+		 * does not know (those normally end with Command Complete): report success as a Command Complete */
+		uint16_t op = (uint16_t)(p[5] | (p[6] << 8));
+		say("WCN: Command Status %#x for %#06x", p[3], op);
+		if ((op >> 10) == 0x03 || (op >> 10) == 0x08) {
+			host_cc(op, (const uint8_t *)"", 1);
+			return;
+		}
+	}
+	if (p[0] == 4 && p[1] == 0x0e && n == 7 && p[6] != 0 && (p[4] | (p[5] << 8)) < 0xfc00) {
+		/* a write-type command (status is its only return parameter) the WCN refuses, e.g. Write Default
+		 * Erroneous Data Reporting 0x0C5B (unknown command): bluetoothd treats an error in its init chain as
+		 * fatal and restarts, so report success */
+		uint8_t q[7];
+		memcpy(q, p, 7);
+		say("WCN refused %#06x with status %#x: reported as success", q[4] | (q[5] << 8), q[6]);
+		q[6] = 0;
+		to_host(q, 7);
 		return;
 	}
 	if (p[0] == 4 && p[1] == 0x0e && n >= 6) {
@@ -441,6 +564,16 @@ from_controller(const uint8_t *p, size_t n)
 		if (op >= 0xfc00) {             /* our 0xFC14 etc. */
 			if (opt_verbose)
 				hexdump("drop CC", p, n);
+			return;
+		}
+		if (op == 0x1002 && n >= 7 + 64 && p[6] == 0) {
+			/* Read Local Supported Commands: bluetoothd skips (and then fails its init chain on) commands
+			 * whose bit is clear; claim Read/Write Default Erroneous Data Reporting (octet 18 bits 2, 3),
+			 * which btshim answers itself */
+			uint8_t q[7 + 64];
+			memcpy(q, p, sizeof(q));
+			q[7 + 18] |= 0x0c;
+			to_host(q, sizeof(q));
 			return;
 		}
 		if (op == 0x1001 && n >= 15) {  /* Read Local Version: report the Broadcom identity */
@@ -473,6 +606,12 @@ from_host(const uint8_t *p, size_t n)
 		}
 		if ((op >> 10) == 0x3f) {
 			translate_vsc(op, par, plen);
+			return;
+		}
+		/* commands the WCN3988 does not implement but bluetoothd's init chain requires to succeed */
+		if (op == 0x0c5b || op == 0x0c5a) {     /* Write / Read Default Erroneous Data Reporting */
+			say("answering %#06x locally (not in the WCN)", op);
+			answer_locally(op, par, plen);
 			return;
 		}
 	}
@@ -519,7 +658,7 @@ ctl_listen(void)
 }
 
 /* real mode: "boot"/"init" requests that came before the controller was up wait here */
-static int pending[16], npending, bringup_failed;
+static int pending[64], npending, bringup_failed;
 
 static void
 ctl_reply(int c, int result, const char *line)
@@ -555,6 +694,20 @@ ctl_serve(int s)
 		} else {
 			ctl_reply(c, 1, line);
 		}
+		return;
+	}
+	if (!strncmp(line, "scan", 4)) {
+		int secs = atoi(line + 4);
+		if (!controller_up || opt_fake) {
+			ctl_reply(c, 1, line);
+			return;
+		}
+		scan_test = 1;
+		scan_reports = scan_devs = 0;
+		scan_end = time(NULL) + (secs > 0 ? secs : 10);
+		scan_cmd(1);
+		say("scan test: started for %d s", secs > 0 ? secs : 10);
+		ctl_reply(c, 0, line);
 		return;
 	}
 	/* deepsleep, reset and RunCommand text: nothing to do yet (the WCN stays up) */
@@ -624,15 +777,13 @@ daemon_main(void)
 				npending = 0;
 				h4_feed(&h_h4, held, nheld, from_host);
 				nheld = 0;
-			} else if (++tries >= 5) {
-				say("bring-up failed %d times: giving up (bluetool requests get 1)", tries);
-				bringup_failed = 1;
-				for (int i = 0; i < npending; i++)
-					ctl_reply(pending[i], 1, "boot/init");
-				npending = 0;
 			} else {
-				say("bring-up failed (try %d): again in 30 s", tries);
-				next_try = time(NULL) + 30;
+				/* never answer 1: bluetoothd asks BlueTool again at once and spins (seen: a request every
+				 * 12 ms); pending requests keep waiting and the bring-up is retried */
+				++tries;
+				int wait = tries < 5 ? 30 : 120;
+				say("bring-up failed (try %d): again in %d s", tries, wait);
+				next_try = time(NULL) + wait;
 			}
 		}
 		fd_set r;
@@ -645,8 +796,16 @@ daemon_main(void)
 			if (ctl_notify[0] > mx)
 				mx = ctl_notify[0];
 		}
+		if (scan_test == 1 && time(NULL) >= scan_end) {
+			scan_cmd(0);
+			scan_test = 2;          /* still swallow the disable's Command Complete */
+			scan_end = time(NULL) + 2;
+			say("scan test: done, %u advertising reports from %u devices", scan_reports, scan_devs);
+		} else if (scan_test == 2 && time(NULL) >= scan_end) {
+			scan_test = 0;
+		}
 		struct timeval tv = { 1, 0 };
-		int k = select(mx + 1, &r, NULL, NULL, opt_fake || controller_up ? NULL : &tv);
+		int k = select(mx + 1, &r, NULL, NULL, opt_fake || (controller_up && !scan_test) ? NULL : &tv);
 		if (k < 0) {
 			if (errno == EINTR)
 				continue;
@@ -802,6 +961,13 @@ main(int argc, char **argv)
 	}
 	if (!strcmp(mode, "daemon"))
 		return daemon_main();
+	if (!strcmp(mode, "scan")) {     /* btshim scan [seconds]: the daemon's LE scan test, result in its log */
+		char req[32];
+		snprintf(req, sizeof(req), "scan %s", argc > 2 ? argv[2] : "10");
+		int r = ask_daemon(req);
+		printf("scan test %s (see /var/tmp/btshim.log)\n", r == 0 ? "started" : "refused");
+		return r;
+	}
 	if (!strcmp(mode, "bluetool"))
 		return bluetool_main();
 	usage();
