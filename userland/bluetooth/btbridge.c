@@ -13,6 +13,12 @@
  * (aa:bb:cc:dd:ee:ff, display order), "transport-encoding" 1 (H4) and "transport-speed" 3000000. Every other
  * lookup goes to IOKit unchanged. When the kernel publishes a real "bluetooth" service, its answers win.
  * Log: /var/tmp/btbridge.log.
+ *
+ * Code patch (bluetoothd 20H392 only, the bytes are checked first): when a device with audio connects, bluetoothd
+ * asks the device object whether it "supports Skywalk Path" (0x10022c488, virtual call) and then builds a
+ * BTAudioSkywalk channel on an audio Skywalk nexus our kernel does not have; os_channel_get_fd(NULL) crashed it
+ * (SIGSEGV at 0, queue com.apple.bluetooth.media, 0x1003effb4) on every connection of a paired phone. The
+ * "cbz w0" after the call at 0x10022c48c becomes "b" to the non-Skywalk path (0x10022c620).
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -22,6 +28,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <mach/mach.h>
+#include <mach-o/dyld.h>
+#include <libkern/OSCacheControl.h>
 
 static io_registry_entry_t fake_bt;     /* the registry root, standing in for "bluetooth" */
 
@@ -126,8 +135,41 @@ __attribute__((used, section("__DATA,__interpose"))) static const struct {
 	{ (const void *)my_IORegistryEntryCreateCFProperty, (const void *)IORegistryEntryCreateCFProperty },
 };
 
+static intptr_t main_slide = -1;
+
+static void
+patch_insn(uint64_t unslid, uint32_t expect, uint32_t insn, const char *what)
+{
+	intptr_t slide = main_slide;
+	uint32_t *p = (uint32_t *)(uintptr_t)(unslid + (uint64_t)slide);
+	if (*p != expect) {
+		blog("%s: not patched, found %#x at %#llx (expected %#x)", what, *p, unslid, expect);
+		return;
+	}
+	vm_address_t page = (vm_address_t)p & ~(vm_address_t)(vm_page_size - 1);
+	if (vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
+		blog("%s: page not writable", what);
+		return;
+	}
+	*p = insn;
+	vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+	sys_icache_invalidate(p, 4);
+	blog("%s: patched", what);
+}
+
 __attribute__((constructor)) static void
 btbridge_init(void)
 {
 	blog("btbridge loaded into pid %d", getpid());
+	/* image 0 is not the main executable while inserted libraries initialise: find bluetoothd by name */
+	for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+		const char *n = _dyld_get_image_name(i);
+		size_t l = n ? strlen(n) : 0;
+		if (l >= 11 && !strcmp(n + l - 11, "/bluetoothd")) {
+			main_slide = _dyld_get_image_vmaddr_slide(i);
+			break;
+		}
+	}
+	if (main_slide != -1 && access("/var/jb/var/sapphire-bt-skywalk", F_OK) != 0)
+		patch_insn(0x10022c48cull, 0x34000ca0u, 0x14000065u, "no Skywalk audio path (cbz -> b)");
 }
