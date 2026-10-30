@@ -10,7 +10,7 @@
  *  - The VIRT driver ("VirtualCTRL") opens <options>-in O_WRONLY (host -> controller bytes) and
  *    <options>-out O_RDONLY|O_NONBLOCK (controller -> host bytes), and a thread select()s and
  *    read()s the second one. With the H4 transport the bytes are plain H4 (type byte + packet).
- *  So bluetoothd runs with BT_HCI_TRANSPORT=H4:VIRT:/var/run/btshim/hci, and this program owns
+ *  So bluetoothd runs with BT_HCI_TRANSPORT=VIRT:VIRT:/var/run/btshim/hci, and this program owns
  *  the two FIFOs /var/run/btshim/hci-in and hci-out.
  *  - bluetoothd starts only if the local address is non-zero (BT_DEVICE_ADDRESS=aa:bb:.. in the
  *    environment, else the device tree's local-mac-address) and if /dev/cu.bluetooth or
@@ -37,9 +37,11 @@
  *   btshim daemon -F       fake controller, no hardware: answers like a BCM4357B1 and logs every
  *                          packet, to record what bluetoothd sends.
  *   btshim bluetool        the com.apple.BlueTool replacement (launchd job, MachServices).
+ *   btshim bdstart         bluetoothd's launchd program: execs it with DYLD_INSERT_LIBRARIES=btbridge.dylib.
  * The Qualcomm bring-up itself is qca.c (shared with the standalone qcabtfw).
  * Options: -d fw-dir (/var/root/btfw)  -r rampatch.tlv  -n nvm.bin  -a aa:bb:cc:dd:ee:ff
  *          -s speed (default 115200; faster needs QCABT_SETBAUD)  -p fifo-prefix  -v  -I
+ *          -w seconds: the bring-up waits until the boot is that old (120)
  * Log: /var/tmp/btshim.log (and stderr).
  */
 #include <errno.h>
@@ -57,6 +59,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
+#include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
 #include <dispatch/dispatch.h>
@@ -98,6 +101,7 @@ static const char *opt_prefix = DEF_PREFIX;
 static uint32_t opt_speed = 115200;
 static uint8_t opt_bdaddr[6] = { 0x02, 0x5a, 0x50, 0x48, 0x52, 0x45 };  /* MSB first as printed */
 static int opt_have_addr, opt_fake, opt_verbose;
+static long opt_settle = 120;   /* -w: seconds of boot age before the bring-up */
 static int log_fd = -1;
 
 void
@@ -356,7 +360,29 @@ answer_locally(uint16_t op, const uint8_t *par, size_t plen)
 		r[1] = 0x57, r[2] = 0x07, r[3] = 0x13, r[4] = 0x00, r[5] = 0x10, r[6] = 0x01;
 		n = 7;
 		break;
+	case 0xfce2:    /* Apple "Olympic" multiplexed VSC: the reply must echo the sub-opcode (else "timedout waiting
+			 * for controller", e.g. BD_VSC_OLYMPIC_ANTENNA_PREF_B, sub-op 0x15, and a restart) */
+		/* fall through */
+	case 0xfce9:    /* also multiplexed; byte-stream callbacks (_BCM_ByteStreamEventParser) want more than
+			 * one byte: [status][sub-op][8 zero bytes] */
+		r[1] = plen ? par[0] : 0;
+		n = 10;
+		break;
+	case 0xfd48:    /* BCM LE create multi-adv instance: [status][instance] (bcm_vsc.c asserts on the byte) */
+		{
+			static uint8_t inst;
+			r[1] = (uint8_t)(++inst ? inst : ++inst);
+			n = 2;
+		}
+		break;
 	default:
+		/* other Broadcom VSCs: status only until a parser is seen to need more (record.sh) */
+		/* byte-stream VSCs (_BCM_ByteStreamEventParser, e.g. BD_VSC_FACTORY_CAL_READ_TABLE 0xFD1B) need
+		 * more than one byte or the caller times out and bluetoothd restarts: [status][first param][zeros] */
+		if (ogf == 0x3f) {
+			r[1] = plen ? par[0] : 0;
+			n = 32;
+		}
 		break;
 	}
 	/* link control commands and the LE connection-type ones answer with Command Status */
@@ -387,7 +413,7 @@ translate_vsc(uint16_t op, const uint8_t *par, size_t plen)
 		if (plen >= 6) {
 			for (int i = 0; i < 6; i++)
 				opt_bdaddr[5 - i] = par[i];
-			if (qca_cmd(0xfc14, par, 6) < 0)
+			if (qca_cmd(0xfc14, opt_bdaddr, 6) < 0)   /* MSB first; its answer is dropped in from_controller */
 				return -1;
 			say("vsc: Write_BD_ADDR -> QCA 0xFC14");
 		}
@@ -445,11 +471,6 @@ from_host(const uint8_t *p, size_t n)
 			answer_locally(op, par, plen);
 			return;
 		}
-		if (!controller_up) {
-			say("command %#06x before the controller is up: answered locally", op);
-			answer_locally(op, par, plen);
-			return;
-		}
 		if ((op >> 10) == 0x3f) {
 			translate_vsc(op, par, plen);
 			return;
@@ -497,6 +518,19 @@ ctl_listen(void)
 	return s;
 }
 
+/* real mode: "boot"/"init" requests that came before the controller was up wait here */
+static int pending[16], npending, bringup_failed;
+
+static void
+ctl_reply(int c, int result, const char *line)
+{
+	say("bluetool request \"%s\" -> %d", line, result);
+	char out[32];
+	int k = snprintf(out, sizeof(out), "%d\n", result);
+	(void)write(c, out, (size_t)k);
+	close(c);
+}
+
 /* one request line from "btshim bluetool": boot | init | deepsleep | reset | cmd <text> */
 static void
 ctl_serve(int s)
@@ -512,21 +546,46 @@ ctl_serve(int s)
 	}
 	line[n] = 0;
 	line[strcspn(line, "\r\n")] = 0;
-	int result = 0;
-	if (!strcmp(line, "boot") || !strcmp(line, "init")) {
-		if (!opt_fake)
-			result = controller_bringup() == 0 ? 0 : 1;
-	} else if (!strcmp(line, "reset")) {
-		controller_up = 0;
-		if (!opt_fake)
-			result = controller_bringup() == 0 ? 0 : 1;
+	if (!opt_fake && !controller_up && (!strcmp(line, "boot") || !strcmp(line, "init"))) {
+		if (bringup_failed) {
+			ctl_reply(c, 1, line);
+		} else if (npending < (int)(sizeof(pending) / sizeof(pending[0]))) {
+			say("bluetool request \"%s\": waits for the bring-up", line);
+			pending[npending++] = c;
+		} else {
+			ctl_reply(c, 1, line);
+		}
+		return;
 	}
-	/* deepsleep and RunCommand text: nothing to do yet */
-	say("bluetool request \"%s\" -> %d", line, result);
-	char out[32];
-	int k = snprintf(out, sizeof(out), "%d\n", result);
-	(void)write(c, out, (size_t)k);
-	close(c);
+	/* deepsleep, reset and RunCommand text: nothing to do yet (the WCN stays up) */
+	ctl_reply(c, 0, line);
+}
+
+static long
+boot_age(void)
+{
+	struct timeval bt;
+	size_t sz = sizeof(bt);
+	int mib[2] = { CTL_KERN, KERN_BOOTTIME };
+	if (sysctl(mib, 2, &bt, &sz, NULL, 0) < 0)
+		return 1 << 20;
+	return (long)(time(NULL) - bt.tv_sec);
+}
+
+/* bluetoothd's start gate: /dev/uart.bluetooth (or cu.bluetooth) must exist; it is only access()ed.
+ * The kernel should create it; if it did not, try a node of our own (devfs: gone at reboot). */
+static void
+uart_node(void)
+{
+	if (access("/dev/uart.bluetooth", F_OK) == 0 || access("/dev/cu.bluetooth", F_OK) == 0)
+		return;
+	if (mknod("/dev/uart.bluetooth", S_IFCHR | 0666, makedev(3, 2)) == 0)
+		say("made /dev/uart.bluetooth (char 3,2) for bluetoothd's start check");
+	else if (symlink("/dev/null", "/dev/uart.bluetooth") == 0)
+		say("made /dev/uart.bluetooth -> /dev/null for bluetoothd's start check");
+	else
+		say("cannot make /dev/uart.bluetooth (%s): bluetoothd will say \"No bluetooth on this device\"",
+		    strerror(errno));
 }
 
 static int
@@ -542,14 +601,40 @@ daemon_main(void)
 	int ls = ctl_listen();
 	if (host_rd < 0 || host_wr < 0 || ls < 0)
 		return 1;
-	/* bluetoothd's start gate: one of these must exist (it only calls access()) */
-	if (access("/dev/uart.bluetooth", F_OK) < 0 && access("/dev/cu.bluetooth", F_OK) < 0)
-		say("note: neither /dev/uart.bluetooth nor /dev/cu.bluetooth exists; bluetoothd also accepts an "
-		    "IOService named \"bluetooth\"");
+	uart_node();
+	if (log_fd >= 0)
+		fchmod(log_fd, 0666);   /* "btshim bluetool" runs as mobile and logs here too */
 	say("btshim daemon: %s mode, host FIFOs %s / %s, speed %u", opt_fake ? "FAKE" : "real", in, out, opt_speed);
 	signal(SIGPIPE, SIG_IGN);
 	uint8_t buf[4096];
+	/* real mode: the bring-up waits until the boot is opt_settle s old (like the other daemons);
+	 * what bluetoothd writes before that is held, not answered */
+	static uint8_t held[65536];
+	size_t nheld = 0;
+	int tries = 0;
+	time_t next_try = time(NULL) + (boot_age() < opt_settle ? opt_settle - boot_age() : 0);
+	if (!opt_fake)
+		say("bring-up in %ld s", (long)(next_try - time(NULL)));
 	for (;;) {
+		if (!opt_fake && !controller_up && !bringup_failed && time(NULL) >= next_try) {
+			if (controller_bringup() == 0) {
+				say("controller up: %d bluetool request(s) answered, %zu held bytes passed on", npending, nheld);
+				for (int i = 0; i < npending; i++)
+					ctl_reply(pending[i], 0, "boot/init");
+				npending = 0;
+				h4_feed(&h_h4, held, nheld, from_host);
+				nheld = 0;
+			} else if (++tries >= 5) {
+				say("bring-up failed %d times: giving up (bluetool requests get 1)", tries);
+				bringup_failed = 1;
+				for (int i = 0; i < npending; i++)
+					ctl_reply(pending[i], 1, "boot/init");
+				npending = 0;
+			} else {
+				say("bring-up failed (try %d): again in 30 s", tries);
+				next_try = time(NULL) + 30;
+			}
+		}
 		fd_set r;
 		FD_ZERO(&r);
 		FD_SET(host_rd, &r);
@@ -560,7 +645,8 @@ daemon_main(void)
 			if (ctl_notify[0] > mx)
 				mx = ctl_notify[0];
 		}
-		int k = select(mx + 1, &r, NULL, NULL, NULL);
+		struct timeval tv = { 1, 0 };
+		int k = select(mx + 1, &r, NULL, NULL, opt_fake || controller_up ? NULL : &tv);
 		if (k < 0) {
 			if (errno == EINTR)
 				continue;
@@ -571,8 +657,14 @@ daemon_main(void)
 			ctl_serve(ls);
 		if (FD_ISSET(host_rd, &r)) {
 			ssize_t n = read(host_rd, buf, sizeof(buf));
-			if (n > 0)
+			if (n > 0 && !opt_fake && !controller_up) {
+				if (nheld + (size_t)n <= sizeof(held)) {
+					memcpy(held + nheld, buf, (size_t)n);
+					nheld += (size_t)n;
+				}
+			} else if (n > 0) {
 				h4_feed(&h_h4, buf, (size_t)n, from_host);
+			}
 		}
 		if (controller_up && ctl_notify[0] >= 0 && FD_ISSET(ctl_notify[0], &r)) {
 			while (read(ctl_notify[0], buf, sizeof(buf)) > 0)
@@ -603,7 +695,7 @@ ask_daemon(const char *req)
 	(void)write(s, req, strlen(req));
 	(void)write(s, "\n", 1);
 	char b[32] = { 0 };
-	struct timeval tv = { 60, 0 };  /* a download takes a few seconds */
+	struct timeval tv = { 300, 0 };  /* the daemon waits for the boot to settle, then ~25 s of download */
 	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 	ssize_t n = read(s, b, sizeof(b) - 1);
 	close(s);
@@ -663,8 +755,8 @@ bluetool_main(void)
 static void
 usage(void)
 {
-	fprintf(stderr, "usage: btshim daemon [-F] | bluetool | probe | up   [-r tlv] [-n nvm] [-a addr] [-s speed] "
-	    "[-p fifo-prefix] [-v] [-I] [-k]\n");
+	fprintf(stderr, "usage: btshim daemon [-F] [-d dir] [-r tlv] [-n nvm] [-a addr] [-s speed] "
+	    "[-p fifo-prefix] [-w settle-s] [-v] [-I] | bluetool\n");
 	exit(2);
 }
 
@@ -679,10 +771,11 @@ main(int argc, char **argv)
 		opt_have_addr = 1;
 	int c;
 	optind = 2;
-	while ((c = getopt(argc, argv, "Fd:r:n:a:s:p:vI")) != -1) {
+	while ((c = getopt(argc, argv, "Fd:r:n:a:s:p:vIw:")) != -1) {
 		switch (c) {
 		case 'F': opt_fake = 1; break;
 		case 'd': opt_dir = optarg; break;
+		case 'w': opt_settle = strtol(optarg, NULL, 0); break;
 		case 'r': opt_ramp = optarg; break;
 		case 'n': opt_nvm = optarg; break;
 		case 'a':
@@ -696,6 +789,16 @@ main(int argc, char **argv)
 		case 'I': qca_keep_ibs = 1; break;
 		default: usage();
 		}
+	}
+	if (!strcmp(mode, "bdstart")) {
+		/* bluetoothd's launchd program: launchd drops DYLD_* for system daemons, so set it here and exec
+		 * the real bluetoothd (same pid: the job's Mach services stay). btbridge.dylib answers bluetoothd's
+		 * local-mac-address lookup (its BT_DEVICE_ADDRESS is zeroed in release builds). */
+		setenv("DYLD_INSERT_LIBRARIES", "/redwood/lib/btbridge.dylib", 1);
+		char *bargv[] = { "/usr/sbin/bluetoothd", NULL };
+		execv(bargv[0], bargv);
+		perror("btshim bdstart: exec bluetoothd");
+		return 1;
 	}
 	if (!strcmp(mode, "daemon"))
 		return daemon_main();

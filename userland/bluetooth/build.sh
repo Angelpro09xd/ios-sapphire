@@ -11,8 +11,12 @@ $L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -Wext
 	-fblocks -o ../obj/btshim btshim.c
 # qcabtfw: the standalone Qualcomm bring-up (firmware download, BD address) for testing by hand
 $L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -Wextra -Wno-unused-parameter 	-framework CoreFoundation -framework IOKit -o ../obj/qcabtfw qcabtfw.c
+# btbridge.dylib: inserted into bluetoothd (btshim bdstart), answers its local-mac-address lookup
+$L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -Wextra -Wno-unused-parameter \
+	-dynamiclib -install_name /redwood/lib/btbridge.dylib -framework CoreFoundation -framework IOKit \
+	-o ../obj/btbridge.dylib btbridge.c
 LDID=$(command -v ldid || ls "$HOME"/tools-dl/ldid/ldid 2>/dev/null || true)
-for f in btshim qcabtfw; do
+for f in btshim qcabtfw btbridge.dylib; do
 	[ -n "$LDID" ] && "$LDID" -S ../obj/$f || echo "sign ../obj/$f with ldid -S"
 	echo "../obj/$f"
 done

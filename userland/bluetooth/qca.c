@@ -246,6 +246,14 @@ wait_vse(uint8_t rtype, unsigned ms, uint8_t *out, size_t *outlen)
 			return 0;
 		}
 		if (pkt[0] == 4 && pkt[1] == 0x0e && n >= 7 && pkt[4] == 0x00 && pkt[5] == 0xfc) {
+			/* the WCN3988 acks NVM segments with a Command Complete for 0xFC00, not a VSE */
+			if (rtype == 0x04) {
+				if (out) {
+					out[0] = pkt[6];
+					*outlen = 1;
+				}
+				return 0;
+			}
 			if (pkt[6])
 				say("qca: 0xFC00 Command Complete status %#x", pkt[6]);
 			continue;
@@ -531,10 +539,8 @@ fail:
 int
 qca_set_bdaddr(const uint8_t a[6])
 {
-	uint8_t le[6];
-	for (int i = 0; i < 6; i++)
-		le[i] = a[5 - i];
-	if (qca_cmd(0xfc14, le, 6) < 0)
+	/* the WCN3988 takes it MSB first (sent reversed, Read BD_ADDR showed it reversed) */
+	if (qca_cmd(0xfc14, a, 6) < 0)
 		return -1;
 	uint64_t dl = q_now() + 1000;
 	while (q_now() < dl) {
