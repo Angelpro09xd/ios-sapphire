@@ -1,0 +1,415 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0274: camera capture in stages, SMMU bank mapping only the pool
+
+0273's op 12 took the phone down without a trace. It is split into four ops
+that log before every risky access and first write the console log to the
+partition (new sweet_log_sync() in sweet_ufs.c), so recovery shows the step:
+op 20 programs a stage-1 bank for stream 0x400 (apps SMMU 0xc600000, the DT's
+msm_cam_smmu_tfe) in a free bank that no valid SMR uses, mapping only the
+frame pool in 2 MB identity blocks (tables in the pool's last 2 MB), faults
+reported and terminated, never stalled; it lists the SMRs, the bank taken
+and the RT TBU's GDSC vote. Op 21 reads the TFE (clock state first, hw
+version, status, WM7). Op 22 writes WM7 and the masks without enabling and
+checks the read-back. Op 23 enables RDI0/WM7 and takes one frame, polling the
+bank's fault status and stopping everything at the first fault.
+---
+ bsd/dev/sweet_cam.c | 312 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ bsd/dev/sweet_ufs.c |  22 ++++
+ 2 files changed, 331 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index 2fe67d4..d3deb13 100755
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -11,7 +11,9 @@
+  *     (arg: slot | mode << 4: HM6 0x00/0x10/0x40, 4H7 0x02), 11 CSIPHY + PPI + CSID0 RDI0 and its
+  *     packet counters (arg settle << 8), 12 one frame through TFE0 RDI0 / write master 7 into the
+  *     pool 0xD7000000 (144 MB) with an identity SMMU bank for stream 0x400, 13 stop, 14 the pool's
+- *     pattern test (arg 1: check only); kern.sweet_cam_seek + kern.sweet_cam_frame: the frame in
++ *     pattern test (arg 1: check only); 0274: op 12 split into 20 (SMMU stage-1 bank mapping only
++ *     the pool), 21 (TFE registers read), 22 (WM7 written, not enabled), 23 (enable + one frame);
++ *     kern.sweet_cam_seek + kern.sweet_cam_frame: the frame in
+  *     1 MB reads, kern.sweet_cam_frame_len its size.
+  *   kern.sweet_cam_log: the log of the last request (also in the kernel log, "SWEET CAM:").
+  *   kern.sweet_cam_i2c = "m addr reg" reads 2 bytes, "m addr reg val" writes val (1 byte if
+@@ -1076,7 +1078,7 @@ cam_pool_map(void)
+ 	return cam_pool != NULL;
+ }
+ 
+-static int
++static int __attribute__((unused))
+ cam_capture(void)
+ {
+ 	uint32_t bytes = cs.w * cs.h * 10 / 8;
+@@ -1264,6 +1266,297 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_cam_frame_len, CTLFLAG_RD | CTLFLAG_LOCKED, &
+ SYSCTL_INT(_kern, OID_AUTO, sweet_cam_arg, CTLFLAG_RW | CTLFLAG_LOCKED, &cam_arg, 0,
+     "argument of the camera ops (op 10: slot | mode << 4; op 11: settle << 8; op 14: 1 = check only)");
+ 
++/* ================================================================ 0274: op 12 in stages */
++
++/*
++ * 0273's op 12 took the phone down at once (no log). Now four ops, each logging before every
++ * risky access and writing the console log to the partition first (sweet_log_sync()), so the
++ * last line read back from recovery names the step:
++ *   20 SMMU only: a stage-1 bank for stream 0x400 that maps only the frame pool (2 MB blocks,
++ *      identity), so a stray TFE write faults and is terminated (no stall) instead of landing
++ *      anywhere; nothing in the camera is touched.
++ *   21 TFE registers read only (hw version, top/bus status, WM7).
++ *   22 WM7 + TFE RDI0 written, nothing enabled; read back.
++ *   23 enable + one frame, the SMMU fault status polled throughout (any fault: everything
++ *      stops at once).
++ * op 12 now only says to use these.
++ */
++extern void sweet_log_sync(unsigned max_ms);     /* bsd/dev/sweet_ufs.c */
++
++#define CAM_TBL_PA      (CAM_POOL_PA + CAM_POOL_SIZE - 0x2000)   /* level 1 + level 2, in the pool's last 2 MB block */
++#define CAM_MAP_END     (CAM_POOL_PA + CAM_POOL_SIZE - 0x200000) /* mapped for the TFE: the pool but its last 2 MB */
++
++static vm_offset_t s_cbp;                       /* the bank op 20 programmed */
++static bool s_ready, w_ready;
++
++static void
++step(const char *fmt, ...)
++{
++	char line[200];
++	va_list ap;
++	va_start(ap, fmt);
++	(void)vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++	camlog("step: %s", line);
++	sweet_log_sync(500);
++}
++
++/* op 20 */
++static int
++cam_smmu_stage(void)
++{
++	if (!cam_pool_map()) {
++		return ENOMEM;
++	}
++	if (cam_smmu == 0) {
++		step("mapping the apps SMMU %#x (0x80000)", SMMU_PA);
++		cam_smmu = ml_io_map(SMMU_PA, 0x80000);
++	}
++	if (cam_smmu == 0 || !cam_map()) {
++		return EIO;
++	}
++	vm_offset_t s = cam_smmu;
++	step("reading the SMMU's ID and global state");
++	uint32_t id0 = rd(s, 0x20), id1 = rd(s, 0x24), nsmr = id0 & 0xFF, ncb = id1 & 0xFF;
++	uint32_t psize = (id1 & (1u << 31)) ? 0x10000 : 0x1000, npage = 1u << (((id1 >> 28) & 7) + 1);
++	camlog("SMMU %#x: sCR0 %#x ID0 %#x ID1 %#x: %u SMRs, %u banks, page %#x x %u; sGFSR %#x", SMMU_PA, rd(s, 0x0), id0, id1,
++	    nsmr, ncb, psize, npage, rd(s, 0x48));
++	camlog("GCC hlos1_vote_mm_snoc_mmu_tbu_rt_gdsc (0x147d074, the TBU of streams 0x400-0x7ff) %#x", rd(gcc, 0x7D074));
++	uint32_t slot = ~0u, cb = ~0u, valid = 0;
++	uint64_t used = 0;
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		uint32_t smr = rd(s, 0x800 + 4 * i), s2cr = rd(s, 0xC00 + 4 * i);
++		if ((smr >> 31) == 0) {
++			if (slot == ~0u) {
++				slot = i;
++			}
++			continue;
++		}
++		valid++;
++		if (((s2cr >> 16) & 3) == 0) {
++			used |= 1ull << (s2cr & 0x3F);
++		}
++		camlog("SMR%u %#x (id %#x mask %#x) S2CR %#x (type %u, bank %u)", i, smr, smr & 0x7FFF, (smr >> 16) & 0x7FFF, s2cr,
++		    (s2cr >> 16) & 3, s2cr & 0x3F);
++		if ((smr & 0x7FFF) == TFE_SID) {
++			slot = i;
++		}
++	}
++	for (uint32_t i = 4; i < ncb && i < 64 && cb == ~0u; i++) {
++		if ((used & (1ull << i)) == 0) {
++			cb = i;
++		}
++	}
++	if (slot == ~0u || cb == ~0u || (uint64_t)(npage + cb + 1) * psize > 0x80000) {
++		camlog("SMMU: no free SMR/bank (slot %u bank %u): stop", slot, cb);
++		return EIO;
++	}
++	vm_offset_t gr1 = s + psize, cbp = s + (vm_offset_t)npage * psize + (vm_offset_t)cb * psize;
++	camlog("SMMU: %u valid SMRs; taking SMR%u and bank %u (no valid SMR points at it): SCTLR %#x CBAR %#x FSR %#x", valid,
++	    slot, cb, rd(cbp, 0x0), rd(gr1, 4 * cb), rd(cbp, 0x58));
++
++	/* tables in the pool's last 2 MB block: level 1 maps the 4th GB to level 2; 2 MB blocks for the pool */
++	uint64_t *l1 = (uint64_t *)(void *)(cam_pool + (CAM_TBL_PA - CAM_POOL_PA)), *l2 = l1 + 512;
++	bzero(l1, 0x2000);
++	l1[3] = (CAM_TBL_PA + 0x1000) | 3;
++	unsigned blocks = 0;
++	for (uint64_t pa = CAM_POOL_PA; pa < CAM_MAP_END; pa += 0x200000, blocks++) {
++		/* block, AF, AP read-write, attribute 0 (normal non-cacheable), non-shareable */
++		l2[(pa >> 21) & 511] = pa | (1u << 10) | (1u << 6) | 1;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	camlog("SMMU: tables at %#llx: %u blocks of 2 MB, %#llx-%#llx identity", CAM_TBL_PA, blocks, CAM_POOL_PA, CAM_MAP_END);
++
++	step("programming bank %u (SCTLR off while it changes)", cb);
++	wr(cbp, 0x0, 0);
++	wr(cbp, 0x58, 0xFFFFFFFF);
++	wr(cbp, 0x20, (uint32_t)CAM_TBL_PA);
++	wr(cbp, 0x24, (uint32_t)(CAM_TBL_PA >> 32));
++	wr(cbp, 0x30, 32u | (1u << 23));                /* TCR: T0SZ 32, non-cacheable walks, 4 KB, EPD1 */
++	wr(cbp, 0x10, (7u << 15) | 2u);                 /* TCR2: 40-bit output */
++	wr(cbp, 0x38, 0x44);                            /* MAIR0: attribute 0 normal non-cacheable */
++	wr(cbp, 0x3C, 0);
++	wr(gr1, 0x800 + 4 * cb, 1);                     /* CBA2R: 64-bit */
++	wr(gr1, 4 * cb, 0x0001F000);                    /* CBAR: stage 1, stage 2 bypass */
++	wr(cbp, 0x610, 0);                              /* TLBIASID 0 */
++	wr(cbp, 0x7F0, 0);                              /* TLBSYNC */
++	for (uint32_t k = 0; k < 100000 && (rd(cbp, 0x7F4) & 1) != 0; k++) {
++		IODelay(1);
++	}
++	/* translate; faults reported and terminated, never stalled (CFCFG 0) */
++	wr(cbp, 0x0, (1u << 6) | (1u << 5) | 1u);
++	step("pointing stream %#x (SMR%u) at bank %u", TFE_SID, slot, cb);
++	wr(s, 0xC00 + 4 * slot, cb);
++	wr(s, 0x800 + 4 * slot, (1u << 31) | TFE_SID);
++	wr(s, 0x70, 0);
++	for (uint32_t k = 0; k < 100000 && (rd(s, 0x74) & 1) != 0; k++) {
++		IODelay(1);
++	}
++	uint32_t smr = rd(s, 0x800 + 4 * slot), s2cr = rd(s, 0xC00 + 4 * slot);
++	s_ready = (smr == ((1u << 31) | TFE_SID)) && s2cr == cb && (rd(cbp, 0x0) & 0x61) == 0x61;
++	camlog("SMMU: SMR%u %#x S2CR %#x; bank %u SCTLR %#x TTBR0 %#x TCR %#x CBAR %#x FSR %#x: %s", slot, smr, s2cr, cb,
++	    rd(cbp, 0x0), rd(cbp, 0x20), rd(cbp, 0x30), rd(gr1, 4 * cb), rd(cbp, 0x58), s_ready ? "as written" : "NOT as written");
++	s_cbp = s_ready ? cbp : 0;
++	sweet_log_sync(500);
++	return s_ready ? 0 : EIO;
++}
++
++/* op 21 */
++static int
++cam_tfe_read(void)
++{
++	if (!cam_csid_up || cam_csid == 0) {
++		camlog("op 21: CSID not up (op 11 first: it also turns on tfe_0)");
++		return EAGAIN;
++	}
++	camlog("TFE clocks: tfe_0 CBCR %#x, tfe_0_csid %#x, tfe_0_cphy_rx %#x, top_ahb %#x, axi %#x, rt_axi %#x", rd(gcc, 0x5201C),
++	    rd(gcc, 0x520AC), rd(gcc, 0x5207C), rd(gcc, CBCR_TOP_AHB), rd(gcc, CBCR_AXI), rd(gcc, CBCR_RT_AXI));
++	if ((rd(gcc, 0x5201C) >> 31) != 0) {
++		camlog("op 21: tfe_0 is off: stop");
++		return EIO;
++	}
++	step("reading TFE0 hw version at %#x", CSID0_PA + 0x1000);
++	uint32_t v = rd(cam_csid, 0x1000);
++	camlog("TFE0 hw version %#x", v);
++	if (v == 0 || v == 0xffffffffu) {
++		camlog("op 21: TFE version looks wrong: stop");
++		return EIO;
++	}
++	step("reading TFE0 top and bus status");
++	camlog("TFE0 top irq status %#x %#x %#x, bus %#x %#x, overflow %#x, size violation %#x", rd(cam_csid, 0x104C),
++	    rd(cam_csid, 0x1050), rd(cam_csid, 0x1054), rd(cam_csid, 0x1A28), rd(cam_csid, 0x1A2C), rd(cam_csid, 0x1A68),
++	    rd(cam_csid, 0x1A70));
++	step("reading WM7 (0x2300)");
++	camlog("WM7 cfg %#x addr %#x incr %#x cfg0 %#x stride %#x packer %#x addr status %#x; TFE RDI0 cfg %#x status %#x",
++	    rd(cam_csid, 0x2300), rd(cam_csid, 0x2304), rd(cam_csid, 0x2308), rd(cam_csid, 0x230C), rd(cam_csid, 0x2314),
++	    rd(cam_csid, 0x2318), rd(cam_csid, 0x2368), rd(cam_csid, 0x1460), rd(cam_csid, 0x1404));
++	return 0;
++}
++
++/* op 22 */
++static int
++cam_wm_config(void)
++{
++	uint32_t bytes = cs.w * cs.h * 10 / 8;
++	if (!cam_csid_up || !s_ready) {
++		camlog("op 22: needs op 11 and op 20 first");
++		return EAGAIN;
++	}
++	if (CAM_POOL_PA + bytes > CAM_MAP_END) {
++		camlog("op 22: %u bytes do not fit the mapped pool", bytes);
++		return ENOMEM;
++	}
++	vm_offset_t t = cam_csid;
++	step("TFE0: IRQ masks and clears");
++	wr(t, 0x1034, 0xFFFFFFFF); wr(t, 0x1038, 0xFFFFFFFF); wr(t, 0x103C, 0xFFFFFFFF);
++	wr(t, 0x1040, 0xFFFFFFFF); wr(t, 0x1044, 0xFFFFFFFF); wr(t, 0x1048, 0xFFFFFFFF); wr(t, 0x1030, 1);
++	wr(t, 0x1A18, 0xFFFFFFFF); wr(t, 0x1A1C, 0xFFFFFFFF);
++	wr(t, 0x1A20, 0xFFFFFFFF); wr(t, 0x1A24, 0xFFFFFFFF); wr(t, 0x1A30, 1);
++	step("WM7: frame mode, %u bytes at %#llx, not enabled", bytes, CAM_POOL_PA);
++	wr(t, 0x231C, 0xF);
++	wr(t, 0x230C, 0x0000FFFF);
++	wr(t, 0x2318, 0xA);
++	wr(t, 0x2314, 0xFFFF);
++	wr(t, 0x2304, (uint32_t)CAM_POOL_PA);
++	wr(t, 0x2308, bytes);
++	wr(t, 0x2338, 0);
++	wr(t, 0x233C, 1);
++	camlog("WM7 read back: cfg %#x addr %#x incr %#x cfg0 %#x stride %#x packer %#x bw %#x drop %#x/%#x", rd(t, 0x2300),
++	    rd(t, 0x2304), rd(t, 0x2308), rd(t, 0x230C), rd(t, 0x2314), rd(t, 0x2318), rd(t, 0x231C), rd(t, 0x2338), rd(t, 0x233C));
++	w_ready = rd(t, 0x2304) == (uint32_t)CAM_POOL_PA && rd(t, 0x2308) == bytes;
++	if (!w_ready) {
++		camlog("op 22: WM7 address/size did not read back as written (address shifted?): stop");
++	}
++	sweet_log_sync(500);
++	return w_ready ? 0 : EIO;
++}
++
++static bool
++smmu_fault(const char *when)
++{
++	uint32_t fsr = s_cbp ? rd(s_cbp, 0x58) : 0;
++	if (fsr != 0) {
++		camlog("SMMU FAULT %s: FSR %#x FAR %#x%08x FSYNR0 %#x", when, fsr, rd(s_cbp, 0x64), rd(s_cbp, 0x60), rd(s_cbp, 0x68));
++	}
++	return fsr != 0;
++}
++
++/* op 23 */
++static int
++cam_capture_staged(void)
++{
++	uint32_t bytes = cs.w * cs.h * 10 / 8;
++	if (!w_ready || !s_ready || !cam_csid_up) {
++		camlog("op 23: needs ops 11, 20, 22 first");
++		return EAGAIN;
++	}
++	vm_offset_t t = cam_csid;
++	memset(cam_pool, 0xA5, 4096);
++	memset(cam_pool + bytes - 4096, 0xA5, 4096);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (smmu_fault("before")) {
++		return EIO;
++	}
++	step("CSID RDI0 halt");
++	wr(t, 0x308, 0);
++	step("TFE RDI0 path on (0x1460=1, epoch 0x1470)");
++	wr(t, 0x1460, 0x1);
++	wr(t, 0x1470, 0x00140014);
++	step("WM7 enable (0x2300=0x10001) + reg update");
++	wr(t, 0x2300, 0x00010001);
++	wr(t, 0x102C, 0x2);
++	step("CSID RDI0 resume: the TFE starts writing at the next frame");
++	wr(t, 0x308, 1);
++	uint64_t t0 = mach_absolute_time(), ns = 0;
++	uint32_t logs = 0, b0 = 0, b1 = 0;
++	bool eof = false, done = false, fault = false;
++	while (!done) {
++		fault = smmu_fault("during the frame");
++		uint32_t s0 = rd(t, 0x104C), s1 = rd(t, 0x1050), rdi = rd(t, 0x040);
++		b0 = rd(t, 0x1A28);
++		b1 = rd(t, 0x1A2C);
++		if ((s0 | s1 | b0 | b1) && logs < 10) {
++			camlog("TFE top %#x %#x, bus %#x %#x, overflow %#x, size violation %#x, rdi0 irq %#x", s0, s1, b0, b1,
++			    rd(t, 0x1A68), rd(t, 0x1A70), rdi);
++			logs++;
++		}
++		if (s0 | s1) {
++			wr(t, 0x1040, s0); wr(t, 0x1044, s1); wr(t, 0x1030, 1);
++		}
++		if (b0 | b1) {
++			wr(t, 0x1A20, b0); wr(t, 0x1A24, b1); wr(t, 0x1A30, 1);
++		}
++		eof |= (rdi & (1u << 9)) != 0;
++		if (rdi) {
++			wr(t, 0x048, rdi); wr(t, 0x080, 1);
++		}
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		done = fault || (eof && (b0 | b1) != 0) || ns > 3000000000ull;
++		if (!done) {
++			IOSleep(2);
++		}
++	}
++	wr(t, 0x2300, 0);                               /* WM7 off first on a fault */
++	wr(t, 0x102C, 0x2);
++	wr(t, 0x308, 0);
++	sweet_log_sync(500);
++	unsigned changed = 0, tail = 0;
++	for (unsigned i = 0; i < 4096; i++) {
++		changed += cam_pool[i] != 0xA5;
++		tail += cam_pool[bytes - 4096 + i] != 0xA5;
++	}
++	camlog("frame: %s%s after %llu ms; WM7 addr status %#x; first 4 KB %u bytes written, last 4 KB %u", eof ? "EOF" : "NO EOF",
++	    fault ? ", SMMU FAULT" : "", ns / 1000000, rd(t, 0x2368), changed, tail);
++	camlog("frame +0: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", cam_pool[0],
++	    cam_pool[1], cam_pool[2], cam_pool[3], cam_pool[4], cam_pool[5], cam_pool[6], cam_pool[7], cam_pool[8], cam_pool[9],
++	    cam_pool[10], cam_pool[11], cam_pool[12], cam_pool[13], cam_pool[14], cam_pool[15]);
++	(void)smmu_fault("after");
++	cam_frame_len = changed != 0 ? bytes : 0;
++	cam_seek = 0;
++	camlog("op 23: %s (%u bytes in kern.sweet_cam_frame)", changed ? "FRAME CAPTURED" : "nothing written", cam_frame_len);
++	return changed && !fault ? 0 : EIO;
++}
++
+ static int
+ sysctl_sweet_cam SYSCTL_HANDLER_ARGS
+ {
+@@ -1295,7 +1588,20 @@ sysctl_sweet_cam SYSCTL_HANDLER_ARGS
+ 		r = cam_link_on();
+ 		break;
+ 	case 12:
+-		r = cam_capture();
++		camlog("op 12 is split since 0274: 20 SMMU, 21 TFE read, 22 WM7 config, 23 capture");
++		r = EINVAL;
++		break;
++	case 20:
++		r = cam_smmu_stage();
++		break;
++	case 21:
++		r = cam_tfe_read();
++		break;
++	case 22:
++		r = cam_wm_config();
++		break;
++	case 23:
++		r = cam_capture_staged();
+ 		break;
+ 	case 13:
+ 		r = cam_stop();
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index c3924c6..f5eb5ca 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -845,6 +845,7 @@ sweet_ufs_init(void)
+ static char sweet_log_ring[SWEET_LOG_SIZE];
+ static uint64_t _Atomic sweet_log_total;
+ static int sweet_log_chan;
++static uint64_t _Atomic sweet_log_flushed;      /* 0274: what the log thread has written */
+ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+ 
+ /* Called for all console output, any context: never blocks. */
+@@ -903,6 +904,7 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
+ 	uint64_t flushed = 0, seq = 0;
++	extern void IOSleep(unsigned int);
+ 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 
+ 	printf("SWEET LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
+@@ -945,11 +947,31 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 			return;
+ 		}
+ 		flushed = total;
++		os_atomic_store(&sweet_log_flushed, total, relaxed);
+ 	}
+ }
+ 
+ static bool sweet_log_on;
+ 
++/*
++ * 0274: write the console log to the partition now and wait (up to max_ms) until it is there,
++ * so that the last lines before a risky step survive a hang (sweet_cam.c).
++ */
++void sweet_log_sync(unsigned max_ms);
++void
++sweet_log_sync(unsigned max_ms)
++{
++	extern void IOSleep(unsigned int);
++	if (!sweet_log_on) {
++		return;
++	}
++	uint64_t want = os_atomic_load(&sweet_log_total, relaxed);
++	wakeup(&sweet_log_chan);
++	for (unsigned ms = 0; ms < max_ms && os_atomic_load(&sweet_log_flushed, relaxed) < want; ms += 5) {
++		IOSleep(5);
++	}
++}
++
+ /*
+  * Black box. Called from SavePanicInfo() (osfmk/arm/model_dep.c): the panic string has
+  * already gone through the console into the ring, every other CPU is halted and
