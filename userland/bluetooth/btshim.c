@@ -418,9 +418,63 @@ answer_locally(uint16_t op, const uint8_t *par, size_t plen)
 }
 
 /* real mode: Broadcom vendor commands with a Qualcomm meaning */
+#include "le_ext.c"
+
+/* one line per classic-BT milestone (inquiry, scan enable, connections, pairing), also without -v */
+static unsigned inq_results;
+
+static void
+trace_cmd(uint16_t op, const uint8_t *par, size_t plen)
+{
+	switch (op) {
+	case 0x0401: say("BR: inquiry started"); inq_results = 0; break;
+	case 0x0402: say("BR: inquiry cancelled"); break;
+	case 0x0405: say("BR: create connection"); break;
+	case 0x0409: say("BR: accept connection request (role %u)", plen >= 7 ? par[6] : 0); break;
+	case 0x040a: say("BR: reject connection request"); break;
+	case 0x0411: say("BR: authentication requested"); break;
+	case 0x042b: say("BR: IO capability reply (cap %u)", plen >= 7 ? par[6] : 0); break;
+	case 0x042c: say("BR: user confirmation reply (yes)"); break;
+	case 0x042d: say("BR: user confirmation negative reply"); break;
+	case 0x0c1a: say("BR: write scan enable %#x (1 inquiry scan = discoverable, 2 page scan = connectable)",
+	    plen ? par[0] : 0); break;
+	case 0x0c13: say("BR: local name set"); break;
+	default: break;
+	}
+}
+
+static void
+trace_event(const uint8_t *p, size_t n)
+{
+	if (p[0] != 4 || n < 3)
+		return;
+	switch (p[1]) {
+	case 0x01: say("BR: inquiry complete, %u results", inq_results); break;
+	case 0x02: case 0x22: case 0x2f:
+		if (inq_results++ < 20)
+			say("BR: inquiry result (event %#x, %u so far)", p[1], inq_results);
+		break;
+	case 0x03: say("BR: connection complete status %#x handle %#x", p[3], n >= 6 ? p[4] | (p[5] << 8) : 0); break;
+	case 0x04: say("BR: connection request (class %02x%02x%02x)", n >= 12 ? p[11] : 0, n >= 11 ? p[10] : 0,
+	    n >= 10 ? p[9] : 0); break;
+	case 0x05: say("BR: disconnection complete reason %#x", n >= 7 ? p[6] : 0); break;
+	case 0x06: say("BR: authentication complete status %#x", p[3]); break;
+	case 0x31: say("BR: IO capability request"); break;
+	case 0x32: say("BR: IO capability response (remote cap %u)", n >= 10 ? p[9] : 0); break;
+	case 0x33: say("BR: user confirmation request"); break;
+	case 0x36: say("BR: simple pairing complete status %#x", p[3]); break;
+	case 0x18: say("BR: link key notification"); break;
+	case 0x17: say("BR: link key request"); break;
+	case 0x16: say("BR: PIN code request"); break;
+	default: break;
+	}
+}
+
 static int
 translate_vsc(uint16_t op, const uint8_t *par, size_t plen)
 {
+	if (le_vsc(op, par, plen))
+		return 0;
 	switch (op) {
 	case 0xfc01:    /* BCM Write_BD_ADDR (LE order) -> QCA 0xFC14 */
 		if (plen >= 6) {
@@ -529,6 +583,9 @@ from_controller(const uint8_t *p, size_t n)
 			hexdump("drop VSE", p, n);
 		return;
 	}
+	trace_event(p, n);
+	if (own_event(p, n) || le_event(p, n))
+		return;
 	if (p[0] == 2 && n >= 5) {
 		unsigned h = (unsigned)(p[1] | (p[2] << 8)) & 0x0fff;
 		if (h == 0x2edc || h == 0x2edd) {       /* QCA_DEBUG_HANDLE / memdump: not for bluetoothd */
@@ -608,6 +665,9 @@ from_host(const uint8_t *p, size_t n)
 			translate_vsc(op, par, plen);
 			return;
 		}
+		trace_cmd(op, par, plen);
+		if ((op >> 10) == 0x08 && le_legacy(op, par, plen))
+			return;
 		/* commands the WCN3988 does not implement but bluetoothd's init chain requires to succeed */
 		if (op == 0x0c5b || op == 0x0c5a) {     /* Write / Read Default Erroneous Data Reporting */
 			say("answering %#06x locally (not in the WCN)", op);
@@ -805,7 +865,9 @@ daemon_main(void)
 			scan_test = 0;
 		}
 		struct timeval tv = { 1, 0 };
-		int k = select(mx + 1, &r, NULL, NULL, opt_fake || (controller_up && !scan_test) ? NULL : &tv);
+		int k = select(mx + 1, &r, NULL, NULL, opt_fake ? NULL : &tv);
+		if (controller_up && !opt_fake)
+			own_pump();     /* time out a lost answer to one of our own commands */
 		if (k < 0) {
 			if (errno == EINTR)
 				continue;
