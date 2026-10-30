@@ -666,6 +666,10 @@ from_host(const uint8_t *p, size_t n)
 			return;
 		}
 		trace_cmd(op, par, plen);
+		if (op == 0x0c03) {     /* HCI_Reset: bluetoothd (re)starts; its advertising instances are gone */
+			memset(adv, 0, sizeof(adv));
+			le_scanning = 0;
+		}
 		if ((op >> 10) == 0x08 && le_legacy(op, par, plen))
 			return;
 		/* commands the WCN3988 does not implement but bluetoothd's init chain requires to succeed */
