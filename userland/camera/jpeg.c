@@ -115,12 +115,16 @@ static void dht(FILE *f, int cls_id, const uint8_t bits[16], const uint8_t *vals
 	fwrite(vals, 1, n, f);
 }
 
+const uint8_t *g_jpeg_app1;
+size_t g_jpeg_app1_len;
+
 void jpeg_write_header(JpegEnc *e, FILE *f)
 {
 	static const uint8_t app0[] = { 0xff, 0xe0, 0, 16, 'J', 'F', 'I', 'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0 };
 	fputc(0xff, f);
 	fputc(0xd8, f);
 	fwrite(app0, 1, sizeof app0, f);
+	if (g_jpeg_app1 && g_jpeg_app1_len) fwrite(g_jpeg_app1, 1, g_jpeg_app1_len, f); /* e.g. Exif */
 	/* DQT */
 	fputc(0xff, f);
 	fputc(0xdb, f);
