@@ -1,0 +1,39 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0271: camera: camera AHB/XO enabled before the GDSC, checked after it
+
+gcc_camera_ahb_clk reports CLK_OFF while the camss domain is collapsed, so
+op 1 stopped at once. Enable it (and camera XO) first, power the GDSC and the
+top clocks, then require the AHB branch to read on before any CCI/CPAS access.
+---
+ bsd/dev/sweet_cam.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index 84c5427..6ebd8c4 100755
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -392,9 +392,9 @@ camss_on(void)
+ 	}
+ 	/* the always-on camera AHB/XO branches gcc-khaje turns on at probe (nobody does here) */
+ 	camlog("gcc_camera_ahb_clk %#x, gcc_camera_xo_clk %#x", rd(gcc, 0x17008), rd(gcc, 0x17028));
+-	if (!branch_on("camera_ahb", 0x17008) || !branch_on("camera_xo", 0x17028)) {
+-		return EIO;
+-	}
++	/* their CLK_OFF bit only clears once the camss domain is powered: enable now, check after the GDSC */
++	wr(gcc, 0x17008, rd(gcc, 0x17008) | 1);
++	wr(gcc, 0x17028, rd(gcc, 0x17028) | 1);
+ 	if (!gdsc_on()) {
+ 		return EIO;
+ 	}
+@@ -403,6 +403,11 @@ camss_on(void)
+ 	    !branch_on("nrt_axi", CBCR_NRT_AXI) || !rcg_set("cci_0 37.5 MHz", RCG_CCI, 0x20F) || !branch_on("cci_0", CBCR_CCI)) {
+ 		return EIO;
+ 	}
++	camlog("after the GDSC and top clocks: gcc_camera_ahb_clk %#x, gcc_camera_xo_clk %#x", rd(gcc, 0x17008),
++	    rd(gcc, 0x17028));
++	if (!branch_on("camera_ahb", 0x17008)) {
++		return EIO;
++	}
+ 	if (cci == 0) {
+ 		cci = ml_io_map(CCI_PA, 0x1000);
+ 		cpas = ml_io_map(CPAS_PA, 0x1000);
