@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.sapphire.camd: the main camera for apps (camd.c). Put into launchd's cache,
+  /System/Library/xpc/launchd.plist, under /System/Library/LaunchDaemons/com.sapphire.camd.plist by
+  ../../haptics/launchd-job.py (install.sh; the cache before it: launchd.plist.pre-camd), like vibd and fpd:
+  /var/jb/Library/LaunchDaemons is not loaded at boot here. Kept alive; the memory limit covers the
+  forked develop child of a 108 MP still (~250 MB) on top of camd itself (~60 MB).
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.sapphire.camd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/camd</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>EnablePressuredExit</key>
+	<false/>
+	<key>EnableTransactions</key>
+	<false/>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>JetsamProperties</key>
+	<dict>
+		<key>JetsamPriority</key>
+		<integer>18</integer>
+		<key>JetsamMemoryLimit</key>
+		<integer>600</integer>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>UserName</key>
+	<string>root</string>
+	<key>POSIXSpawnType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>/var/tmp/camd.out</string>
+	<key>StandardErrorPath</key>
+	<string>/var/tmp/camd.out</string>
+</dict>
+</plist>

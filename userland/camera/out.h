@@ -46,6 +46,9 @@ void sinks_run(Sink **s, int n);
 
 /* jpeg.c */
 typedef struct JpegEnc JpegEnc;
+/* an optional complete APP1 segment (marker included) written after the JFIF header */
+extern const uint8_t *g_jpeg_app1;
+extern size_t g_jpeg_app1_len;
 JpegEnc *jpeg_new(int w, int h, int quality);
 void jpeg_write_header(JpegEnc *e, FILE *f);
 /* encode one 16-row MCU row from 8-bit RGB rows (rows[k] for k<16, may repeat); thread-safe.

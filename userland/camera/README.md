@@ -159,3 +159,32 @@ there with `BIN=` pointing at the iOS binaries.
 Lens shading and per-module colour calibration (module EEPROM), defect/PDAF pixel masking
 (if mode 0 embeds PD pixels in the image they will show as dots), highlight reconstruction
 (clipped areas go white), HEIC output, EXIF in the JPEG.
+
+## camd: the camera daemon (`camd/`)
+
+The phone side of all this: a root daemon (launchd job `com.sapphire.camd`, `/redwood/bin/camd`)
+that owns `kern.sweet_cam`, streams the preview to apps and develops stills with this library
+linked in (a forked child per still). Protocol and shared-memory layout: `camd/camd_proto.h`
+(copied into the SapphireCamera app as `SCCamdProtocol.h`).
+
+| file | what |
+|---|---|
+| `camd.c` | socket `/var/run/camd.sock`, preview loop, AE/AWB, stills, idle power-off, `/var/root/camd.conf` |
+| `camk.c` | the kernel ops: 0276 (preview ring op 30/31, still op 32, `kern.sweet_cam_exp`, `_latest`, `_sel`) or 0275 (stream + op 23 per frame, exposure over `kern.sweet_cam_i2c`), picked at start by which sysctls exist |
+| `preview.c` | RAW10 -> upright BGRX (block means, or 2x2 quads at full size for the 1280x720 mode) + metering/gray-world statistics in one pass |
+| `develop.c` | rawtool's graph for camd: JPEG (+ DNG), WB from the preview, brightness check against the preview |
+| `exif.c` | the JPEG's Exif (orientation, date, exposure); written through `g_jpeg_app1` in `jpeg.c` |
+| `camctl.c` | `camctl STATUS`, `camctl -s 20 START`, `camctl CAPTURE 108 dng`, `camctl SET rotate 270` |
+
+```sh
+bash camd/build.sh test     # preview + develop on rawsynth frames (PC)
+bash camd/install.sh        # build, install on the phone (launchd cache, backups), restart camd
+bash camd/uninstall.sh      # remove (or --rollback to the previous binaries)
+```
+
+Stills: 108 MP = op 32 (0276) or mode 0 + op 23 (0275), the raw (135 MB) to `/var/tmp`, developed
+into Files' "On My iPhone"/Camara/`IMG_YYYYMMDD_HHMMSS.jpg` (+ `.dng` with `SET dng 1` or
+`CAPTURE 108 dng`), a thumbnail from the preview in `Camara/.thumbs/`. 12 MP = one mode 1 frame.
+The sensor's image is landscape: the preview is rotated and the JPEG gets an Exif orientation
+from `rotate` (default 90 = clockwise; `camctl SET rotate 270` if the photos come out upside
+down). Log: `/var/tmp/camd.log`.
