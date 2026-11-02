@@ -17,6 +17,7 @@ typedef struct {
 	long stride;       /* bytes per raw line (packed RAW10: w * 5 / 4) */
 	int cell;          /* 1 Bayer (binned modes), 3 nonacell (modes 0 and 4) */
 	int black, white;  /* 10-bit levels */
+	int ox, oy;        /* CFA phase against GRBG: 1,0 RGGB, 0,1 BGGR, 1,1 GBRG */
 } PvRaw;
 
 typedef struct {

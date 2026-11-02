@@ -20,6 +20,7 @@ typedef struct {
 	const uint8_t *app1;      /* Exif segment for the JPEG */
 	size_t app1_len;
 	const char *sensor;
+	const char *cfa;          /* the raw's CFA order (NULL: grbg) */
 	int progress_fd;          /* "P n" (0..100) and "CAL g" lines go here, -1 none */
 } DevJob;
 

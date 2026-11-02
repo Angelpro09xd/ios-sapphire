@@ -135,14 +135,34 @@ typedef struct {
 	double line_us;   /* used when the kernel does not report it */
 	unsigned fll;
 	double fps;
+	int slot;         /* 0 main S5KHM6, 1 front OV16A1Q, 2 ultra wide S5K4H7, 3 macro SC202PCS */
+	const char *cfa;  /* CFA order of the raw */
+	int ox, oy;       /* the same as a phase against GRBG (preview.c) */
+	int rot;          /* sensor rotation for the upright picture, -1: conf.rotate */
+	const char *sensor;
+	double gain_max;  /* analog gain the exposure code can set */
 } ModeInfo;
 
-static const ModeInfo MODES[5] = {
-	[0] = { 12000, 9000, 3, 1e6 / (7.04 * 9248), 9248, 7.04 },
-	[1] = { 4000, 3000, 1, 1e6 / (30.04 * 4296), 4296, 30.04 },
-	[3] = { 1280, 720, 1, 0, 0, 120 },
-	[4] = { 4000, 3000, 3, 1e6 / (30.0 * 3234), 3234, 30.0 },
+/* 0287/0288: modes 11, 12, 13 are the other lenses' one mode each, in the preview ring (op 30 arg = slot) */
+#define NMODES 14
+static const ModeInfo MODES[NMODES] = {
+	[0] = { 12000, 9000, 3, 1e6 / (7.04 * 9248), 9248, 7.04, 0, "grbg", 0, 0, -1, "S5KHM6", 32 },
+	[1] = { 4000, 3000, 1, 1e6 / (30.04 * 4296), 4296, 30.04, 0, "grbg", 0, 0, -1, "S5KHM6", 32 },
+	[3] = { 1280, 720, 1, 0, 0, 120, 0, "grbg", 0, 0, -1, "S5KHM6", 32 },
+	[4] = { 4000, 3000, 3, 1e6 / (30.0 * 3234), 3234, 30.0, 0, "grbg", 0, 0, -1, "S5KHM6", 32 },
+	[11] = { 2304, 1728, 1, 1e6 / (30.0 * 3920), 3920, 30.0, 1, "rggb", 1, 0, 270, "OV16A1Q", 15.5 },
+	[12] = { 3264, 2448, 1, 1e6 / (30.0 * 2560), 2560, 30.0, 2, "grbg", 0, 0, 90, "S5K4H7", 16 },
+	[13] = { 1600, 1200, 1, 1e6 / (30.3 * 1242), 1242, 30.3, 3, "rggb", 1, 0, 90, "SC202PCS", 16 },
 };
+
+static int mode_rot(int m);
+static int mode_maxout(int m)
+{
+	if (m == 3) return CAMD_SHM_MAXDIM;
+	if (MODES[m].slot == 0) return 1000;
+	int longest = MODES[m].w > MODES[m].h ? MODES[m].w : MODES[m].h;
+	return longest / 2 < CAMD_SHM_MAXDIM ? longest / 2 : CAMD_SHM_MAXDIM;
+}
 #define BLACK 64
 #define WHITE 1023
 
@@ -331,6 +351,12 @@ static struct {
 } ae = { .E = 8000, .gain = 1, .mx = -1, .my = -1, .wb = { 1.9f, 1.0f, 1.6f } };
 
 static int
+mode_rot(int m)
+{
+	return MODES[m].rot >= 0 ? MODES[m].rot : conf.rotate;
+}
+
+static int
 default_preview_mode(void)
 {
 	int pm = conf.preview_mode;
@@ -339,6 +365,27 @@ default_preview_mode(void)
 }
 
 /* ================================================================== camera ops (camq) */
+static int op(int o, int arg, const char *what);
+static bool uw_linked;   /* the S5K4H7 started through ops 10/11 since power-up (see ring_start) */
+
+/* op 30. The ultra wide sends nothing when op 30 starts it cold (no CSI packets at all); started
+ * once through op 10 (sensor) + op 11 (receiver) first, op 30 then streams it at 30 fps. */
+static int
+ring_start(int arg, const char *what)
+{
+	if ((arg & 0xF) == 2 && !uw_linked) {
+		usleep(100000);                 /* the sensor after its power-up */
+		int r = op(10, 2, "ultra wide sensor");
+		usleep(50000);
+		r = r ? r : op(11, 0, "ultra wide receiver");
+		usleep(50000);
+		if (r == 0) uw_linked = true;
+	}
+	int r = op(30, arg, what);
+	/* about one start in four the receiver gets no packets from it: the next attempt goes through ops 10/11 again */
+	if (r != 0 && (arg & 0xF) == 2) uw_linked = false;
+	return r;
+}
 static int
 op(int o, int arg, const char *what)
 {
@@ -378,15 +425,20 @@ set_powered(bool p)
 	atomic_store(&g_powered, p);
 }
 
+static int want_slot, powered_slot = -1;
+static void power_off(const char *why);
+
 static int
 power_on(void)
 {
-	if (powered) return 0;
+	if (powered && powered_slot == want_slot) return 0;
+	if (powered) power_off("another lens");
 	int r = op(1, -1, "camss on");
-	r = r ? r : op(2, -1, "main sensor power");
+	r = r ? r : op(2 + want_slot, -1, want_slot == 0 ? "main sensor power" : "sensor power");
 	if (r == 0) {
 		set_powered(true);
-		LOG("camera powered");
+		powered_slot = want_slot;
+		LOG("camera powered (slot %d)", want_slot);
 	}
 	return r;
 }
@@ -395,6 +447,7 @@ static void
 forget_hw(void)
 {
 	set_powered(false);
+	uw_linked = false;
 	ring_on = false;
 	ring_mode = -1;
 	stream_cur = -1;
@@ -427,8 +480,8 @@ stream_mode(int m)
 }
 
 /* ================================================================== autofocus (camq) */
-#define AF_COARSE   12
-#define AF_FINE      7
+#define AF_COARSE    9
+#define AF_FINE      5
 #define AF_SETTLE    0.025   /* s for the lens to settle after a move */
 static struct {
 	bool scanning, manual;
@@ -448,7 +501,7 @@ static struct {
 static bool
 af_move(int pos)
 {
-	if (!camk.af) return false;
+	if (!camk.af || powered_slot != 0) return false;
 	pos = pos < 0 ? 0 : pos > 1023 ? 1023 : pos;
 	int r = camk_af(pos);
 	if (r) {
@@ -502,11 +555,18 @@ af_start(const char *why)
 	LOG("af: scan (%s), window %.2f,%.2f", why, af.fx, af.fy);
 }
 
+/* a frame taken from the ring at t was exposed wholly after the last lens move */
+static bool
+af_settled(double t)
+{
+	return t - 1.0 / 30 - ae.t_us * 1e-6 >= af.moved_at + AF_SETTLE;
+}
+
 /* one preview frame rendered into img (camq). t_frame: when the frame was taken from the ring. */
 static void
 af_frame(const uint8_t *img, int w, int h, long stride, double t_frame)
 {
-	if (!camk.af) return;
+	if (!camk.af || MODES[pv_mode].slot != 0) return;
 	if (af.want && !af.scanning) af_start("asked");
 	double luma = 0;
 	if (!af.scanning) {
@@ -521,7 +581,7 @@ af_frame(const uint8_t *img, int w, int h, long stride, double t_frame)
 		return;
 	}
 	/* the whole exposure must come after the lens settled: frame time - one frame - exposure */
-	if (t_frame - 1.0 / 30 - ae.t_us * 1e-6 < af.moved_at + AF_SETTLE) return;
+	if (!af_settled(t_frame)) return;
 	af.score[af.i] = af_measure(img, w, h, stride, &luma);
 	af.i++;
 	if (af.phase == 1 && af.i >= 4) {
@@ -580,7 +640,7 @@ exp_refresh_mode(int m)
 	ae.line_us = MODES[m].line_us;
 	ae.def_fll = MODES[m].fll;
 	ae.def_max_lines = MODES[m].fll > 16 ? MODES[m].fll - 16 : 12;
-	if (camk.kexp) {
+	if (camk.kexp && MODES[m].slot == 0) {
 		CamExp e;
 		if (camk_exp_read(&e) == 0 && e.line_ns > 0) {
 			ae.line_us = e.line_ns / 1000.0;
@@ -594,6 +654,62 @@ exp_refresh_mode(int m)
 
 #define GAIN_MAX 32.0
 #define T_MAX_PREVIEW 33333.0
+
+/* the other sensors' exposure through kern.sweet_cam_i2c (byte writes, 16-bit register addresses);
+ * *gx comes back as the gain really set */
+static int
+i2c_w(int m, int addr, int reg, int val)
+{
+	char b[48];
+	int n = snprintf(b, sizeof b, "%x %x %x %x", m, addr, reg, val & 0xff);
+	return sysctlbyname("kern.sweet_cam_i2c", NULL, NULL, b, (size_t)n + 1) == 0 ? 0 : errno;
+}
+
+static int
+lens_exposure(int slot, unsigned lines, unsigned *gx)
+{
+	int r = 0;
+	double g = *gx / 1000.0;
+	switch (slot) {
+	case 1: {   /* OV16A1Q: 0x3500-0x3502 = lines << 4, 0x3508/0x3509 = gain x 128 (group 0 hold) */
+		unsigned e = lines << 4, gc = (unsigned)(g * 128 + 0.5);
+		r = i2c_w(1, 0x10, 0x3208, 0x00);
+		r = r ? r : i2c_w(1, 0x10, 0x3500, (e >> 16) & 0x0f);
+		r = r ? r : i2c_w(1, 0x10, 0x3501, (e >> 8) & 0xff);
+		r = r ? r : i2c_w(1, 0x10, 0x3502, e & 0xf0);
+		r = r ? r : i2c_w(1, 0x10, 0x3508, (gc >> 8) & 0x1f);
+		r = r ? r : i2c_w(1, 0x10, 0x3509, gc & 0xff);
+		r = r ? r : i2c_w(1, 0x10, 0x3208, 0x10);
+		r = r ? r : i2c_w(1, 0x10, 0x3208, 0xa0);
+		*gx = (unsigned)(gc * 1000 / 128);
+		break;
+	}
+	case 2: {   /* S5K4H7: SMIA 0x0202 coarse, 0x0204 analog gain (x 32), group hold 0x0104 */
+		unsigned gc = (unsigned)(g * 32 + 0.5);
+		r = i2c_w(1, 0x2d, 0x0104, 1);
+		r = r ? r : i2c_w(1, 0x2d, 0x0202, (lines >> 8) & 0xff);
+		r = r ? r : i2c_w(1, 0x2d, 0x0203, lines & 0xff);
+		r = r ? r : i2c_w(1, 0x2d, 0x0204, (gc >> 8) & 0xff);
+		r = r ? r : i2c_w(1, 0x2d, 0x0205, gc & 0xff);
+		r = r ? r : i2c_w(1, 0x2d, 0x0104, 0);
+		*gx = gc * 1000 / 32;
+		break;
+	}
+	case 3: {   /* SC202PCS: 0x3e00-0x3e02 = lines << 4, coarse analog gain 0x3e09 (1/2/4/8/16x) */
+		unsigned e = lines << 4, code = 0, real = 1;
+		while (real * 2 <= g && real < 16) { real *= 2; code = code * 2 + 1; }
+		r = i2c_w(0, 0x36, 0x3e00, (e >> 16) & 0x0f);
+		r = r ? r : i2c_w(0, 0x36, 0x3e01, (e >> 8) & 0xff);
+		r = r ? r : i2c_w(0, 0x36, 0x3e02, e & 0xf0);
+		r = r ? r : i2c_w(0, 0x36, 0x3e09, (int)code);
+		*gx = real * 1000;
+		break;
+	}
+	default:
+		r = EINVAL;
+	}
+	return r;
+}
 
 /* E -> time and gain for the current mode (50 Hz anti-banding above 10 ms) and to the sensor.
  * preview: frame length for at most 30 fps (the 120 fps mode 3 would only cost bus and CPU). */
@@ -615,7 +731,11 @@ exp_apply(double t_max, bool preview)
 	unsigned lines = (unsigned)(t / ae.line_us + 0.5);
 	if (lines < 12) lines = 12;
 	unsigned fll = 0;
-	if (camk.kexp) {
+	int slot = MODES[ae.mode].slot;
+	if (slot != 0) {
+		if (lines > ae.def_max_lines) lines = ae.def_max_lines;
+		if (g > MODES[ae.mode].gain_max) g = MODES[ae.mode].gain_max;
+	} else if (camk.kexp) {
 		unsigned fll30 = (unsigned)(33333.0 / ae.line_us);
 		if (preview && fll30 > ae.def_fll) fll = fll30;
 		if (lines + 16 > (fll ? fll : ae.def_fll)) fll = lines + 16;
@@ -627,7 +747,9 @@ exp_apply(double t_max, bool preview)
 	if (gx > 64000) gx = 64000;
 	if (lines == ae.lines && gx == ae.gain_x1000 && fll == ae.fll) return;
 	int r;
-	if (camk.kexp) {
+	if (slot != 0) {
+		r = lens_exposure(slot, lines, &gx);
+	} else if (camk.kexp) {
 		char b[64];
 		int n = fll ? snprintf(b, sizeof b, "%u %u %u", lines, gx, fll) : snprintf(b, sizeof b, "%u %u", lines, gx);
 		r = sysctlbyname("kern.sweet_cam_exp", NULL, NULL, b, (size_t)n + 1) == 0 ? 0 : errno;
@@ -743,11 +865,11 @@ render_frame(const uint8_t *raw, int mode, uint64_t ts_ns, PvStats *out)
 	static RenderJob j;
 	memset(&j, 0, sizeof j);
 	j.raw = raw;
-	j.r = (PvRaw){ mi->w, mi->h, (long)mi->w * 5 / 4, mi->cell, BLACK, WHITE };
+	j.r = (PvRaw){ mi->w, mi->h, (long)mi->w * 5 / 4, mi->cell, BLACK, WHITE, mi->ox, mi->oy };
 	memcpy(j.p.wb, ae.wb, sizeof j.p.wb);
 	j.p.gain = 1;
-	j.p.rotate = conf.rotate;
-	j.p.max_out = mode == 3 ? CAMD_SHM_MAXDIM : 1000;
+	j.p.rotate = mode_rot(mode);
+	j.p.max_out = mode_maxout(mode);
 	j.p.meter_x = ae.mx;
 	j.p.meter_y = ae.my;
 	int B, S, ow, oh;
@@ -800,16 +922,18 @@ static void pv_schedule(double delay_s);
 static int
 preview_start_hw(int mode)
 {
+	want_slot = MODES[mode].slot;
 	int r = power_on();
 	if (r) return r;
+	int rarg = want_slot ? want_slot : mode << 4;
 	if (camk.ring) {
-		r = op(30, mode << 4, "preview ring");
+		r = ring_start(rarg, "preview ring");
 		if (r == EAGAIN || r == ENXIO || r == ENODEV) {
 			/* powered off under us (op 9 from elsewhere): power up again once */
 			LOG("op 30: %s, powering up again", strerror(r));
 			forget_hw();
 			r = power_on();
-			r = r ? r : op(30, mode << 4, "preview ring");
+			r = r ? r : ring_start(rarg, "preview ring");
 		}
 		ring_on = r == 0;
 		ring_mode = r == 0 ? mode : -1;
@@ -830,7 +954,7 @@ preview_start_hw(int mode)
 		af.pos = -1;
 		af.scanning = false;
 		af.ref = 0;
-		af.want = camk.af;
+		af.want = camk.af && want_slot == 0;
 		LOG("preview mode %d running (%s), line %.2f us, max %u lines", mode, camk.ring ? "ring" : "single frames", ae.line_us,
 		    ae.def_max_lines);
 	}
@@ -909,6 +1033,13 @@ pv_step(unsigned gen)
 				return pv_fail("ring stalled", ETIMEDOUT);
 			}
 			pv_schedule(0.010);
+			return;
+		}
+		if (af.scanning && MODES[mode].slot == 0 && !af_settled(t0)) {
+			/* exposed while the lens moved: not worth reading during a focus scan */
+			ring_last_seq = l.seq;
+			ring_seq_at = t0;
+			pv_schedule(0.004);
 			return;
 		}
 		len = l.bytes;
@@ -1155,7 +1286,8 @@ still_develop(Still *s)
 	const ModeInfo *mi = &MODES[s->mode];
 	char dt[32];
 	strftime(dt, sizeof dt, "%Y:%m:%d %H:%M:%S", &s->tm);
-	ExifInfo ei = { conf.rotate == 90 ? 6 : conf.rotate == 180 ? 3 : conf.rotate == 270 ? 8 : 1, dt, "Xiaomi",
+	int rot = mode_rot(s->mode);
+	ExifInfo ei = { rot == 90 ? 6 : rot == 180 ? 3 : rot == 270 ? 8 : 1, dt, "Xiaomi",
 		"Redmi Note 13", "sapphire camd 1.0", (unsigned)(ae.t_us + 0.5), (unsigned)(ae.gain * 50 + 0.5),
 		(unsigned)mi->w, (unsigned)mi->h };
 	s->app1_len = exif_build(s->app1, sizeof s->app1, &ei);
@@ -1178,7 +1310,8 @@ still_develop(Still *s)
 	j.sharpen = s->mp == 12 ? 0.3f : 0;
 	j.app1 = s->app1_len ? s->app1 : NULL;
 	j.app1_len = s->app1_len;
-	j.sensor = "S5KHM6";
+	j.sensor = mi->sensor;
+	j.cfa = mi->cfa;
 	s->t_dev = now_s();
 	atomic_store(&g_developing, true);
 	pid_t pid = fork();
@@ -1289,12 +1422,13 @@ static int
 still_take(Still *s)
 {
 	atomic_store(&g_still_taking, true);
+	want_slot = MODES[s->mode].slot;
 	int r = power_on();
 	size_t len = 0;
 	const ModeInfo *mi = &MODES[s->mode];
 	s->E_preview = ae.E_at_stats > 0 ? ae.E_at_stats : ae.t_us * ae.gain;
 	s->gplain = ae.have_stats ? ae.gplain : 0;
-	double cal = conf.cal[s->mode][s->pv_mode];
+	double cal = s->mode < 5 && s->pv_mode < 5 ? conf.cal[s->mode][s->pv_mode] : 1.0;
 	if (r == 0 && camk.ring) {
 		if (s->mode == 0) {
 			r = op(32, 0, "108 MP still");
@@ -1302,9 +1436,10 @@ still_take(Still *s)
 			ring_mode = -1;
 			r = r ? r : camk_select(100);
 		} else {
-			if (!ring_on || ring_mode != 1) r = op(30, 1 << 4, "preview ring mode 1");
+			int rm = s->mode >= 10 ? s->mode : 1, ra = s->mode >= 10 ? MODES[s->mode].slot : 1 << 4;
+			if (!ring_on || ring_mode != rm) r = ring_start(ra, "preview ring for the still");
 			ring_on = r == 0;
-			ring_mode = r == 0 ? 1 : -1;
+			ring_mode = r == 0 ? rm : -1;
 			CamLatest l0, l;
 			r = r ? r : camk_latest(&l0);
 			double t0 = now_s();
@@ -1391,8 +1526,9 @@ still_begin(int who, int mp, bool dng)
 	}
 	s->who = who;
 	s->mp = mp;
-	s->mode = mp == 108 ? 0 : 1;
 	s->pv_mode = pv_running ? pv_mode : default_preview_mode();
+	s->mode = MODES[s->pv_mode].slot != 0 ? s->pv_mode : mp == 108 ? 0 : 1;
+	if (s->mode >= 10) s->mp = (MODES[s->mode].w * MODES[s->mode].h + 500000) / 1000000;
 	s->dng = dng;
 	s->t0 = now_s();
 	s->pid = -1;
@@ -1505,14 +1641,14 @@ handle_line(struct client *c, char *line)
 			return;
 		}
 		int m = atoi(args);
-		if (m != 1 && m != 3 && m != 4) m = default_preview_mode();
+		if (m != 1 && m != 3 && m != 4 && !(m >= 11 && m <= 13 && camk.ring)) m = default_preview_mode();
 		if (m == 3 && !camk.ring) m = 1;
 		c->wants_preview = true;
 		c->mode = m;
 		c->want_at = now_s();
 		update_preview_want();
-		PvRaw r = { MODES[m].w, MODES[m].h, MODES[m].w * 5 / 4, MODES[m].cell, BLACK, WHITE };
-		PvParams p = { .rotate = conf.rotate, .max_out = m == 3 ? CAMD_SHM_MAXDIM : 1000 };
+		PvRaw r = { MODES[m].w, MODES[m].h, MODES[m].w * 5 / 4, MODES[m].cell, BLACK, WHITE, MODES[m].ox, MODES[m].oy };
+		PvParams p = { .rotate = mode_rot(m), .max_out = mode_maxout(m) };
 		int ow, oh;
 		pv_geometry(&r, &p, NULL, NULL, &ow, &oh);
 		reply(c, "OK preview %d %d %s", ow, oh, CAMD_SHM_PATH);
@@ -1565,6 +1701,20 @@ handle_line(struct client *c, char *line)
 			reply(c, "OK");
 		} else {
 			reply(c, "ERR EXPOSURE auto | lines,gain");
+		}
+	} else if (!strcmp(line, "MANUAL")) {
+		/* MANUAL <exposure us> <gain>: manual exposure in time units (the line time of the lens applies) */
+		double tus, g;
+		if (sscanf(args, "%lf %lf", &tus, &g) == 2 && tus >= 10 && tus <= 2e6 && g >= 1 && g <= 64) {
+			dispatch_async(camq, ^{
+				ae.manual = true;
+				ae.t_us = tus;
+				ae.gain = g;
+				if (powered) exp_apply(1e9, pv_running);
+			});
+			reply(c, "OK");
+		} else {
+			reply(c, "ERR MANUAL <us> <gain>");
 		}
 	} else if (!strcmp(line, "EV")) {
 		double v = atof(args);
