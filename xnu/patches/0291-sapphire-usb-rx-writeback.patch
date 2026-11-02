@@ -1,0 +1,62 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0291: USB Ethernet: RX stays armed when the TRB write-back is late
+
+The PC -> phone direction died under load while phone -> PC kept going (30 MB copies out of the phone
+worked, into it never). The trace showed why: an RX completion event whose TRB still had HWO set
+(the controller's write-back not visible yet) was taken for a late event and dropped, after the
+event had already marked the transfer inactive. Nothing armed RX again: the controller NAKed every
+bulk OUT, the PC's cdc_ether timed out after 5 s and usbipd gave the device up ("late rx" counted
+one per dead link). The write-back is now waited for (up to 1 ms); when it never comes RX is
+armed again at once (that one frame is lost, TCP sends it again); and ud_watch arms RX
+whenever nothing is armed at all.
+---
+ bsd/dev/sweet_usb.c | 28 +++++++++++++++++++++++++++-
+ 1 file changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 9f0b9ac..f4f919c 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -606,8 +606,23 @@ ud_rx_done(void)
+ {
+ 	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+ 	ud_sync(UD_TRB_RX, 16);
++	/*
++	 * 0291: the completion event can come before the controller's write-back of the TRB is visible
++	 * (HWO still set). Returning there left RX unarmed for good -- the event had already marked the
++	 * transfer inactive, so ud_watch did not look at it either -- and every bulk OUT from the host
++	 * was NAKed from then on: the PC -> phone direction of the link died ("late rx" went up by one
++	 * each time). Wait for the write-back; if HWO stays set the controller finished the transfer
++	 * without writing the TRB back (that frame is lost): arm RX again at once (ud_rx_arm ends a
++	 * transfer the controller still holds first).
++	 */
++	for (int i = 0; (t[3] & TRB_HWO) && i < 100; i++) {
++		delay(10);
++		ud_sync(UD_TRB_RX, 16);
++	}
+ 	if (t[3] & TRB_HWO) {
+-		ud.stale_rx++;          /* a late event for a frame ud_watch already took */
++		ud.stale_rx++;
++		ut("RXS", t[3], t[2]);
++		ud_rx_arm();
+ 		return;
+ 	}
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+@@ -947,6 +962,17 @@ ud_watch(void)
+ 	 * until usbipd gave the device up, while the phone's own frames kept going out. End the
+ 	 * transfer and arm it again; on a link that is merely idle that costs nothing.
+ 	 */
++	/* 0291: configured and no RX transfer at all (nothing armed): arm it */
++	static unsigned rx_unarmed;
++	if (!ud.xfer_active[EP_RX] && !(rt[3] & TRB_HWO)) {
++		if (++rx_unarmed >= 2) {
++			rx_unarmed = 0;
++			ut("RXU", (uint32_t)ud.rx_frames, rt[3]);
++			ud_rx_arm();
++		}
++	} else {
++		rx_unarmed = 0;
++	}
+ 	static unsigned rx_silent;
+ 	if (ud.xfer_active[EP_RX] && (rt[3] & TRB_HWO) && ud.rx_frames == ud.watch_rx) {
+ 		if (++rx_silent >= 4) {
