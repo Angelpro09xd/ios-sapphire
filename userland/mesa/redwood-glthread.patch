@@ -1,0 +1,49 @@
+OSMesa: Mesa's glthread on request (mesa_glthread=true), as the DRI frontend does it
+
+--- a/src/gallium/frontends/osmesa/osmesa.c
++++ b/src/gallium/frontends/osmesa/osmesa.c
+@@ -62,6 +62,7 @@
+ #include <c11/threads.h>
+ 
+ #include "state_tracker/st_context.h"
++#include "main/glthread.h"
+ 
+ #include "glapi/glapi.h"  /* for OSMesaGetProcAddress below */
+ 
+@@ -713,6 +714,14 @@
+ 
+    osmesa->st->frontend_context = osmesa;
+ 
++   /*
++    * redwood (ios-sapphire): Mesa's glthread on request (mesa_glthread=true), as the DRI frontend
++    * does it: the GL calls of the thread that draws are queued and carried out on one of Mesa's
++    * own, so the CPU work of the state tracker runs beside the caller's.
++    */
++   if (debug_get_bool_option("mesa_glthread", false))
++      _mesa_glthread_init(osmesa->st->ctx);
++
+    osmesa->format = format;
+    osmesa->user_row_length = 0;
+    osmesa->y_up = GL_TRUE;
+@@ -766,6 +775,13 @@
+                   GLsizei width, GLsizei height)
+ {
+    enum pipe_format color_format;
++   struct st_context *was = st_api_get_current();
++
++   /* (glthread: what either context has queued is done before contexts change hands) */
++   if (was)
++      _mesa_glthread_finish(was->ctx);
++   if (osmesa && osmesa->st && osmesa->st != was)
++      _mesa_glthread_finish(osmesa->st->ctx);
+ 
+    if (!osmesa && !buffer) {
+       st_api_make_current(NULL, NULL, NULL);
+@@ -861,6 +877,7 @@
+       fn(data);
+       return;
+    }
++   _mesa_glthread_finish(osmesa->st->ctx);     /* (the pipe is glthread's while it runs) */
+    pipe->callback(pipe, fn, data, false);
+    pipe->flush(pipe, NULL, PIPE_FLUSH_ASYNC);      /* (sends the batch that holds it on) */
+ }

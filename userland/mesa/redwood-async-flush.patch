@@ -1,0 +1,51 @@
+glFlush asynchronous on request, and redwood_after_flush(): backboardd orders its frames with the display itself
+
+--- a/src/mesa/main/context.c
++++ b/src/mesa/main/context.c
+@@ -1618,7 +1618,15 @@
+ void
+ _mesa_flush(struct gl_context *ctx)
+ {
+-   bool async = !ctx->Shared->HasExternallySharedImages;
++   /*
++    * redwood (ios-sapphire): REDWOOD_ASYNC_FLUSH=1 keeps glFlush asynchronous even with images
++    * shared with other processes. backboardd's GL bridge sets it and orders the display itself
++    * (redwood_after_flush below; kernel SweetFramebuffer holds the swap until the frame is sent).
++    */
++   static int redwood_async = -1;
++   if (redwood_async < 0)
++      redwood_async = getenv("REDWOOD_ASYNC_FLUSH") != NULL && atoi(getenv("REDWOOD_ASYNC_FLUSH")) != 0;
++   bool async = redwood_async || !ctx->Shared->HasExternallySharedImages;
+    FLUSH_VERTICES(ctx, 0, 0);
+ 
+    st_glFlush(ctx, async ? PIPE_FLUSH_ASYNC : 0);
+--- a/src/gallium/frontends/osmesa/osmesa.c
++++ b/src/gallium/frontends/osmesa/osmesa.c
+@@ -844,6 +844,27 @@
+ 
+ 
+ 
++/*
++ * redwood (ios-sapphire): fn(data) runs on the driver's thread once everything before it in the
++ * current context's queue has been handed to the kernel -- after an asynchronous glFlush, the
++ * frame's submission. Without a threaded context, at once.
++ */
++GLAPI void GLAPIENTRY redwood_after_flush(void (*fn)(void *), void *data);
++
++GLAPI void GLAPIENTRY
++redwood_after_flush(void (*fn)(void *), void *data)
++{
++   OSMesaContext osmesa = OSMesaGetCurrentContext();
++   struct pipe_context *pipe = osmesa != NULL && osmesa->st != NULL ? osmesa->st->pipe : NULL;
++
++   if (pipe == NULL || pipe->callback == NULL) {
++      fn(data);
++      return;
++   }
++   pipe->callback(pipe, fn, data, false);
++   pipe->flush(pipe, NULL, PIPE_FLUSH_ASYNC);      /* (sends the batch that holds it on) */
++}
++
+ GLAPI OSMesaContext GLAPIENTRY
+ OSMesaGetCurrentContext(void)
+ {
