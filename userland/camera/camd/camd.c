@@ -20,6 +20,11 @@
  *             all cores) into Files' "On My iPhone"/Camara/IMG_YYYYMMDD_HHMMSS.jpg (+ .dng only
  *             when asked), Exif with the orientation; a thumbnail from the preview in Camara/.thumbs/.
  *   power     ops 1, 2 on demand; op 9 after 30 s without preview or capture.
+ *   focus     kernel 0287: contrast autofocus on the main lens (kern.sweet_cam_af, 0..1023). A scan
+ *             (coarse 12 positions, then fine around the best) measures the normalised gradient
+ *             energy of a window of the preview (centre, or the tapped point); it runs when the
+ *             preview starts, on a tap (METER), on AF, and when the window's sharpness drops to
+ *             half for a while. Frames exposed while the lens moved are not measured.
  * Every wait is bounded and sleeps; nothing polls without a delay.
  * Log: /var/tmp/camd.log (256 KB, then .1).
  */
@@ -63,6 +68,29 @@
 #define PV_FPS     15.0     /* preview frames processed per second at most */
 #define PV_FPS_DEV 4.0      /* ... while a still is being developed */
 #define WD_NOFRAME 2.0      /* watchdog: seconds without a frame */
+
+/* ================================================================== memory limit */
+/* launchd gives camd a tiny jetsam limit here (\"InactiveHard 6 MB\", whatever the plist says): a
+ * 4000x3000 preview frame (15 MB) got it killed. Set our own: 700 MB active and inactive, non-fatal. */
+struct camd_memlimit {
+	int32_t active;
+	uint32_t active_attr;
+	int32_t inactive;
+	uint32_t inactive_attr;
+};
+extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *buffer, size_t size);
+#define MEMSTAT_SET_MEMLIMIT_PROPERTIES 7
+#define MEMSTAT_SET_JETSAM_TASK_LIMIT   6
+
+static int mem_limit_rc = -1;
+
+static void
+set_mem_limit(void)
+{
+	struct camd_memlimit l = { 700, 0, 700, 0 };
+	mem_limit_rc = memorystatus_control(MEMSTAT_SET_MEMLIMIT_PROPERTIES, getpid(), 0, &l, sizeof l);
+	if (mem_limit_rc != 0) mem_limit_rc = memorystatus_control(MEMSTAT_SET_JETSAM_TASK_LIMIT, getpid(), 700, NULL, 0);
+}
 
 /* ================================================================== log */
 static pthread_mutex_t log_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -189,6 +217,8 @@ static struct {
 	bool manual;
 	uint64_t seq;
 	char last_error[160];
+	int af_pos;
+	bool af_scanning;
 } snap;
 
 /* ================================================================== clients (ctlq only) */
@@ -304,8 +334,8 @@ static int
 default_preview_mode(void)
 {
 	int pm = conf.preview_mode;
-	if (pm == 1 || pm == 4) return pm;
-	return camk.ring ? 3 : 1;
+	if (pm == 1 || pm == 3 || pm == 4) return pm;
+	return 1;   /* the whole 4:3 field (mode 3 is a 1.6x crop of the centre) */
 }
 
 /* ================================================================== camera ops (camq) */
@@ -396,6 +426,135 @@ stream_mode(int m)
 	return r;
 }
 
+/* ================================================================== autofocus (camq) */
+#define AF_COARSE   12
+#define AF_FINE      7
+#define AF_SETTLE    0.025   /* s for the lens to settle after a move */
+static struct {
+	bool scanning, manual;
+	int pos;                  /* the lens now (-1: unknown, the kernel's rest) */
+	int phase;                /* 1 coarse, 2 fine */
+	int list[AF_COARSE + AF_FINE], n, i;
+	double score[AF_COARSE + AF_FINE];
+	double moved_at, started_at;
+	float fx, fy;             /* window centre in the portrait preview, 0..1 */
+	double ref, ref_luma;     /* sharpness / luma when it last settled */
+	int low;                  /* frames in a row well below ref */
+	double last_scan;
+	bool want;                /* a scan was asked for (start, tap, AF) */
+	int scans;
+} af = { .pos = -1, .fx = 0.5f, .fy = 0.5f };
+
+static bool
+af_move(int pos)
+{
+	if (!camk.af) return false;
+	pos = pos < 0 ? 0 : pos > 1023 ? 1023 : pos;
+	int r = camk_af(pos);
+	if (r) {
+		LOG("af: move to %d failed: %s; kernel log: %s", pos, strerror(r), camk_log);
+		return false;
+	}
+	af.pos = pos;
+	af.moved_at = now_s();
+	return true;
+}
+
+/* normalised gradient energy of the green channel in a window of the portrait BGRX image */
+static double
+af_measure(const uint8_t *img, int w, int h, long stride, double *luma)
+{
+	int ww = w / 4, wh = h / 4;
+	int x0 = (int)(af.fx * w) - ww / 2, y0 = (int)(af.fy * h) - wh / 2;
+	x0 = x0 < 1 ? 1 : x0 + ww > w - 2 ? w - 2 - ww : x0;
+	y0 = y0 < 1 ? 1 : y0 + wh > h - 2 ? h - 2 - wh : y0;
+	double e = 0, sum = 0;
+	long n = 0;
+	for (int y = y0; y < y0 + wh; y++) {
+		const uint8_t *r = img + (long)y * stride, *d = r + stride;
+		for (int x = x0; x < x0 + ww; x++) {
+			int g = r[x * 4 + 1], gx = r[x * 4 + 5] - g, gy = d[x * 4 + 1] - g;
+			e += gx * gx + gy * gy;
+			sum += g;
+			n++;
+		}
+	}
+	if (n == 0) return 0;
+	double m = sum / n;
+	if (luma) *luma = m;
+	return e / n / (m * m + 25.0);
+}
+
+static void
+af_start(const char *why)
+{
+	if (!camk.af || af.manual) return;
+	af.scanning = true;
+	af.want = false;
+	af.phase = 1;
+	af.n = AF_COARSE;
+	for (int k = 0; k < AF_COARSE; k++) af.list[k] = k * 1023 / (AF_COARSE - 1);
+	af.i = 0;
+	af.started_at = now_s();
+	af.last_scan = af.started_at;
+	af.scans++;
+	af_move(af.list[0]);
+	LOG("af: scan (%s), window %.2f,%.2f", why, af.fx, af.fy);
+}
+
+/* one preview frame rendered into img (camq). t_frame: when the frame was taken from the ring. */
+static void
+af_frame(const uint8_t *img, int w, int h, long stride, double t_frame)
+{
+	if (!camk.af) return;
+	if (af.want && !af.scanning) af_start("asked");
+	double luma = 0;
+	if (!af.scanning) {
+		if (af.manual || af.ref <= 0) return;
+		double m = af_measure(img, w, h, stride, &luma);
+		bool lchange = af.ref_luma > 0 && (luma > af.ref_luma * 1.8 || luma < af.ref_luma / 1.8);
+		af.low = (m < af.ref * 0.5 || lchange) ? af.low + 1 : 0;
+		if (af.low >= 10 && now_s() - af.last_scan > 2.0) {
+			af.low = 0;
+			af_start(lchange ? "the scene's light changed" : "sharpness dropped");
+		}
+		return;
+	}
+	/* the whole exposure must come after the lens settled: frame time - one frame - exposure */
+	if (t_frame - 1.0 / 30 - ae.t_us * 1e-6 < af.moved_at + AF_SETTLE) return;
+	af.score[af.i] = af_measure(img, w, h, stride, &luma);
+	af.i++;
+	if (af.phase == 1 && af.i >= 4) {
+		/* past a clear peak: stop the coarse pass early */
+		double best = 0;
+		for (int k = 0; k < af.i; k++) best = af.score[k] > best ? af.score[k] : best;
+		if (af.score[af.i - 1] < best * 0.45 && af.score[af.i - 2] < best * 0.6) af.n = af.i;
+	}
+	if (af.i < af.n) {
+		af_move(af.list[af.i]);
+		return;
+	}
+	int b = 0;
+	for (int k = 1; k < af.n; k++) if (af.score[k] > af.score[b]) b = k;
+	if (af.phase == 1) {
+		int c = af.list[b], step = 1023 / (AF_COARSE - 1);
+		af.phase = 2;
+		af.n = AF_FINE;
+		for (int k = 0; k < AF_FINE; k++) af.list[k] = c - step + k * 2 * step / (AF_FINE - 1);
+		for (int k = 0; k < AF_FINE; k++) af.list[k] = af.list[k] < 0 ? 0 : af.list[k] > 1023 ? 1023 : af.list[k];
+		af.i = 0;
+		af_move(af.list[0]);
+		return;
+	}
+	af.scanning = false;
+	af_move(af.list[b]);
+	af.ref = af.score[b];
+	af.ref_luma = luma;
+	af.low = 0;
+	af.last_scan = now_s();
+	LOG("af: lens %d (sharpness %.4f) in %.2f s", af.list[b], af.score[b], af.last_scan - af.started_at);
+}
+
 /* ================================================================== exposure (camq) */
 static void
 snap_update(void)
@@ -409,6 +568,8 @@ snap_update(void)
 	snap.ev = ae.ev;
 	snap.manual = ae.manual;
 	snap.seq = pv_seq;
+	snap.af_pos = af.pos;
+	snap.af_scanning = af.scanning;
 	pthread_mutex_unlock(&snap_mu);
 }
 
@@ -666,6 +827,10 @@ preview_start_hw(int mode)
 		exp_refresh_mode(mode);
 		exp_apply(T_MAX_PREVIEW, true);
 		ae.skip = 2;
+		af.pos = -1;
+		af.scanning = false;
+		af.ref = 0;
+		af.want = camk.af;
 		LOG("preview mode %d running (%s), line %.2f us, max %u lines", mode, camk.ring ? "ring" : "single frames", ae.line_us,
 		    ae.def_max_lines);
 	}
@@ -785,11 +950,13 @@ pv_step(unsigned gen)
 	PvStats st;
 	if (render_frame(frame, mode, ts, &st)) {
 		ae_update(&st);
+		const CamdSlot *sl = &shm->slot[shm->latest];
+		af_frame(shm_slot(shm->latest), (int)sl->width, (int)sl->height, (long)sl->stride, t0);
 		atomic_store(&g_last_frame, now_s());
 		snap_update();
 	}
 	atomic_store(&g_last_activity, now_s());
-	double dt = now_s() - t0, period = 1.0 / (atomic_load(&g_developing) ? PV_FPS_DEV : PV_FPS);
+	double dt = now_s() - t0, period = af.scanning ? 0.0 : 1.0 / (atomic_load(&g_developing) ? PV_FPS_DEV : PV_FPS);
 	pv_schedule(dt < period ? period - dt : 0.002);
 }
 
@@ -1274,12 +1441,12 @@ cmd_status(struct client *c)
 	bool cap = atomic_load(&g_cap_busy), pv = atomic_load(&g_pv_want);
 	reply(c, "STATUS state=%s kernel=%s exp=%s powered=%d preview=%d mode=%d seq=%llu last_frame=%.1fs camq=%s exp_us=%.0f "
 	    "gain=%.2f ae=%s ev=%.1f luma=%.3f wb=%.2f,%.2f,%.2f busy=%d developing=%d dng=%d rotate=%d quality=%d "
-	    "preview_mode=%d last_error=\"%s\" dir=%s",
+	    "preview_mode=%d af=%d%s last_error=\"%s\" dir=%s",
 	    cap ? "capture" : pv ? "preview" : atomic_load(&g_powered) ? "on" : "off",
 	    camk.ring ? "ring" : camk.present ? "frames" : "none", camk.kexp ? "sysctl" : camk.i2c ? "i2c" : "none",
 	    atomic_load(&g_powered), pv, sn.mode, (unsigned long long)sn.seq, lf > 0 ? now - lf : -1.0, busy, sn.exp_us, sn.gain,
 	    sn.manual ? "manual" : "auto", sn.ev, sn.luma, sn.wb[0], sn.wb[1], sn.wb[2], cap, atomic_load(&g_developing), conf.dng,
-	    conf.rotate, conf.quality, default_preview_mode(), sn.last_error, files_dir);
+	    conf.rotate, conf.quality, default_preview_mode(), sn.af_pos, sn.af_scanning ? ",scanning" : "", sn.last_error, files_dir);
 }
 
 static void
@@ -1408,13 +1575,37 @@ handle_line(struct client *c, char *line)
 		});
 		reply(c, "OK");
 	} else if (!strcmp(line, "METER")) {
-		double x, y;
+		double x = 0.5, y = 0.5;
 		float mx = -1, my = -1;
 		if (sscanf(args, "%lf,%lf", &x, &y) == 2 && x >= 0 && x <= 1 && y >= 0 && y <= 1) portrait_to_raw(x, y, &mx, &my);
+		float fx = mx < 0 ? 0.5f : (float)x, fy = mx < 0 ? 0.5f : (float)y;
 		dispatch_async(camq, ^{
 			ae.mx = mx;
 			ae.my = my;
 			ae.skip = 0;
+			af.fx = fx;
+			af.fy = fy;
+			af.manual = false;
+			af.want = true;
+		});
+		reply(c, "OK");
+	} else if (!strcmp(line, "AF")) {
+		/* AF: scan now; AF auto: back to autofocus; AF <0..1023>: fixed lens position */
+		int v = -1;
+		bool fixed = sscanf(args, "%d", &v) == 1 && v >= 0 && v <= 1023;
+		if (!camk.af) {
+			reply(c, "ERR no focus motor in this kernel");
+			return;
+		}
+		dispatch_async(camq, ^{
+			if (fixed) {
+				af.manual = true;
+				af.scanning = false;
+				if (powered) af_move(v);
+			} else {
+				af.manual = false;
+				af.want = true;
+			}
 		});
 		reply(c, "OK");
 	} else if (!strcmp(line, "WB")) {
@@ -1583,6 +1774,7 @@ int
 main(int argc, char **argv)
 {
 	signal(SIGPIPE, SIG_IGN);
+	set_mem_limit();
 	if (!(argc > 1 && !strcmp(argv[1], "--no-wait"))) {
 		/* notifications reach jobs started early in the boot only later (as vibd, fpd): wait until it is 2 min old */
 		struct timeval bt;
@@ -1603,6 +1795,7 @@ main(int argc, char **argv)
 	    camk.ring ? "0276 ring" : camk.present ? "single frames (0275)" : "WITHOUT kern.sweet_cam",
 	    camk.kexp ? "kern.sweet_cam_exp" : camk.i2c ? "sensor registers over kern.sweet_cam_i2c" : "none",
 	    default_preview_mode(), conf.rotate, ncores());
+	LOG("memory limit 700 MB: %s; focus motor: %s", mem_limit_rc == 0 ? "set" : strerror(errno), camk.af ? "kern.sweet_cam_af" : "none");
 	ctlq = dispatch_queue_create("com.sapphire.camd.ctl", DISPATCH_QUEUE_SERIAL);
 	camq = dispatch_queue_create("com.sapphire.camd.cam",
 	    dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));

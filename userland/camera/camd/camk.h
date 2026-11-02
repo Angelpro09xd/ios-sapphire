@@ -12,6 +12,7 @@ typedef struct {
 	bool ring;    /* 0276: ops 30/31/32, kern.sweet_cam_latest, kern.sweet_cam_sel */
 	bool kexp;    /* 0276: kern.sweet_cam_exp */
 	bool i2c;     /* kern.sweet_cam_i2c (the exposure fallback) */
+	bool af;      /* 0287: kern.sweet_cam_af (main lens position) */
 } CamCaps;
 extern CamCaps camk;
 
@@ -44,5 +45,7 @@ int camk_exp_read(CamExp *e);
 int camk_exp_write(unsigned lines, unsigned gain_x1000);
 /* 0275 fallback: the same registers through kern.sweet_cam_i2c (byte writes, group hold) */
 int camk_i2c_exposure(unsigned lines, unsigned gain_x1000);
+/* 0287: move the main lens, 0..1023 */
+int camk_af(int pos);
 
 #endif

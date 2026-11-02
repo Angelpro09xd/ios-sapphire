@@ -25,6 +25,7 @@ void camk_detect(void)
 	camk.ring = exists("kern.sweet_cam_latest") && exists("kern.sweet_cam_sel");
 	camk.kexp = exists("kern.sweet_cam_exp");
 	camk.i2c = exists("kern.sweet_cam_i2c");
+	camk.af = exists("kern.sweet_cam_af");
 }
 
 static int set_int(const char *name, int v)
@@ -213,4 +214,11 @@ int camk_i2c_exposure(unsigned lines, unsigned gain_x1000)
 	r = r ? r : i2c(0x0205, code & 0xff);
 	int h = i2c(0x0104, 0x00);           /* release, even after a failure */
 	return r ? r : h;
+}
+
+int camk_af(int pos)
+{
+	int r = set_int("kern.sweet_cam_af", pos);
+	if (r != 0) grab_log();
+	return r;
 }
