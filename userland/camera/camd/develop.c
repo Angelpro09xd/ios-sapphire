@@ -103,7 +103,7 @@ int develop_run(const DevJob *j)
 	r.stride = j->stride;
 	r.white = j->white;
 	r.geo.n = j->cell;
-	cfa_parse("grbg", &r.geo.cfa);
+	cfa_parse(j->cfa ? j->cfa : "grbg", &r.geo.cfa);
 	for (int c = 0; c < 3; c++) r.black[c] = j->black;
 	rawin_open(&r, j->raw);
 

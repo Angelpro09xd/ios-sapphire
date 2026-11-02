@@ -1,0 +1,125 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0288: camera: the preview ring for every lens
+
+Op 30 takes the slot in the low bits of its argument: the front (OV16A1Q 2304x1728), ultra wide
+(S5K4H7 3264x2448) and macro (SC202PCS 1600x1200) sensors stream their one mode into the same
+4-buffer preview ring as the main camera. The sensor that was streaming is stopped first, and
+the CSIPHY/CSID are set up again whenever the slot differs from the one they were set up for
+(op 11 and the still remember it). Op 32 (108 MP) stays the main camera's.
+---
+ bsd/dev/sweet_cam.c | 61 +++++++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 54 insertions(+), 7 deletions(-)
+
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index c4a6933..2744a25 100755
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -20,6 +20,9 @@
+  *     0278: op 10 slots 1 (OV16A1Q, CSIPHY2), 2 (S5K4H7, CSIPHY1) and 3 (SC202PCS, CSIPHY1 one lane);
+  *     op 11 restarts the sensor's stream after the receiver is set up.
+  *     0279: every mapping made once at op 1 (counted in each op's last line).
++ *     0288: op 30 takes a slot (arg slot | mode << 4): the front, ultra wide and macro sensors
++ *     stream into the same preview ring (their one mode); the receiver is set up again whenever
++ *     the slot differs from the one it was set up for. Op 32 is the HM6's only.
+  *     0287: the main lens's focus motor (GT9764 VCM driver, master 0 7-bit 0x0C, 8-bit registers):
+  *     VAF (TLMM GPIO101) on with slot 0, kern.sweet_cam_af = lens position 0..1023 (written: moves
+  *     the lens, the driver set up at the first move after power-up; read: the last position, -1
+@@ -96,6 +99,7 @@ static const unsigned reset_pin[4] = { 18, 24, 19, 68 };
+ #define GPIO_MAIN_VDIG  85
+ #define GPIO_MAIN_VAF   101     /* 0287: the actuator's 2.8 V (DT cam_vaf for slot 0) */
+ #define AF_ADDR         0x0C    /* GT9764, 8-bit 0x18 on master 0 */
++static int link_slot = -1;      /* 0288: the slot the CSIPHY/CSID were last set up for */
+ static int af_pos = -1;         /* last lens position written, -1: none since power-up */
+ static bool af_ready;           /* the GT9764 set up since power-up */
+ 
+@@ -763,6 +767,7 @@ cam_off(void)
+ 	}
+ 	cam_streaming = false;
+ 	cam_csid_up = false;
++	link_slot = -1;
+ 	if (camss_up) {
+ 		branch_off("cci_0", CBCR_CCI);
+ 		branch_off("nrt_axi", CBCR_NRT_AXI);
+@@ -1998,16 +2003,52 @@ pv_stop(void)
+ static int
+ pv_start(void)
+ {
+-	unsigned mode = ((unsigned)cam_arg >> 4) & 0xF;
+-	mode = mode == 0 ? 1 : mode;
+-	if (mode != 1 && mode != 3 && mode != 4) {
+-		camlog("op 30: preview modes are 1, 3, 4");
++	unsigned slot = (unsigned)cam_arg & 0xF, mode = ((unsigned)cam_arg >> 4) & 0xF;
++	int r;
++	if (slot > 3) {
++		camlog("op 30: slot %u", slot);
+ 		return EINVAL;
+ 	}
++	if (slot == 0) {
++		mode = mode == 0 ? 1 : mode;
++		if (mode != 1 && mode != 3 && mode != 4) {
++			camlog("op 30: preview modes are 1, 3, 4");
++			return EINVAL;
++		}
++	} else {
++		mode = 0;
++		if (!camss_up || !slot_up[slot]) {
++			camlog("op 30: slot %u is not powered (op %u first)", slot, slot + 2);
++			return EAGAIN;
++		}
++	}
+ 	pv_stop();
+-	int r = hm6_switch(mode);
+-	if (r == 0 && !cam_csid_up) {
++	if (cam_streaming && cs.slot != slot) {
++		(void)cam_stream_onoff(false);          /* 0288: the other sensor stops talking first */
++		cam_streaming = false;
++	}
++	if (slot == 0) {
++		r = hm6_switch(mode);
++	} else {
++		const struct cam_sdesc *d = &sdesc[slot];
++		uint8_t id[2];
++		cs.w = d->w; cs.h = d->h; cs.phy = d->phy; cs.cphy = false; cs.settle = d->settle; cs.lanes = d->lanes;
++		cs.rxcfg0 = d->rxcfg0;
++		if (!cci_read(d->m, d->addr, d->idreg, id, 2) || (unsigned)(id[0] << 8 | id[1]) != d->id) {
++			camlog("op 30: no %s at m%u %#x", d->name, d->m, d->addr);
++			return ENODEV;
++		}
++		r = cam_replay(d->m, d->addr, d->init, d->ni, "init");
++		r = r ? r : cam_replay(d->m, d->addr, d->mode, d->nm, "mode 0");
++		r = r ? r : cam_replay(d->m, d->addr, d->on, d->non, "stream on");
++		cs.slot = slot;
++		cs.mode = 0;
++		cam_streaming = r == 0;
++		camlog("op 30: %s %ux%u: %s", d->name, cs.w, cs.h, r == 0 ? "streaming" : "FAILED");
++	}
++	if (r == 0 && (!cam_csid_up || link_slot != (int)slot)) {
+ 		r = cam_link_on();
++		link_slot = r == 0 ? (int)slot : -1;
+ 	}
+ 	if (r == 0 && !s_ready) {
+ 		r = cam_smmu_stage();
+@@ -2071,9 +2112,14 @@ static int
+ cam_still(void)
+ {
+ 	pv_stop();
++	if (cam_streaming && cs.slot != 0) {
++		(void)cam_stream_onoff(false);
++		cam_streaming = false;
++	}
+ 	int r = hm6_switch(0);
+-	if (r == 0 && !cam_csid_up) {
++	if (r == 0 && (!cam_csid_up || link_slot != 0)) {
+ 		r = cam_link_on();
++		link_slot = r == 0 ? 0 : -1;
+ 	}
+ 	if (r == 0 && !s_ready) {
+ 		r = cam_smmu_stage();
+@@ -2268,6 +2314,7 @@ sysctl_sweet_cam SYSCTL_HANDLER_ARGS
+ 		break;
+ 	case 11:
+ 		r = cam_link_on();
++		link_slot = r == 0 ? (int)cs.slot : -1;
+ 		break;
+ 	case 12:
+ 		camlog("op 12 is split since 0274: 20 SMMU, 21 TFE read, 22 WM7 config, 23 capture");

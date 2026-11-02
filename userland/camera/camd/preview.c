@@ -88,8 +88,9 @@ void pv_render_rows(const uint8_t *raw, const PvRaw *r, const PvParams *p, int b
 	/* pixels of each colour in a block (the same for every block: B is a multiple of the tile, or a
 	 * 2x2 quad of a Bayer frame) */
 	int cnt[3] = { 0, 0, 0 };
+	int ox = r->ox * cell, oy = r->oy * cell;
 	for (int y = 0; y < B; y++)
-		for (int x = 0; x < B; x++) cnt[grbg(x, y, cell)]++;
+		for (int x = 0; x < B; x++) cnt[grbg(x + ox, y + oy, cell)]++;
 	float range = (float)(r->white - r->black);
 	if (range < 1) range = 1;
 	float inv[3], blk = (float)r->black;
@@ -105,7 +106,7 @@ void pv_render_rows(const uint8_t *raw, const PvRaw *r, const PvParams *p, int b
 			int y = by * S + yy;
 			unpack10(raw + (size_t)r->stride * y, npx, line);
 			int col[6];
-			for (int k = 0; k < tile; k++) col[k] = grbg(k, y, cell);
+			for (int k = 0; k < tile; k++) col[k] = grbg(k + ox, y + oy, cell);
 			uint32_t *a = acc;
 			if (S == B) {
 				int k = 0;
