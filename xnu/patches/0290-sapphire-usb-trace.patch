@@ -1,0 +1,135 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0290: USB Ethernet: an event trace that outlives a dead link
+
+The console log goes out over the same USB link, so when the link dies the reason goes with it.
+kern.sweet_usb_trace keeps the last 256 events (ms since boot): control requests, bus resets, data
+endpoint events other than plain completions, RX completions with a TRB status, a bad length or a
+gap of more than a second, refused RX starts, RX rearms and transfers taken without an event.
+---
+ bsd/dev/sweet_usb.c | 57 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 57 insertions(+)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 83c681d..9f0b9ac 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -409,6 +409,33 @@ static void ud_rx_arm(void);
+ static void ud_tx_kick_locked(void);
+ static void ud_ep_reset_seq(unsigned ep);
+ 
++/*
++ * 0290: what the controller and the host did, kept for after a dead link (the console log goes
++ * over the same link): 256 entries of (ms since boot, what, a, b). Read: kern.sweet_usb_trace.
++ */
++#define UT_N 256
++static struct ut_ent { uint32_t ms; char what[4]; uint32_t a, b; } ut_ring[UT_N];
++static uint32_t ut_pos;
++static uint64_t ut_last_rx_ms;
++
++static uint32_t
++ut_now_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return (uint32_t)(ns / 1000000ull);
++}
++
++static void
++ut(const char *what, uint32_t a, uint32_t b)
++{
++	struct ut_ent *e = &ut_ring[ut_pos++ % UT_N];
++	e->ms = ut_now_ms();
++	strlcpy(e->what, what, sizeof(e->what));
++	e->a = a;
++	e->b = b;
++}
++
+ /* NETWORK_CONNECTION notification: the host brings its link up on it. */
+ static void
+ ud_notify_connected(void)
+@@ -458,6 +485,7 @@ ud_setup(void)
+ 	bool ok = true;
+ 
+ 	printf("SWEET USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
++	ut("SET", (uint32_t)type << 8 | req, (uint32_t)value << 16 | index);
+ 	ud.data_in = (type & 0x80) != 0;
+ 	if ((type & 0x60) == 0x20) {    /* class request (e.g. SET_ETHERNET_PACKET_FILTER) */
+ 		ok = (length == 0);
+@@ -566,6 +594,7 @@ ud_rx_arm(void)
+ {
+ 	/* refused (a transfer still held by the controller): end it and arm again, or RX is dead for good */
+ 	if (ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, UD_FRAME_MAX, TRBCTL_NORMAL) != 0) {
++		ut("RXR", dwc_rd(DEPCMD(EP_RX)), 0);
+ 		ud.xfer_active[EP_RX] = true;
+ 		ud_end_transfer(EP_RX);
+ 		(void)ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, UD_FRAME_MAX, TRBCTL_NORMAL);
+@@ -582,6 +611,11 @@ ud_rx_done(void)
+ 		return;
+ 	}
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
++	uint32_t now = ut_now_ms();
++	if ((t[2] >> 28) != 0 || len < ETHER_HDR_LEN || len > ETHER_MAX_LEN || (ut_last_rx_ms && now - ut_last_rx_ms > 1000)) {
++		ut("RXd", t[2], now - (uint32_t)ut_last_rx_ms);
++	}
++	ut_last_rx_ms = now;
+ 	ud_sync(UD_RX, UD_FRAME_MAX);
+ 	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+ 		/*
+@@ -804,6 +838,7 @@ ud_event(uint32_t ev)
+ 		uint32_t type = (ev >> 8) & 0xf;
+ 		if (type == 1) {        /* USB reset */
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
++			ut("RST", ud.resets, (uint32_t)ud.rx_frames);
+ 			ud_bus_reset();
+ 			if (ud.resets++ < 20) {
+ 				printf("SWEET USB: bus reset\n");
+@@ -825,6 +860,9 @@ ud_event(uint32_t ev)
+ 	unsigned type = (ev >> 6) & 0xf;
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
++	if (ep >= EP_RX && ep <= EP_INT && (type != 1 || (status & 1))) {   /* not a completion, or a bus error */
++		ut("EV", ev, (uint32_t)ud.rx_frames);
++	}
+ 	if (ep <= EP_INT && type == 1) {
+ 		ud.xfer_active[ep] = false;
+ 	}
+@@ -894,6 +932,7 @@ ud_watch(void)
+ 	ud_sync(UD_TRB_RX, 16);
+ 	bool rx_idle = ud.xfer_active[EP_RX] && !(rt[3] & TRB_HWO) && ud.rx_frames == ud.watch_rx;
+ 	if (rx_idle && rx_seen) {
++		ut("RXL", ud.lost_rx, 0);
+ 		if (ud.lost_rx++ < 20) {
+ 			printf("SWEET USB: rx transfer done without an event (%u), taking it\n", ud.lost_rx);
+ 		}
+@@ -913,6 +952,7 @@ ud_watch(void)
+ 		if (++rx_silent >= 4) {
+ 			rx_silent = 0;
+ 			ud.rx_rearms++;
++			ut("RRA", ud.rx_rearms, ((volatile uint32_t *)(ud.dma + UD_TRB_RX))[2]);
+ 			ud_end_transfer(EP_RX);
+ 			ud_rx_arm();
+ 		}
+@@ -957,6 +997,23 @@ sysctl_sweet_usb_stats SYSCTL_HANDLER_ARGS
+ 	    ud.tx_busy, ud.txq_count, ud.lost_rx, ud.lost_tx, ud.stale_rx, ud.rx_rearms, ud.halt_clears, dsts);
+ 	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
+ }
++static int
++sysctl_sweet_usb_trace SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	static char out[UT_N * 40];
++	size_t n = 0;
++	uint32_t start = ut_pos > UT_N ? ut_pos - UT_N : 0;
++	for (uint32_t i = start; i < ut_pos && n + 48 < sizeof(out); i++) {
++		struct ut_ent *e = &ut_ring[i % UT_N];
++		n += (size_t)snprintf(out + n, sizeof(out) - n, "%u %s %08x %08x\n", e->ms, e->what, e->a, e->b);
++	}
++	out[n] = 0;
++	return SYSCTL_OUT(req, out, n + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_usb_trace, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_usb_trace, "A", "USB gadget trace: ms what a b");
++
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_usb_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_usb_stats, "A", "USB Ethernet gadget state");
+ 
