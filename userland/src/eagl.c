@@ -351,6 +351,13 @@ struct eagl {
 	const char *sources[256];       /* the text of the shaders being made, by name (modulo this) */
 	bool fragment[256];             /* ... and which of the two kinds each is */
 	unsigned plain_said;
+	/* the state the draws ask about, kept here as it is set (gs_*): a glGet waits for Mesa's glthread */
+	bool gs_known;
+	GLint gs_viewport[4], gs_scissor[4];
+	bool gs_scissor_on, gs_blend_on;
+	GLint gs_blend[4];              /* source and destination, colour then opacity */
+	bool gs_attrib_on[4];
+	GLfloat gs_clear[4];
 };
 
 /*
@@ -387,6 +394,207 @@ static int trace_listed;                        /* the draw at hand is one of th
 static int all_shaders;                         /* boot-arg glshaders=1: the text of every shader, not of the first two */
 static struct group_texture *group_of(struct eagl *e, GLuint texture);
 static __thread struct eagl *current;
+
+/*
+ * The state a draw asks about (the viewport and scissor for damage(), blending, which vertex arrays
+ * are on), kept per context as it is set: every glEnable, glDisable, glViewport, glScissor,
+ * glBlendFunc[Separate] and gl[En|Dis]ableVertexAttribArray of this file -- CoreAnimation's through
+ * the generated entries as much as ours -- goes through here, for the context current on this
+ * thread. A glGet makes Mesa's glthread wait for everything queued; these are asked of no one.
+ * What was set before the context was first asked about is read once (gs_learn).
+ */
+#define GL_SCISSOR_TEST                 0x0c11
+#define GL_VIEWPORT                     0x0ba2
+#define GL_SCISSOR_BOX                  0x0c10
+#define GL_COLOR_CLEAR_VALUE            0x0c22
+#define GL_BLEND                        0x0be2
+#define GL_BLEND_DST_RGB                0x80c8
+#define GL_BLEND_SRC_RGB                0x80c9
+#define GL_BLEND_SRC_ALPHA              0x80cb
+#define GL_BLEND_DST_ALPHA              0x80ca
+#define GL_VERTEX_ATTRIB_ARRAY_ENABLED  0x8622
+
+static void
+gs_learn(struct eagl *e)
+{
+	GLint on;
+
+	if (e->gs_known) {
+		return;
+	}
+	glGetIntegerv(GL_VIEWPORT, e->gs_viewport);
+	glGetIntegerv(GL_SCISSOR_BOX, e->gs_scissor);
+	e->gs_scissor_on = glIsEnabled(GL_SCISSOR_TEST);
+	e->gs_blend_on = glIsEnabled(GL_BLEND);
+	glGetIntegerv(GL_BLEND_SRC_RGB, &e->gs_blend[0]);
+	glGetIntegerv(GL_BLEND_DST_RGB, &e->gs_blend[1]);
+	glGetIntegerv(GL_BLEND_SRC_ALPHA, &e->gs_blend[2]);
+	glGetIntegerv(GL_BLEND_DST_ALPHA, &e->gs_blend[3]);
+	for (GLuint i = 0; i < 4; i++) {
+		glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &on);
+		e->gs_attrib_on[i] = on != 0;
+	}
+	glGetFloatv(GL_COLOR_CLEAR_VALUE, e->gs_clear);
+	e->gs_known = true;
+}
+
+static inline void
+gs_clear_colour(GLfloat r, GLfloat g, GLfloat b, GLfloat a)
+{
+	struct eagl *e = current;
+
+	glClearColor(r, g, b, a);
+	if (e != NULL && e->gs_known) {
+		e->gs_clear[0] = r, e->gs_clear[1] = g, e->gs_clear[2] = b, e->gs_clear[3] = a;
+	}
+}
+
+/* The queries of that state, answered from it; any other goes to the library */
+static void
+gs_get_integer(GLenum name, GLint *values)
+{
+	struct eagl *e = current;
+	const GLint *kept = NULL;
+	unsigned n = 1;
+
+	if (e != NULL) {
+		gs_learn(e);
+		switch (name) {
+		case GL_VIEWPORT: kept = e->gs_viewport; n = 4; break;
+		case GL_SCISSOR_BOX: kept = e->gs_scissor; n = 4; break;
+		case GL_BLEND_SRC_RGB: kept = &e->gs_blend[0]; break;
+		case GL_BLEND_DST_RGB: kept = &e->gs_blend[1]; break;
+		case GL_BLEND_SRC_ALPHA: kept = &e->gs_blend[2]; break;
+		case GL_BLEND_DST_ALPHA: kept = &e->gs_blend[3]; break;
+		}
+	}
+	if (kept == NULL) {
+		glGetIntegerv(name, values);
+		return;
+	}
+	memcpy(values, kept, n * sizeof(GLint));
+}
+
+static GLboolean
+gs_is_enabled(GLenum cap)
+{
+	struct eagl *e = current;
+
+	if (e != NULL && (cap == GL_SCISSOR_TEST || cap == GL_BLEND)) {
+		gs_learn(e);
+		return cap == GL_SCISSOR_TEST ? e->gs_scissor_on : e->gs_blend_on;
+	}
+	return glIsEnabled(cap);
+}
+
+static void
+gs_get_float(GLenum name, GLfloat *values)
+{
+	struct eagl *e = current;
+
+	if (e != NULL && name == GL_COLOR_CLEAR_VALUE) {
+		gs_learn(e);
+		memcpy(values, e->gs_clear, sizeof(e->gs_clear));
+		return;
+	}
+	glGetFloatv(name, values);
+}
+
+static void
+gs_get_attrib(GLuint index, GLenum name, GLint *value)
+{
+	struct eagl *e = current;
+
+	if (e != NULL && name == GL_VERTEX_ATTRIB_ARRAY_ENABLED && index < 4) {
+		gs_learn(e);
+		*value = e->gs_attrib_on[index];
+		return;
+	}
+	glGetVertexAttribiv(index, name, value);
+}
+
+static inline void
+gs_enable(GLenum cap, bool on)
+{
+	struct eagl *e = current;
+
+	(on ? glEnable : glDisable)(cap);
+	if (e != NULL && e->gs_known) {
+		if (cap == GL_SCISSOR_TEST) {
+			e->gs_scissor_on = on;
+		} else if (cap == GL_BLEND) {
+			e->gs_blend_on = on;
+		}
+	}
+}
+
+static inline void
+gs_viewport(GLint x, GLint y, GLsizei width, GLsizei height)
+{
+	struct eagl *e = current;
+
+	glViewport(x, y, width, height);
+	if (e != NULL && e->gs_known) {
+		e->gs_viewport[0] = x, e->gs_viewport[1] = y, e->gs_viewport[2] = width, e->gs_viewport[3] = height;
+	}
+}
+
+static inline void
+gs_scissor(GLint x, GLint y, GLsizei width, GLsizei height)
+{
+	struct eagl *e = current;
+
+	glScissor(x, y, width, height);
+	if (e != NULL && e->gs_known) {
+		e->gs_scissor[0] = x, e->gs_scissor[1] = y, e->gs_scissor[2] = width, e->gs_scissor[3] = height;
+	}
+}
+
+static inline void
+gs_blend_func(GLenum source, GLenum destination, GLenum source_alpha, GLenum destination_alpha)
+{
+	struct eagl *e = current;
+
+	glBlendFuncSeparate(source, destination, source_alpha, destination_alpha);
+	if (e != NULL && e->gs_known) {
+		e->gs_blend[0] = (GLint)source, e->gs_blend[1] = (GLint)destination;
+		e->gs_blend[2] = (GLint)source_alpha, e->gs_blend[3] = (GLint)destination_alpha;
+	}
+}
+
+static inline void
+gs_attrib(GLuint index, bool on)
+{
+	struct eagl *e = current;
+
+	(on ? glEnableVertexAttribArray : glDisableVertexAttribArray)(index);
+	if (e != NULL && e->gs_known && index < 4) {
+		e->gs_attrib_on[index] = on;
+	}
+}
+
+/* (reads: the state as kept, learnt the first time) */
+static inline bool
+gs_enabled(struct eagl *e, GLenum cap)
+{
+	gs_learn(e);
+	return cap == GL_SCISSOR_TEST ? e->gs_scissor_on : cap == GL_BLEND ? e->gs_blend_on : glIsEnabled(cap);
+}
+
+#define glEnable(cap)                           gs_enable((cap), true)
+#define glDisable(cap)                          gs_enable((cap), false)
+#define glViewport(x, y, w, h)                  gs_viewport((x), (y), (w), (h))
+#define glScissor(x, y, w, h)                   gs_scissor((x), (y), (w), (h))
+#define glBlendFunc(s, d)                       gs_blend_func((s), (d), (s), (d))
+#define glBlendFuncSeparate(s, d, sa, da)       gs_blend_func((s), (d), (sa), (da))
+#define glEnableVertexAttribArray(i)            gs_attrib((i), true)
+#define glDisableVertexAttribArray(i)           gs_attrib((i), false)
+#define glClearColor(r, g, b, a)                gs_clear_colour((r), (g), (b), (a))
+#define glGetIntegerv(name, values)             gs_get_integer((name), (values))
+#define glIsEnabled(cap)                        gs_is_enabled(cap)
+#define glGetFloatv(name, values)               gs_get_float((name), (values))
+#define glGetVertexAttribiv(i, name, value)     gs_get_attrib((i), (name), (value))
+
 static struct eagl *contexts[8];
 static uint32_t slot_calls[SLOTS];
 static uint64_t slot_ticks[SLOTS];      /* glprofile=1 */
@@ -421,6 +629,16 @@ static int full_mirror;                 /* boot-arg glmirror=full (a test): all 
 static int wait_for_frames = 1;
 static unsigned frames_ahead = 3;       /* frames on the GPU at most (frame_end; file /redwood/glahead: N, 0 off) */
 static int sync_frames = 1;             /* boot-arg glsync=0 (a test): a frame's end does not push what Mesa holds back (frame_end()) */
+/*
+ * glFlush waited (Mesa makes it synchronous with images shared with other processes) for the
+ * driver's thread to send the whole frame to the kernel: a quarter of backboardd's frame time.
+ * With /redwood/glasync, in backboardd only, it does not (REDWOOD_ASYNC_FLUSH, our Mesa patch):
+ * the frame's display surface is named to the kernel first and reported sent from the driver's
+ * thread once its submission has gone out (redwood_after_flush; frame_note()); the kernel holds a
+ * swap of that surface until then (xnu 0286).
+ */
+static int async_frames;
+extern void redwood_after_flush(void (*fn)(void *), void *data) __attribute__((weak_import));
 /*
  * EXT_shader_framebuffer_fetch -- a fragment shader reads the pixel it is about to write -- is
  * what CoreAnimation draws a number of things with where the library offers it: the shadows
@@ -1741,7 +1959,7 @@ frame_end(struct eagl *e, bool finished)
 	mirrored = now_us();
 	if (in_place != 0 && !finished && wait_for_frames) {
 		glFinish();             /* the display's driver reads the surface as soon as it is told of it */
-	} else if (in_place != 0 && !finished && sync_frames) {
+	} else if (in_place != 0 && !finished && sync_frames && !async_frames) {
 		/*
 		 * The display's driver waits for the last submission that named the surface -- and Mesa's
 		 * freedreno may still hold a batch back after glFlush, to merge it with the next (submit
@@ -2925,8 +3143,8 @@ vblur_level(struct eagl *e, int from)
 	/* back as it was */
 	glBindTexture(GL_TEXTURE_2D, picture);
 	glUseProgram(0);
-	(blended ? glEnable : glDisable)(GL_BLEND);
-	(scissored ? glEnable : glDisable)(GL_SCISSOR_TEST);
+	gs_enable(GL_BLEND, blended);
+	gs_enable(GL_SCISSOR_TEST, scissored);
 	glScissor(box[0], box[1], box[2], box[3]);
 	glViewport(view[0], view[1], view[2], view[3]);
 	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
@@ -2953,12 +3171,12 @@ clear_now(struct eagl *e)
 	boxed = glIsEnabled(GL_SCISSOR_TEST);
 	glGetIntegerv(GL_SCISSOR_BOX, box);
 	glGetFloatv(GL_COLOR_CLEAR_VALUE, colour);
-	(e->unclear_boxed ? glEnable : glDisable)(GL_SCISSOR_TEST);
+	gs_enable(GL_SCISSOR_TEST, e->unclear_boxed);
 	glScissor(e->unclear_box[0], e->unclear_box[1], e->unclear_box[2], e->unclear_box[3]);
 	glClearColor(e->unclear_colour[0], e->unclear_colour[1], e->unclear_colour[2], e->unclear_colour[3]);
 	glClear(e->unclear);
 	e->unclear = 0;
-	(boxed ? glEnable : glDisable)(GL_SCISSOR_TEST);
+	gs_enable(GL_SCISSOR_TEST, boxed);
 	glScissor(box[0], box[1], box[2], box[3]);
 	glClearColor(colour[0], colour[1], colour[2], colour[3]);
 }
@@ -3446,15 +3664,15 @@ group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
 		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 		glVertexAttribPointer(0, e->arrays[0].size, e->arrays[0].type, 0, e->arrays[0].stride, e->arrays[0].pointer);
 		for (GLuint i = 0; i < 3; i++) {
-			(enabled[i] ? glEnableVertexAttribArray : glDisableVertexAttribArray)(i);
+			gs_attrib(i, enabled[i]);
 		}
 		glUseProgram(e->program);
-		(blending ? glEnable : glDisable)(GL_BLEND);
+		gs_enable(GL_BLEND, blending);
 	}
 	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
 	glViewport(view[0], view[1], view[2], view[3]);
 	glScissor(box[0], box[1], box[2], box[3]);
-	(scissored ? glEnable : glDisable)(GL_SCISSOR_TEST);
+	gs_enable(GL_SCISSOR_TEST, scissored);
 }
 
 /* A texture's contents are made anew (an upload, a copy into it): whatever it held is gone. */
@@ -3614,7 +3832,7 @@ group_draw_end(struct eagl *e, const GLint enabled[4])
 			glDisableVertexAttribArray(i);
 		}
 	}
-	(e->group_blend ? glEnable : glDisable)(GL_BLEND);
+	gs_enable(GL_BLEND, e->group_blend);
 	glBlendFuncSeparate((GLenum)e->group_blend_func[0], (GLenum)e->group_blend_func[1], (GLenum)e->group_blend_func[2],
 	    (GLenum)e->group_blend_func[3]);
 	glUseProgram(e->program);
@@ -3990,6 +4208,43 @@ my_glFinish(void *context)
 	EAGL_LEAVE(e, 0x2d0);
 }
 
+/*
+ * async_frames: tell the display frame N (not 0) is being sent (sent 0) or has been (1). Its user
+ * client, selector 61 (xnu 0286): backboardd's sandbox writes no sysctl. The first call is always
+ * the render thread's (sent 0), so the connection is made before the driver's thread uses it.
+ */
+static void
+frame_note(int sent, uint32_t frame)
+{
+	static io_connect_t display;
+	static int opened;
+	uint64_t in[3] = { 0x53570286, (uint64_t)sent, frame };
+
+	if (!opened) {
+		io_service_t service = IOServiceGetMatchingService(0, IOServiceMatching("IOMobileFramebuffer"));
+		kern_return_t kr = service != 0 ? IOServiceOpen(service, mach_task_self(), 0, &display) : KERN_FAILURE;
+
+		opened = 1;
+		if (kr != KERN_SUCCESS) {
+			display = 0;
+			say("redwood-gl: no connection to the display (%#x): its swaps are not held for the frames being sent\n", kr);
+		}
+		if (service != 0) {
+			IOObjectRelease(service);
+		}
+	}
+	if (display != 0) {
+		(void)IOConnectCallScalarMethod(display, 61, in, 3, NULL, NULL);
+	}
+}
+
+/* On Mesa's driver thread, once this frame has been sent (async_frames) */
+static void
+frame_sent(void *frame)
+{
+	frame_note(1, (uint32_t)(uintptr_t)frame);
+}
+
 static void
 my_glFlush(void *context)
 {
@@ -4013,9 +4268,21 @@ my_glFlush(void *context)
 			e->premirrored++;
 		}
 	}
+	/*
+	 * Every flush is numbered (a swap may follow any of them: which picture is the display's is
+	 * not known here for certain), and the kernel holds a swap that comes before its frame is sent.
+	 */
+	static uint32_t frame_seq;
+	if (async_frames) {
+		frame_seq = frame_seq + 1 != 0 ? frame_seq + 1 : 1;
+		frame_note(0, frame_seq);
+	}
 	began = now_us();
 	glFlush();
 	e->flushing += now_us() - began;
+	if (async_frames) {
+		redwood_after_flush(frame_sent, (void *)(uintptr_t)frame_seq);
+	}
 	frame_end(e, false);
 	EAGL_LEAVE(e, 0x2d8);
 }
@@ -5432,6 +5699,21 @@ install(void)
 		if (f != NULL) {
 			fclose(f);
 		}
+	}
+	/*
+	 * (file /redwood/glthread, in backboardd: Mesa's glthread -- our Mesa patch redwood-glthread --
+	 * carries out the GL calls on a thread of its own; the state the draws ask about is kept here,
+	 * gs_*, so that they do not wait for it)
+	 */
+	if (strcmp(getprogname(), "backboardd") == 0 && access("/redwood/glthread", F_OK) == 0) {
+		setenv("mesa_glthread", "true", 1);
+		say("redwood-gl: Mesa's glthread on\n");
+	}
+	/* (file /redwood/glasync, in backboardd: see async_frames) */
+	if (redwood_after_flush != NULL && strcmp(getprogname(), "backboardd") == 0 && access("/redwood/glasync", F_OK) == 0) {
+		setenv("REDWOOD_ASYNC_FLUSH", "1", 1);
+		async_frames = 1;
+		say("redwood-gl: glFlush does not wait for the frame to be sent: the display holds its swap until it is\n");
 	}
 
 	if (class == Nil) {

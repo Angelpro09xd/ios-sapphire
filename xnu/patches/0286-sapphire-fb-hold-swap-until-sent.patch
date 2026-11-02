@@ -1,0 +1,274 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0286: framebuffer: hold a swap until its frame has been sent to the GPU
+
+backboardd's GL bridge waited in glFlush (synchronous for shared images) for Mesa's driver thread
+to send each frame: a quarter of the render thread's time. With the flush asynchronous the swap
+can come first, and the GPU copy into the panel would run ahead of the frame. The bridge numbers
+the frame (kern.sweet_fb_frame_await) and reports it sent from the driver thread
+(kern.sweet_fb_frame_sent); a swap that comes in between is held until then. A held
+swap goes out anyway at the next swap or after 3 vsync ticks. backboardd's sandbox writes no
+sysctl, so the bridge says the same through user client selector 61.
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 186 ++++++++++++++++++++++++++++++----
+ 1 file changed, 167 insertions(+), 19 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 38a56b7..7c7b82b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -74,6 +74,7 @@ sweet_hold_set(SweetSurface **set, bool on)
+ class AppleCLCD;
+ static AppleCLCD *sweet_cons_fb;
+ static AppleCLCD *sweet_dsi_fb;                 /* 0260: sweet_fb_dsi_seq() */
++static AppleCLCD *sweet_frame_fb;               /* 0286: kern.sweet_fb_frame_await/_sent */
+ static void sweet_cons_show(void);
+ class OSDictionary;
+ static void sweet_bl_log(const char *who, OSDictionary *d);
+@@ -227,6 +228,14 @@ public:
+ 	void          scanFrom(uint64_t pa, uint32_t stride);
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	uint32_t      fRateHz;        /* vsync and published refresh rate: 60, 90 or 120 (sweetfb_hz) */
++	/* 0286: a frame still being sent to the GPU (kern.sweet_fb_frame_await/_sent, backboardd's GL bridge) */
++	uint32_t      fAwaitSid;      /* its number, the bridge's (0: none) */
++	bool          fAwaitSent;     /* ... reported sent before its swap came */
++	uint32_t      fHeldSeq;       /* the number of the frame the held swap waits for */
++	uint8_t      *fHeldRec;       /* its swap, held back until then */
++	SweetSurface *fHeldHold[4];
++	uint32_t      fHeldTicks;
++	uint64_t      fHeldCount, fHeldLate, fHeldForced, fSentCount;
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fPowerOns;      /* 0236: display-on requests so far, up to 2 (the second: the UI is up) */
+ 	uint64_t      fStartAbs;      /* mach_absolute_time() at start */
+@@ -271,6 +280,8 @@ public:
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	bool present(const uint8_t *rec);
++	void presentNow(const uint8_t *rec, SweetSurface **held);
++	void presentHeld(bool late);
+ 	IOLock       *fPresentLock;   /* 0201: present() from SwapEnd and from the vsync timer */
+ 	bool          fNow;           /* 0201: boot-arg sweetfb_now (default 1): present at SwapEnd */
+ };
+@@ -414,6 +425,7 @@ AppleCLCD::start(IOService *provider)
+ 		PE_parse_boot_argn("sweetfb_now", &now, sizeof(now));
+ 		fNow = now != 0 && fPresentLock != NULL;
+ 	}
++	sweet_frame_fb = this;
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+@@ -752,6 +764,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	bzero(fb->fRetireHold, sizeof(fb->fRetireHold));
+ 	IOLockUnlock(fb->fLock);
+ 	sweet_hold_set(retire, false);
++	fb->presentHeld(true);
+ 	if (fb->fPresentLock != NULL) {
+ 		/* 0235: a back buffer whose GPU copy has landed since the last swap goes on the panel now */
+ 		IOLockLock(fb->fPresentLock);
+@@ -857,28 +870,34 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	bool now = fNow && !fPowerOff && fFadeOrig == NULL;
+ 	IOLockUnlock(fLock);
+ 	if (now) {
+-		IOLockLock(fPresentLock);
+-		bool copied = present(rec);
+-		IOLockUnlock(fPresentLock);
+-		SweetSurface *release[4] = {};
++		/*
++		 * 0286: backboardd's GL bridge no longer waits in glFlush for its frame to reach the
++		 * GPU (a quarter of its frame time): it numbers the frame first
++		 * (kern.sweet_fb_frame_await) and reports it sent from Mesa's driver thread
++		 * (kern.sweet_fb_frame_sent). A swap that comes in between is that frame's
++		 * (CoreAnimation: flush, swap, the next frame's flush) and is held until then --
++		 * presented now, the GPU's copy into the panel would go ahead of the frame in the
++		 * GPU's queue and show what the surface held before. A held swap goes out anyway when
++		 * the next swap comes (frames stay in order) or after 3 vsync ticks.
++		 */
++		presentHeld(false);
+ 		IOLockLock(fLock);
+-		fDirty = false;
+-		SweetSurface *pend[4];
+-		memcpy(pend, fPendHold, sizeof(pend));         /* (a frame of the timer's path, now replaced) */
+-		bzero(fPendHold, sizeof(fPendHold));
+-		if (copied) {
+-			memcpy(release, held, sizeof(release));
+-		} else {
+-			memcpy(release, fRetireHold, sizeof(release));
+-			memcpy(fRetireHold, fShowHold, sizeof(fRetireHold));
+-			memcpy(fShowHold, held, sizeof(fShowHold));
++		if (fAwaitSid != 0) {
++			if (!fAwaitSent && fHeldRec == NULL &&
++			    (fHeldRec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE)) != NULL) {
++				memcpy(fHeldRec, rec, SWEET_FB_SWAP_REC_SIZE);
++				memcpy(fHeldHold, held, sizeof(fHeldHold));
++				fHeldSeq = fAwaitSid;
++				fHeldTicks = 0;
++				fHeldCount++;
++				IOLockUnlock(fLock);
++				return;
++			}
++			fAwaitSid = 0;
++			fAwaitSent = false;
+ 		}
+ 		IOLockUnlock(fLock);
+-		sweet_hold_set(pend, false);
+-		sweet_hold_set(release, false);
+-		if ((++sweet_fb_swap_count % 1000) == 0) {
+-			IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+-		}
++		presentNow(rec, held);
+ 		return;
+ 	}
+ 	IOLockLock(fLock);
+@@ -894,6 +913,63 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
++/* SwapEnd's frame on the panel now, and the surfaces it holds and frees as before (0201) */
++void
++AppleCLCD::presentNow(const uint8_t *rec, SweetSurface **held)
++{
++	IOLockLock(fPresentLock);
++	bool copied = present(rec);
++	IOLockUnlock(fPresentLock);
++	SweetSurface *release[4] = {};
++	IOLockLock(fLock);
++	fDirty = false;
++	SweetSurface *pend[4];
++	memcpy(pend, fPendHold, sizeof(pend));         /* (a frame of the timer's path, now replaced) */
++	bzero(fPendHold, sizeof(fPendHold));
++	if (copied) {
++		memcpy(release, held, sizeof(release));
++	} else {
++		memcpy(release, fRetireHold, sizeof(release));
++		memcpy(fRetireHold, fShowHold, sizeof(fRetireHold));
++		memcpy(fShowHold, held, sizeof(fShowHold));
++	}
++	IOLockUnlock(fLock);
++	sweet_hold_set(pend, false);
++	sweet_hold_set(release, false);
++	if ((++sweet_fb_swap_count % 1000) == 0) {
++		IOLog("SWEET FB: %llu swaps; 0286: %llu held, %llu sent, %llu late, %llu forced\n", sweet_fb_swap_count,
++		    fHeldCount, fSentCount, fHeldLate, fHeldForced);
++	}
++}
++
++/* 0286: the held swap out: its frame was sent, or the next swap came (late false), or a vsync tick (late true) */
++void
++AppleCLCD::presentHeld(bool late)
++{
++	SweetSurface *hold[4];
++	uint8_t *rec;
++
++	IOLockLock(fLock);
++	rec = fHeldRec;
++	if (rec == NULL || (late && ++fHeldTicks < 3)) {
++		IOLockUnlock(fLock);
++		return;
++	}
++	fHeldRec = NULL;
++	memcpy(hold, fHeldHold, sizeof(hold));
++	bzero(fHeldHold, sizeof(fHeldHold));
++	if (fAwaitSid == fHeldSeq) {
++		fAwaitSid = 0;
++		fAwaitSent = false;
++	}
++	if (late) {
++		fHeldLate++;
++	}
++	IOLockUnlock(fLock);
++	presentNow(rec, hold);
++	IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++}
++
+ void
+ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ {
+@@ -1676,6 +1752,7 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+ }
+ 
+ static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
++static void sweet_fb_frame(AppleCLCD *fb, bool sent, uint32_t sid);     /* 0286 */
+ 
+ IOReturn
+ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+@@ -1807,6 +1884,15 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
++	case 61:
++		/*
++		 * 0286: [0x53570286, 0 (await) or 1 (sent), frame number] from backboardd's GL bridge, whose
++		 * sandbox writes no sysctl (kern.sweet_fb_frame_await/_sent do the same for root).
++		 */
++		if (args->scalarInputCount == 3 && args->scalarInput[0] == 0x53570286) {
++			sweet_fb_frame(fFB, args->scalarInput[1] != 0, (uint32_t)args->scalarInput[2]);
++		}
++		break;
+ 	case kSweetFBSwapWait:
+ 	default:
+ 		break;
+@@ -2058,3 +2144,65 @@ sweet_fb_dsi_seq(const uint8_t *seq, uint32_t len, const char *what, int quiet)
+ 	return failed;
+ }
+ #endif /* SWEET */
++
++/*
++ * 0286: kern.sweet_fb_frame_await = N: frame N (the bridge's numbers, not 0) is being sent to the
++ * GPU; kern.sweet_fb_frame_sent = N: it has been (Mesa's driver thread, after the submission).
++ * kern.sweet_fb_frame_stats: swaps held, frames reported sent, held swaps that went out late.
++ */
++#include <sys/sysctl.h>
++
++static void
++sweet_fb_frame(AppleCLCD *fb, bool sent, uint32_t sid)
++{
++	if (fb == NULL || fb->fLock == NULL) {
++		return;
++	}
++	IOLockLock(fb->fLock);
++	if (!sent) {
++		fb->fAwaitSid = sid;
++		fb->fAwaitSent = false;
++		IOLockUnlock(fb->fLock);
++		return;
++	}
++	fb->fSentCount++;
++	bool held = fb->fHeldRec != NULL && fb->fHeldSeq == sid;
++	if (!held && fb->fAwaitSid == sid) {
++		fb->fAwaitSent = true;
++	}
++	IOLockUnlock(fb->fLock);
++	if (held) {
++		fb->presentHeld(false);
++	}
++}
++
++static int
++sweet_fb_frame_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg2)
++	int sid = 0;
++	int error = sysctl_handle_int(oidp, &sid, 0, req);
++
++	if (error == 0 && req->newptr != USER_ADDR_NULL) {
++		sweet_fb_frame(sweet_frame_fb, arg1 != NULL, (uint32_t)sid);
++	}
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_frame_await, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    NULL, 0, sweet_fb_frame_sysctl, "I", "a frame of this surface is being sent to the GPU");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_frame_sent, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    (void *)1, 0, sweet_fb_frame_sysctl, "I", "the frame of this surface has been sent to the GPU");
++
++static int
++sweet_fb_frame_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char line[160];
++	AppleCLCD *fb = sweet_frame_fb;
++
++	snprintf(line, sizeof(line), "held %llu sent %llu late %llu", fb ? fb->fHeldCount : 0, fb ? fb->fSentCount : 0,
++	    fb ? fb->fHeldLate : 0);
++	return SYSCTL_OUT(req, line, strlen(line) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_frame_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_fb_frame_stats, "A", "0286: swaps held until their frame was sent");
