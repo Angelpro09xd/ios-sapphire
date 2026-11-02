@@ -9,7 +9,7 @@ out=${1:-/tmp}
 app=$(mktemp -d)
 A="$app/Payload/Tienda.app"
 mkdir -p "$A"
-$CC -fobjc-arc -framework Foundation -framework UIKit -framework CoreGraphics -o "$A/Tienda" app/Tienda.m
+$CC -fobjc-arc -framework Foundation -framework UIKit -framework WebKit -framework CoreGraphics -o "$A/Tienda" app/Tienda.m
 "$LDID" -Sapp/Tienda.entitlements "$A/Tienda"
 cp app/Info.plist "$A/Info.plist"
 python3 -I app/mkicon.py 120 "$A/AppIcon60x60@2x.png"

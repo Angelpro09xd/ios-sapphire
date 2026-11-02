@@ -2,6 +2,7 @@
 // downloads the IPA and hands it to TrollStore's trollstorehelper (spawned as root, the way TrollStore does it),
 // so apps install, update and uninstall with one tap, without an Apple ID.
 #import <UIKit/UIKit.h>
+#import <WebKit/WebKit.h>
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include <spawn.h>
 #include <sys/wait.h>
@@ -131,7 +132,9 @@ static NSString *sizeText(long long b)
 @property (strong) NSMutableDictionary<NSString *, Job *> *jobs;             // bundle id -> job
 @property (strong) NSCache *icons;
 @property BOOL loading;
+@property int busyFiles;
 + (instancetype)shared;
+- (void)installFile:(NSString *)path name:(NSString *)name from:(UIViewController *)vc done:(void (^)(int))done;
 - (NSArray<NSString *> *)sources;
 - (void)setSources:(NSArray<NSString *> *)s;
 - (void)reload:(void (^)(void))done;
@@ -154,6 +157,29 @@ static void alert(UIViewController *vc, NSString *t, NSString *m)
 static void changed(void)
 {
 	dispatch_async(dispatch_get_main_queue(), ^{ [NSNotificationCenter.defaultCenter postNotificationName:kChanged object:nil]; });
+}
+
+// trollstorehelper's install codes: 0 ok; 182 (needs developer mode) and 184 (extra encrypted binaries) are
+// installed with a warning; 180 is a FairPlay-encrypted main binary (an App Store copy, not a decrypted one)
+static void reportInstall(UIViewController *vc, NSString *name, int rc, NSString *out)
+{
+	if (rc == 0) return;
+	if (rc == 182) {
+		alert(vc, [NSString stringWithFormat:@"%@ instalada", name],
+		      @"Esta app está hecha para desarrolladores (pide el «Modo desarrollador»). Si no abre, activa el Modo desarrollador en Ajustes → Privacidad y seguridad, o en los ajustes de TrollStore, y reinicia.");
+		return;
+	}
+	if (rc == 184) {
+		alert(vc, [NSString stringWithFormat:@"%@ instalada", name],
+		      @"Aviso: algunas partes de la app (extensiones) siguen cifradas y puede que no funcionen.");
+		return;
+	}
+	if (rc == 180) {
+		alert(vc, name, @"Esta IPA está cifrada con FairPlay (es una copia sacada de la App Store tal cual). Hace falta una versión descifrada.");
+		return;
+	}
+	NSString *o = out.length > 600 ? [out substringFromIndex:out.length - 600] : out;
+	alert(vc, name, [NSString stringWithFormat:@"TrollStore no pudo instalarla (código %d).\n%@", rc, o]);
 }
 
 @implementation Store
@@ -305,15 +331,31 @@ static void changed(void)
 		dispatch_async(dispatch_get_main_queue(), ^{
 			[self.jobs removeObjectForKey:a.bundleID];
 			changed();
-			if (rc != 0) {
-				NSString *o = out.length > 600 ? [out substringFromIndex:out.length - 600] : out;
-				alert(vc, a.name, [NSString stringWithFormat:@"TrollStore no pudo instalarla (código %d).\n%@", rc, o]);
-			}
+			reportInstall(vc, a.name, rc, out);
 		});
 	}];
 	self.jobs[a.bundleID] = j;
 	[j.task resume];
 	changed();
+}
+
+// an IPA already on disk (downloaded by the browser, or opened from Files/Safari); the file is removed afterwards
+- (void)installFile:(NSString *)path name:(NSString *)name from:(UIViewController *)vc done:(void (^)(int))done
+{
+	if (!helperPath()) { alert(vc, @"Falta TrollStore", @"La Tienda instala las apps con TrollStore, y no lo encuentro."); return; }
+	self.busyFiles++;
+	changed();
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+		NSString *out = nil;
+		int rc = runHelper(@[@"install", path], &out);
+		[NSFileManager.defaultManager removeItemAtPath:path error:nil];
+		dispatch_async(dispatch_get_main_queue(), ^{
+			self.busyFiles--;
+			changed();
+			reportInstall(vc, name, rc, out);
+			if (done) done(rc);
+		});
+	});
 }
 
 - (void)uninstall:(StoreApp *)a from:(UIViewController *)vc
@@ -719,6 +761,304 @@ static UIImage *placeholder(void)
 }
 @end
 
+#pragma mark - browser (decrypted IPA sites): downloads of IPAs are caught and installed
+
+@interface BrowserVC : UIViewController <WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate>
+@property (strong) NSURL *start;
+@property (copy) NSString *appName;
+@property (strong) WKWebView *web;
+@property (strong) UIProgressView *bar;
+@property (strong) WKDownload *download;
+@property (copy) NSString *dlPath, *dlName;
+@property (strong) NSTimer *timer;
+@end
+
+@implementation BrowserVC
+- (void)viewDidLoad
+{
+	[super viewDidLoad];
+	self.view.backgroundColor = UIColor.systemBackgroundColor;
+	self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeNever;
+	WKWebViewConfiguration *cfg = [WKWebViewConfiguration new];
+	self.web = [[WKWebView alloc] initWithFrame:self.view.bounds configuration:cfg];
+	self.web.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+	self.web.navigationDelegate = self;
+	self.web.UIDelegate = self;
+	self.web.allowsBackForwardNavigationGestures = YES;
+	self.web.customUserAgent = @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1";
+	[self.view addSubview:self.web];
+	self.bar = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleBar];
+	self.bar.translatesAutoresizingMaskIntoConstraints = NO;
+	[self.view addSubview:self.bar];
+	[NSLayoutConstraint activateConstraints:@[
+		[self.bar.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
+		[self.bar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+		[self.bar.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+	]];
+	UIBarButtonItem *back = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"chevron.backward"] style:UIBarButtonItemStylePlain target:self.web action:@selector(goBack)];
+	UIBarButtonItem *reload = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self.web action:@selector(reload)];
+	self.navigationItem.rightBarButtonItems = @[reload, back];
+	self.title = self.appName ?: @"Navegador";
+	[self.web loadRequest:[NSURLRequest requestWithURL:self.start]];
+	self.timer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *t) { [self tick]; }];
+}
+
+- (void)viewDidDisappear:(BOOL)animated
+{
+	[super viewDidDisappear:animated];
+	if (self.isMovingFromParentViewController) [self.timer invalidate];
+}
+
+- (void)tick
+{
+	if (self.download) {
+		double f = self.download.progress.fractionCompleted;
+		self.bar.hidden = NO;
+		self.bar.progress = f;
+		self.navigationItem.prompt = [NSString stringWithFormat:@"Descargando %@ · %d %%", self.dlName ?: @"", (int)(f * 100)];
+	} else if (Store.shared.busyFiles) {
+		self.bar.hidden = YES;
+		self.navigationItem.prompt = @"Instalando…";
+	} else {
+		self.navigationItem.prompt = nil;
+		self.bar.hidden = self.web.estimatedProgress >= 1.0 || !self.web.isLoading;
+		self.bar.progress = self.web.estimatedProgress;
+	}
+}
+
+static BOOL looksLikeIPA(NSURLResponse *r)
+{
+	NSString *p = r.URL.path.lowercaseString, *m = r.MIMEType.lowercaseString, *name = r.suggestedFilename.lowercaseString;
+	if ([p hasSuffix:@".ipa"] || [name hasSuffix:@".ipa"]) return YES;
+	if ([m isEqualToString:@"application/octet-stream"] || [m containsString:@"zip"] || [m containsString:@"itunes"]) return YES;
+	if ([r isKindOfClass:NSHTTPURLResponse.class]) {
+		NSString *cd = [((NSHTTPURLResponse *)r).allHeaderFields[@"Content-Disposition"] lowercaseString];
+		if ([cd containsString:@"attachment"]) return YES;
+	}
+	return NO;
+}
+
+- (void)webView:(WKWebView *)wv decidePolicyForNavigationAction:(WKNavigationAction *)a decisionHandler:(void (^)(WKNavigationActionPolicy))h
+{
+	NSString *s = a.request.URL.scheme.lowercaseString;
+	if (s.length && ![@[@"http", @"https", @"about", @"blob", @"data"] containsObject:s]) {
+		[UIApplication.sharedApplication openURL:a.request.URL options:@{} completionHandler:nil];
+		h(WKNavigationActionPolicyCancel);
+		return;
+	}
+	h(a.shouldPerformDownload ? WKNavigationActionPolicyDownload : WKNavigationActionPolicyAllow);
+}
+
+- (void)webView:(WKWebView *)wv decidePolicyForNavigationResponse:(WKNavigationResponse *)r decisionHandler:(void (^)(WKNavigationResponsePolicy))h
+{
+	BOOL dl = r.isForMainFrame && (looksLikeIPA(r.response) || !r.canShowMIMEType);
+	h(dl ? WKNavigationResponsePolicyDownload : WKNavigationResponsePolicyAllow);
+}
+
+- (void)webView:(WKWebView *)wv navigationAction:(WKNavigationAction *)a didBecomeDownload:(WKDownload *)d { d.delegate = self; }
+- (void)webView:(WKWebView *)wv navigationResponse:(WKNavigationResponse *)r didBecomeDownload:(WKDownload *)d { d.delegate = self; }
+
+// target=_blank links open here
+- (WKWebView *)webView:(WKWebView *)wv createWebViewWithConfiguration:(WKWebViewConfiguration *)c forNavigationAction:(WKNavigationAction *)a windowFeatures:(WKWindowFeatures *)f
+{
+	if (a.request.URL) [wv loadRequest:a.request];
+	return nil;
+}
+
+- (void)download:(WKDownload *)d decideDestinationUsingResponse:(NSURLResponse *)r suggestedFilename:(NSString *)name completionHandler:(void (^)(NSURL *))h
+{
+	if (self.download) { h(nil); return; }   // one at a time
+	NSString *dir = @"/var/mobile/Documents/Tienda";
+	[NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+	self.dlName = name.length ? name : @"app.ipa";
+	self.dlPath = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"web-%@.ipa", NSUUID.UUID.UUIDString]];
+	self.download = d;
+	h([NSURL fileURLWithPath:self.dlPath]);
+}
+
+- (void)downloadDidFinish:(WKDownload *)d
+{
+	self.download = nil;
+	NSString *path = self.dlPath, *name = [self.dlName stringByDeletingPathExtension];
+	NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
+	NSData *magic = [fh readDataOfLength:2];
+	[fh closeFile];
+	if (magic.length < 2 || memcmp(magic.bytes, "PK", 2) != 0) {
+		[NSFileManager.defaultManager removeItemAtPath:path error:nil];
+		alert(self, self.dlName, @"Lo descargado no es una IPA (no es un archivo zip).");
+		return;
+	}
+	[Store.shared installFile:path name:self.appName ?: name from:self done:^(int rc) {
+		if (rc == 0) alert(self, [NSString stringWithFormat:@"%@ instalada", self.appName ?: name], @"Ya está en la pantalla de inicio.");
+	}];
+}
+
+- (void)download:(WKDownload *)d didFailWithError:(NSError *)e resumeData:(NSData *)rd
+{
+	self.download = nil;
+	[NSFileManager.defaultManager removeItemAtPath:self.dlPath error:nil];
+	alert(self, self.dlName, [NSString stringWithFormat:@"La descarga falló: %@", e.localizedDescription]);
+}
+@end
+
+#pragma mark - App Store catalog (Apple's public search API; free apps only), installs through the browser
+
+static NSString *const kStoreSite = @"https://armconverter.com/store";
+static NSString *const kPopular = @"310633997,389801252,835599320,686449807,544007664,324684580,363590051,447188370,333903271,284882215,454638411,985746746,585027354,422689480,535886823,1094591345,1446075923";
+
+@interface CatalogVC : UITableViewController <UISearchBarDelegate>
+@property (strong) NSArray<NSDictionary *> *items;
+@property (strong) UISearchController *search;
+@property (strong) NSURLSessionDataTask *task;
+@property BOOL loading;
+@end
+
+@implementation CatalogVC
+- (void)viewDidLoad
+{
+	[super viewDidLoad];
+	self.tableView.rowHeight = 76;
+	self.items = @[];
+	self.search = [[UISearchController alloc] initWithSearchResultsController:nil];
+	self.search.searchBar.delegate = self;
+	self.search.obscuresBackgroundDuringPresentation = NO;
+	self.search.searchBar.placeholder = @"Buscar en la App Store";
+	self.navigationItem.searchController = self.search;
+	self.navigationItem.hidesSearchBarWhenScrolling = NO;
+	self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"safari"] style:UIBarButtonItemStylePlain target:self action:@selector(browser)];
+	[NSNotificationCenter.defaultCenter addObserver:self.tableView selector:@selector(reloadData) name:kChanged object:nil];
+	[self query:[NSString stringWithFormat:@"https://itunes.apple.com/lookup?id=%@&country=es&entity=software", kPopular]];
+}
+
+- (void)browser
+{
+	BrowserVC *b = [BrowserVC new];
+	b.start = [NSURL URLWithString:kStoreSite];
+	[self.navigationController pushViewController:b animated:YES];
+}
+
+- (void)searchBarSearchButtonClicked:(UISearchBar *)sb
+{
+	NSString *q = [sb.text stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLQueryAllowedCharacterSet];
+	if (!q.length) return;
+	[self query:[NSString stringWithFormat:@"https://itunes.apple.com/search?term=%@&country=es&entity=software&limit=60", q]];
+}
+
+- (void)searchBarCancelButtonClicked:(UISearchBar *)sb
+{
+	[self query:[NSString stringWithFormat:@"https://itunes.apple.com/lookup?id=%@&country=es&entity=software", kPopular]];
+}
+
+- (void)query:(NSString *)u
+{
+	[self.task cancel];
+	self.loading = YES;
+	[self empty];
+	self.task = [NSURLSession.sharedSession dataTaskWithURL:[NSURL URLWithString:u] completionHandler:^(NSData *data, NSURLResponse *r, NSError *e) {
+		NSDictionary *d = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+		NSMutableArray *ok = [NSMutableArray new];
+		for (NSDictionary *x in ([d isKindOfClass:NSDictionary.class] ? d[@"results"] : nil)) {
+			if (![x isKindOfClass:NSDictionary.class] || !str(x[@"bundleId"]) || !str(x[@"trackViewUrl"])) continue;
+			if ([x[@"price"] doubleValue] > 0) continue;          // free apps only
+			[ok addObject:x];
+		}
+		dispatch_async(dispatch_get_main_queue(), ^{
+			if (e.code == NSURLErrorCancelled) return;
+			self.loading = NO;
+			self.items = ok;
+			[self.tableView reloadData];
+			[self empty];
+			if (e) alert(self, @"App Store", [NSString stringWithFormat:@"No se pudo buscar: %@", e.localizedDescription]);
+		});
+	}];
+	[self.task resume];
+}
+
+- (void)empty
+{
+	if (self.loading && !self.items.count) {
+		UIActivityIndicatorView *sp = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
+		[sp startAnimating];
+		self.tableView.backgroundView = sp;
+	} else if (!self.items.count) {
+		UILabel *l = [UILabel new];
+		l.text = @"Sin resultados gratuitos";
+		l.textAlignment = NSTextAlignmentCenter;
+		l.textColor = UIColor.secondaryLabelColor;
+		self.tableView.backgroundView = l;
+	} else {
+		self.tableView.backgroundView = nil;
+	}
+}
+
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return self.items.count; }
+
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s
+{
+	return self.items.count ? @"Solo apps gratuitas. «Obtener» abre la página de la versión descifrada; al pulsar descargar allí, la Tienda la instala sola." : nil;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip
+{
+	UITableViewCell *c = [tv dequeueReusableCellWithIdentifier:@"c"];
+	if (!c) {
+		c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"c"];
+		c.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+		c.textLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+		UIButton *b = pill();
+		[b addTarget:self action:@selector(buttonTap:) forControlEvents:UIControlEventTouchUpInside];
+		c.accessoryView = b;
+	}
+	NSDictionary *x = self.items[ip.row];
+	c.textLabel.text = str(x[@"trackName"]);
+	NSString *minOS = str(x[@"minimumOsVersion"]);
+	NSString *sub = str(x[@"sellerName"]) ?: str(x[@"artistName"]) ?: @"";
+	if (minOS && newer(minOS, UIDevice.currentDevice.systemVersion))
+		sub = [NSString stringWithFormat:@"⚠️ la última pide iOS %@ · %@", minOS, sub];
+	c.detailTextLabel.text = sub;
+	NSURL *icon = url(x[@"artworkUrl100"]) ?: url(x[@"artworkUrl60"]);
+	c.imageView.image = [Store.shared.icons objectForKey:icon] ?: placeholder();
+	if (![Store.shared.icons objectForKey:icon]) {
+		[Store.shared icon:icon done:^(UIImage *img) {
+			UITableViewCell *cc = [tv cellForRowAtIndexPath:ip];
+			if (cc && ip.row < (NSInteger)self.items.count && self.items[ip.row] == x) { cc.imageView.image = img; [cc setNeedsLayout]; }
+		}];
+	}
+	UIButton *b = (UIButton *)c.accessoryView;
+	b.tag = ip.row;
+	[b setTitle:installedVersion(str(x[@"bundleId"])) ? @"Abrir" : @"Obtener" forState:UIControlStateNormal];
+	[b sizeToFit];
+	return c;
+}
+
+- (void)buttonTap:(UIButton *)b
+{
+	if (b.tag >= (NSInteger)self.items.count) return;
+	NSDictionary *x = self.items[b.tag];
+	if (installedVersion(str(x[@"bundleId"]))) {
+		[[NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace] openApplicationWithBundleID:str(x[@"bundleId"])];
+		return;
+	}
+	[self get:x];
+}
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip
+{
+	[tv deselectRowAtIndexPath:ip animated:YES];
+	[self get:self.items[ip.row]];
+}
+
+- (void)get:(NSDictionary *)x
+{
+	// https://apps.apple.com/es/app/whatsapp-messenger/id310633997?uo=4 -> https://armconverter.com/store/es/app/whatsapp-messenger/id310633997
+	NSURL *t = url(x[@"trackViewUrl"]);
+	BrowserVC *b = [BrowserVC new];
+	b.appName = str(x[@"trackName"]);
+	b.start = [NSURL URLWithString:[kStoreSite stringByAppendingString:t.path ?: @"/"]];
+	[self.navigationController pushViewController:b animated:YES];
+}
+@end
+
 #pragma mark - app
 
 @interface AppDelegate : UIResponder <UIApplicationDelegate>
@@ -743,7 +1083,8 @@ static UINavigationController *nav(UIViewController *vc, NSString *title, NSStri
 	AppsVC *mine = [[AppsVC alloc] initWithStyle:UITableViewStylePlain];
 	mine.onlyInstalled = YES;
 	SourcesVC *src = [[SourcesVC alloc] initWithStyle:UITableViewStyleInsetGrouped];
-	tb.viewControllers = @[nav(all, @"Apps", @"square.grid.2x2.fill"), nav(mine, @"Instaladas", @"arrow.down.app.fill"),
+	CatalogVC *cat = [[CatalogVC alloc] initWithStyle:UITableViewStyleGrouped];
+	tb.viewControllers = @[nav(cat, @"App Store", @"bag.fill"), nav(all, @"Apps", @"square.grid.2x2.fill"),nav(mine, @"Instaladas", @"arrow.down.app.fill"),
 			       nav(src, @"Fuentes", @"tray.full.fill")];
 	self.window.rootViewController = tb;
 	[self.window makeKeyAndVisible];
@@ -759,6 +1100,22 @@ static UINavigationController *nav(UIViewController *vc, NSString *title, NSStri
 // tienda://add?url=… or opening an AltStore "altstore://source?url=" style link adds a source
 - (BOOL)application:(UIApplication *)app openURL:(NSURL *)u options:(NSDictionary *)o
 {
+	if (u.isFileURL) {   // an .ipa opened with Tienda from Files, Safari or a share sheet
+		BOOL scoped = [u startAccessingSecurityScopedResource];
+		NSString *dir = @"/var/mobile/Documents/Tienda";
+		[NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+		NSString *dst = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"open-%@.ipa", NSUUID.UUID.UUIDString]];
+		NSError *e = nil;
+		BOOL ok = [NSFileManager.defaultManager copyItemAtPath:u.path toPath:dst error:&e];
+		if (scoped) [u stopAccessingSecurityScopedResource];
+		NSString *name = u.lastPathComponent.stringByDeletingPathExtension;
+		UIViewController *vc = self.window.rootViewController;
+		if (!ok) { alert(vc, name, [NSString stringWithFormat:@"No pude leer el archivo: %@", e.localizedDescription]); return NO; }
+		[Store.shared installFile:dst name:name from:vc done:^(int rc) {
+			if (rc == 0) alert(vc, [NSString stringWithFormat:@"%@ instalada", name], @"Ya está en la pantalla de inicio.");
+		}];
+		return YES;
+	}
 	NSURLComponents *c = [NSURLComponents componentsWithURL:u resolvingAgainstBaseURL:NO];
 	for (NSURLQueryItem *q in c.queryItems) {
 		if ([q.name isEqualToString:@"url"] && q.value.length) {
