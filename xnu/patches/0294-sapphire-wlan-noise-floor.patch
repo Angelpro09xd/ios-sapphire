@@ -1,0 +1,79 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0294: Wi-Fi: report a noise floor (auto-join never joined)
+
+Scan results, the link event and the current network went out with noise 0 dBm (the firmware
+gives no noise figure, the fields stayed zero) and there was no answer to APPLE80211_IOC_NOISE.
+CoreWiFi's auto-join then saw every access point's signal-to-noise ratio below its minimum:
+"Below minimum RSSI threshold" for a network heard at -60 dBm, so the phone never joined a known
+network by itself, even with the password in the keychain. Every answer now carries a -95 dBm
+floor (noise_known set) and SNR = RSSI - floor; NOISE (17) answers in the RSSI request's shape.
+---
+ bsd/dev/sapphire_apple80211.c | 34 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sapphire_apple80211.c b/bsd/dev/sapphire_apple80211.c
+index e9c92f3..5aed602 100644
+--- a/bsd/dev/sapphire_apple80211.c
++++ b/bsd/dev/sapphire_apple80211.c
+@@ -199,7 +199,22 @@ _Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct
+ enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
+        EVENT_SCAN_DONE = 10 };
+ 
+-static const char interface_name[16] = "en0";   /* (bsd/dev/sapphire_net.c makes one interface, and that is its name) */
++static const char interface_name[16] = "en0";
++
++/*
++ * 0294: the noise floor every answer reports. The firmware gives no noise figure; scan results and
++ * the link went out with noise 0 dBm, so CoreWiFi's auto-join saw every access point's
++ * signal-to-noise ratio below its minimum ("Below minimum RSSI threshold" for a network heard at
++ * -60 dBm) and never joined anything by itself, even with its password in the keychain.
++ */
++#define NOISE_FLOOR_DBM         (-95)
++
++static int16_t
++snr_of(int rssi)
++{
++	int snr = rssi - NOISE_FLOOR_DBM;
++	return (int16_t)(snr < 0 ? 0 : snr > 90 ? 90 : snr);
++}   /* (bsd/dev/sapphire_net.c makes one interface, and that is its name) */
+ 
+ static LCK_GRP_DECLARE(apple80211_lock_group, "sapphire-apple80211");
+ static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
+@@ -263,6 +278,9 @@ give_network(const struct apple80211req *request, const struct sapphire_sta_bss
+ 	result->version = 1;
+ 	channel_fill(&result->channel, bss->frequency, 0);
+ 	result->rssi = bss->rssi;
++	result->noise_known = 1;
++	result->noise = NOISE_FLOOR_DBM;
++	result->snr = snr_of(bss->rssi);
+ 	result->beacon_interval = bss->beacon_interval;
+ 	result->capability = bss->capability;
+ 	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
+@@ -437,6 +455,16 @@ get(struct apple80211req *request)
+ 		error = state->phase != SAPPHIRE_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+ 		break;
+ 	}
++	case 17: {                              /* 0294: the noise floor, in the RSSI answer's shape */
++		struct {
++			uint32_t version, radios, unit;
++			int32_t each[4], all, each_ext[4], all_ext;
++		} answer = { .version = 1, .radios = 1, .each = { NOISE_FLOOR_DBM }, .all = NOISE_FLOOR_DBM,
++			     .each_ext = { NOISE_FLOOR_DBM }, .all_ext = NOISE_FLOOR_DBM };
++
++		error = state->phase != SAPPHIRE_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++		break;
++	}
+ 	case 103:                               /* all of it, as a scan's result */
+ 		error = state->phase != SAPPHIRE_STA_JOINED ? ENXIO : give_network(request, &state->bss);
+ 		break;
+@@ -652,6 +680,10 @@ sapphire_apple80211_event(enum sapphire_sta_event event, int status)
+ 		if (state != NULL) {
+ 			sapphire_sta_state(state);
+ 			link.rssi = status == 1 ? state->bss.rssi : 0;
++			if (status == 1) {
++				link.snr = (uint16_t)snr_of(state->bss.rssi);
++				link.noise = (uint16_t)(int16_t)NOISE_FLOOR_DBM;
++			}
+ 			kfree_data(state, sizeof(*state));
+ 		}
+ 		post(EVENT_SSID_CHANGED, NULL, 0);

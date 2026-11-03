@@ -1,0 +1,58 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0292: camera: frame reads through a cacheable alias of the pool
+
+The frame pool is mapped write-combined, so kern.sweet_cam_frame copied every byte out of uncached
+memory: a 15 MB main-camera preview frame took longer than a frame period and the main camera's
+preview ran at 5 fps while the sensor sent 31. A cacheable read-only alias of the pool now serves
+the reads; each 1 MB piece is cleaned and invalidated to the point of coherency first, so the cache
+never holds anything older than the TFE's DMA. Nothing is written through the alias.
+---
+ bsd/dev/sweet_cam.c | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index 2744a25..28bd270 100755
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -119,6 +119,16 @@ static int64_t cam_seek;
+ static uint32_t cam_frame_len, cam_frame_off;
+ static uint64_t cam_frame_ns;                   /* 0277: the HM6 frame time in use (exposure, frame length) */
+ static uint8_t *cam_pool;
++/*
++ * 0292: a cacheable, read-only alias of the frame pool for the frame reads. Through the write-combined
++ * mapping every read was uncached: a 15 MB main-camera preview frame took longer than a frame period
++ * and the preview ran at 5 fps. Each piece is cleaned and invalidated (PoC) before it is copied out,
++ * so the cache never holds anything older than the TFE's DMA; nothing is ever written through it.
++ */
++static uint8_t *cam_pool_rd;
++extern vm_offset_t io_map(vm_map_offset_t phys_addr, vm_size_t size, unsigned int flags, vm_prot_t prot, bool unmappable);
++extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
++#define CAM_WIMG_DEFAULT 0x2    /* VM_WIMG_DEFAULT (osfmk/arm/memory_types.h): normal cacheable memory */
+ static vm_offset_t cam_phy, cam_ppi, cam_csid, cam_smmu, cam_phys[3];
+ static bool slot_up[4], cam_streaming, cam_csid_up;
+ static struct { unsigned slot, mode, w, h, phy, settle, lanes; uint32_t rxcfg0; bool cphy; } cs;
+@@ -1229,6 +1239,10 @@ cam_pool_map(void)
+ 		return false;
+ 	}
+ 	cam_pool = (uint8_t *)topaz_map_wc(CAM_POOL_PA, CAM_POOL_SIZE);
++	if (cam_pool != NULL && cam_pool_rd == NULL) {
++		cam_pool_rd = (uint8_t *)io_map(CAM_POOL_PA, CAM_POOL_SIZE, CAM_WIMG_DEFAULT, VM_PROT_READ, false);
++		camlog("pool: cacheable read alias %s", cam_pool_rd ? "mapped" : "NOT mapped (reads stay uncached)");
++	}
+ 	camlog("pool %llx-%llx (kernel RAM %lx-%lx): %s", CAM_POOL_PA, CAM_POOL_PA + CAM_POOL_SIZE, gPhysBase,
+ 	    gPhysBase + gPhysSize, cam_pool ? "mapped write-combined" : "NOT mapped");
+ 	return cam_pool != NULL;
+@@ -1405,7 +1419,12 @@ sysctl_sweet_cam_frame SYSCTL_HANDLER_ARGS
+ 	} else {
+ 		uint32_t n = cam_frame_len - (uint32_t)cam_seek;
+ 		n = n > (1u << 20) ? (1u << 20) : n;
+-		err = SYSCTL_OUT(req, cam_pool + cam_frame_off + cam_seek, n);
++		const uint8_t *src = cam_pool + cam_frame_off + cam_seek;
++		if (cam_pool_rd != NULL && req->oldptr != USER_ADDR_NULL) {
++			src = cam_pool_rd + cam_frame_off + cam_seek;
++			FlushPoC_DcacheRegion((vm_offset_t)src, n);     /* 0292: nothing older than the DMA */
++		}
++		err = SYSCTL_OUT(req, src, n);
+ 		if (err == 0 && req->oldptr != USER_ADDR_NULL) {
+ 			cam_seek += n;
+ 		}
