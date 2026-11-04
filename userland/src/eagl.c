@@ -5134,10 +5134,20 @@ my_dealloc(id self, SEL selector)
 			redwood_gl_make_current(NULL);
 			current = NULL;
 		}
-		redwood_gl_destroy(e->gl);
-		free(e->images);
-		free(e->image_index);
-		free(e);
+		/*
+		 * Outside backboardd (apps, CoreImage in any process) a context is often released on
+		 * another thread than the one it is current on, or while a context sharing its objects
+		 * still draws (CoreImage keeps several and frees them on its own queues): destroying the
+		 * Mesa context there crashed in OSMesaDestroyContext, and a thread still holding it as
+		 * current would use freed memory. There it is left alive (CoreImage makes few and keeps
+		 * them); backboardd, one render thread, frees as before.
+		 */
+		if (strcmp(getprogname(), "backboardd") == 0) {
+			redwood_gl_destroy(e->gl);
+			free(e->images);
+			free(e->image_index);
+			free(e);
+		}
 	}
 	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&super, selector);
 }
