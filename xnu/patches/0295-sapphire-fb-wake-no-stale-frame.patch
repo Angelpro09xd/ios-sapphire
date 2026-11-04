@@ -1,0 +1,64 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0295: framebuffer: no frame from before "off" at wake
+
+"On" marked the latest frame dirty, so the next vsync tick put the frame from before "off" back on
+the panel -- the app or home screen that was up -- and the lock screen replaced it when
+backboardd's first new frame came a moment later: a flash of old content at every wake (the
+lock screen's "graphic bug when it turns on"). The panel now keeps the black it has scanned since
+"off" until a new frame is presented; only when none comes within 0.3 s is the old one shown.
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7c7b82b..5738438 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -216,6 +216,7 @@ public:
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
++	uint32_t      fWakeTicks;     /* 0295: vsync ticks left before the frame from before "off" may be shown again */
+ 	/* topaz direct MDP scanout (VIG0 / CTL0 from TopazGpuW disp.c) */
+ 	volatile uint32_t *fVig0;
+ 	volatile uint32_t *fCtl0;
+@@ -746,6 +747,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->armVsync(sender);
+ 		return;
+ 	}
++	if (fb->fWakeTicks != 0 && --fb->fWakeTicks == 0) {
++		fb->fDirty = true;              /* 0295: no new frame since "on": the latest one after all */
++	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *rec = NULL;
+ 	SweetSurface *taken[4] = {};
+@@ -923,6 +927,7 @@ AppleCLCD::presentNow(const uint8_t *rec, SweetSurface **held)
+ 	SweetSurface *release[4] = {};
+ 	IOLockLock(fLock);
+ 	fDirty = false;
++	fWakeTicks = 0;
+ 	SweetSurface *pend[4];
+ 	memcpy(pend, fPendHold, sizeof(pend));         /* (a frame of the timer's path, now replaced) */
+ 	bzero(fPendHold, sizeof(fPendHold));
+@@ -1868,7 +1873,20 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			if (changed) {
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
+-				fFB->fDirty = true;     /* on: redraw the latest frame */
++				if (off) {
++					fFB->fDirty = true;
++					fFB->fWakeTicks = 0;
++				} else {
++					/*
++					 * 0295: "on" showed the latest frame again at once -- the frame from before
++					 * "off" (the app or home screen that was up), then the lock screen when
++					 * backboardd's first new frame came a moment later: a flash of old content at
++					 * every wake. The panel keeps the black it scans since "off" until a new frame
++					 * is presented; only if none comes in 0.3 s is the old one shown.
++					 */
++					fFB->fDirty = false;
++					fFB->fWakeTicks = fFB->fRateHz * 3 / 10 + 1;
++				}
+ 			}
+ 			uint32_t level = fFB->fBlLevel;
+ 			IOLockUnlock(fFB->fLock);
