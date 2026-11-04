@@ -19,6 +19,7 @@
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <pthread.h>
 #include <mach/thread_act.h>
 #include <libkern/OSCacheControl.h>
@@ -64,7 +65,20 @@ say(const char *fmt, ...)
 		log_fd = open("/var/tmp/ccbridge.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
 	}
 	if (log_fd >= 0) {
-		write(log_fd, buf, (size_t)n);
+		/*
+		 * At most 8 MB, then it becomes ccbridge.log.1 (the one before goes): it grew without end
+		 * across boots in /var/tmp -- 146 MB, and 130 KB a second while CommCenter looped on NAS.
+		 */
+		static unsigned writes;
+		struct stat st;
+		if ((writes++ & 255) == 0 && fstat(log_fd, &st) == 0 && st.st_size > 8 * 1024 * 1024) {
+			rename("/var/tmp/ccbridge.log", "/var/tmp/ccbridge.log.1");
+			close(log_fd);
+			log_fd = open("/var/tmp/ccbridge.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+		}
+		if (log_fd >= 0) {
+			write(log_fd, buf, (size_t)n);
+		}
 	}
 }
 
@@ -941,13 +955,30 @@ br_nas_poll(void *arg)
 	pthread_mutex_unlock(&br_lock);
 }
 
+/*
+ * One poll pending at a time. Every 0x0003 (indication register) used to schedule its own poll,
+ * and each poll's answer went to every NAS client as an indication, after which CommCenter's 16
+ * clients registered again: the polls piled up and fed each other -- a NAS poll every few
+ * milliseconds, CommCenter at 180 % of a core and its helper at 60 %, for ever.
+ */
+static volatile int br_nas_poll_pending;
+
+static void
+br_nas_poll_once(void *arg)
+{
+	br_nas_poll_pending = 0;
+	br_nas_poll(arg);
+}
+
 static void
 br_nas_poll_soon(struct br_chan *c)
 {
 	(void)c;
 	static int timer_on;
-	dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0),
-	    NULL, br_nas_poll);
+	if (__sync_bool_compare_and_swap(&br_nas_poll_pending, 0, 1)) {
+		dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0),
+		    NULL, br_nas_poll_once);
+	}
 	if (!timer_on) {
 		timer_on = 1;
 		dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
