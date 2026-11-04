@@ -5566,6 +5566,164 @@ no_digital_dimming_noop(id self, SEL selector, float scaler)
 	no_digital_dimming_real(self, selector, 1.0f);
 }
 
+/*
+ * Brightness without a backlight service (the default: xnu boot-arg sweetbl=0). CoreBrightness, in
+ * backboardd, has no display to drive then and drops what the brightness slider sets: Control
+ * Center's slider and Settings' moved and nothing happened, and BKSDisplayBrightnessGetCurrent()
+ * stayed 0.75. Here -[BrightnessSystem setProperty:forKey:] keeps "DisplayBrightness" (0 to 1)
+ * itself and gives the panel its level (AppleCLCD's IOMFBBrightnessLevel, nits in 16.16: the
+ * framebuffer sends DCS 0x51), and -copyPropertyForKey: answers with it, so the slider stays where
+ * it was put. The level is kept (com.sapphire.brightness, "level") and given back at start.
+ * backboardd's BKDisplayBrightnessController, which drops every level while it thinks there is no
+ * control (-isBrightnessLevelControlAvailable), is told there is.
+ * With a backlight service CoreBrightness does all of it, and this stays out.
+ */
+#define BRIGHTNESS_MAX_NITS     500.0           /* xnu SweetFramebuffer.cpp SWEET_FB_MAX_NITS */
+#define BRIGHTNESS_MIN_NITS     5.0             /* (the slider at its bottom: dim, never black) */
+/* (in IOKit on iOS too; the SDK only marks it unavailable) */
+extern kern_return_t brightness_set_property(io_registry_entry_t, CFStringRef, CFTypeRef) __asm__("_IORegistryEntrySetCFProperty");
+static bool (*brightness_set_real)(id, SEL, id, id);
+static id (*brightness_copy_real)(id, SEL, id);
+static float brightness_level = -1;
+static int brightness_debug;
+
+static void
+brightness_to_panel(float level)
+{
+	io_service_t fb = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleCLCD"));
+	/* the slider is perceptual: nits rise with its square */
+	double nits = BRIGHTNESS_MIN_NITS + (BRIGHTNESS_MAX_NITS - BRIGHTNESS_MIN_NITS) * (double)level * (double)level;
+	long long fixed = (long long)(nits * 65536.0);
+	CFNumberRef value;
+
+	if (fb == 0) {
+		return;
+	}
+	value = CFNumberCreate(NULL, kCFNumberLongLongType, &fixed);
+	brightness_set_property(fb, CFSTR("IOMFBBrightnessLevel"), value);
+	CFRelease(value);
+	IOObjectRelease(fb);
+}
+
+static bool
+brightness_key(id key)
+{
+	return key != NULL && CFGetTypeID((CFTypeRef)key) == CFStringGetTypeID() &&
+	    CFStringCompare((CFStringRef)key, CFSTR("DisplayBrightness"), 0) == kCFCompareEqualTo;
+}
+
+static bool
+brightness_set(id self, SEL selector, id value, id key)
+{
+	float level;
+
+	if (brightness_debug && brightness_debug++ < 40) {
+		char name[96] = "?";
+		if (key != NULL && CFGetTypeID((CFTypeRef)key) == CFStringGetTypeID()) {
+			CFStringGetCString((CFStringRef)key, name, sizeof(name), kCFStringEncodingUTF8);
+		}
+		char what[200] = "";
+		CFStringRef described = value != NULL ? CFCopyDescription((CFTypeRef)value) : NULL;
+		if (described != NULL) {
+			CFStringGetCString(described, what, sizeof(what), kCFStringEncodingUTF8);
+			CFRelease(described);
+		}
+		say("redwood-gl: BrightnessSystem setProperty for %s: %s\n", name, what);
+	}
+	/* the value: a number, or (the slider) { Brightness = 0..1; Commit = 0 while dragging, 1 at the end } */
+	if (brightness_key(key) && value != NULL) {
+		CFTypeRef number = value, commit = NULL;
+		bool committed = true;
+		int flag = 1;
+
+		if (CFGetTypeID((CFTypeRef)value) == CFDictionaryGetTypeID()) {
+			number = CFDictionaryGetValue((CFDictionaryRef)value, CFSTR("Brightness"));
+			commit = CFDictionaryGetValue((CFDictionaryRef)value, CFSTR("Commit"));
+			if (commit != NULL && CFGetTypeID(commit) == CFNumberGetTypeID() &&
+			    CFNumberGetValue((CFNumberRef)commit, kCFNumberIntType, &flag)) {
+				committed = flag != 0;
+			}
+		}
+		if (number != NULL && CFGetTypeID(number) == CFNumberGetTypeID() &&
+		    CFNumberGetValue((CFNumberRef)number, kCFNumberFloatType, &level)) {
+			level = level < 0 ? 0 : level > 1 ? 1 : level;
+			brightness_level = level;
+			brightness_to_panel(level);
+			if (committed) {
+				CFNumberRef kept = CFNumberCreate(NULL, kCFNumberFloatType, &level);
+				CFPreferencesSetAppValue(CFSTR("level"), kept, CFSTR("com.sapphire.brightness"));
+				CFPreferencesAppSynchronize(CFSTR("com.sapphire.brightness"));
+				CFRelease(kept);
+			}
+		}
+	}
+	return brightness_set_real(self, selector, value, key);
+}
+
+static id
+brightness_copy(id self, SEL selector, id key)
+{
+	if (brightness_key(key) && brightness_level >= 0) {
+		float level = brightness_level;
+		return (id)CFNumberCreate(NULL, kCFNumberFloatType, &level);   /* (a copy: +1, as the real one) */
+	}
+	return brightness_copy_real(self, selector, key);
+}
+
+/* backboardd's own controller asks whether the level can be set at all: without a backlight, no -- it can */
+static bool
+brightness_available(id self, SEL selector)
+{
+	(void)self;
+	(void)selector;
+	return true;
+}
+
+static void
+brightness_install(void)
+{
+	io_service_t backlight = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleARMBacklight"));
+	Class system = objc_getClass("BrightnessSystem");
+	Method set, copy;
+	CFPropertyListRef kept;
+
+	if (backlight != 0) {
+		IOObjectRelease(backlight);
+		return;                 /* CoreBrightness has a display of its own */
+	}
+	if (system == Nil) {
+		return;
+	}
+	brightness_debug = access("/var/tmp/gl.brightnessdebug", F_OK) == 0;
+	set = class_getInstanceMethod(system, sel_registerName("setProperty:forKey:"));
+	copy = class_getInstanceMethod(system, sel_registerName("copyPropertyForKey:"));
+	if (set == NULL || copy == NULL) {
+		say("redwood-gl: BrightnessSystem without setProperty:forKey: / copyPropertyForKey:\n");
+		return;
+	}
+	Class controller = objc_getClass("BKDisplayBrightnessController");
+	Method available = controller != Nil ?
+	    class_getInstanceMethod(controller, sel_registerName("isBrightnessLevelControlAvailable")) : NULL;
+	if (available != NULL) {
+		method_setImplementation(available, (IMP)brightness_available);
+	} else {
+		say("redwood-gl: no -[BKDisplayBrightnessController isBrightnessLevelControlAvailable]\n");
+	}
+	brightness_set_real = (bool (*)(id, SEL, id, id))method_setImplementation(set, (IMP)brightness_set);
+	brightness_copy_real = (id (*)(id, SEL, id))method_setImplementation(copy, (IMP)brightness_copy);
+	kept = CFPreferencesCopyAppValue(CFSTR("level"), CFSTR("com.sapphire.brightness"));
+	if (kept != NULL && CFGetTypeID(kept) == CFNumberGetTypeID()) {
+		float level = 0;
+		CFNumberGetValue((CFNumberRef)kept, kCFNumberFloatType, &level);
+		brightness_level = level < 0 ? 0 : level > 1 ? 1 : level;
+		brightness_to_panel(brightness_level);
+	}
+	if (kept != NULL) {
+		CFRelease(kept);
+	}
+	say("redwood-gl: brightness without a backlight: the slider drives the panel (level %g)\n", (double)brightness_level);
+}
+
 static void
 no_digital_dimming_try(void)
 {
@@ -5576,6 +5734,7 @@ no_digital_dimming_try(void)
 	if (done || (manager = objc_getClass("CBCAManager")) == Nil) {
 		return;
 	}
+	brightness_install();
 	method = class_getInstanceMethod(manager, sel_registerName("updateDigitalDimmingBrightnessScaler:"));
 	if (method != NULL) {
 		no_digital_dimming_real = (void (*)(id, SEL, float))method_setImplementation(method, (IMP)no_digital_dimming_noop);
