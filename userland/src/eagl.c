@@ -68,6 +68,8 @@
  * every frame (see frame_end()).
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <dispatch/dispatch.h>
+#include <mach-o/dyld.h>
 #include <IOKit/IOKitLib.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <mach/mach_time.h>
@@ -79,6 +81,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5541,6 +5544,58 @@ my_presentRenderbuffer_atTime(id self, SEL selector, unsigned long target, doubl
 	return my_presentRenderbuffer(self, selector, target);
 }
 
+/*
+ * No digital dimming. With a backlight service (xnu boot-arg sweetbl=1) CoreBrightness, inside
+ * backboardd, drives the panel itself (IOMFBBrightnessLevel: the brightness slider works) but also
+ * dims digitally below the panel's lowest level -- a colour filter CoreAnimation puts over every
+ * frame, which on this GPU made everything lag (xnu 0210 turned the service off for it). The panel
+ * goes low enough on its own: -[CBCAManager updateDigitalDimmingBrightnessScaler:] is always given
+ * 1, so the scaler stays 1. CoreBrightness may load after this library: hooked as it comes.
+ */
+static void (*no_digital_dimming_real)(id, SEL, float);
+
+static void
+no_digital_dimming_noop(id self, SEL selector, float scaler)
+{
+	static unsigned told;
+
+	if (told++ < 3) {
+		say("redwood-gl: digital dimming to %g made 1\n", (double)scaler);
+	}
+	/* (the call itself is kept: CoreBrightness waits for what it sets off -- left out, every wake took 5 s) */
+	no_digital_dimming_real(self, selector, 1.0f);
+}
+
+static void
+no_digital_dimming_try(void)
+{
+	static int done;
+	Class manager;
+	Method method;
+
+	if (done || (manager = objc_getClass("CBCAManager")) == Nil) {
+		return;
+	}
+	method = class_getInstanceMethod(manager, sel_registerName("updateDigitalDimmingBrightnessScaler:"));
+	if (method != NULL) {
+		no_digital_dimming_real = (void (*)(id, SEL, float))method_setImplementation(method, (IMP)no_digital_dimming_noop);
+		say("redwood-gl: CoreBrightness's digital dimming off\n");
+	}
+	done = 1;
+}
+
+static void
+no_digital_dimming_image(const struct mach_header *header, intptr_t slide)
+{
+	Dl_info info;
+
+	(void)slide;
+	if (dladdr(header, &info) != 0 && info.dli_fname != NULL && strstr(info.dli_fname, "/CoreBrightness") != NULL) {
+		/* (classes of an image being added are not ready yet: a moment later) */
+		dispatch_async(dispatch_get_main_queue(), ^{ no_digital_dimming_try(); });
+	}
+}
+
 __attribute__((constructor)) static void
 install(void)
 {
@@ -5563,8 +5618,30 @@ install(void)
 	size_t size = sizeof(arguments) - 1;
 	const char *argument;
 
-	/* the kernel's boot-args are where a run is told things */
-	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+	if (strcmp(getprogname(), "backboardd") == 0 && access("/var/tmp/gl.digitaldimming", F_OK) != 0) {
+		no_digital_dimming_try();
+		_dyld_register_func_for_add_image(no_digital_dimming_image);
+	}
+	/*
+	 * the kernel's boot-args are where a run is told things; /var/tmp/gl.args (the same words, one
+	 * line) is read after them, so that a process can be traced again without a new boot image
+	 */
+	int got = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0;
+	if (!got) {
+		arguments[0] = 0;
+	}
+	int extra_fd = open("/var/tmp/gl.args", O_RDONLY);
+	if (extra_fd >= 0) {
+		size_t used = strlen(arguments);
+		if (used + 2 < sizeof(arguments)) {
+			arguments[used++] = ' ';
+			ssize_t n = read(extra_fd, arguments + used, sizeof(arguments) - 1 - used);
+			arguments[used + (n > 0 ? (size_t)n : 0)] = 0;
+			got = 1;
+		}
+		close(extra_fd);
+	}
+	if (got) {
 		if ((argument = strstr(arguments, "gltrace=")) != NULL) {
 			trace_last = trace_first = (unsigned)strtoul(argument + 8, (char **)&argument, 10);
 			if (*argument == '-') {
