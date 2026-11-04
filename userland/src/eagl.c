@@ -4800,6 +4800,86 @@ my_glCreateShader(void *context, GLenum type)
  * CoreAnimation does not ask whether its shaders compiled. Here it is asked, and what the
  * compiler said is written down with the shader's text.
  */
+/*
+ * CoreImage's kernels pick their input with "#define sample(s,p) texture2D(_samplers[s], p)" and
+ * call it with s a function's parameter (_gaussianBlur13(int image, ...): sample(image, ...)). Apple's
+ * compiler takes that; GLSL ES 3.00 (and Mesa) forbid indexing an array of samplers with anything
+ * but a constant: the program did not link, the draw went out with no program, and every CoreImage
+ * filter in an app gave back its input unconverted -- no blur, and linear colours where sRGB ones
+ * were due (a grey of 128 came back 55). Rewritten here: with one sampler, _samplers[s] is
+ * _samplers[0]; with more, sample() is a function that picks each with a constant index.
+ * NULL: nothing to change. Otherwise a new text, to be freed.
+ */
+static char *
+ci_samplers_constant(const char *text)
+{
+	const char *declaration = strstr(text, "sampler2D _samplers ["), *define, *at;
+	unsigned count = 0;
+	size_t length = strlen(text), extra;
+	char *out, *to;
+
+	if (declaration == NULL || strstr(text, "_samplers[s]") == NULL ||
+	    sscanf(declaration + strlen("sampler2D _samplers ["), "%u", &count) != 1 || count == 0 || count > 16) {
+		return NULL;
+	}
+	if (count == 1) {
+		if ((out = malloc(length + 1)) == NULL) {
+			return NULL;
+		}
+		to = out;
+		for (at = text; *at != '\0';) {
+			if (strncmp(at, "_samplers[s]", 12) == 0) {
+				memcpy(to, "_samplers[0]", 12);
+				to += 12;
+				at += 12;
+			} else {
+				*to++ = *at++;
+			}
+		}
+		*to = '\0';
+		return out;
+	}
+	/* several: "#define sample(s,p) BODY" -> a function after the declaration, BODY once per sampler */
+	define = strstr(text, "#define sample(s,p) ");
+	if (define == NULL) {
+		return NULL;
+	}
+	const char *body = define + strlen("#define sample(s,p) ");
+	size_t body_length = strcspn(body, "\n");
+	const char *after = declaration + strcspn(declaration, "\n");
+	extra = 160 + count * (body_length + 48);
+	if (*after == '\0' || (out = malloc(length + extra + 1)) == NULL) {
+		return NULL;
+	}
+	to = out;
+	for (at = text; *at != '\0';) {
+		if (at == define) {
+			to += sprintf(to, "#define sample(s,p) _ci_sample_any(s, p)");
+			at = body + body_length;
+		} else if (at == after) {
+			*to++ = *at++;          /* the declaration's newline */
+			to += sprintf(to, "vec4 _ci_sample_any(int s, highp vec2 p) {\n");
+			for (unsigned k = 0; k < count; k++) {
+				to += sprintf(to, "  %sif (s == %u) return ", k == 0 ? "" : "else ", k);
+				for (const char *b = body; b < body + body_length;) {
+					if (strncmp(b, "_samplers[s]", 12) == 0) {
+						to += sprintf(to, "_samplers[%u]", k);
+						b += 12;
+					} else {
+						*to++ = *b++;
+					}
+				}
+				to += sprintf(to, ";\n");
+			}
+			to += sprintf(to, "  return vec4(0.0);\n}\n");
+		} else {
+			*to++ = *at++;
+		}
+	}
+	*to = '\0';
+	return out;
+}
+
 static void
 my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *const *strings, const GLint *lengths)
 {
@@ -4834,6 +4914,10 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 	}
 	parts[0] = head;
 	parts[3] = text;
+	char *fixed = fragment ? ci_samplers_constant(text) : NULL;
+	if (fixed != NULL) {
+		parts[3] = fixed;
+	}
 	if (fragment) {
 		fetch = strstr(text, "gl_LastFragData") != NULL;
 		parts[2] = fetch ? fragment_fetch : fragment_plain;
@@ -4842,6 +4926,7 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 	free((void *)e->sources[shader % 256]);
 	e->sources[shader % 256] = text;
 	glShaderSource(shader, 6, (const GLchar *const[6]){ parts[0], parts[5], parts[1], parts[2], parts[3], parts[4] }, NULL);
+	free(fixed);
 	EAGL_LEAVE(e, 0x12a0);
 }
 
@@ -4920,21 +5005,43 @@ _Static_assert(EAGL_TABLE_SIZE <= SLOTS * 8, "the table has grown");
 
 /* ---- EAGLContext ---------------------------------------------------------------------------------- */
 
+static struct eagl *context_of(id object);
+
+/*
+ * A context made to share with another (-initWithAPI:sharegroup:, CoreImage's way: it makes its
+ * textures in one context and draws into them from another) shares that one's Mesa objects. It
+ * shared nothing before: CoreImage's second context found "non-existent texture 1", every pass
+ * drew into nothing, and a filter gave back its input unfiltered.
+ */
+static struct eagl *init_share;
+
 static id
 my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 {
 	struct eagl *e;
+	struct eagl *share = init_share;
 	unsigned place;
 
 	(void)selector;
-	(void)properties;
+	init_share = NULL;
+	/* (CoreImage's way: EAGLContextPropertySharegroup, what -sharegroup gave it -- one of our contexts) */
+	if (share == NULL && properties != nil && CFGetTypeID((CFTypeRef)properties) == CFDictionaryGetTypeID()) {
+		id group = (id)CFDictionaryGetValue((CFDictionaryRef)properties, CFSTR("EAGLContextPropertySharegroup"));
+		if (group != nil) {
+			share = context_of(group);
+		}
+	}
 	for (place = 0; place < sizeof(contexts) / sizeof(contexts[0]) && contexts[place] != NULL; place++) {
 	}
 	if (api < 2 || api > 3 || place == sizeof(contexts) / sizeof(contexts[0]) || (e = calloc(1, sizeof(*e))) == NULL) {
 		say("redwood-gl: no context of API %lu\n", api);
 		return nil;
 	}
-	if ((e->gl = redwood_gl_create((int)api)) == NULL || !redwood_gl_make_current(e->gl)) {
+	if (share != NULL) {
+		say("redwood-gl: a context sharing the objects of %p\n", (void *)share->object);
+	}
+	if ((e->gl = redwood_gl_create_shared((int)api, share != NULL ? share->gl : NULL)) == NULL ||
+	    !redwood_gl_make_current(e->gl)) {
 		say("redwood-gl: %s gives no OpenGL ES %lu context\n", redwood_gl_library(), api);
 		free(e);
 		return nil;
@@ -4977,13 +5084,13 @@ my_sharegroup(id self, SEL selector)
 {
 	static int said;
 
-	(void)self;
 	(void)selector;
 	if (!said) {
 		said = 1;
-		say("redwood-gl: -sharegroup asked for: none (nothing here shares a context)\n");
+		say("redwood-gl: -sharegroup asked for: the context itself stands for its group\n");
 	}
-	return nil;
+	/* (what -initWithAPI:sharegroup: gets back: our own contexts are told apart by context_of()) */
+	return context_of(self) != NULL ? self : nil;
 }
 
 static unsigned long
@@ -5353,9 +5460,12 @@ my_initWithAPI_plain(id self, SEL selector, unsigned long api)
 static id
 my_initWithAPI_sharegroup(id self, SEL selector, unsigned long api, id sharegroup)
 {
-	if (sharegroup != nil) {
-		say("redwood-gl: a context sharing with another was asked for; it shares nothing\n");
+	struct eagl *share = sharegroup != nil ? context_of(sharegroup) : NULL;
+
+	if (sharegroup != nil && share == NULL) {
+		say("redwood-gl: a context sharing with a group not made here was asked for; it shares nothing\n");
 	}
+	init_share = share;
 	return my_initWithAPI(self, selector, api, nil);
 }
 
