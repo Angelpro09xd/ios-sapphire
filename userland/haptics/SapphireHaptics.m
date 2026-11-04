@@ -13,7 +13,8 @@
  * Mapping (ERM pulses): light 15, medium 30, heavy 45, soft 18, rigid 25 ms, selection 12, keyboard 14,
  * success / warning / error patterns.
  *
- * AudioServicesPlaySystemSound(WithCompletion) / AudioServicesPlayAlertSound(WithCompletion) (ElleKit's
+ * AudioServicesPlaySystemSound(WithCompletion) / AudioServicesPlayAlertSound(WithCompletion), hooked where they
+ * end (AudioServicesPlaySystemSoundWithOptions, AudioServicesPlayAlertSoundWithCompletion; ElleKit's
  * MSHookFunction): 4095 kSystemSoundID_Vibrate and 1011 long, 1519 peek light, 1520 pop medium, 1521 nope
  * error, 1350 medium, 1351/1352 long; the sound is still played as before. Off with the file
  * /var/jb/var/sapphire-haptics-noaudiohook.
@@ -261,8 +262,8 @@ my_kb_loc(id self, SEL sel, long long action, CGPoint loc)
 /* ------------------------------------------------------------------ AudioServices */
 
 typedef uint32_t SystemSoundID_;
-static void (*o_ass)(SystemSoundID_), (*o_asa)(SystemSoundID_);
-static void (*o_assc)(SystemSoundID_, id), (*o_asac)(SystemSoundID_, id);
+static void (*o_asso)(SystemSoundID_, CFDictionaryRef, id), (*o_asac)(SystemSoundID_, id);
+static __thread int in_alert;   /* (an alert sound may go through the system sound path too: one vibration) */
 
 static const char *
 sound_preset(SystemSoundID_ s)
@@ -285,10 +286,31 @@ sound_vib(SystemSoundID_ s)
 	}
 }
 
-static void my_ass(SystemSoundID_ s) { sound_vib(s); o_ass(s); }
-static void my_asa(SystemSoundID_ s) { sound_vib(s); o_asa(s); }
-static void my_assc(SystemSoundID_ s, id c) { sound_vib(s); o_assc(s, c); }
-static void my_asac(SystemSoundID_ s, id c) { sound_vib(s); o_asac(s, c); }
+/*
+ * Hooked where the public calls end: AudioServicesPlaySystemSound and ...WithCompletion are "mov x1/x2;
+ * b AudioServicesPlaySystemSoundWithOptions", AudioServicesPlayAlertSound "mov x1, #0; b
+ * AudioServicesPlayAlertSoundWithCompletion" -- two or three instructions, too short for a branch:
+ * ElleKit hooked them with brk and an exception handler, and a process whose handler was not there
+ * died with EXC_BREAKPOINT at the function's first instruction (as SpringBoard did at MGCopyAnswer,
+ * SapphireBTCapability). The two functions they go to are full-size.
+ */
+static void
+my_asso(SystemSoundID_ s, CFDictionaryRef options, id completion)
+{
+	if (!in_alert) {
+		sound_vib(s);
+	}
+	o_asso(s, options, completion);
+}
+
+static void
+my_asac(SystemSoundID_ s, id completion)
+{
+	sound_vib(s);
+	in_alert++;
+	o_asac(s, completion);
+	in_alert--;
+}
 
 static void
 hook_audio_services(void)
@@ -313,9 +335,7 @@ hook_audio_services(void)
 		return;
 	}
 	struct { const char *name; void *rep; void **orig; } f[] = {
-		{ "AudioServicesPlaySystemSound", (void *)my_ass, (void **)&o_ass },
-		{ "AudioServicesPlayAlertSound", (void *)my_asa, (void **)&o_asa },
-		{ "AudioServicesPlaySystemSoundWithCompletion", (void *)my_assc, (void **)&o_assc },
+		{ "AudioServicesPlaySystemSoundWithOptions", (void *)my_asso, (void **)&o_asso },
 		{ "AudioServicesPlayAlertSoundWithCompletion", (void *)my_asac, (void **)&o_asac },
 	};
 	for (size_t i = 0; i < sizeof f / sizeof f[0]; i++) {

@@ -21,7 +21,7 @@
 
 typedef void (*MSHookFunction_t)(void *, void *, void **);
 static Boolean (*o_getbool)(CFStringRef);
-static CFTypeRef (*o_copy)(CFStringRef, CFDictionaryRef);
+static CFTypeRef (*o_copy)(CFStringRef, void *, void *);
 
 static int
 is_key(CFStringRef k, CFStringRef plain, CFStringRef obf)
@@ -50,8 +50,16 @@ my_getbool(CFStringRef k)
 	return o_getbool(k);
 }
 
+/*
+ * MobileGestalt's own answer function, the one MGCopyAnswer (key, NULL), MGCopyAnswerWithError and
+ * MGGetBoolAnswer (key, &error) all go to. MGCopyAnswer itself is two instructions ("mov x1, #0;
+ * b <that>"): too short for a branch, ElleKit hooked it with a brk and an exception handler, and
+ * when that handler was not there in time SpringBoard died at MGCopyAnswer+0 with EXC_BREAKPOINT
+ * (2026-11-04: waking the screen, BatteryCenter asking UserAssignedDeviceName; the lock screen
+ * then took no passcode). The function it branches to is hooked instead.
+ */
 static CFTypeRef
-my_copy(CFStringRef k, CFDictionaryRef opts)
+my_copy(CFStringRef k, void *x1, void *x2)
 {
 	if (is_key(k, CFSTR("bluetooth"), CFSTR("XSLlJd/8sMyXO0qtvvUTBQ")))
 		return kCFBooleanTrue;
@@ -60,7 +68,18 @@ my_copy(CFStringRef k, CFDictionaryRef opts)
 		if (a)
 			return CFRetain(a);
 	}
-	return o_copy(k, opts);
+	return o_copy(k, x1, x2);
+}
+
+/* where "mov x1, #0; b TARGET" (MGCopyAnswer) goes; NULL if it is not that */
+static void *
+branch_target(void *function)
+{
+	const uint32_t *insn = function;
+	if (insn == NULL || insn[0] != 0xd2800001u || (insn[1] & 0xfc000000u) != 0x14000000u)
+		return NULL;
+	int32_t imm26 = (int32_t)(insn[1] << 6) >> 6;
+	return (void *)((const uint8_t *)&insn[1] + (intptr_t)imm26 * 4);
 }
 
 /* ---- IOKit: an IOService "bluetooth" with local-mac-address (as btbridge.c) */
@@ -135,8 +154,13 @@ init(void)
 		NSLog(@TAG "not hooked (MSHookFunction %p, MGGetBoolAnswer %p, MGCopyAnswer %p)", mshook, gb, ca);
 		return;
 	}
+	void *answer = branch_target(ca);
+	if (!answer) {
+		NSLog(@TAG "MGCopyAnswer is not \"mov x1, #0; b ...\": not hooked (a brk hook there crashed SpringBoard)");
+		return;
+	}
 	mshook(gb, (void *)my_getbool, (void **)&o_getbool);
-	mshook(ca, (void *)my_copy, (void **)&o_copy);
+	mshook(answer, (void *)my_copy, (void **)&o_copy);
 	mshook((void *)IOServiceGetMatchingService, (void *)my_gms, (void **)&o_gms);
 	mshook((void *)IORegistryEntrySearchCFProperty, (void *)my_search, (void **)&o_search);
 	mshook((void *)IORegistryEntryCreateCFProperty, (void *)my_create, (void **)&o_create);
