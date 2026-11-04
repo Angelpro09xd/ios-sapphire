@@ -25,3 +25,9 @@ $L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -Wext
 	-framework CoreFoundation -o ../obj/ctdial ctdial.c
 ldid -Sctdial.entitlements ../obj/ctdial 2>/dev/null || echo "sign ../obj/ctdial with ctdial.entitlements"
 echo "../obj/ctdial"
+# libsapphire-fakebb.dylib + bbstart: the fake AppleBaseband for locationd and abm-helper (fakebb.c, bbstart.c); install-bbstart.sh
+$L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -Wextra -Wno-unused-parameter \
+	-dynamiclib -install_name /redwood/lib/libsapphire-fakebb.dylib -framework CoreFoundation -framework IOKit \
+	-o ../obj/libsapphire-fakebb.dylib fakebb.c
+$L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -o ../obj/bbstart bbstart.c
+echo "../obj/libsapphire-fakebb.dylib ../obj/bbstart"
