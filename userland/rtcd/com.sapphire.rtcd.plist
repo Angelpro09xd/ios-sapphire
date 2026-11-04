@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- com.sapphire.rtcd: the wall clock from the PMIC RTC at boot (rtcd.c), in the launchd cache like camd. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.sapphire.rtcd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/rtcd</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+	<key>UserName</key>
+	<string>root</string>
+	<key>StandardErrorPath</key>
+	<string>/var/tmp/rtcd.log</string>
+</dict>
+</plist>
