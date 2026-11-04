@@ -50,6 +50,13 @@ struct redwood_gl {
 struct redwood_gl *
 redwood_gl_create(int version)
 {
+	return redwood_gl_create_shared(version, NULL);
+}
+
+/* ... sharing textures, buffers, programs with `share` (EAGL sharegroups; NULL: with nobody) */
+struct redwood_gl *
+redwood_gl_create_shared(int version, struct redwood_gl *share)
+{
 	const int attributes[] = {
 		OSMESA_FORMAT, OSMESA_RGBA, OSMESA_DEPTH_BITS, 24, OSMESA_STENCIL_BITS, 8,
 		OSMESA_PROFILE, OSMESA_ES_PROFILE, OSMESA_CONTEXT_MAJOR_VERSION, version, OSMESA_CONTEXT_MINOR_VERSION, 0,
@@ -57,7 +64,7 @@ redwood_gl_create(int version)
 	};
 	struct redwood_gl *gl = calloc(1, sizeof(*gl));
 
-	if (gl != NULL && (gl->context = OSMesaCreateContextAttribs(attributes, NULL)) == NULL) {
+	if (gl != NULL && (gl->context = OSMesaCreateContextAttribs(attributes, share != NULL ? share->context : NULL)) == NULL) {
 		free(gl);
 		gl = NULL;
 	}

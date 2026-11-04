@@ -8,6 +8,7 @@
 struct redwood_gl;
 
 struct redwood_gl *redwood_gl_create(int version);              /* a context of OpenGL ES 2 or 3; NULL: none to be had */
+struct redwood_gl *redwood_gl_create_shared(int version, struct redwood_gl *share);
 int redwood_gl_make_current(struct redwood_gl *gl);             /* ... the calling thread's (NULL: none); 0 on failure */
 void redwood_gl_destroy(struct redwood_gl *gl);
 const char *redwood_gl_library(void);                           /* for the log */
