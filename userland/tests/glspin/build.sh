@@ -11,5 +11,6 @@ rm -rf "$out" && mkdir -p "$out"
 	-Wno-deprecated-declarations -framework UIKit -framework QuartzCore -framework OpenGLES -framework Foundation \
 	-o "$out/GLSpin" main.m
 cp Info.plist "$out/Info.plist"
+cp icon/*.png "$out/"
 "$LDID" -S "$out/GLSpin"
 echo "$out"
