@@ -1,5 +1,56 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-11-04 (night): stability pass (kernels 0293-0298, userland)
+
+A night of reboots, logs and stress tests (apps opened in turn, lock/unlock loops, an hour-long soak).
+Phone-side test helpers: `/var/root/code.sh` (unlock; wakes the screen only when BacklightServices says it
+is off, `/var/root/scr2`: SpringBoard's hasBlankedScreen notify state lies after the 6 s lock-screen
+idle-off), `/var/root/appopen BUNDLE-ID`, `stress.sh`, `lockloop.sh`, `soak.sh`.
+
+- Keychain (0293): aks_wrap_key handed back class 0 for every item, so securityd threw items away as
+  corrupt (-26275): no Wi-Fi password was ever kept. Now the class asked for; passwords survive reboots.
+- Wi-Fi auto-join (0294, 0296, 0297): the noise floor (17) is answered, joined or not, and the RSSI bounds
+  (106: RSSI_MIN/MAX/THRESHOLD, read by wifid at open) are -95/-20/-85. Unanswered, the threshold was 0 dBm
+  and wifid called every network "Below minimum RSSI threshold". RESIDENCIA_ALUMNOS joins by itself after
+  the first unlock.
+- The wake flash (0295): "on" no longer shows the frame from before "off"; black until a new frame.
+- Clock (userland/rtcd): set from the PM6125 RTC at boot.
+- locationd and abm-helper aborted every 15-18 s for ever (TelephonyBasebandController: no AppleBaseband
+  driver after 15 s, then throw); ReportCrash spent most of a core on them. `/redwood/bin/bbstart` (their
+  launchd program now, install-bbstart.sh) injects libsapphire-fakebb (ccbridge's fake IOKit, AppleBaseband
+  only). Load 3 minutes after boot: ~12 before, ~2.5 after.
+- CommCenter at 180 % and its helper at 60 %: every NAS indication register scheduled a NAS poll of its
+  own and each poll's answer re-triggered the registers; one pending poll at a time now. ccbridge.log had
+  reached 146 MB (130 KB/s); it rotates at 8 MB.
+- App Library folders: a red/blue band at the top was boot-arg vblur=2 (a check mode painting variable
+  blurs by their masks), inherited from the 0247 image. Images are now repacked with `--drop vblur`.
+- Brightness (no backlight service, sweetbl=0): the slider did nothing. The bridge, in backboardd, tells
+  BKDisplayBrightnessController the level can be set and takes CoreBrightness's DisplayBrightness to
+  AppleCLCD's IOMFBBrightnessLevel (5-500 nits), kept in com.sapphire.brightness. Control Center and
+  Settings both work. sweetbl=1 is still not usable: CoreBrightness's digital dimming (now held at 1 by
+  the bridge) and backboardd stalls on EDR mach_msg timeouts (swipes reach SpringBoard ~3 s late).
+- CoreImage (every filter in every app gave back its input unfiltered and darker): our EAGL contexts did not
+  honour EAGLContextPropertySharegroup ("non-existent texture"), and CI's `sample()` indexes sampler arrays
+  with a non-constant (GLSL ES 3 forbids it). Both fixed in the bridge; a blur now blurs, in sRGB.
+  Also: a context released on another thread no longer destroys its Mesa context outside backboardd (crash).
+- Photos opened and aborted at once: assetsd had been disabled (clean-base, Oct 23). It runs fine now;
+  Photos opens. SapphireCamera copies its photos/videos into Photos too (asks once for add access).
+- Re-enabled and disabled again: dasd, coreduetd, aggregated still spin a whole core minutes after boot.
+- Kernel log noise: AppleKeyStore logged every call (~300 lines/min idle); 0298 logs failures and state
+  changes. /redwood/gllat (a log line per frame, the fps probe) removed after measuring.
+- SpringBoard died after 50 minutes of the soak (EXC_BREAKPOINT at MGCopyAnswer+0, waking the screen:
+  BatteryCenter asking UserAssignedDeviceName) and the lock screen then took no passcode. Our tweaks
+  hooked functions of two or three instructions (MGCopyAnswer in SapphireBTCapability, three
+  AudioServicesPlay* in SapphireHaptics): too short for a branch, ElleKit used brk + an exception
+  handler. Now they hook the full-size functions those branch to. Very likely also the SpringBoard that
+  froze in the kernel while the passcode was typed (a brk whose exception is never answered).
+- Icons for GLSpin and Reproductor.
+- Measured: lock screen 53 fps; home page swipes 36 fps (108 draws a frame: the GL bridge, unchanged).
+- Soak (soak.sh: unlock, 4 random apps, App Library, lock, 30 s idle): first run 43 good cycles, then the
+  SpringBoard brk crash above; after the tweak fix 33 of 33 cycles (132 app launches), no crash.
+- Open: boot ~100 s to SSH and ~3 min until the passcode is taken; Bluetooth audio (HAL plugin re-enabled) to be
+  tried with headphones; CalendarWidgetExtension uses ~50 % CPU for minutes (cpu_resource reports).
+
 ## SAPPHIRE 2026-10-29: a real passcode lock (kernels 0246, 0247)
 
 The lock screen never asked for the passcode: the kernel's AppleKeyStore stand-in said "unlocked" at boot,
