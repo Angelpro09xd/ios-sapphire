@@ -671,12 +671,13 @@ lens_exposure(int slot, unsigned lines, unsigned *gx)
 	int r = 0;
 	double g = *gx / 1000.0;
 	switch (slot) {
-	case 1: {   /* OV16A1Q: 0x3500-0x3502 = lines << 4, 0x3508/0x3509 = gain x 128 (group 0 hold) */
-		unsigned e = lines << 4, gc = (unsigned)(g * 128 + 0.5);
+	case 1: {   /* OV16A1Q: 0x3500-0x3502 = lines (not << 4: that made every frame 16x longer, 2 fps),
+		     * 0x3508/0x3509 = gain x 128 (group 0 hold) */
+		unsigned e = lines, gc = (unsigned)(g * 128 + 0.5);
 		r = i2c_w(1, 0x10, 0x3208, 0x00);
 		r = r ? r : i2c_w(1, 0x10, 0x3500, (e >> 16) & 0x0f);
 		r = r ? r : i2c_w(1, 0x10, 0x3501, (e >> 8) & 0xff);
-		r = r ? r : i2c_w(1, 0x10, 0x3502, e & 0xf0);
+		r = r ? r : i2c_w(1, 0x10, 0x3502, e & 0xff);
 		r = r ? r : i2c_w(1, 0x10, 0x3508, (gc >> 8) & 0x1f);
 		r = r ? r : i2c_w(1, 0x10, 0x3509, gc & 0xff);
 		r = r ? r : i2c_w(1, 0x10, 0x3208, 0x10);
