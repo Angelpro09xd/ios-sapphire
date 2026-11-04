@@ -1,0 +1,36 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0297: Wi-Fi: the RSSI bounds (auto-join threshold)
+
+wifid reads APPLE80211_IOC 106 (IO80211: RSSI_MIN, RSSI_MAX, RSSI_THRESHOLD) as the device opens and
+refuses to auto-join any network heard more weakly than the threshold. Unanswered, it was 0 dBm:
+"Below minimum RSSI threshold" for every network, even at -64 dBm. Answered: min = the noise floor,
+max -20, threshold -85 dBm.
+---
+ bsd/dev/sapphire_apple80211.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/bsd/dev/sapphire_apple80211.c b/bsd/dev/sapphire_apple80211.c
+index 10b7fe5..8b5cdae 100644
+--- a/bsd/dev/sapphire_apple80211.c
++++ b/bsd/dev/sapphire_apple80211.c
+@@ -386,6 +386,20 @@ get(struct apple80211req *request)
+ 		kfree_data(answer, sizeof(*answer));
+ 		return error;
+ 	}
++	case 106: {                             /* 0297: the RSSI bounds: version, min, max, auto-join threshold */
++		/*
++		 * wifid reads them once, as the device opens (IO80211's dictionary RSSI_MIN, RSSI_MAX,
++		 * RSSI_THRESHOLD), and refuses to auto-join any network heard more weakly than the threshold
++		 * ("Below minimum RSSI threshold"). Unanswered, the threshold was 0 dBm: no network was ever
++		 * strong enough, and every join had to be made by hand.
++		 */
++		struct {
++			uint32_t version;
++			int32_t min, max, threshold;
++		} answer = { .version = 1, .min = NOISE_FLOOR_DBM, .max = -20, .threshold = -85 };
++
++		return give(request, &answer, sizeof(answer));
++	}
+ 	case 21:                                /* how the last join went (0: not over yet) */
+ 		lck_mtx_lock(&apple80211_lock);
+ 		request->req_val = (int32_t)join_result;
