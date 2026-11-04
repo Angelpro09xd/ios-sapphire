@@ -42,12 +42,12 @@ EXTENSIONS="
 /System/Library/AppPlaceholders/Stocks.app/PlugIns/StocksDetailIntents.appex
 /System/Library/AppPlaceholders/Passbook.app/PlugIns/PassbookWidgetsExtension-iPhone.appex
 "
-# wifip2pd: AWDL / Wi-Fi Direct, no such radio mode here; assetsd: the photo library daemon,
-# crash-looping (Photos needs it: turn it back on when Photos is worked on); coreduetd and
+# wifip2pd: AWDL / Wi-Fi Direct, no such radio mode here. (assetsd, the photo library daemon, was
+# here too while it crash-looped; back on since 2026-11-04: it runs, and Photos opens.) coreduetd and
 # aggregated (usage learning, analytics): each spun a whole core after the clock jumped from 1970
 # to 2026 with the first network time, and the phone answered slowly (nothing needs them here);
 # dasd (the background task scheduler) spun the same way right after
-DAEMONS="com.apple.wifip2pd com.apple.assetsd com.apple.coreduetd com.apple.aggregated com.apple.dasd"
+DAEMONS="com.apple.wifip2pd com.apple.coreduetd com.apple.aggregated com.apple.dasd"
 
 if [ "${1:-}" = undo ]; then
 	[ -f "$B/origen.txt" ] && while read -r path; do
