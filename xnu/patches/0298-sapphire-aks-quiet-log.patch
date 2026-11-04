@@ -1,0 +1,38 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0298: AppleKeyStore: a log line per failure, not per call
+
+Every key store call wrote a line: some 300 a minute with the phone idle (SpringBoard, coreduetd,
+contextstored, duetexpertd and biomed asking the lock state, selector 17, over and over), each an
+IOLog and an os_log entry. Now every failure and every lock state change, and of the rest the first
+16 of each selector since boot, then one in 1024.
+---
+ iokit/Kernel/arm/SweetKeyStore.cpp | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index 2f7b8f0..2b8483a 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -1173,9 +1173,19 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		sweet_aks_post(post);
+ 	}
+ 
+-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x%s%s\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret,
+-	    post != 0 ? ", now " : "", post != 0 ? sweet_aks_state_name(mkb) : "");
++	/*
++	 * 0298: a line for every call was some 300 a minute with the phone idle (SpringBoard, coreduetd,
++	 * contextstored... asking the lock state, sel 17, over and over), each an IOLog and an os_log
++	 * entry. Now: every failure and every state change, and of the rest the first 16 of each
++	 * selector since boot, then one in 1024.
++	 */
++	static uint32_t sweet_aks_logged[64];
++	uint32_t seen = selector < 64 ? sweet_aks_logged[selector]++ : 0;
++	if (ret != kIOReturnSuccess || post != 0 || seen < 16 || (seen & 1023) == 0) {
++		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x%s%s\n", name, selector,
++		    arg0, in_scalars, in_struct, out_scalars, out_struct, ret,
++		    post != 0 ? ", now " : "", post != 0 ? sweet_aks_state_name(mkb) : "");
++	}
+ 	return ret;
+ }
+ /*
