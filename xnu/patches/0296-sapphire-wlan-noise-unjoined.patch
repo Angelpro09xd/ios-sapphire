@@ -1,0 +1,23 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0296: Wi-Fi: NOISE answered when not joined
+
+0294's NOISE (17) answered only while joined (ENXIO otherwise), the same as RSSI; auto-join asks for
+it before it has joined anything. The noise floor is answered at any time.
+---
+ bsd/dev/sapphire_apple80211.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sapphire_apple80211.c b/bsd/dev/sapphire_apple80211.c
+index 5aed602..10b7fe5 100644
+--- a/bsd/dev/sapphire_apple80211.c
++++ b/bsd/dev/sapphire_apple80211.c
+@@ -462,7 +462,8 @@ get(struct apple80211req *request)
+ 		} answer = { .version = 1, .radios = 1, .each = { NOISE_FLOOR_DBM }, .all = NOISE_FLOOR_DBM,
+ 			     .each_ext = { NOISE_FLOOR_DBM }, .all_ext = NOISE_FLOOR_DBM };
+ 
+-		error = state->phase != SAPPHIRE_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++		/* 0296: answered joined or not: auto-join reads the noise before it joins anything */
++		error = give(request, &answer, sizeof(answer));
+ 		break;
+ 	}
+ 	case 103:                               /* all of it, as a scan's result */
