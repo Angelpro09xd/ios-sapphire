@@ -1,0 +1,517 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0299: the boot screen, painted by xnu while it boots (boot-arg sweet_splash)
+
+The shim puts its boot screen's picture on the panel and starts xnu straight away with
+sweet_splash=<physical address of the picture>. xnu then:
+- draws no log: the early console (sweet_early.c) reads the boot-args itself first thing in arm_init
+  and draws only panics, the text console is muted from the first line (the log still goes to the
+  persistent ring);
+- paints the boot screen itself: the picture as soon as the console exists (by then the panel
+  memory is found black), then a thread types the lines out and keeps the frame on the panel (boot
+  framebuffer, then AppleCLCD's console frame) until iOS's first frame;
+- restarts into recovery when Volume up is held while the boot screen is up (sweet_keys.c), through
+  reboot_kernel with the restart mode set to recovery.
+Without the boot-arg nothing changes.
+---
+ bsd/dev/sweet_keys.c                  |   9 ++
+ bsd/dev/sweet_reboot.c                |  10 ++
+ iokit/Kernel/arm/SweetFramebuffer.cpp |  27 +++++
+ osfmk/arm/arm_init.c                  |   3 +
+ osfmk/arm64/sweet_early.c             |  32 ++++-
+ osfmk/arm64/sweet_early.h             |   5 +
+ osfmk/console/serial_console.c        |  12 ++
+ osfmk/console/video_console.c         | 215 ++++++++++++++++++++++++++++++++++
+ 8 files changed, 311 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 4d30707..2810b60 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -15,6 +15,9 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
++extern int sweet_splash_active;         /* osfmk/console/video_console.c (0299): the boot screen is up */
++extern void sweet_reboot_mode_set(int mode);
++extern int reboot_kernel(int howto, char *message);
+ void sweet_keys_init(void);
+ 
+ /* topaz (SM6225, sm6125.dtsi spmi_bus; PM6125 USID 0): PON 0x800, Vol+ = GPIO5 */
+@@ -136,6 +139,12 @@ keys_thread(void *arg, wait_result_t result)
+ 				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
+ 				    k, state[k], pon, gpio);
+ 				sweet_hid_key(k, state[k]);
++				/* 0299: Volume up during the boot screen restarts into recovery (as Power + Volume up) */
++				if (k == 1 && state[k] && sweet_splash_active) {
++					printf("SWEET KEYS: Volume up on the boot screen: restarting into recovery\n");
++					sweet_reboot_mode_set(1);
++					(void)reboot_kernel(0, (char *)"Volume up on the boot screen: recovery");
++				}
+ 			}
+ 		}
+ 		keys_wait();
+diff --git a/bsd/dev/sweet_reboot.c b/bsd/dev/sweet_reboot.c
+index 503f196..0628506 100644
+--- a/bsd/dev/sweet_reboot.c
++++ b/bsd/dev/sweet_reboot.c
+@@ -12,6 +12,16 @@
+ 
+ static int sweet_reboot_mode = -1;
+ int sweet_reboot_mode_get(void);
++void sweet_reboot_mode_set(int mode);
++
++/* 0299: Volume up held during the boot screen (sweet_keys.c): the next restart goes to recovery */
++void
++sweet_reboot_mode_set(int mode)
++{
++	if (mode >= 0 && mode <= 2) {
++		sweet_reboot_mode = mode;
++	}
++}
+ 
+ int
+ sweet_reboot_mode_get(void)
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 5738438..a612e70 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,7 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" int sweet_splash_stop(void); /* osfmk/console/video_console.c (0299): the boot screen */
+ extern "C" void sweet_console_retarget(vm_offset_t va);   /* osfmk/console/video_console.c */
+ extern "C" void (*sweet_console_show_hook)(void);
+ extern "C" void topaz_modem_init(void);
+@@ -250,6 +251,7 @@ public:
+ 	uint32_t      fFlipIdx;
+ 	bool          fConsShown;     /* console frames on the panel (no iOS frame yet) */
+ 	void          flipFrom(const uint8_t *src, uint32_t srcStride);
++	void          splashEnd(void);
+ 	uint8_t      *backBuffer(void) { return (uint8_t *)fFlip[fFlipIdx ^ 1]->getBytesNoCopy(); }
+ 	void          flipBack(void);
+ 	bool          fFlipWait;      /* 0235: the back buffer waits for the GPU's copy before the MDP is pointed at it */
+@@ -1183,6 +1185,29 @@ AppleARMBacklight::setProperties(OSObject *properties)
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * 0299: iOS's first frame: the boot screen stops being painted, and the boot framebuffer and the
++ * console frame it was painted into go black -- the fade when backboardd turns the display off after
++ * the Apple logo starts from one of them, and showed the boot screen again for a few seconds.
++ */
++void
++AppleCLCD::splashEnd(void)
++{
++	if (!sweet_splash_stop()) {
++		return;
++	}
++	for (uint32_t y = 0; fPixels != 0 && y < fHeight; y++) {
++		volatile uint64_t *row = (volatile uint64_t *)(fPixels + (uint64_t)y * fRowBytes);
++		for (uint32_t x = 0; x < fWidth / 2; x++) {
++			row[x] = 0;
++		}
++	}
++	if (fCons != NULL) {
++		bzero(fCons->getBytesNoCopy(), (size_t)fRowBytes * fHeight);
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ /* panic: show the console frame (MMIO only, no locks) */
+ static void
+ sweet_cons_show(void)
+@@ -1461,6 +1486,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		return false;
+ 	}
+ 	fConsShown = false;
++	splashEnd();                    /* 0299: iOS draws from here on */
+ 	if (directPresent(rec)) {
+ 		if (!fConsolePaused) {
+ 			int quiet = 0;
+@@ -1512,6 +1538,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+ 		fConsolePaused = true;
++		splashEnd();                    /* 0299: iOS draws from here on */
+ 		if (PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
+ 			/* Not PE_initialize_console(kPEDisableScreen): its console switch
+ 			 * writes the read-only-late cons_ops_index and panics. */
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 42362c5..404d5f2 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -347,6 +347,9 @@ arm_init(
+ 	DTEntry chosen = NULL;
+ 	unsigned int dt_entry_size = 0;
+ 
++#if defined(SWEET)
++	sweet_early_cmdline(args->CommandLine);        /* 0299: the boot screen stays */
++#endif
+ 	sweet_early_mark(1, "arm_init entered (MMU on)");
+ 
+ 	arm_setup_pre_sign();
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 0644461..cbecd03 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -31,6 +31,7 @@ extern unsigned char iso_font[256 * 16];
+ /* Initialized data must remain writable until disable, including panics. */
+ static unsigned int early_row, early_col;
+ static unsigned int early_started, early_disabled, early_panicking;
++static unsigned int early_quiet;        /* 0299: sweet_splash (boot screen), only panics are drawn */
+ 
+ static void
+ sweet_early_clear_row(void)
+@@ -46,7 +47,7 @@ sweet_early_clear_row(void)
+ void
+ sweet_early_putc(char c)
+ {
+-	if (early_disabled) {
++	if (early_disabled || (early_quiet && !early_panicking)) {
+ 		return;
+ 	}
+ 	if (!early_started) {
+@@ -93,7 +94,7 @@ sweet_early_string(const char *s)
+ void
+ sweet_early_mark(unsigned int stage, const char *label)
+ {
+-	if (early_disabled || stage > 20) {
++	if (early_disabled || early_quiet || stage > 20) {
+ 		return;
+ 	}
+ 	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+@@ -138,6 +139,33 @@ sweet_early_relocate(uint64_t base)
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+ }
+ 
++/*
++ * sapphire 0299: called first thing in arm_init with the boot-args (no parsing services yet). With
++ * sweet_splash=<anything but 0> (the shim's boot screen is up) nothing but a panic is drawn.
++ */
++void
++sweet_early_cmdline(const char *cmdline)
++{
++	static const char key[] = "sweet_splash=";
++	for (unsigned int i = 0; cmdline != NULL && i < 608 && cmdline[i]; i++) {
++		if (i != 0 && cmdline[i - 1] != ' ') {
++			continue;
++		}
++		unsigned int k = 0;
++		while (key[k] && cmdline[i + k] == key[k]) {
++			k++;
++		}
++		if (key[k]) {
++			continue;
++		}
++		const char *v = cmdline + i + k;
++		if (*v != '\0' && *v != ' ' && !(v[0] == '0' && (v[1] == '\0' || v[1] == ' '))) {
++			early_quiet = 1;
++		}
++		return;
++	}
++}
++
+ void
+ sweet_early_disable(void)
+ {
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index d7a25f2..a6c8130 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -12,6 +12,7 @@ void sweet_early_putc(char c);
+ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);
+ void sweet_early_disable(void);
++void sweet_early_cmdline(const char *cmdline);
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ {
+@@ -19,6 +20,10 @@ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ 	(void)label;
+ }
+ static inline void sweet_early_disable(void) {}
++static inline void sweet_early_cmdline(const char *cmdline)
++{
++	(void)cmdline;
++}
+ #endif
+ 
+ #endif
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index d97cba8..6774ee9 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -314,6 +314,18 @@ _cnputs(char *c, int size, bool poll)
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_log_append(c, size);
++	/*
++	 * sapphire 0299: boot-arg sweet_splash (the boot screen, video_console.c): muted from the
++	 * start, the boot screen stays until iOS's first frame. The log still goes to the ring.
++	 */
++	static int sweet_splash = -1;
++	if (sweet_splash < 0) {
++		uint64_t v = 0;
++		sweet_splash = PE_parse_boot_argn("sweet_splash", &v, sizeof(v)) && v != 0;
++		if (sweet_splash) {
++			sweet_console_muted = 1;
++		}
++	}
+ 	if (sweet_console_muted && !panic_active()) {
+ 		return;
+ 	}
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+index 4193f57..d46957b 100644
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -101,6 +101,10 @@
+ #include <machine/machine_cpu.h>
+ 
+ #include <pexpert/pexpert.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <kern/clock.h>                 /* 0299: the boot screen's thread */
++#include <kern/thread.h>
++#endif
+ #include <sys/kdebug.h>
+ 
+ #include "iso_font.c"
+@@ -158,6 +162,8 @@ static void (*sweet_orig_clear)(unsigned int, unsigned int, unsigned int, unsign
+ static void (*sweet_orig_sdown)(int, unsigned int, unsigned int);
+ static void (*sweet_orig_sup)(int, unsigned int, unsigned int);
+ static void (*sweet_orig_cursor)(unsigned int, unsigned int);
++static void sweet_splash_first(void);
++static void sweet_splash_start(void);
+ #endif
+ 
+ static unsigned char *gc_buffer_attributes;
+@@ -2949,6 +2955,9 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
+ 			sweet_shadow_va = 0;    /* re-initialised on the boot framebuffer */
+ #endif
+ 			gc_initialize(&vinfo);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			sweet_splash_first();
++#endif
+ 		}
+ 	}
+ 
+@@ -2989,6 +2998,9 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
+ 		vc_progress_set( graphics_now, delay );
+ #endif /* !defined(XNU_TARGET_OS_BRIDGE) */
+ 		gc_enable( !graphics_now );
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		sweet_splash_start();
++#endif
+ 		gc_acquired = TRUE;
+ 		gc_desire_text = FALSE;
+ 		break;
+@@ -3409,6 +3421,209 @@ sweet_cursor(unsigned int xx, unsigned int yy)
+ 	sweet_flush_rows(yy, yy + 1);
+ }
+ 
++/*
++ * sapphire 0299: the boot screen. The shim (shim/splash.c) puts its picture on the panel and starts
++ * xnu straight away with sweet_splash=<physical address of the picture: "SPLH", width, height, 0,
++ * then width * height a8r8g8b8>. xnu then draws no log (serial_console.c, sweet_early.c) and paints
++ * the boot screen itself while it boots: the picture as soon as the console exists (the panel memory
++ * is found black by then), then a thread types the lines out and keeps the frame on the panel --
++ * the boot framebuffer, then AppleCLCD's console frame -- until iOS's first frame
++ * (SweetFramebuffer.cpp clears sweet_splash_active). Volume up held meanwhile restarts into
++ * recovery (sweet_keys.c).
++ */
++int sweet_splash_active;
++static uint64_t sweet_splash_pa;
++static const uint32_t *sweet_splash_pic;        /* the shim's picture, mapped */
++static uint32_t sweet_splash_w, sweet_splash_h;
++
++#define SPLASH_PIC_Y    380
++#define SPLASH_GREY     0xff8a8a8au
++#define SPLASH_HEART    0xffff3b5cu
++
++static const unsigned char sweet_splash_heart[16] = {
++	0x00, 0x00, 0x00, 0x00, 0x36, 0x7f, 0x7f, 0x7f, 0x7f, 0x3e, 0x1c, 0x08, 0x00, 0x00, 0x00, 0x00,
++};
++
++/* the picture, centred, on black: the whole frame */
++static void
++sweet_splash_base(uint32_t *dst, unsigned int pitch, unsigned int w, unsigned int h)
++{
++	unsigned int x0 = (w - sweet_splash_w) / 2;
++	for (unsigned int y = 0; y < h; y++) {
++		uint32_t *row = (uint32_t *)((uintptr_t)dst + (uintptr_t)y * pitch);
++		unsigned int py = y - SPLASH_PIC_Y;
++		if (y < SPLASH_PIC_Y || py >= sweet_splash_h) {
++			for (unsigned int x = 0; x < w; x++) {
++				row[x] = 0xff000000u;
++			}
++			continue;
++		}
++		for (unsigned int x = 0; x < x0; x++) {
++			row[x] = 0xff000000u;
++		}
++		memcpy(row + x0, sweet_splash_pic + (size_t)py * sweet_splash_w, sweet_splash_w * 4);
++		for (unsigned int x = x0 + sweet_splash_w; x < w; x++) {
++			row[x] = 0xff000000u;
++		}
++	}
++}
++
++static void
++sweet_splash_first(void)
++{
++	static int parsed;
++	if (!parsed) {
++		parsed = 1;
++		uint64_t pa = 0;
++		if (PE_parse_boot_argn("sweet_splash", &pa, sizeof(pa)) && pa > 1) {
++			sweet_splash_pa = pa;
++		}
++	}
++	if (sweet_splash_pa == 0 || vinfo.v_baseaddr == 0 || vinfo.v_depth != 32 || sweet_splash_pic != NULL) {
++		return;
++	}
++	vm_offset_t m = ml_io_map_unmappable((vm_map_offset_t)(sweet_splash_pa & ~(uint64_t)PAGE_MASK),
++	    round_page(16 + (vm_size_t)vinfo.v_width * vinfo.v_height * 4 + PAGE_SIZE), VM_WIMG_WCOMB);
++	if (m == 0) {
++		return;
++	}
++	const uint32_t *hdr = (const uint32_t *)(m + (sweet_splash_pa & PAGE_MASK));
++	if (hdr[0] != 0x484c5053u || hdr[1] == 0 || hdr[1] > vinfo.v_width || hdr[2] == 0 ||
++	    SPLASH_PIC_Y + hdr[2] > vinfo.v_height) {
++		return;
++	}
++	sweet_splash_w = hdr[1];
++	sweet_splash_h = hdr[2];
++	sweet_splash_pic = hdr + 4;
++	sweet_splash_active = 1;
++	sweet_splash_base((uint32_t *)vinfo.v_baseaddr, vinfo.v_rowbytes, vinfo.v_width, vinfo.v_height);
++}
++
++/* one 8x16 glyph (iso_font: bit 0 is the left column), scaled */
++static void
++sweet_splash_glyph(uint32_t *f, unsigned int w, unsigned int h, int x0, int y0,
++    const unsigned char *g, int scale, uint32_t fg)
++{
++	for (int gy = 0; gy < 16; gy++) {
++		for (int gx = 0; gx < 8; gx++) {
++			if (!(g[gy] & (1u << gx))) {
++				continue;
++			}
++			for (int sy = 0; sy < scale; sy++) {
++				int y = y0 + gy * scale + sy;
++				for (int sx = 0; sx < scale; sx++) {
++					int x = x0 + gx * scale + sx;
++					if (x >= 0 && y >= 0 && (unsigned int)x < w && (unsigned int)y < h) {
++						f[(size_t)y * w + x] = fg;
++					}
++				}
++			}
++		}
++	}
++}
++
++/* the frame (or the rows y0..y1 of it) onto whatever the console draws to now */
++static void
++sweet_splash_show(const uint32_t *f, unsigned int y0, unsigned int y1)
++{
++	VCPUTC_LOCK_LOCK();
++	if (sweet_splash_active && vinfo.v_baseaddr != 0 && vinfo.v_depth == 32) {
++		unsigned int w = vinfo.v_width, h = vinfo.v_height;
++		if (y1 > h) {
++			y1 = h;
++		}
++		for (unsigned int y = y0; y < y1; y++) {
++			memcpy((void *)(vinfo.v_baseaddr + (vm_offset_t)y * vinfo.v_rowbytes), f + (size_t)y * w, w * 4);
++		}
++		/* AppleCLCD flips the console frame when it is dirty */
++		if (sweet_shadow_va != 0) {
++			sweet_dirty_top = 0;
++			sweet_dirty_bottom = vinfo.v_rows ? vinfo.v_rows : 1;
++		}
++	}
++	VCPUTC_LOCK_UNLOCK();
++}
++
++static void
++sweet_splash_sleep(unsigned int ms)
++{
++	delay_for_interval(ms, 1000 * 1000);
++}
++
++static void
++sweet_splash_line(uint32_t *f, unsigned int w, unsigned int h, int y, const char *s, int scale, uint32_t fg,
++    unsigned int ms)
++{
++	int x = ((int)w - (int)strlen(s) * 8 * scale) / 2;
++	for (; *s && sweet_splash_active; s++, x += 8 * scale) {
++		unsigned char ch = (unsigned char)*s;
++		if (ch == 1) {
++			sweet_splash_glyph(f, w, h, x, y, sweet_splash_heart, scale, SPLASH_HEART);
++		} else if (ch != ' ') {
++			sweet_splash_glyph(f, w, h, x, y, iso_font + ch * 16, scale, fg);
++		}
++		if (ms) {
++			sweet_splash_show(f, (unsigned int)y, (unsigned int)(y + 16 * scale));
++			sweet_splash_sleep(ms);
++		}
++	}
++}
++
++static void
++sweet_splash_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	unsigned int w = vinfo.v_width, h = vinfo.v_height;
++	vm_size_t size = (vm_size_t)w * h * 4;
++	uint32_t *f = kalloc_data(size, Z_WAITOK);
++	if (f == NULL) {
++		return;
++	}
++	sweet_splash_base(f, w * 4, w, h);
++	sweet_splash_line(f, w, h, (int)h - 150, "Hold VOL+ for Recovery", 2, SPLASH_GREY, 0);
++	sweet_splash_show(f, 0, h);
++
++	const unsigned int ms = 45;     /* per letter */
++	int y = 1220;
++	sweet_splash_line(f, w, h, y, "Thanks for using this port!", 4, 0xffffffffu, ms);
++	sweet_splash_line(f, w, h, y += 88, "Please consider donating", 4, 0xffffffffu, ms);
++	sweet_splash_line(f, w, h, y += 122, "#iOS4Sapphire", 5, 0xffffffffu, ms);
++	sweet_splash_line(f, w, h, y += 104, "Enjoy it!", 4, 0xffffffffu, ms);
++	sweet_splash_line(f, w, h, y += 110, "Made with \x01 by Angelpro09_Devv", 3, 0xffffffffu, ms);
++
++	/* kept on the panel until iOS's first frame (anything else drawing there is drawn over) */
++	for (unsigned int t = 0; sweet_splash_active && t < 600; t++) {
++		sweet_splash_show(f, 0, h);
++		sweet_splash_sleep(500);
++	}
++	kfree_data(f, size);
++}
++
++/* AppleCLCD, at iOS's first frame: stop painting; 1 if the boot screen was up */
++int sweet_splash_stop(void);
++int
++sweet_splash_stop(void)
++{
++	VCPUTC_LOCK_LOCK();
++	int was = sweet_splash_active;
++	sweet_splash_active = 0;
++	VCPUTC_LOCK_UNLOCK();
++	return was;
++}
++
++static void
++sweet_splash_start(void)
++{
++	static int started;
++	thread_t thread;
++	if (started || !sweet_splash_active) {
++		return;
++	}
++	started = 1;
++	if (kernel_thread_start(sweet_splash_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ /* Point the console at the shadow frame (same geometry as the boot one). */
+ void
+ sweet_console_retarget(vm_offset_t va)
