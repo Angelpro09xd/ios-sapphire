@@ -16,6 +16,9 @@ SECTIONS
 	. = ALIGN(4096);
 	_sec_stacks = .;
 	. += 8 * 0x1000;
+	/* the boot screen's picture (splash_data.S): after the stacks, so start.S's adr still reach them */
+	. = ALIGN(16);
+	.splash : { *(.splash*) }
 	_end = .;
 	/DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
 }

@@ -11,6 +11,7 @@
 #include "console.h"
 #include "fdt.h"
 #include "loader.h"
+#include "splash.h"
 
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
@@ -216,6 +217,19 @@ const char *loader_boot(uintptr_t dtb)
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
+	if (splash_shown) {
+		/* xnu paints the boot screen from the picture there until iOS's first frame (0299) */
+		char arg[] = " sweet_splash=0x0000000000000000";
+		int n = 0;
+		uint64_t pa = splash_shown;
+		for (int d = 0; d < 16; d++, pa >>= 4)
+			arg[sizeof(arg) - 2 - d] = "0123456789abcdef"[pa & 0xf];
+		while (n < BOOT_LINE_LENGTH && ba->CommandLine[n])
+			n++;
+		if (n + (int)sizeof(arg) <= BOOT_LINE_LENGTH)
+			for (int i = 0; i < (int)sizeof(arg); i++)
+				ba->CommandLine[n + i] = arg[i];
+	}
 	ba->memSizeActual = mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 

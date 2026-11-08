@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Rebuild a UEFI boot image (uefi/mkuefi-v4.py output) around another kernel, keeping the rest.
 
-  sapphire-repack.py OLD.img KERNEL OUT.img [--set ARG=VALUE ...] [--drop ARG ...] [--adt NAME=U32 ...] [--print]
+  sapphire-repack.py OLD.img KERNEL OUT.img [--set ARG=VALUE ...] [--drop ARG ...] [--adt NAME=U32 ...] [--shim IMAGE] [--print]
 
 (iOS drawing at 2x, xnu 0239: --set sweetfb_scale=2 --adt display-scale=2 --adt canvas-width=750
 --adt canvas-height=1624.)
 
 OLD.img's BootShim + FD, shim, device tree and ADT (with the GPU/IPA firmware mkadt.py put in it)
-are reused; only the kernel is replaced (tools/mkpayload.py) and the boot-args edited. For working
+are reused; only the kernel is replaced (tools/mkpayload.py) and the boot-args edited. --shim puts a
+newly built shim in (shim/build.sh's out/Image, without a payload: the code up to _end). For working
 without the machine that has the UEFI tree and research/ipsw-x. --print shows OLD.img's boot-args.
 Needs MKBOOTIMG (AOSP mkbootimg.py, header v4).
 """
@@ -21,6 +22,7 @@ ap.add_argument('out', nargs='?')
 ap.add_argument('--set', action='append', default=[])
 ap.add_argument('--drop', action='append', default=[])
 ap.add_argument('--adt', action='append', default=[], help='NAME=U32: every 4-byte ADT property NAME set to U32')
+ap.add_argument('--shim', help="shim/out/Image to use instead of OLD.img's shim")
 ap.add_argument('--print', action='store_true')
 a = ap.parse_args()
 
@@ -74,7 +76,12 @@ t = tempfile.mkdtemp()
 open(os.path.join(t, 'adt'), 'wb').write(adt)
 subprocess.check_call([sys.executable, os.path.join(here, 'mkpayload.py'), a.kernel, os.path.join(t, 'adt'),
                        os.path.join(t, 'payload'), '--cmdline', cmd])
-shim = bytearray(shim[:po] + open(os.path.join(t, 'payload'), 'rb').read())
+code = shim[:po]
+if a.shim:
+    code = open(a.shim, 'rb').read()
+    assert code[56:60] == b'ARM\x64' and code.find(b'SWEETXNU', 0x1000) % 0x1000 != 0, 'not a bare shim Image'
+    code = code + bytes(-len(code) % 0x1000)     # the payload starts at the first 4K boundary after _end
+shim = bytearray(code + open(os.path.join(t, 'payload'), 'rb').read())
 struct.pack_into('<Q', shim, 16, len(shim))
 dto = (0x1000 + len(shim) + 0xfff) & ~0xfff
 total = dto + len(dtb)

@@ -12,6 +12,7 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#include "splash.h"
 
 #define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
@@ -521,6 +522,8 @@ void shim_main(uint64_t dtb)
 	uint64_t quiet = 0;
 	if (dtb && fdt_chosen_u64(dtb, "sapphire,quiet", &quiet) && quiet)
 		con_quiet = 1;
+	/* The boot screen (Volume up held: recovery), then a black screen for xnu's Apple logo. */
+	splash_run();
 	con_clear(RED);
 	con_str("SHIM", "sweet milestone 4: xnu loader");
 	/* topaz: xnu needs the 16K granule (TGran16 != 0); Cortex-A53 may lack it */
