@@ -1,5 +1,24 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-11-08: a boot screen instead of the log (shim splash, kernel 0299)
+
+- The shim (`shim/splash.c`) puts a picture on the panel (`shim/splash/splash.png`, converted at build
+  time by `gen_splash.py` into a-r-g-b words linked behind the stacks) and starts xnu straight away with
+  `sweet_splash=<physical address of the picture>`. Volume up already held then restarts into recovery
+  (PON reason 1 + PSCI reset). `sweet_splash=0` in the payload's boot-args skips the screen.
+- xnu (0299) draws no log with that boot-arg (the early console and the text console stay quiet, the log
+  still reaches the persistent ring; panics are drawn) and paints the boot screen itself while it boots:
+  the picture again as soon as the console exists, then a thread types the lines out, until iOS's first
+  frame. Volume up held while it is up restarts into recovery (reboot_kernel, restart mode 1).
+- Found on the way: by the time xnu's console starts, the panel memory is black (not the caches: the
+  shim cleaning the frame to PoC did not change it), so the shim's picture alone never survived into
+  xnu; and the early console (sweet_early.c, 2x text) is what drew the full-screen log, not the text
+  console. AppleCLCD's display-off fade after the Apple logo starts from the boot framebuffer, so at
+  iOS's first frame that and the console frame are cleared (else the boot screen came back for a few
+  seconds).
+- `tools/sapphire-repack.py --shim shim/out/Image` puts a newly built shim into an existing image.
+  Image in use: `C:\adb\sapphire-uefi-4k-0299-splash.img` (0298-120's boot-args, kernel 0299, new shim).
+
 ## SAPPHIRE 2026-11-04 (night): stability pass (kernels 0293-0298, userland)
 
 A night of reboots, logs and stress tests (apps opened in turn, lock/unlock loops, an hour-long soak).
