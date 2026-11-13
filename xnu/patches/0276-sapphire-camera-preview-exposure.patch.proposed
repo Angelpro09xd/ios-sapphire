@@ -1,0 +1,2232 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0276: camera exposure, preview ring, 108 MP still op
+
+kern.sweet_cam_exp: write "lines gain_x1000 [frame_length]" (HM6 0x0202,
+0x0204 with 1x = 0x20 up to 64x, 0x0340, inside a 0x0104 group hold, page
+0x4000); read the mode, frame/line length, line time and limits. The
+exposure time is carried over a mode change.
+Op 30 starts a preview (HM6 mode 1 by default, 3 = 1280x720, 4 = 2x crop;
+arg bits 4-7) into a ring of four buffers at the pool start: a kernel thread
+follows CSID RDI0 SOF/EOF, programs the next buffer into WM7 at each SOF
+(latched at the next one) and publishes each finished buffer
+(kern.sweet_cam_latest: seq, buffer, offset, size, time); it stops at an SMMU
+fault. kern.sweet_cam_sel chooses what kern.sweet_cam_frame reads (-1 the
+newest preview frame, 0-3 a buffer, 100 the still). Op 31 stops the preview.
+Op 32 stops it, switches to mode 0 and takes one 108 MP frame at the pool
+start. Op 9 now also stops the stream, CSID/TFE and turns their clocks off
+(the L4/L18 votes stay at UEFI's values: the display and USB PHYs share
+them). A CCI failure logs the master's pin levels; the ultra wide's power-up
+sets the CSI mux low. HM6 mode 3 joins the generated tables.
+---
+ bsd/dev/sweet_cam.c        |  481 ++++++++++++-
+ bsd/dev/sweet_cam_tables.h | 1624 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 2084 insertions(+), 21 deletions(-)
+
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index 7ada2bf..be71af8 100755
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -13,6 +13,8 @@
+  *     pool 0xD7000000 (144 MB) with an identity SMMU bank for stream 0x400, 13 stop, 14 the pool's
+  *     pattern test (arg 1: check only); 0274: op 12 split into 20 (SMMU stage-1 bank mapping only
+  *     the pool), 21 (TFE registers read), 22 (WM7 written, not enabled), 23 (enable + one frame);
++ *     0276: kern.sweet_cam_exp (exposure), op 30 preview ring (kern.sweet_cam_latest,
++ *     kern.sweet_cam_sel), 31 preview off, 32 108 MP still; op 9 also stops the stream/capture path.
+  *     kern.sweet_cam_seek + kern.sweet_cam_frame: the frame in
+  *     1 MB reads, kern.sweet_cam_frame_len its size.
+  *   kern.sweet_cam_log: the log of the last request (also in the kernel log, "SWEET CAM:").
+@@ -34,6 +36,9 @@
+ #include "sweet_spmi.h"
+ #include <kern/clock.h>
+ #include <mach/mach_time.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++extern kern_return_t thread_terminate(thread_t);
+ 
+ extern void IODelay(unsigned microseconds);
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -94,7 +99,7 @@ static bool camss_up;
+ /* 0272 */
+ static int cam_arg;
+ static int64_t cam_seek;
+-static uint32_t cam_frame_len;
++static uint32_t cam_frame_len, cam_frame_off;
+ static uint8_t *cam_pool;
+ static vm_offset_t cam_phy, cam_ppi, cam_csid, cam_smmu;
+ static bool slot_up[4], cam_streaming, cam_csid_up;
+@@ -377,6 +382,11 @@ cci_run(unsigned m, unsigned q, uint32_t donebit, const char *what)
+ 		camlog("CCI m%u q%u: cur words %u, cur cmd %#x, report status %#x, irq mask %#x, read level %u", m, q,
+ 		    rd(cci, CCI_Q(m, q) + 0x4), rd(cci, CCI_Q(m, q) + 0x8), rd(cci, CCI_Q(m, q) + 0xC), rd(cci, CCI_IRQ_MASK0),
+ 		    rd(cci, CCI_M(m) + 0x1C));
++		{
++			volatile uint32_t *sda = tlmm_pin(cci_pins[2 * m]), *scl = tlmm_pin(cci_pins[2 * m + 1]);
++			camlog("CCI m%u pins: SDA gpio%u ctl %#x level %u, SCL gpio%u ctl %#x level %u", m, cci_pins[2 * m],
++			    sda ? sda[0] : 0, sda ? (sda[1] & 1) : 9, cci_pins[2 * m + 1], scl ? scl[0] : 0, scl ? (scl[1] & 1) : 9);
++		}
+ 		cci_recover(m);
+ 		return false;
+ 	}
+@@ -587,7 +597,8 @@ slot_on(unsigned slot)
+ 		ok = ok && pin_out(rst, 1); IOSleep(10);
+ 		break;
+ 	case 2:     /* S5K4H7: RESET 0 (1), DVDD (1), AVDD (1), VIO (1), RESET 1 (5), MCLK (10) */
+-		ok = pin_out(rst, 0); IOSleep(1);
++		ok = pin_out(GPIO_CSI_MUX, 0);    /* 0276: CSIPHY1 to the ultra wide */
++		ok = ok && pin_out(rst, 0); IOSleep(1);
+ 		ok = ok && dvdd(1); IOSleep(1);
+ 		ok = ok && avdd(1); IOSleep(1);
+ 		ok = ok && pin_out(GPIO_VIO, 1); IOSleep(1);
+@@ -613,12 +624,15 @@ slot_on(unsigned slot)
+ }
+ 
+ /* op 9: everything off, in reverse order */
++static void cam_stream_off_all(void);
++
+ static int
+ cam_off(void)
+ {
+ 	if (!cam_map()) {
+ 		return EIO;
+ 	}
++	cam_stream_off_all();
+ 	for (int s = 3; s >= 0; s--) {
+ 		branch_off("mclk", cbcr_mclk[s]);
+ 		(void)pin_out(mclk_pin[s], 0);
+@@ -794,6 +808,8 @@ fail:
+ 
+ /* ---------------------------------------------------------------- op 10: sensor init, mode, stream on */
+ 
++static int hm6_switch(unsigned mode);
++
+ static int
+ cam_sensor_on(void)
+ {
+@@ -808,24 +824,9 @@ cam_sensor_on(void)
+ 		return EAGAIN;
+ 	}
+ 	if (slot == 0) {
+-		if (mode == 0) {
+-			mt = hm6_mode0; mn = sizeof(hm6_mode0) / sizeof(hm6_mode0[0]); cs.w = 12000; cs.h = 9000;
+-		} else if (mode == 1) {
+-			mt = hm6_mode1; mn = sizeof(hm6_mode1) / sizeof(hm6_mode1[0]); cs.w = 4000; cs.h = 3000;
+-		} else if (mode == 4) {
+-			mt = hm6_mode4; mn = sizeof(hm6_mode4) / sizeof(hm6_mode4[0]); cs.w = 4000; cs.h = 3000;
+-		} else {
+-			camlog("op 10: HM6 mode %u not built in (0, 1, 4)", mode);
+-			return EINVAL;
+-		}
+-		cs.phy = 0; cs.cphy = true; cs.settle = 0x32;
+-		if (!cci_read(0, 0x10, 0x0000, id, 2) || (id[0] << 8 | id[1]) != 0x1AD6) {
+-			camlog("op 10: no S5KHM6 at m0 0x10: stop");
+-			return ENODEV;
+-		}
+-		r = cam_replay(0, 0x10, hm6_init, sizeof(hm6_init) / sizeof(hm6_init[0]), "HM6 init");
+-		r = r ? r : cam_replay(0, 0x10, mt, mn, "HM6 mode");
+-		r = r ? r : cam_replay(0, 0x10, hm6_on, sizeof(hm6_on) / sizeof(hm6_on[0]), "HM6 stream on");
++		r = hm6_switch(mode);
++		cam_frame_off = 0;
++		return r;
+ 	} else if (slot == 2) {
+ 		if (mode != 0) {
+ 			camlog("op 10: S5K4H7 mode %u not built in (0)", mode);
+@@ -1250,7 +1251,7 @@ sysctl_sweet_cam_frame SYSCTL_HANDLER_ARGS
+ 	} else {
+ 		uint32_t n = cam_frame_len - (uint32_t)cam_seek;
+ 		n = n > (1u << 20) ? (1u << 20) : n;
+-		err = SYSCTL_OUT(req, cam_pool + cam_seek, n);
++		err = SYSCTL_OUT(req, cam_pool + cam_frame_off + cam_seek, n);
+ 		if (err == 0 && req->oldptr != USER_ADDR_NULL) {
+ 			cam_seek += n;
+ 		}
+@@ -1571,11 +1572,439 @@ cam_capture_staged(void)
+ 	    cam_pool[10], cam_pool[11], cam_pool[12], cam_pool[13], cam_pool[14], cam_pool[15]);
+ 	(void)smmu_fault("after");
+ 	cam_frame_len = changed != 0 ? bytes : 0;
++	cam_frame_off = 0;
+ 	cam_seek = 0;
+ 	camlog("op 23: %s (%u bytes in kern.sweet_cam_frame)", changed ? "FRAME CAPTURED" : "nothing written", cam_frame_len);
+ 	return changed && !fault ? 0 : EIO;
+ }
+ 
++/* ================================================================ 0276: exposure, preview ring, still */
++
++/*
++ * kern.sweet_cam_exp: write "coarse_lines analog_gain_x1000 [frame_length_lines]" (decimal) ->
++ * HM6 0x0202 / 0x0204 (1x = 0x20, max 64x = 0x800) / 0x0340 inside a group hold (0x0104);
++ * read: the current mode, its line time and limits and the values in use.
++ * Op 30 preview: HM6 in mode (arg >> 4 & 0xF, default 1; 3 = 1280x720), frames into a ring of
++ * 4 buffers at the start of the pool; a kernel thread follows CSID RDI0 SOF/EOF: at each SOF
++ * it programs the next buffer into WM7 (latched at the next SOF), at each EOF it publishes the
++ * buffer just finished (kern.sweet_cam_latest). kern.sweet_cam_sel picks what
++ * kern.sweet_cam_frame reads: -1 the newest preview frame, 0-3 a ring buffer, 100 the still.
++ * Op 31 stops the preview. Op 32: preview off, mode 0 with the exposure time carried over, one
++ * 108 MP frame at the pool start (it overwrites the ring: op 30 again after reading it).
++ */
++#define PV_NBUF         4
++
++static const unsigned hm6_fps_x100[5] = { 704, 3004, 3004, 12000, 3000 };
++static struct { bool set; uint32_t coarse, gain_x1000, fll; } ex;
++static uint32_t m_fll, m_llp, m_line_ns;
++static volatile bool pv_run, pv_alive;
++static volatile int pv_latest = -1;
++static volatile uint64_t pv_seq, pv_ts_ns, pv_ovf;
++static volatile uint32_t pv_fault;
++static uint32_t pv_bytes, pv_stride, pv_mode, cam_still_len;
++static int cam_sel = 100;
++
++static uint16_t
++tbl_last(const struct cam_reg *t, unsigned n, uint16_t addr, uint16_t dflt)
++{
++	uint16_t v = dflt;
++	for (unsigned i = 0; i < n; i++) {
++		if (t[i].blen == 0 && t[i].dt == 2 && t[i].addr == addr) {
++			v = t[i].val;
++		}
++	}
++	return v;
++}
++
++static bool
++hm6_mode_table(unsigned mode, const struct cam_reg **t, unsigned *n)
++{
++	switch (mode) {
++	case 0: *t = hm6_mode0; *n = sizeof(hm6_mode0) / sizeof(hm6_mode0[0]); cs.w = 12000; cs.h = 9000; return true;
++	case 1: *t = hm6_mode1; *n = sizeof(hm6_mode1) / sizeof(hm6_mode1[0]); cs.w = 4000; cs.h = 3000; return true;
++	case 3: *t = hm6_mode3; *n = sizeof(hm6_mode3) / sizeof(hm6_mode3[0]); cs.w = 1280; cs.h = 720; return true;
++	case 4: *t = hm6_mode4; *n = sizeof(hm6_mode4) / sizeof(hm6_mode4[0]); cs.w = 4000; cs.h = 3000; return true;
++	default: return false;
++	}
++}
++
++static uint32_t
++exp_max_lines(void)
++{
++	uint32_t fll = ex.fll != 0 ? ex.fll : m_fll;
++	return fll > 16 ? fll - 16 : 12;
++}
++
++/* the exposure in ex to the sensor (page 0x4000, group hold) */
++static int
++hm6_apply_exposure(void)
++{
++	uint32_t code = ex.gain_x1000 * 32 / 1000;
++	code = code < 0x20 ? 0x20 : code > 0x800 ? 0x800 : code;
++	uint32_t lines = ex.coarse < 12 ? 12 : ex.coarse > exp_max_lines() ? exp_max_lines() : ex.coarse;
++	bool ok = cci_write(0, 0x10, 0xFCFC, 0x4000, 2) && cci_write(0, 0x10, 0x0104, 0x0101, 2);
++	if (ok && ex.fll != 0) {
++		ok = cci_write(0, 0x10, 0x0340, ex.fll, 2);
++	}
++	ok = ok && cci_write(0, 0x10, 0x0202, lines, 2) && cci_write(0, 0x10, 0x0204, code, 2);
++	ok = ok && cci_write(0, 0x10, 0x0104, 0x0001, 2);
++	camlog("exposure: %u lines (%u us), gain code %#x (%u.%03ux), frame length %u: %s", lines,
++	    (uint32_t)((uint64_t)lines * m_line_ns / 1000), code, code / 32, (code % 32) * 1000 / 32, ex.fll ? ex.fll : m_fll,
++	    ok ? "written" : "FAILED");
++	return ok ? 0 : EIO;
++}
++
++/* HM6 into mode: init + mode + stream on the first time, else stream off + mode + stream on */
++static int
++hm6_switch(unsigned mode)
++{
++	const struct cam_reg *mt;
++	unsigned mn;
++	uint8_t id[2];
++	int r = 0;
++	uint32_t old_line_ns = m_line_ns;
++
++	if (!camss_up || !slot_up[0]) {
++		camlog("HM6: slot 0 is not powered (ops 1, 2 first)");
++		return EAGAIN;
++	}
++	if (!hm6_mode_table(mode, &mt, &mn)) {
++		camlog("HM6: mode %u not built in (0, 1, 3, 4)", mode);
++		return EINVAL;
++	}
++	if (cam_streaming && cs.slot == 0) {
++		r = cam_replay(0, 0x10, hm6_off, sizeof(hm6_off) / sizeof(hm6_off[0]), "HM6 stream off");
++	} else {
++		if (!cci_read(0, 0x10, 0x0000, id, 2) || (id[0] << 8 | id[1]) != 0x1AD6) {
++			camlog("HM6: no S5KHM6 at m0 0x10: stop");
++			return ENODEV;
++		}
++		r = cam_replay(0, 0x10, hm6_init, sizeof(hm6_init) / sizeof(hm6_init[0]), "HM6 init");
++	}
++	cam_streaming = false;
++	r = r ? r : cam_replay(0, 0x10, mt, mn, "HM6 mode");
++	if (r != 0) {
++		return r;
++	}
++	m_fll = tbl_last(mt, mn, 0x0340, 1);
++	m_llp = tbl_last(mt, mn, 0x0342, 0);
++	m_line_ns = (uint32_t)(100000000000ull / ((uint64_t)hm6_fps_x100[mode] * m_fll));
++	if (ex.set) {
++		if (old_line_ns != 0 && old_line_ns != m_line_ns) {
++			/* the same exposure time in the new mode's lines; its own frame length */
++			ex.coarse = (uint32_t)((uint64_t)ex.coarse * old_line_ns / m_line_ns);
++			ex.fll = 0;
++		}
++		(void)hm6_apply_exposure();
++	}
++	r = cam_replay(0, 0x10, hm6_on, sizeof(hm6_on) / sizeof(hm6_on[0]), "HM6 stream on");
++	cs.slot = 0; cs.mode = mode; cs.phy = 0; cs.cphy = true; cs.settle = 0x32;
++	cam_streaming = r == 0;
++	camlog("HM6 mode %u: %ux%u, frame length %u lines, line length %u, line time %u ns: %s", mode, cs.w, cs.h, m_fll, m_llp,
++	    m_line_ns, r == 0 ? "streaming" : "FAILED");
++	return r;
++}
++
++static int
++sysctl_sweet_cam_exp SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[256];
++	snprintf(buf, sizeof(buf), "mode %u %ux%u fll %u llp %u line_ns %u coarse %u (min 12 max %u) gain_x1000 %u (1000-64000) "
++	    "fll_set %u set %u streaming %u", cs.mode, cs.w, cs.h, m_fll, m_llp, m_line_ns, ex.coarse, exp_max_lines(), ex.gain_x1000,
++	    ex.fll, ex.set, cam_streaming);
++	int err = sysctl_handle_string(oidp, buf, sizeof(buf), req);
++	if (err != 0 || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	uint32_t v[3] = { 0, 0, 0 };
++	unsigned k = 0;
++	for (const char *p = buf; *p != 0 && k < 3;) {
++		while (*p == ' ') {
++			p++;
++		}
++		if (*p < '0' || *p > '9') {
++			break;
++		}
++		while (*p >= '0' && *p <= '9') {
++			v[k] = v[k] * 10 + (uint32_t)(*p++ - '0');
++		}
++		k++;
++	}
++	if (k < 2 || v[1] < 1000 || v[1] > 64000) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_cam_mtx);
++	cam_log_len = 0;
++	cam_log[0] = 0;
++	ex.set = true;
++	ex.coarse = v[0];
++	ex.gain_x1000 = v[1];
++	ex.fll = k > 2 ? v[2] : 0;
++	int r = 0;
++	if (cam_streaming && cs.slot == 0) {
++		r = hm6_apply_exposure();
++	} else {
++		camlog("exposure kept for the next HM6 stream");
++	}
++	lck_mtx_unlock(&sweet_cam_mtx);
++	return r;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cam_exp, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_cam_exp, "A", "HM6 exposure: write \"lines gain_x1000 [frame_length]\"; read the state");
++
++/* ---------------------------------------------------------------- the preview thread */
++
++static void
++pv_thread(void *arg __unused, wait_result_t wres __unused)
++{
++	vm_offset_t t = cam_csid;
++	int cur = -1;
++	unsigned prog = 0, polls = 0;
++	while (pv_run) {
++		uint32_t rdi = rd(t, 0x040);
++		if (rdi != 0) {
++			wr(t, 0x048, rdi);
++			wr(t, 0x080, 1);
++		}
++		if ((rdi & (1u << 9)) && cur >= 0) {            /* EOF: buffer cur is complete */
++			pv_latest = cur;
++			uint64_t ns;
++			absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++			pv_ts_ns = ns;
++			pv_seq++;
++		}
++		if (rdi & (1u << 12)) {                         /* SOF: prog was latched; the next one now */
++			cur = (int)prog;
++			prog = (prog + 1) % PV_NBUF;
++			wr(t, 0x2304, (uint32_t)(CAM_POOL_PA + (uint64_t)prog * pv_stride));
++			wr(t, 0x102C, 0x2);
++		}
++		if (rdi & (1u << 2)) {
++			pv_ovf++;
++		}
++		if ((++polls & 63) == 0) {
++			uint32_t s0 = rd(t, 0x104C), s1 = rd(t, 0x1050), b0 = rd(t, 0x1A28), b1 = rd(t, 0x1A2C);
++			if (s0 | s1) {
++				wr(t, 0x1040, s0); wr(t, 0x1044, s1); wr(t, 0x1030, 1);
++			}
++			if (b0 | b1) {
++				wr(t, 0x1A20, b0); wr(t, 0x1A24, b1); wr(t, 0x1A30, 1);
++			}
++			uint32_t fsr = s_cbp ? rd(s_cbp, 0x58) : 0;
++			if (fsr & SMMU_FSR_FAULT) {
++				pv_fault = fsr;
++				wr(t, 0x2300, 0);                       /* stop writing at once */
++				wr(t, 0x102C, 0x2);
++				break;
++			}
++		}
++		IOSleep(1);
++	}
++	pv_alive = false;
++	thread_terminate(current_thread());
++}
++
++static void
++pv_stop(void)
++{
++	if (!pv_alive) {
++		return;
++	}
++	pv_run = false;
++	for (int i = 0; i < 200 && pv_alive; i++) {
++		IOSleep(1);
++	}
++	if (cam_csid != 0) {
++		wr(cam_csid, 0x308, 0);                         /* RDI0 halt at the frame boundary */
++		wr(cam_csid, 0x2300, 0);
++		wr(cam_csid, 0x102C, 0x2);
++	}
++	camlog("preview stopped after %llu frames (overflows %llu, SMMU fault %#x)", pv_seq, pv_ovf, pv_fault);
++}
++
++/* op 30 */
++static int
++pv_start(void)
++{
++	unsigned mode = ((unsigned)cam_arg >> 4) & 0xF;
++	mode = mode == 0 ? 1 : mode;
++	if (mode != 1 && mode != 3 && mode != 4) {
++		camlog("op 30: preview modes are 1, 3, 4");
++		return EINVAL;
++	}
++	pv_stop();
++	int r = hm6_switch(mode);
++	if (r == 0 && !cam_csid_up) {
++		r = cam_link_on();
++	}
++	if (r == 0 && !s_ready) {
++		r = cam_smmu_stage();
++	}
++	if (r != 0) {
++		return r;
++	}
++	pv_bytes = cs.w * cs.h * 10 / 8;
++	pv_stride = (pv_bytes + 0xFFF) & ~0xFFFu;
++	if (CAM_POOL_PA + (uint64_t)PV_NBUF * pv_stride > CAM_MAP_END) {
++		camlog("op 30: %u buffers of %u bytes do not fit", PV_NBUF, pv_stride);
++		return ENOMEM;
++	}
++	vm_offset_t t = cam_csid;
++	step("preview: WM7 frame mode, %u buffers of %u bytes from %#llx", PV_NBUF, pv_stride, CAM_POOL_PA);
++	wr(t, 0x308, 0);
++	wr(t, 0x1034, 0xFFFFFFFF); wr(t, 0x1038, 0xFFFFFFFF); wr(t, 0x103C, 0xFFFFFFFF);
++	wr(t, 0x1040, 0xFFFFFFFF); wr(t, 0x1044, 0xFFFFFFFF); wr(t, 0x1048, 0xFFFFFFFF); wr(t, 0x1030, 1);
++	wr(t, 0x1A18, 0xFFFFFFFF); wr(t, 0x1A1C, 0xFFFFFFFF);
++	wr(t, 0x1A20, 0xFFFFFFFF); wr(t, 0x1A24, 0xFFFFFFFF); wr(t, 0x1A30, 1);
++	wr(t, 0x231C, 0xF);
++	wr(t, 0x230C, 0x0000FFFF);
++	wr(t, 0x2318, 0xA);
++	wr(t, 0x2314, 0xFFFF);
++	wr(t, 0x2304, (uint32_t)CAM_POOL_PA);
++	wr(t, 0x2308, pv_bytes);
++	wr(t, 0x2338, 0);
++	wr(t, 0x233C, 1);
++	wr(t, 0x1460, 0x1);
++	wr(t, 0x1470, 0x00140014);
++	wr(t, 0x2300, 0x00010001);
++	wr(t, 0x102C, 0x2);
++	smmu_fsr_clear("before the preview");
++	w_ready = false;                                /* op 23 must configure WM7 again */
++	pv_seq = 0;
++	pv_ovf = 0;
++	pv_fault = 0;
++	pv_latest = -1;
++	pv_mode = mode;
++	pv_run = true;
++	pv_alive = true;
++	thread_t th;
++	if (kernel_thread_start(pv_thread, NULL, &th) != KERN_SUCCESS) {
++		pv_run = pv_alive = false;
++		camlog("op 30: no thread");
++		return ENOMEM;
++	}
++	thread_deallocate(th);
++	wr(t, 0x308, 1);                                /* RDI0 resume */
++	cam_sel = -1;
++	cam_frame_off = 0;
++	cam_frame_len = 0;
++	IOSleep(300);
++	camlog("op 30: preview mode %u (%ux%u, %u bytes a frame): %llu frames in 300 ms, latest buffer %d", mode, cs.w, cs.h,
++	    pv_bytes, pv_seq, pv_latest);
++	return pv_seq != 0 ? 0 : EIO;
++}
++
++/* op 32 */
++static int
++cam_still(void)
++{
++	pv_stop();
++	int r = hm6_switch(0);
++	if (r == 0 && !cam_csid_up) {
++		r = cam_link_on();
++	}
++	if (r == 0 && !s_ready) {
++		r = cam_smmu_stage();
++	}
++	IOSleep(300);                                   /* the first frames after a mode change */
++	r = r ? r : cam_wm_config();
++	r = r ? r : cam_capture_staged();
++	cam_still_len = r == 0 ? cs.w * cs.h * 10 / 8 : 0;
++	cam_sel = 100;
++	cam_frame_off = 0;
++	camlog("op 32: still %ux%u: %s (op 30 restarts the preview, which overwrites it)", cs.w, cs.h, r == 0 ? "CAPTURED" : "FAILED");
++	return r;
++}
++
++static int
++sysctl_sweet_cam_latest SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[200];
++	int n = snprintf(buf, sizeof(buf), "running %u seq %llu buf %d off %#x bytes %u w %u h %u mode %u t_ns %llu ovf %llu fault %#x",
++	    pv_alive, pv_seq, pv_latest, pv_latest >= 0 ? (uint32_t)pv_latest * pv_stride : 0, pv_bytes, cs.w, cs.h, pv_mode,
++	    pv_ts_ns, pv_ovf, pv_fault);
++	return SYSCTL_OUT(req, buf, (size_t)n + 1);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cam_latest, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_cam_latest, "A", "the preview ring: newest complete frame");
++
++/* what kern.sweet_cam_frame reads: -1 the newest preview frame, 0..3 a ring buffer, 100 the still */
++static int
++sysctl_sweet_cam_sel SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = cam_sel;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, NULL);
++	if (err != 0 || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	lck_mtx_lock(&sweet_cam_mtx);
++	if (v == 100) {
++		cam_frame_off = 0;
++		cam_frame_len = cam_still_len;
++	} else if (v >= -1 && v < PV_NBUF && pv_stride != 0) {
++		int b = v < 0 ? pv_latest : v;
++		if (b < 0) {
++			err = EAGAIN;
++		} else {
++			cam_frame_off = (uint32_t)b * pv_stride;
++			cam_frame_len = pv_bytes;
++		}
++	} else {
++		err = EINVAL;
++	}
++	if (err == 0) {
++		cam_sel = v;
++		cam_seek = 0;
++	}
++	lck_mtx_unlock(&sweet_cam_mtx);
++	return err;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cam_sel, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_cam_sel, "I", "kern.sweet_cam_frame source: -1 newest preview, 0-3 ring buffer, 100 still");
++
++/* op 9's extra: the stream, the capture path and their clocks */
++static void
++cam_stream_off_all(void)
++{
++	pv_stop();
++	if (cam_csid != 0 && cam_csid_up) {
++		wr(cam_csid, 0x308, 0);
++		wr(cam_csid, 0x2300, 0);
++		wr(cam_csid, 0x1460, 0);
++		wr(cam_csid, 0x102C, 0x2);
++	}
++	if (cam_streaming && camss_up) {
++		(void)cam_replay(cs.slot == 0 ? 0 : 1, cs.slot == 0 ? 0x10 : 0x2D, cs.slot == 0 ? hm6_off : h7_off,
++		    cs.slot == 0 ? (unsigned)(sizeof(hm6_off) / sizeof(hm6_off[0])) : (unsigned)(sizeof(h7_off) / sizeof(h7_off[0])),
++		    "stream off");
++	}
++	if (cam_phy != 0 && cam_csid_up) {
++		wr(cam_phy, 0x814, 0);                          /* CSIPHY lanes off, reset */
++		wr(cam_phy, 0x800, 0x01);
++		IOSleep(1);
++		wr(cam_phy, 0x800, 0x00);
++	}
++	if (gcc != 0) {
++		branch_off("tfe_0", 0x5201Cu);
++		branch_off("tfe_0_cphy_rx", 0x5207Cu);
++		branch_off("tfe_0_csid", 0x520ACu);
++		for (unsigned n = 0; n < 3; n++) {
++			branch_off("csiphytimer", 0x59018u + 0x1Cu * n);
++			branch_off("cphy", 0x52088u + 4u * n);
++		}
++	}
++	cam_streaming = false;
++	cam_csid_up = false;
++	w_ready = false;
++	/* the RPM votes for L4/L18 stay: they are APPS' only vote on rails the display and USB PHYs share, at the values UEFI set */
++}
++
+ static int
+ sysctl_sweet_cam SYSCTL_HANDLER_ARGS
+ {
+@@ -1613,6 +2042,16 @@ sysctl_sweet_cam SYSCTL_HANDLER_ARGS
+ 	case 20:
+ 		r = cam_smmu_stage();
+ 		break;
++	case 30:
++		r = pv_start();
++		break;
++	case 31:
++		pv_stop();
++		r = 0;
++		break;
++	case 32:
++		r = cam_still();
++		break;
+ 	case 21:
+ 		r = cam_tfe_read();
+ 		break;
+diff --git a/bsd/dev/sweet_cam_tables.h b/bsd/dev/sweet_cam_tables.h
+index 87a31d7..2a548c5 100755
+--- a/bsd/dev/sweet_cam_tables.h
++++ b/bsd/dev/sweet_cam_tables.h
+@@ -4003,6 +4003,1630 @@ static const struct cam_reg hm6_mode1[1622] = {
+ 	{ 0xfcfc, 0x4000, 0, 2, 0, 0 },
+ 	{ 0x0000, 0x1ad6, 0, 2, 0, 0 },
+ };
++static const struct cam_reg hm6_mode3[1622] = {
++	{ 0xfcfc, 0x4000, 0, 2, 0, 0 },
++	{ 0x0b30, 0x01ff, 0, 2, 0, 0 },
++	{ 0x0136, 0x1300, 0, 2, 0, 0 },
++	{ 0x013e, 0x00c8, 0, 2, 0, 0 },
++	{ 0x0b04, 0x0021, 0, 2, 0, 0 },
++	{ 0x0112, 0x0a0a, 0, 2, 0, 0 },
++	{ 0x0114, 0x0201, 0, 2, 0, 0 },
++	{ 0x0bc8, 0x0001, 0, 2, 0, 0 },
++	{ 0x011c, 0x0101, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x2000, 0, 2, 0, 0 },
++	{ 0x2a58, 0x2ef8, 0, 2, 0, 0 },
++	{ 0x2a5a, 0x2370, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x4000, 0, 2, 0, 0 },
++	{ 0x0344, 0x084c, 0, 2, 0, 0 },
++	{ 0x0346, 0x0930, 0, 2, 0, 0 },
++	{ 0x0348, 0x26ab, 0, 2, 0, 0 },
++	{ 0x034a, 0x1a3f, 0, 2, 0, 0 },
++	{ 0x034c, 0x0500, 0, 2, 0, 0 },
++	{ 0x034e, 0x02d0, 0, 2, 0, 0 },
++	{ 0x0350, 0x0008, 0, 2, 0, 0 },
++	{ 0x0352, 0x0004, 0, 2, 0, 0 },
++	{ 0x0380, 0x0003, 0, 2, 0, 0 },
++	{ 0x0382, 0x0003, 0, 2, 0, 0 },
++	{ 0x0384, 0x0003, 0, 2, 0, 0 },
++	{ 0x0386, 0x0009, 0, 2, 0, 0 },
++	{ 0x0900, 0x2336, 0, 2, 0, 0 },
++	{ 0x040c, 0x1000, 0, 2, 0, 0 },
++	{ 0x0404, 0x2000, 0, 2, 0, 0 },
++	{ 0x0408, 0x0100, 0, 2, 0, 0 },
++	{ 0x040a, 0x0100, 0, 2, 0, 0 },
++	{ 0x0400, 0x1010, 0, 2, 0, 0 },
++	{ 0x0342, 0x2fb0, 0, 2, 0, 0 },
++	{ 0x0340, 0x045c, 0, 2, 0, 0 },
++	{ 0x0304, 0x0003, 0, 2, 0, 0 },
++	{ 0x030c, 0x0000, 0, 2, 0, 0 },
++	{ 0x0306, 0x00e0, 0, 2, 0, 0 },
++	{ 0x0320, 0x0000, 0, 2, 0, 0 },
++	{ 0x0322, 0x3800, 0, 2, 0, 0 },
++	{ 0x0302, 0x0001, 0, 2, 0, 0 },
++	{ 0x0300, 0x0007, 0, 2, 0, 0 },
++	{ 0x030e, 0x0003, 0, 2, 0, 0 },
++	{ 0x0312, 0x0001, 0, 2, 0, 0 },
++	{ 0x0310, 0x00c2, 0, 2, 0, 0 },
++	{ 0x0324, 0x0000, 0, 2, 0, 0 },
++	{ 0x0326, 0xf000, 0, 2, 0, 0 },
++	{ 0x030a, 0x0001, 0, 2, 0, 0 },
++	{ 0x0308, 0x0008, 0, 2, 0, 0 },
++	{ 0x031a, 0x0003, 0, 2, 0, 0 },
++	{ 0x031c, 0x004b, 0, 2, 0, 0 },
++	{ 0x031e, 0x0002, 0, 2, 0, 0 },
++	{ 0x021e, 0x0000, 0, 2, 0, 0 },
++	{ 0x0122, 0x0000, 0, 2, 0, 0 },
++	{ 0x0260, 0x0002, 0, 2, 0, 0 },
++	{ 0x0262, 0x0304, 0, 2, 0, 0 },
++	{ 0x020a, 0x0000, 0, 2, 0, 0 },
++	{ 0x0b02, 0x0100, 0, 2, 0, 0 },
++	{ 0x0228, 0x0100, 0, 2, 0, 0 },
++	{ 0x0d00, 0x0100, 0, 2, 0, 0 },
++	{ 0x0d02, 0x0101, 0, 2, 0, 0 },
++	{ 0x0d04, 0x0100, 0, 2, 0, 0 },
++	{ 0x0d06, 0x0280, 0, 2, 0, 0 },
++	{ 0x0d08, 0x0168, 0, 2, 0, 0 },
++	{ 0x0274, 0x2b31, 0, 2, 0, 0 },
++	{ 0x0d0c, 0x0004, 0, 2, 0, 0 },
++	{ 0x0d0e, 0x0002, 0, 2, 0, 0 },
++	{ 0x0b08, 0x0000, 0, 2, 0, 0 },
++	{ 0x0b06, 0x0101, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x2000, 0, 2, 0, 0 },
++	{ 0xc410, 0x0000, 0, 2, 0, 0 },
++	{ 0xc43c, 0x0000, 0, 2, 0, 0 },
++	{ 0xc43e, 0x0000, 0, 2, 0, 0 },
++	{ 0xc44a, 0x0000, 0, 2, 0, 0 },
++	{ 0x7e2a, 0x0000, 0, 2, 0, 0 },
++	{ 0xc422, 0x0400, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x4000, 0, 2, 0, 0 },
++	{ 0x0b10, 0x0100, 0, 2, 0, 0 },
++	{ 0x0fec, 0x6100, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x2000, 0, 2, 0, 0 },
++	{ 0xc41e, 0x7940, 0, 2, 0, 0 },
++	{ 0xc432, 0x0001, 0, 2, 0, 0 },
++	{ 0xc434, 0x0000, 0, 2, 0, 0 },
++	{ 0xc438, 0x0000, 0, 2, 0, 0 },
++	{ 0xc43a, 0x0000, 0, 2, 0, 0 },
++	{ 0xc444, 0x0000, 0, 2, 0, 0 },
++	{ 0xc446, 0x0018, 0, 2, 0, 0 },
++	{ 0xc448, 0x0010, 0, 2, 0, 0 },
++	{ 0xc46c, 0x0064, 0, 2, 0, 0 },
++	{ 0xc46e, 0x0100, 0, 2, 0, 0 },
++	{ 0xc484, 0x009c, 0, 2, 0, 0 },
++	{ 0xc44c, 0x00a0, 0, 2, 0, 0 },
++	{ 0xc44e, 0x0060, 0, 2, 0, 0 },
++	{ 0xc486, 0x0fa8, 0, 2, 0, 0 },
++	{ 0xc488, 0x0bd0, 0, 2, 0, 0 },
++	{ 0xc456, 0x0020, 0, 2, 0, 0 },
++	{ 0x190c, 0x0020, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x2001, 0, 2, 0, 0 },
++	{ 0x9e86, 0x0001, 0, 2, 0, 0 },
++	{ 0x9e7a, 0x05b0, 0, 2, 0, 0 },
++	{ 0x9e7c, 0x05b0, 0, 2, 0, 0 },
++	{ 0x9e7e, 0x05b0, 0, 2, 0, 0 },
++	{ 0x9e80, 0x05b0, 0, 2, 0, 0 },
++	{ 0x9e82, 0x0060, 0, 2, 0, 0 },
++	{ 0x9e84, 0x0060, 0, 2, 0, 0 },
++	{ 0x9e88, 0x0001, 0, 2, 0, 0 },
++	{ 0x9e8a, 0x0003, 0, 2, 0, 0 },
++	{ 0x9e8c, 0x0006, 0, 2, 0, 0 },
++	{ 0x9e8e, 0x0008, 0, 2, 0, 0 },
++	{ 0x9e90, 0x1d1a, 0, 2, 0, 0 },
++	{ 0x9e92, 0x02c8, 0, 2, 0, 0 },
++	{ 0x9e94, 0x05d1, 0, 2, 0, 0 },
++	{ 0x9e96, 0x0008, 0, 2, 0, 0 },
++	{ 0x9e98, 0x0005, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x2000, 0, 2, 0, 0 },
++	{ 0x1902, 0x0000, 0, 2, 0, 0 },
++	{ 0x1912, 0x000b, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x4000, 0, 2, 0, 0 },
++	{ 0x0d0a, 0x0000, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x2000, 0, 2, 0, 0 },
++	{ 0xcd46, 0x00c8, 0, 2, 0, 0 },
++	{ 0xcd62, 0x0400, 0, 2, 0, 0 },
++	{ 0x2ae8, 0x0003, 0, 2, 0, 0 },
++	{ 0x2af0, 0x0003, 0, 2, 0, 0 },
++	{ 0x2af8, 0x0001, 0, 2, 0, 0 },
++	{ 0x7c36, 0x0001, 0, 2, 0, 0 },
++	{ 0x7c40, 0x0400, 0, 2, 0, 0 },
++	{ 0x7c64, 0x0400, 0, 2, 0, 0 },
++	{ 0x7c42, 0x0400, 0, 2, 0, 0 },
++	{ 0xd6a0, 0x0000, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x4000, 0, 2, 0, 0 },
++	{ 0x0d10, 0x0500, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x2000, 0, 2, 0, 0 },
++	{ 0x9ecc, 0x0002, 0, 2, 0, 0 },
++	{ 0x9ece, 0x0002, 0, 2, 0, 0 },
++	{ 0x9ed0, 0x0001, 0, 2, 0, 0 },
++	{ 0x9ed2, 0x0001, 0, 2, 0, 0 },
++	{ 0x9f4a, 0x0004, 0, 2, 0, 0 },
++	{ 0x9f6a, 0x0004, 0, 2, 0, 0 },
++	{ 0xa002, 0x0002, 0, 2, 0, 0 },
++	{ 0xa004, 0x0001, 0, 2, 0, 0 },
++	{ 0xa006, 0x0043, 0, 2, 0, 0 },
++	{ 0xa008, 0x0001, 0, 2, 0, 0 },
++	{ 0xa00a, 0x0040, 0, 2, 0, 0 },
++	{ 0xa00c, 0x0004, 0, 2, 0, 0 },
++	{ 0xa00e, 0x0005, 0, 2, 0, 0 },
++	{ 0xa010, 0x0004, 0, 2, 0, 0 },
++	{ 0xa182, 0x0002, 0, 2, 0, 0 },
++	{ 0xa184, 0x0003, 0, 2, 0, 0 },
++	{ 0xa186, 0x0043, 0, 2, 0, 0 },
++	{ 0xa188, 0x0003, 0, 2, 0, 0 },
++	{ 0xa18a, 0x0044, 0, 2, 0, 0 },
++	{ 0xa192, 0x0040, 0, 2, 0, 0 },
++	{ 0xa194, 0x0003, 0, 2, 0, 0 },
++	{ 0xa196, 0x0003, 0, 2, 0, 0 },
++	{ 0xa198, 0x0003, 0, 2, 0, 0 },
++	{ 0xa19a, 0x0044, 0, 2, 0, 0 },
++	{ 0xa1a2, 0x0040, 0, 2, 0, 0 },
++	{ 0xa1a4, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1a6, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1a8, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1aa, 0x0044, 0, 2, 0, 0 },
++	{ 0xa1b2, 0x0040, 0, 2, 0, 0 },
++	{ 0xa1b4, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1b6, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1b8, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1ba, 0x0044, 0, 2, 0, 0 },
++	{ 0x9ed6, 0x0002, 0, 2, 0, 0 },
++	{ 0x9ed8, 0x0001, 0, 2, 0, 0 },
++	{ 0x9f4c, 0x0008, 0, 2, 0, 0 },
++	{ 0x9f6c, 0x0004, 0, 2, 0, 0 },
++	{ 0x9fea, 0x0001, 0, 2, 0, 0 },
++	{ 0x9fec, 0x0004, 0, 2, 0, 0 },
++	{ 0xa1c2, 0x0000, 0, 2, 0, 0 },
++	{ 0xa1c4, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1c6, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1c8, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1ca, 0x0004, 0, 2, 0, 0 },
++	{ 0xa1ce, 0x0007, 0, 2, 0, 0 },
++	{ 0xa1d2, 0x0000, 0, 2, 0, 0 },
++	{ 0xa1d4, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1d6, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1d8, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1da, 0x0004, 0, 2, 0, 0 },
++	{ 0xa1e2, 0x0000, 0, 2, 0, 0 },
++	{ 0xa1e4, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1e6, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1e8, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1ea, 0x0004, 0, 2, 0, 0 },
++	{ 0xa1ee, 0x0007, 0, 2, 0, 0 },
++	{ 0xa1f2, 0x0000, 0, 2, 0, 0 },
++	{ 0xa1f4, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1f6, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1f8, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1fa, 0x0004, 0, 2, 0, 0 },
++	{ 0xa1fe, 0x0007, 0, 2, 0, 0 },
++	{ 0xb206, 0x0002, 0, 2, 0, 0 },
++	{ 0xb208, 0x0003, 0, 2, 0, 0 },
++	{ 0xb20a, 0x003f, 0, 2, 0, 0 },
++	{ 0xb20c, 0x003f, 0, 2, 0, 0 },
++	{ 0xb212, 0x003f, 0, 2, 0, 0 },
++	{ 0xb214, 0x003f, 0, 2, 0, 0 },
++	{ 0xb21a, 0x003f, 0, 2, 0, 0 },
++	{ 0xb21c, 0x003f, 0, 2, 0, 0 },
++	{ 0xb282, 0x0003, 0, 2, 0, 0 },
++	{ 0xb284, 0x0002, 0, 2, 0, 0 },
++	{ 0xb286, 0x0001, 0, 2, 0, 0 },
++	{ 0xb288, 0x0000, 0, 2, 0, 0 },
++	{ 0xb28a, 0x003f, 0, 2, 0, 0 },
++	{ 0xb28c, 0x003f, 0, 2, 0, 0 },
++	{ 0xb292, 0x003f, 0, 2, 0, 0 },
++	{ 0xb294, 0x003f, 0, 2, 0, 0 },
++	{ 0xb29a, 0x003f, 0, 2, 0, 0 },
++	{ 0xb29c, 0x003f, 0, 2, 0, 0 },
++	{ 0xb306, 0x0002, 0, 2, 0, 0 },
++	{ 0xb308, 0x0003, 0, 2, 0, 0 },
++	{ 0xb30a, 0x003f, 0, 2, 0, 0 },
++	{ 0xb30c, 0x003f, 0, 2, 0, 0 },
++	{ 0xb312, 0x003f, 0, 2, 0, 0 },
++	{ 0xb314, 0x003f, 0, 2, 0, 0 },
++	{ 0xb31a, 0x003f, 0, 2, 0, 0 },
++	{ 0xb31c, 0x003f, 0, 2, 0, 0 },
++	{ 0xb382, 0x0003, 0, 2, 0, 0 },
++	{ 0xb384, 0x0002, 0, 2, 0, 0 },
++	{ 0xb386, 0x0001, 0, 2, 0, 0 },
++	{ 0xb388, 0x0000, 0, 2, 0, 0 },
++	{ 0xb38a, 0x003f, 0, 2, 0, 0 },
++	{ 0xb38c, 0x003f, 0, 2, 0, 0 },
++	{ 0xb392, 0x003f, 0, 2, 0, 0 },
++	{ 0xb394, 0x003f, 0, 2, 0, 0 },
++	{ 0xb39a, 0x003f, 0, 2, 0, 0 },
++	{ 0xb39c, 0x003f, 0, 2, 0, 0 },
++	{ 0xb182, 0x0001, 0, 2, 0, 0 },
++	{ 0xb184, 0x0000, 0, 2, 0, 0 },
++	{ 0xb192, 0x0001, 0, 2, 0, 0 },
++	{ 0xd6a2, 0x0001, 0, 2, 0, 0 },
++	{ 0xd6cc, 0x1111, 0, 2, 0, 0 },
++	{ 0xd6ce, 0x1111, 0, 2, 0, 0 },
++	{ 0xd6d0, 0x1111, 0, 2, 0, 0 },
++	{ 0xd6d2, 0x1111, 0, 2, 0, 0 },
++	{ 0xd6de, 0x0800, 0, 2, 0, 0 },
++	{ 0xd6e0, 0x0800, 0, 2, 0, 0 },
++	{ 0xd6e2, 0x0800, 0, 2, 0, 0 },
++	{ 0xd6e4, 0x0800, 0, 2, 0, 0 },
++	{ 0xd6e6, 0x0800, 0, 2, 0, 0 },
++	{ 0xd6e8, 0x0800, 0, 2, 0, 0 },
++	{ 0xd6ea, 0x0800, 0, 2, 0, 0 },
++	{ 0xd6ec, 0x0800, 0, 2, 0, 0 },
++	{ 0xd6ee, 0x0800, 0, 2, 0, 0 },
++	{ 0xd6f0, 0x0800, 0, 2, 0, 0 },
++	{ 0xd6f2, 0x0800, 0, 2, 0, 0 },
++	{ 0xd6f4, 0x0800, 0, 2, 0, 0 },
++	{ 0xd6f6, 0x0800, 0, 2, 0, 0 },
++	{ 0xd6f8, 0x0800, 0, 2, 0, 0 },
++	{ 0xd6fa, 0x0800, 0, 2, 0, 0 },
++	{ 0xd6fc, 0x0800, 0, 2, 0, 0 },
++	{ 0xa18e, 0x0007, 0, 2, 0, 0 },
++	{ 0xa190, 0x0003, 0, 2, 0, 0 },
++	{ 0xa19e, 0x0007, 0, 2, 0, 0 },
++	{ 0xa1a0, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1ae, 0x0007, 0, 2, 0, 0 },
++	{ 0xa1b0, 0x0003, 0, 2, 0, 0 },
++	{ 0xa1be, 0x0007, 0, 2, 0, 0 },
++	{ 0xa1c0, 0x0003, 0, 2, 0, 0 },
++	{ 0x9e7e, 0x0000, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x2001, 0, 2, 0, 0 },
++	{ 0x90f8, 0x0001, 0, 2, 0, 0 },
++	{ 0x90fa, 0x0002, 0, 2, 0, 0 },
++	{ 0x90fc, 0x0001, 0, 2, 0, 0 },
++	{ 0x99ca, 0x0002, 0, 2, 0, 0 },
++	{ 0x99cc, 0x0002, 0, 2, 0, 0 },
++	{ 0x99ce, 0x0002, 0, 2, 0, 0 },
++	{ 0x99d0, 0x0002, 0, 2, 0, 0 },
++	{ 0x99d2, 0x0002, 0, 2, 0, 0 },
++	{ 0x9c54, 0x0101, 0, 2, 0, 0 },
++	{ 0x9c56, 0x0200, 0, 2, 0, 0 },
++	{ 0x9c58, 0x0fd0, 0, 2, 0, 0 },
++	{ 0x9c5a, 0x0fa0, 0, 2, 0, 0 },
++	{ 0x9c7c, 0x0101, 0, 2, 0, 0 },
++	{ 0x9c7e, 0x0200, 0, 2, 0, 0 },
++	{ 0x9c80, 0x0fd0, 0, 2, 0, 0 },
++	{ 0x9c82, 0x0fd0, 0, 2, 0, 0 },
++	{ 0x9ca4, 0x0101, 0, 2, 0, 0 },
++	{ 0x9ca6, 0x0200, 0, 2, 0, 0 },
++	{ 0x9ca8, 0x0fd0, 0, 2, 0, 0 },
++	{ 0x9caa, 0x0fd0, 0, 2, 0, 0 },
++	{ 0x9ccc, 0x0101, 0, 2, 0, 0 },
++	{ 0x9cce, 0x0200, 0, 2, 0, 0 },
++	{ 0x9cd0, 0x0fd0, 0, 2, 0, 0 },
++	{ 0x9cd2, 0x0fa0, 0, 2, 0, 0 },
++	{ 0x9c5c, 0x0201, 0, 2, 0, 0 },
++	{ 0x9c5e, 0x03ff, 0, 2, 0, 0 },
++	{ 0x9c60, 0x0fa0, 0, 2, 0, 0 },
++	{ 0x9c62, 0x0fd0, 0, 2, 0, 0 },
++	{ 0x9c84, 0x0201, 0, 2, 0, 0 },
++	{ 0x9c86, 0x03ff, 0, 2, 0, 0 },
++	{ 0x9c88, 0x0f90, 0, 2, 0, 0 },
++	{ 0x9c8a, 0x0fb0, 0, 2, 0, 0 },
++	{ 0x9cac, 0x0201, 0, 2, 0, 0 },
++	{ 0x9cae, 0x03ff, 0, 2, 0, 0 },
++	{ 0x9cb0, 0x0f90, 0, 2, 0, 0 },
++	{ 0x9cb2, 0x0fb0, 0, 2, 0, 0 },
++	{ 0x9cd4, 0x0201, 0, 2, 0, 0 },
++	{ 0x9cd6, 0x03ff, 0, 2, 0, 0 },
++	{ 0x9cd8, 0x0fa0, 0, 2, 0, 0 },
++	{ 0x9cda, 0x0fd0, 0, 2, 0, 0 },
++	{ 0x9c64, 0x0400, 0, 2, 0, 0 },
++	{ 0x9c66, 0x1000, 0, 2, 0, 0 },
++	{ 0x9c68, 0x1000, 0, 2, 0, 0 },
++	{ 0x9c6a, 0x1040, 0, 2, 0, 0 },
++	{ 0x9c8c, 0x0400, 0, 2, 0, 0 },
++	{ 0x9c8e, 0x1000, 0, 2, 0, 0 },
++	{ 0x9c90, 0x1000, 0, 2, 0, 0 },
++	{ 0x9c92, 0x1010, 0, 2, 0, 0 },
++	{ 0x9cb4, 0x0400, 0, 2, 0, 0 },
++	{ 0x9cb6, 0x1000, 0, 2, 0, 0 },
++	{ 0x9cb8, 0x1000, 0, 2, 0, 0 },
++	{ 0x9cba, 0x1010, 0, 2, 0, 0 },
++	{ 0x9cdc, 0x0400, 0, 2, 0, 0 },
++	{ 0x9cde, 0x1000, 0, 2, 0, 0 },
++	{ 0x9ce0, 0x1000, 0, 2, 0, 0 },
++	{ 0x9ce2, 0x1040, 0, 2, 0, 0 },
++	{ 0x9c6c, 0x1001, 0, 2, 0, 0 },
++	{ 0x9c6e, 0x2000, 0, 2, 0, 0 },
++	{ 0x9c70, 0x1040, 0, 2, 0, 0 },
++	{ 0x9c72, 0x1010, 0, 2, 0, 0 },
++	{ 0x9c94, 0x1001, 0, 2, 0, 0 },
++	{ 0x9c96, 0x2000, 0, 2, 0, 0 },
++	{ 0x9c98, 0x1010, 0, 2, 0, 0 },
++	{ 0x9c9a, 0x1020, 0, 2, 0, 0 },
++	{ 0x9cbc, 0x1001, 0, 2, 0, 0 },
++	{ 0x9cbe, 0x2000, 0, 2, 0, 0 },
++	{ 0x9cc0, 0x1010, 0, 2, 0, 0 },
++	{ 0x9cc2, 0x1020, 0, 2, 0, 0 },
++	{ 0x9ce4, 0x1001, 0, 2, 0, 0 },
++	{ 0x9ce6, 0x2000, 0, 2, 0, 0 },
++	{ 0x9ce8, 0x1040, 0, 2, 0, 0 },
++	{ 0x9cea, 0x1010, 0, 2, 0, 0 },
++	{ 0x9c74, 0x2001, 0, 2, 0, 0 },
++	{ 0x9c76, 0x4000, 0, 2, 0, 0 },
++	{ 0x9c78, 0x1010, 0, 2, 0, 0 },
++	{ 0x9c7a, 0x1010, 0, 2, 0, 0 },
++	{ 0x9c9c, 0x2001, 0, 2, 0, 0 },
++	{ 0x9c9e, 0x4000, 0, 2, 0, 0 },
++	{ 0x9ca0, 0x1020, 0, 2, 0, 0 },
++	{ 0x9ca2, 0x1010, 0, 2, 0, 0 },
++	{ 0x9cc4, 0x2001, 0, 2, 0, 0 },
++	{ 0x9cc6, 0x4000, 0, 2, 0, 0 },
++	{ 0x9cc8, 0x1020, 0, 2, 0, 0 },
++	{ 0x9cca, 0x1010, 0, 2, 0, 0 },
++	{ 0x9cec, 0x2001, 0, 2, 0, 0 },
++	{ 0x9cee, 0x4000, 0, 2, 0, 0 },
++	{ 0x9cf0, 0x1010, 0, 2, 0, 0 },
++	{ 0x9cf2, 0x1010, 0, 2, 0, 0 },
++	{ 0x913a, 0x0001, 0, 2, 0, 0 },
++	{ 0x973c, 0x0100, 0, 2, 0, 0 },
++	{ 0x973e, 0x0200, 0, 2, 0, 0 },
++	{ 0x9740, 0x0001, 0, 2, 0, 0 },
++	{ 0x9742, 0x0001, 0, 2, 0, 0 },
++	{ 0x9744, 0x0020, 0, 2, 0, 0 },
++	{ 0x9748, 0x0020, 0, 2, 0, 0 },
++	{ 0x974c, 0x0020, 0, 2, 0, 0 },
++	{ 0x9750, 0x0020, 0, 2, 0, 0 },
++	{ 0x9754, 0x0200, 0, 2, 0, 0 },
++	{ 0x9756, 0x0400, 0, 2, 0, 0 },
++	{ 0x9758, 0x0001, 0, 2, 0, 0 },
++	{ 0x975a, 0x0001, 0, 2, 0, 0 },
++	{ 0x975c, 0x0020, 0, 2, 0, 0 },
++	{ 0x9760, 0x0020, 0, 2, 0, 0 },
++	{ 0x9764, 0x0020, 0, 2, 0, 0 },
++	{ 0x9768, 0x0020, 0, 2, 0, 0 },
++	{ 0x976c, 0x0400, 0, 2, 0, 0 },
++	{ 0x976e, 0x0800, 0, 2, 0, 0 },
++	{ 0x9770, 0x0001, 0, 2, 0, 0 },
++	{ 0x9772, 0x0000, 0, 2, 0, 0 },
++	{ 0x9774, 0x0020, 0, 2, 0, 0 },
++	{ 0x9778, 0x0020, 0, 2, 0, 0 },
++	{ 0x977c, 0x0020, 0, 2, 0, 0 },
++	{ 0x9780, 0x0020, 0, 2, 0, 0 },
++	{ 0x9784, 0x0800, 0, 2, 0, 0 },
++	{ 0x9786, 0x0c00, 0, 2, 0, 0 },
++	{ 0x9788, 0x0001, 0, 2, 0, 0 },
++	{ 0x978a, 0x0000, 0, 2, 0, 0 },
++	{ 0x978c, 0x0200, 0, 2, 0, 0 },
++	{ 0x9790, 0x0200, 0, 2, 0, 0 },
++	{ 0x9794, 0x0200, 0, 2, 0, 0 },
++	{ 0x9798, 0x0200, 0, 2, 0, 0 },
++	{ 0x979c, 0x0c00, 0, 2, 0, 0 },
++	{ 0x979e, 0x1000, 0, 2, 0, 0 },
++	{ 0x97a0, 0x0001, 0, 2, 0, 0 },
++	{ 0x97a2, 0x0000, 0, 2, 0, 0 },
++	{ 0x97a4, 0x0230, 0, 2, 0, 0 },
++	{ 0x97a8, 0x0230, 0, 2, 0, 0 },
++	{ 0x97ac, 0x0230, 0, 2, 0, 0 },
++	{ 0x97b0, 0x0230, 0, 2, 0, 0 },
++	{ 0x97b4, 0x1000, 0, 2, 0, 0 },
++	{ 0x97b6, 0x1400, 0, 2, 0, 0 },
++	{ 0x97b8, 0x0001, 0, 2, 0, 0 },
++	{ 0x97ba, 0x0000, 0, 2, 0, 0 },
++	{ 0x97bc, 0x0200, 0, 2, 0, 0 },
++	{ 0x97c0, 0x0210, 0, 2, 0, 0 },
++	{ 0x97c4, 0x0200, 0, 2, 0, 0 },
++	{ 0x97c8, 0x0210, 0, 2, 0, 0 },
++	{ 0x97cc, 0x1400, 0, 2, 0, 0 },
++	{ 0x97ce, 0x1800, 0, 2, 0, 0 },
++	{ 0x97d0, 0x0001, 0, 2, 0, 0 },
++	{ 0x97d2, 0x0000, 0, 2, 0, 0 },
++	{ 0x97d4, 0x0200, 0, 2, 0, 0 },
++	{ 0x97d8, 0x0200, 0, 2, 0, 0 },
++	{ 0x97dc, 0x0200, 0, 2, 0, 0 },
++	{ 0x97e0, 0x0200, 0, 2, 0, 0 },
++	{ 0x97e4, 0x1800, 0, 2, 0, 0 },
++	{ 0x97e6, 0x1c00, 0, 2, 0, 0 },
++	{ 0x97e8, 0x0001, 0, 2, 0, 0 },
++	{ 0x97ea, 0x0000, 0, 2, 0, 0 },
++	{ 0x97ec, 0x0200, 0, 2, 0, 0 },
++	{ 0x97f0, 0x0200, 0, 2, 0, 0 },
++	{ 0x97f4, 0x0200, 0, 2, 0, 0 },
++	{ 0x97f8, 0x0200, 0, 2, 0, 0 },
++	{ 0x97fc, 0x1c00, 0, 2, 0, 0 },
++	{ 0x97fe, 0x2000, 0, 2, 0, 0 },
++	{ 0x9800, 0x0001, 0, 2, 0, 0 },
++	{ 0x9802, 0x0000, 0, 2, 0, 0 },
++	{ 0x9804, 0x0200, 0, 2, 0, 0 },
++	{ 0x9808, 0x0200, 0, 2, 0, 0 },
++	{ 0x980c, 0x0200, 0, 2, 0, 0 },
++	{ 0x9810, 0x0200, 0, 2, 0, 0 },
++	{ 0x9814, 0x2000, 0, 2, 0, 0 },
++	{ 0x9816, 0x2400, 0, 2, 0, 0 },
++	{ 0x9818, 0x0001, 0, 2, 0, 0 },
++	{ 0x981a, 0x0000, 0, 2, 0, 0 },
++	{ 0x981c, 0x0140, 0, 2, 0, 0 },
++	{ 0x9820, 0x0140, 0, 2, 0, 0 },
++	{ 0x9824, 0x0140, 0, 2, 0, 0 },
++	{ 0x9828, 0x0140, 0, 2, 0, 0 },
++	{ 0x982c, 0x2400, 0, 2, 0, 0 },
++	{ 0x982e, 0x2800, 0, 2, 0, 0 },
++	{ 0x9830, 0x0001, 0, 2, 0, 0 },
++	{ 0x9832, 0x0000, 0, 2, 0, 0 },
++	{ 0x9834, 0x0140, 0, 2, 0, 0 },
++	{ 0x9838, 0x0140, 0, 2, 0, 0 },
++	{ 0x983c, 0x0140, 0, 2, 0, 0 },
++	{ 0x9840, 0x0140, 0, 2, 0, 0 },
++	{ 0x9844, 0x2800, 0, 2, 0, 0 },
++	{ 0x9846, 0x2c00, 0, 2, 0, 0 },
++	{ 0x9848, 0x0001, 0, 2, 0, 0 },
++	{ 0x984a, 0x0000, 0, 2, 0, 0 },
++	{ 0x984c, 0x0140, 0, 2, 0, 0 },
++	{ 0x9850, 0x0140, 0, 2, 0, 0 },
++	{ 0x9854, 0x0140, 0, 2, 0, 0 },
++	{ 0x9858, 0x0140, 0, 2, 0, 0 },
++	{ 0x985c, 0x2c00, 0, 2, 0, 0 },
++	{ 0x985e, 0x3000, 0, 2, 0, 0 },
++	{ 0x9860, 0x0001, 0, 2, 0, 0 },
++	{ 0x9862, 0x0000, 0, 2, 0, 0 },
++	{ 0x9864, 0x0140, 0, 2, 0, 0 },
++	{ 0x9868, 0x0140, 0, 2, 0, 0 },
++	{ 0x986c, 0x0140, 0, 2, 0, 0 },
++	{ 0x9870, 0x0140, 0, 2, 0, 0 },
++	{ 0x9874, 0x3000, 0, 2, 0, 0 },
++	{ 0x9876, 0x3800, 0, 2, 0, 0 },
++	{ 0x9878, 0x0001, 0, 2, 0, 0 },
++	{ 0x987a, 0x0000, 0, 2, 0, 0 },
++	{ 0x987c, 0x0140, 0, 2, 0, 0 },
++	{ 0x9880, 0x0140, 0, 2, 0, 0 },
++	{ 0x9884, 0x0140, 0, 2, 0, 0 },
++	{ 0x9888, 0x0140, 0, 2, 0, 0 },
++	{ 0x988c, 0x3800, 0, 2, 0, 0 },
++	{ 0x988e, 0x4000, 0, 2, 0, 0 },
++	{ 0x9890, 0x0001, 0, 2, 0, 0 },
++	{ 0x9892, 0x0000, 0, 2, 0, 0 },
++	{ 0x9894, 0x0140, 0, 2, 0, 0 },
++	{ 0x9898, 0x0140, 0, 2, 0, 0 },
++	{ 0x989c, 0x0140, 0, 2, 0, 0 },
++	{ 0x98a0, 0x0140, 0, 2, 0, 0 },
++	{ 0x98a4, 0x4000, 0, 2, 0, 0 },
++	{ 0x98a6, 0x8000, 0, 2, 0, 0 },
++	{ 0x98a8, 0x0001, 0, 2, 0, 0 },
++	{ 0x98aa, 0x0000, 0, 2, 0, 0 },
++	{ 0x98ac, 0x0140, 0, 2, 0, 0 },
++	{ 0x98b0, 0x0140, 0, 2, 0, 0 },
++	{ 0x98b4, 0x0140, 0, 2, 0, 0 },
++	{ 0x98b8, 0x0140, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x2000, 0, 2, 0, 0 },
++	{ 0x19f4, 0x1e52, 0, 2, 0, 0 },
++	{ 0x1a10, 0x07a0, 0, 2, 0, 0 },
++	{ 0x1a34, 0x0100, 0, 2, 0, 0 },
++	{ 0x1a36, 0x0100, 0, 2, 0, 0 },
++	{ 0x1a38, 0x0100, 0, 2, 0, 0 },
++	{ 0x1a3a, 0x0100, 0, 2, 0, 0 },
++	{ 0x1a3c, 0x0100, 0, 2, 0, 0 },
++	{ 0x1a52, 0x000f, 0, 2, 0, 0 },
++	{ 0x1a5a, 0x0001, 0, 2, 0, 0 },
++	{ 0x1b96, 0x0000, 0, 2, 0, 0 },
++	{ 0x8442, 0x0001, 0, 2, 0, 0 },
++	{ 0x8450, 0x0080, 0, 2, 0, 0 },
++	{ 0x7a12, 0x1f94, 0, 2, 0, 0 },
++	{ 0x7a14, 0x1fb5, 0, 2, 0, 0 },
++	{ 0x7a18, 0x1fb4, 0, 2, 0, 0 },
++	{ 0x1b50, 0x0002, 0, 2, 0, 0 },
++	{ 0x1b60, 0x0003, 0, 2, 0, 0 },
++	{ 0x2310, 0x0001, 0, 2, 0, 0 },
++	{ 0x2312, 0x0001, 0, 2, 0, 0 },
++	{ 0x2314, 0x0001, 0, 2, 0, 0 },
++	{ 0x2316, 0x0000, 0, 2, 0, 0 },
++	{ 0x2318, 0x0001, 0, 2, 0, 0 },
++	{ 0x231a, 0x007f, 0, 2, 0, 0 },
++	{ 0x231c, 0x007f, 0, 2, 0, 0 },
++	{ 0x231e, 0x007f, 0, 2, 0, 0 },
++	{ 0x2320, 0x0020, 0, 2, 0, 0 },
++	{ 0x2322, 0xffff, 0, 2, 0, 0 },
++	{ 0x2324, 0x0080, 0, 2, 0, 0 },
++	{ 0x2326, 0x0080, 0, 2, 0, 0 },
++	{ 0x2328, 0x0080, 0, 2, 0, 0 },
++	{ 0x232e, 0x00ff, 0, 2, 0, 0 },
++	{ 0x2330, 0x00ff, 0, 2, 0, 0 },
++	{ 0x2332, 0x00ff, 0, 2, 0, 0 },
++	{ 0x2338, 0x0100, 0, 2, 0, 0 },
++	{ 0x233a, 0x0100, 0, 2, 0, 0 },
++	{ 0x233c, 0x0100, 0, 2, 0, 0 },
++	{ 0x2342, 0x03ff, 0, 2, 0, 0 },
++	{ 0x2344, 0x03ff, 0, 2, 0, 0 },
++	{ 0x2346, 0x03ff, 0, 2, 0, 0 },
++	{ 0x234c, 0x0400, 0, 2, 0, 0 },
++	{ 0x234e, 0x0400, 0, 2, 0, 0 },
++	{ 0x2350, 0x0400, 0, 2, 0, 0 },
++	{ 0x2352, 0x0020, 0, 2, 0, 0 },
++	{ 0x2354, 0xffff, 0, 2, 0, 0 },
++	{ 0x2356, 0x3000, 0, 2, 0, 0 },
++	{ 0x2358, 0x30c3, 0, 2, 0, 0 },
++	{ 0x235a, 0x0000, 0, 2, 0, 0 },
++	{ 0x235c, 0x30c3, 0, 2, 0, 0 },
++	{ 0x2360, 0xfd98, 0, 2, 0, 0 },
++	{ 0x2364, 0x3000, 0, 2, 0, 0 },
++	{ 0x2366, 0x30c3, 0, 2, 0, 0 },
++	{ 0x2368, 0x30c3, 0, 2, 0, 0 },
++	{ 0x236a, 0x0000, 0, 2, 0, 0 },
++	{ 0x236e, 0xfd9e, 0, 2, 0, 0 },
++	{ 0x2370, 0x0000, 0, 2, 0, 0 },
++	{ 0x2372, 0x3000, 0, 2, 0, 0 },
++	{ 0x2374, 0x30c3, 0, 2, 0, 0 },
++	{ 0x2376, 0x30c3, 0, 2, 0, 0 },
++	{ 0x2378, 0x0000, 0, 2, 0, 0 },
++	{ 0x237c, 0xfd92, 0, 2, 0, 0 },
++	{ 0x237e, 0x0000, 0, 2, 0, 0 },
++	{ 0x2380, 0x0003, 0, 2, 0, 0 },
++	{ 0x2382, 0x000d, 0, 2, 0, 0 },
++	{ 0x2384, 0x000d, 0, 2, 0, 0 },
++	{ 0x2386, 0x0005, 0, 2, 0, 0 },
++	{ 0x238a, 0xf43c, 0, 2, 0, 0 },
++	{ 0x238c, 0x0000, 0, 2, 0, 0 },
++	{ 0x239a, 0x0000, 0, 2, 0, 0 },
++	{ 0x239c, 0x0000, 0, 2, 0, 0 },
++	{ 0x239e, 0x0000, 0, 2, 0, 0 },
++	{ 0x23a0, 0x0000, 0, 2, 0, 0 },
++	{ 0x23a2, 0x0000, 0, 2, 0, 0 },
++	{ 0x23a6, 0x0000, 0, 2, 0, 0 },
++	{ 0x23a8, 0x0000, 0, 2, 0, 0 },
++	{ 0x23aa, 0x0000, 0, 2, 0, 0 },
++	{ 0x23ac, 0x0000, 0, 2, 0, 0 },
++	{ 0x23ae, 0x0000, 0, 2, 0, 0 },
++	{ 0x23b0, 0x0000, 0, 2, 0, 0 },
++	{ 0x23b4, 0x0000, 0, 2, 0, 0 },
++	{ 0x23b6, 0x0000, 0, 2, 0, 0 },
++	{ 0x23ac, 0x0000, 0, 2, 0, 0 },
++	{ 0x23ae, 0x0000, 0, 2, 0, 0 },
++	{ 0x23b0, 0x0000, 0, 2, 0, 0 },
++	{ 0x23b4, 0x0000, 0, 2, 0, 0 },
++	{ 0x23b6, 0x0000, 0, 2, 0, 0 },
++	{ 0x23c6, 0x3000, 0, 2, 0, 0 },
++	{ 0x23c8, 0x30c3, 0, 2, 0, 0 },
++	{ 0x23ca, 0x0000, 0, 2, 0, 0 },
++	{ 0x23cc, 0x30c3, 0, 2, 0, 0 },
++	{ 0x23ce, 0xf71c, 0, 2, 0, 0 },
++	{ 0x23d0, 0xfd98, 0, 2, 0, 0 },
++	{ 0x23d4, 0x3000, 0, 2, 0, 0 },
++	{ 0x23d6, 0x30c3, 0, 2, 0, 0 },
++	{ 0x23d8, 0x30c3, 0, 2, 0, 0 },
++	{ 0x23da, 0x0000, 0, 2, 0, 0 },
++	{ 0x23dc, 0x0003, 0, 2, 0, 0 },
++	{ 0x23de, 0xfd9e, 0, 2, 0, 0 },
++	{ 0x23e2, 0x3000, 0, 2, 0, 0 },
++	{ 0x23e4, 0x30c3, 0, 2, 0, 0 },
++	{ 0x23e6, 0x30c3, 0, 2, 0, 0 },
++	{ 0x23e8, 0x0000, 0, 2, 0, 0 },
++	{ 0x23ec, 0xfd92, 0, 2, 0, 0 },
++	{ 0x23f0, 0xd100, 0, 2, 0, 0 },
++	{ 0x23f2, 0xd100, 0, 2, 0, 0 },
++	{ 0x23f4, 0xd100, 0, 2, 0, 0 },
++	{ 0x23f6, 0x5100, 0, 2, 0, 0 },
++	{ 0x23f8, 0xffff, 0, 2, 0, 0 },
++	{ 0x23fa, 0xf40c, 0, 2, 0, 0 },
++	{ 0x23fe, 0x0003, 0, 2, 0, 0 },
++	{ 0x2400, 0x000d, 0, 2, 0, 0 },
++	{ 0x2402, 0x000d, 0, 2, 0, 0 },
++	{ 0x2404, 0x000a, 0, 2, 0, 0 },
++	{ 0x2406, 0xffff, 0, 2, 0, 0 },
++	{ 0x2408, 0xf43c, 0, 2, 0, 0 },
++	{ 0x240c, 0x0000, 0, 2, 0, 0 },
++	{ 0x240e, 0x0000, 0, 2, 0, 0 },
++	{ 0x2410, 0x0000, 0, 2, 0, 0 },
++	{ 0x2412, 0x0000, 0, 2, 0, 0 },
++	{ 0x2414, 0xffff, 0, 2, 0, 0 },
++	{ 0x2416, 0xf440, 0, 2, 0, 0 },
++	{ 0x2418, 0x0000, 0, 2, 0, 0 },
++	{ 0x241a, 0x0000, 0, 2, 0, 0 },
++	{ 0x241c, 0x0000, 0, 2, 0, 0 },
++	{ 0x241e, 0x0000, 0, 2, 0, 0 },
++	{ 0x2420, 0x0000, 0, 2, 0, 0 },
++	{ 0x2422, 0xffff, 0, 2, 0, 0 },
++	{ 0x2424, 0x0000, 0, 2, 0, 0 },
++	{ 0x2426, 0x0000, 0, 2, 0, 0 },
++	{ 0x2428, 0x0000, 0, 2, 0, 0 },
++	{ 0x242a, 0x0000, 0, 2, 0, 0 },
++	{ 0x242c, 0x0000, 0, 2, 0, 0 },
++	{ 0x242e, 0x0000, 0, 2, 0, 0 },
++	{ 0x2430, 0xffff, 0, 2, 0, 0 },
++	{ 0x2432, 0x0000, 0, 2, 0, 0 },
++	{ 0x2434, 0x0000, 0, 2, 0, 0 },
++	{ 0x2436, 0x0006, 0, 2, 0, 0 },
++	{ 0x2438, 0x0006, 0, 2, 0, 0 },
++	{ 0x243a, 0x0007, 0, 2, 0, 0 },
++	{ 0x243c, 0x0009, 0, 2, 0, 0 },
++	{ 0x243e, 0xffff, 0, 2, 0, 0 },
++	{ 0x2440, 0x0818, 0, 2, 0, 0 },
++	{ 0x2442, 0x0101, 0, 2, 0, 0 },
++	{ 0x2444, 0x0006, 0, 2, 0, 0 },
++	{ 0x2446, 0x0006, 0, 2, 0, 0 },
++	{ 0x2448, 0x0007, 0, 2, 0, 0 },
++	{ 0x244a, 0x0009, 0, 2, 0, 0 },
++	{ 0x244c, 0xffff, 0, 2, 0, 0 },
++	{ 0x244e, 0x0918, 0, 2, 0, 0 },
++	{ 0x2450, 0x0101, 0, 2, 0, 0 },
++	{ 0x2452, 0x0000, 0, 2, 0, 0 },
++	{ 0x2454, 0x0000, 0, 2, 0, 0 },
++	{ 0x2456, 0x0000, 0, 2, 0, 0 },
++	{ 0x2458, 0x0000, 0, 2, 0, 0 },
++	{ 0x245a, 0xffff, 0, 2, 0, 0 },
++	{ 0x245c, 0x0800, 0, 2, 0, 0 },
++	{ 0x245e, 0x0101, 0, 2, 0, 0 },
++	{ 0x2460, 0x0001, 0, 2, 0, 0 },
++	{ 0x2462, 0x0000, 0, 2, 0, 0 },
++	{ 0x2464, 0x0000, 0, 2, 0, 0 },
++	{ 0x2466, 0x0000, 0, 2, 0, 0 },
++	{ 0x2468, 0xffff, 0, 2, 0, 0 },
++	{ 0x246a, 0x0900, 0, 2, 0, 0 },
++	{ 0x246c, 0x0101, 0, 2, 0, 0 },
++	{ 0x246e, 0x0000, 0, 2, 0, 0 },
++	{ 0x2474, 0x0000, 0, 2, 0, 0 },
++	{ 0x2478, 0xcc04, 0, 2, 0, 0 },
++	{ 0x247c, 0x000f, 0, 2, 0, 0 },
++	{ 0x247e, 0x000f, 0, 2, 0, 0 },
++	{ 0x2480, 0x000f, 0, 2, 0, 0 },
++	{ 0x2482, 0x000f, 0, 2, 0, 0 },
++	{ 0x2486, 0xcc06, 0, 2, 0, 0 },
++	{ 0x24a6, 0x3000, 0, 2, 0, 0 },
++	{ 0x24ac, 0x3000, 0, 2, 0, 0 },
++	{ 0x24ae, 0xffff, 0, 2, 0, 0 },
++	{ 0x24b0, 0x0000, 0, 2, 0, 0 },
++	{ 0x24b4, 0x0000, 0, 2, 0, 0 },
++	{ 0x24ba, 0x0000, 0, 2, 0, 0 },
++	{ 0x24be, 0x0000, 0, 2, 0, 0 },
++	{ 0x24c2, 0x0000, 0, 2, 0, 0 },
++	{ 0x24c8, 0x0000, 0, 2, 0, 0 },
++	{ 0x24cc, 0x0000, 0, 2, 0, 0 },
++	{ 0x24d0, 0x0000, 0, 2, 0, 0 },
++	{ 0x24d6, 0x0000, 0, 2, 0, 0 },
++	{ 0x24da, 0x0000, 0, 2, 0, 0 },
++	{ 0x24de, 0x0000, 0, 2, 0, 0 },
++	{ 0x24e4, 0x0000, 0, 2, 0, 0 },
++	{ 0x24e8, 0x0000, 0, 2, 0, 0 },
++	{ 0x24ec, 0x0000, 0, 2, 0, 0 },
++	{ 0x24f2, 0x0000, 0, 2, 0, 0 },
++	{ 0x24f6, 0x0000, 0, 2, 0, 0 },
++	{ 0x24fa, 0x0000, 0, 2, 0, 0 },
++	{ 0x2500, 0x0000, 0, 2, 0, 0 },
++	{ 0x2504, 0x0000, 0, 2, 0, 0 },
++	{ 0x2508, 0x0000, 0, 2, 0, 0 },
++	{ 0x250e, 0x0000, 0, 2, 0, 0 },
++	{ 0x2512, 0x0000, 0, 2, 0, 0 },
++	{ 0x2516, 0x0001, 0, 2, 0, 0 },
++	{ 0x251c, 0x0001, 0, 2, 0, 0 },
++	{ 0x2520, 0x0b02, 0, 2, 0, 0 },
++	{ 0x2522, 0x0610, 0, 2, 0, 0 },
++	{ 0x2524, 0x0000, 0, 2, 0, 0 },
++	{ 0x252a, 0x0000, 0, 2, 0, 0 },
++	{ 0x252e, 0x0000, 0, 2, 0, 0 },
++	{ 0x2530, 0x0000, 0, 2, 0, 0 },
++	{ 0x2532, 0x0000, 0, 2, 0, 0 },
++	{ 0x2538, 0x0000, 0, 2, 0, 0 },
++	{ 0x253c, 0x0000, 0, 2, 0, 0 },
++	{ 0x253e, 0x0000, 0, 2, 0, 0 },
++	{ 0x2540, 0x0000, 0, 2, 0, 0 },
++	{ 0x2546, 0x0000, 0, 2, 0, 0 },
++	{ 0x254a, 0x0000, 0, 2, 0, 0 },
++	{ 0x254c, 0x0000, 0, 2, 0, 0 },
++	{ 0x2586, 0x0001, 0, 2, 0, 0 },
++	{ 0x2900, 0x0001, 0, 2, 0, 0 },
++	{ 0x2910, 0x06ed, 0, 2, 0, 0 },
++	{ 0x2912, 0x06ed, 0, 2, 0, 0 },
++	{ 0x2914, 0x06ed, 0, 2, 0, 0 },
++	{ 0x2916, 0x06ed, 0, 2, 0, 0 },
++	{ 0x2918, 0x06ea, 0, 2, 0, 0 },
++	{ 0x291a, 0x06ea, 0, 2, 0, 0 },
++	{ 0x291c, 0x06ea, 0, 2, 0, 0 },
++	{ 0x291e, 0x06ea, 0, 2, 0, 0 },
++	{ 0x2920, 0x0200, 0, 2, 0, 0 },
++	{ 0x2922, 0x0200, 0, 2, 0, 0 },
++	{ 0x2924, 0x06eb, 0, 2, 0, 0 },
++	{ 0x292c, 0x07ff, 0, 2, 0, 0 },
++	{ 0x292e, 0x06ea, 0, 2, 0, 0 },
++	{ 0x2930, 0x0000, 0, 2, 0, 0 },
++	{ 0x2944, 0x0000, 0, 2, 0, 0 },
++	{ 0x2946, 0x0000, 0, 2, 0, 0 },
++	{ 0x2948, 0x0000, 0, 2, 0, 0 },
++	{ 0x294a, 0x0000, 0, 2, 0, 0 },
++	{ 0x294c, 0x0000, 0, 2, 0, 0 },
++	{ 0x294e, 0x0000, 0, 2, 0, 0 },
++	{ 0x2950, 0x0000, 0, 2, 0, 0 },
++	{ 0x2952, 0x0000, 0, 2, 0, 0 },
++	{ 0x2954, 0x0000, 0, 2, 0, 0 },
++	{ 0x2956, 0x0000, 0, 2, 0, 0 },
++	{ 0x295e, 0x0000, 0, 2, 0, 0 },
++	{ 0x2960, 0x0000, 0, 2, 0, 0 },
++	{ 0x2962, 0x0000, 0, 2, 0, 0 },
++	{ 0x2964, 0x0000, 0, 2, 0, 0 },
++	{ 0x2966, 0x0000, 0, 2, 0, 0 },
++	{ 0x2968, 0x0000, 0, 2, 0, 0 },
++	{ 0x29b2, 0x0000, 0, 2, 0, 0 },
++	{ 0x29b6, 0xffff, 0, 2, 0, 0 },
++	{ 0x29b8, 0x0012, 0, 2, 0, 0 },
++	{ 0x29c6, 0x3efc, 0, 2, 0, 0 },
++	{ 0x29c8, 0x0dd6, 0, 2, 0, 0 },
++	{ 0x29ca, 0x041d, 0, 2, 0, 0 },
++	{ 0x29cc, 0x041d, 0, 2, 0, 0 },
++	{ 0x29ce, 0x041d, 0, 2, 0, 0 },
++	{ 0x29d0, 0x041d, 0, 2, 0, 0 },
++	{ 0x29d2, 0x06ae, 0, 2, 0, 0 },
++	{ 0x29d4, 0x06ae, 0, 2, 0, 0 },
++	{ 0x29d6, 0x06ae, 0, 2, 0, 0 },
++	{ 0x29d8, 0x06ae, 0, 2, 0, 0 },
++	{ 0x29da, 0x0001, 0, 2, 0, 0 },
++	{ 0x29dc, 0x0001, 0, 2, 0, 0 },
++	{ 0x29de, 0x0001, 0, 2, 0, 0 },
++	{ 0x29e0, 0x0001, 0, 2, 0, 0 },
++	{ 0x29e2, 0x0000, 0, 2, 0, 0 },
++	{ 0x29e4, 0x0000, 0, 2, 0, 0 },
++	{ 0x29e6, 0x0000, 0, 2, 0, 0 },
++	{ 0x29e8, 0x0000, 0, 2, 0, 0 },
++	{ 0x29ea, 0x0001, 0, 2, 0, 0 },
++	{ 0x29ec, 0x8000, 0, 2, 0, 0 },
++	{ 0x29ee, 0x8000, 0, 2, 0, 0 },
++	{ 0x29f0, 0x8000, 0, 2, 0, 0 },
++	{ 0x29f2, 0x8000, 0, 2, 0, 0 },
++	{ 0x29f4, 0x0000, 0, 2, 0, 0 },
++	{ 0x29f6, 0x0000, 0, 2, 0, 0 },
++	{ 0x29f8, 0x0000, 0, 2, 0, 0 },
++	{ 0x29fa, 0x0000, 0, 2, 0, 0 },
++	{ 0x29fc, 0x3210, 0, 2, 0, 0 },
++	{ 0x29fe, 0x0002, 0, 2, 0, 0 },
++	{ 0x2a0a, 0x3c00, 0, 2, 0, 0 },
++	{ 0x2a0c, 0x3c00, 0, 2, 0, 0 },
++	{ 0x2a0e, 0x3000, 0, 2, 0, 0 },
++	{ 0x2a10, 0x3000, 0, 2, 0, 0 },
++	{ 0x2a12, 0x3000, 0, 2, 0, 0 },
++	{ 0x2a14, 0x3000, 0, 2, 0, 0 },
++	{ 0x2a16, 0x06ae, 0, 2, 0, 0 },
++	{ 0x2a18, 0x06ae, 0, 2, 0, 0 },
++	{ 0x2a1a, 0x06ae, 0, 2, 0, 0 },
++	{ 0x2a1c, 0x06ae, 0, 2, 0, 0 },
++	{ 0x2a1e, 0x0000, 0, 2, 0, 0 },
++	{ 0x2a20, 0x0000, 0, 2, 0, 0 },
++	{ 0x2a22, 0x0000, 0, 2, 0, 0 },
++	{ 0x2a24, 0x0000, 0, 2, 0, 0 },
++	{ 0x2a26, 0x0000, 0, 2, 0, 0 },
++	{ 0x2a28, 0x0000, 0, 2, 0, 0 },
++	{ 0x2a2a, 0x0000, 0, 2, 0, 0 },
++	{ 0x2a2c, 0x0000, 0, 2, 0, 0 },
++	{ 0x2a2e, 0x0001, 0, 2, 0, 0 },
++	{ 0x2a30, 0x0000, 0, 2, 0, 0 },
++	{ 0x2a32, 0x0000, 0, 2, 0, 0 },
++	{ 0x2a34, 0x0000, 0, 2, 0, 0 },
++	{ 0x2a36, 0x0000, 0, 2, 0, 0 },
++	{ 0x2a38, 0x0000, 0, 2, 0, 0 },
++	{ 0x2a3a, 0x0000, 0, 2, 0, 0 },
++	{ 0x2a3c, 0x0000, 0, 2, 0, 0 },
++	{ 0x2a3e, 0x0000, 0, 2, 0, 0 },
++	{ 0x2a40, 0x3210, 0, 2, 0, 0 },
++	{ 0x2a42, 0x0001, 0, 2, 0, 0 },
++	{ 0x2afa, 0x0003, 0, 2, 0, 0 },
++	{ 0x2eb0, 0x0000, 0, 2, 0, 0 },
++	{ 0x2ee2, 0x0030, 0, 2, 0, 0 },
++	{ 0x2ee8, 0x0010, 0, 2, 0, 0 },
++	{ 0x2f64, 0x0050, 0, 2, 0, 0 },
++	{ 0x2f6e, 0x005b, 0, 2, 0, 0 },
++	{ 0x2f98, 0x0073, 0, 2, 0, 0 },
++	{ 0x2fa2, 0x005b, 0, 2, 0, 0 },
++	{ 0x2fcc, 0x0073, 0, 2, 0, 0 },
++	{ 0x2fd6, 0x005b, 0, 2, 0, 0 },
++	{ 0x304e, 0x001e, 0, 2, 0, 0 },
++	{ 0x3058, 0x05ae, 0, 2, 0, 0 },
++	{ 0x30b6, 0x001e, 0, 2, 0, 0 },
++	{ 0x30c0, 0x05ae, 0, 2, 0, 0 },
++	{ 0x3256, 0x008a, 0, 2, 0, 0 },
++	{ 0x3260, 0x0240, 0, 2, 0, 0 },
++	{ 0x328a, 0x008a, 0, 2, 0, 0 },
++	{ 0x3294, 0x0591, 0, 2, 0, 0 },
++	{ 0x32be, 0x00ee, 0, 2, 0, 0 },
++	{ 0x32c8, 0x0220, 0, 2, 0, 0 },
++	{ 0x32f2, 0x00ee, 0, 2, 0, 0 },
++	{ 0x32fc, 0x0240, 0, 2, 0, 0 },
++	{ 0x3326, 0x001e, 0, 2, 0, 0 },
++	{ 0x3330, 0x0220, 0, 2, 0, 0 },
++	{ 0x335a, 0x001e, 0, 2, 0, 0 },
++	{ 0x3364, 0x0591, 0, 2, 0, 0 },
++	{ 0x344e, 0x0591, 0, 2, 0, 0 },
++	{ 0x345e, 0x00ad, 0, 2, 0, 0 },
++	{ 0x3468, 0x00ad, 0, 2, 0, 0 },
++	{ 0x349c, 0x05ad, 0, 2, 0, 0 },
++	{ 0x3596, 0x0006, 0, 2, 0, 0 },
++	{ 0x35b0, 0x001e, 0, 2, 0, 0 },
++	{ 0x3670, 0x05d3, 0, 2, 0, 0 },
++	{ 0x567e, 0x0064, 0, 2, 0, 0 },
++	{ 0x5688, 0x0068, 0, 2, 0, 0 },
++	{ 0x56a2, 0x0068, 0, 2, 0, 0 },
++	{ 0x56b2, 0x0064, 0, 2, 0, 0 },
++	{ 0x56bc, 0x0096, 0, 2, 0, 0 },
++	{ 0x56d6, 0x0068, 0, 2, 0, 0 },
++	{ 0x56f0, 0x0096, 0, 2, 0, 0 },
++	{ 0x570a, 0x00b4, 0, 2, 0, 0 },
++	{ 0x7152, 0x0000, 0, 2, 0, 0 },
++	{ 0x7154, 0x0000, 0, 2, 0, 0 },
++	{ 0x715e, 0x001e, 0, 2, 0, 0 },
++	{ 0x7160, 0x0514, 0, 2, 0, 0 },
++	{ 0x7166, 0x001e, 0, 2, 0, 0 },
++	{ 0x7168, 0x0514, 0, 2, 0, 0 },
++	{ 0x7172, 0x0000, 0, 2, 0, 0 },
++	{ 0x7174, 0x0000, 0, 2, 0, 0 },
++	{ 0x717e, 0x0000, 0, 2, 0, 0 },
++	{ 0x7180, 0x0000, 0, 2, 0, 0 },
++	{ 0x718e, 0x0000, 0, 2, 0, 0 },
++	{ 0x7190, 0x0000, 0, 2, 0, 0 },
++	{ 0x7196, 0x008a, 0, 2, 0, 0 },
++	{ 0x7198, 0x8864, 0, 2, 0, 0 },
++	{ 0x719e, 0x00ee, 0, 2, 0, 0 },
++	{ 0x71a0, 0x8864, 0, 2, 0, 0 },
++	{ 0x71a2, 0x0000, 0, 2, 0, 0 },
++	{ 0x71a4, 0x0000, 0, 2, 0, 0 },
++	{ 0x71a6, 0x001e, 0, 2, 0, 0 },
++	{ 0x71a8, 0x8864, 0, 2, 0, 0 },
++	{ 0x7206, 0x0000, 0, 2, 0, 0 },
++	{ 0x7208, 0x0000, 0, 2, 0, 0 },
++	{ 0x722a, 0x0000, 0, 2, 0, 0 },
++	{ 0x722c, 0x0000, 0, 2, 0, 0 },
++	{ 0x7232, 0x0000, 0, 2, 0, 0 },
++	{ 0x7234, 0x0000, 0, 2, 0, 0 },
++	{ 0x723a, 0x0000, 0, 2, 0, 0 },
++	{ 0x723c, 0x0000, 0, 2, 0, 0 },
++	{ 0x7242, 0x0000, 0, 2, 0, 0 },
++	{ 0x7244, 0x0000, 0, 2, 0, 0 },
++	{ 0x7246, 0x001e, 0, 2, 0, 0 },
++	{ 0x7248, 0x0024, 0, 2, 0, 0 },
++	{ 0x7266, 0x0000, 0, 2, 0, 0 },
++	{ 0x7268, 0x0000, 0, 2, 0, 0 },
++	{ 0x726e, 0x0126, 0, 2, 0, 0 },
++	{ 0x7270, 0x0526, 0, 2, 0, 0 },
++	{ 0x7276, 0x012e, 0, 2, 0, 0 },
++	{ 0x7278, 0x052e, 0, 2, 0, 0 },
++	{ 0x727e, 0x0112, 0, 2, 0, 0 },
++	{ 0x7280, 0x0526, 0, 2, 0, 0 },
++	{ 0x7286, 0x011a, 0, 2, 0, 0 },
++	{ 0x7288, 0x052e, 0, 2, 0, 0 },
++	{ 0x72c6, 0x0000, 0, 2, 0, 0 },
++	{ 0x72c8, 0x0000, 0, 2, 0, 0 },
++	{ 0x72ce, 0x0000, 0, 2, 0, 0 },
++	{ 0x72d0, 0x0000, 0, 2, 0, 0 },
++	{ 0x72fe, 0x0000, 0, 2, 0, 0 },
++	{ 0x7300, 0x0000, 0, 2, 0, 0 },
++	{ 0x7306, 0x0000, 0, 2, 0, 0 },
++	{ 0x7308, 0x0000, 0, 2, 0, 0 },
++	{ 0x7336, 0x0000, 0, 2, 0, 0 },
++	{ 0x7338, 0x0000, 0, 2, 0, 0 },
++	{ 0x733e, 0x0000, 0, 2, 0, 0 },
++	{ 0x7340, 0x0000, 0, 2, 0, 0 },
++	{ 0x734a, 0x0000, 0, 2, 0, 0 },
++	{ 0x734c, 0x0000, 0, 2, 0, 0 },
++	{ 0x7352, 0x0000, 0, 2, 0, 0 },
++	{ 0x7354, 0x0000, 0, 2, 0, 0 },
++	{ 0x7396, 0x0000, 0, 2, 0, 0 },
++	{ 0x7398, 0x0000, 0, 2, 0, 0 },
++	{ 0x739e, 0x0000, 0, 2, 0, 0 },
++	{ 0x73a0, 0x0000, 0, 2, 0, 0 },
++	{ 0x73ce, 0x0000, 0, 2, 0, 0 },
++	{ 0x73d0, 0x0000, 0, 2, 0, 0 },
++	{ 0x73d6, 0x0000, 0, 2, 0, 0 },
++	{ 0x73d8, 0x0000, 0, 2, 0, 0 },
++	{ 0x7406, 0x0000, 0, 2, 0, 0 },
++	{ 0x7408, 0x0000, 0, 2, 0, 0 },
++	{ 0x740e, 0x0000, 0, 2, 0, 0 },
++	{ 0x7410, 0x0000, 0, 2, 0, 0 },
++	{ 0x743e, 0x0000, 0, 2, 0, 0 },
++	{ 0x7440, 0x0000, 0, 2, 0, 0 },
++	{ 0x7446, 0x0000, 0, 2, 0, 0 },
++	{ 0x7448, 0x0000, 0, 2, 0, 0 },
++	{ 0x745a, 0x03a0, 0, 2, 0, 0 },
++	{ 0x745c, 0x0490, 0, 2, 0, 0 },
++	{ 0x745e, 0x0000, 0, 2, 0, 0 },
++	{ 0x7460, 0x0000, 0, 2, 0, 0 },
++	{ 0x747e, 0x0000, 0, 2, 0, 0 },
++	{ 0x7480, 0x0000, 0, 2, 0, 0 },
++	{ 0x748a, 0x0000, 0, 2, 0, 0 },
++	{ 0x748c, 0x0000, 0, 2, 0, 0 },
++	{ 0x74aa, 0x0216, 0, 2, 0, 0 },
++	{ 0x74ac, 0x0269, 0, 2, 0, 0 },
++	{ 0x74ce, 0x0000, 0, 2, 0, 0 },
++	{ 0x74d0, 0x0000, 0, 2, 0, 0 },
++	{ 0x74da, 0x0000, 0, 2, 0, 0 },
++	{ 0x74dc, 0x0000, 0, 2, 0, 0 },
++	{ 0x74f6, 0x0000, 0, 2, 0, 0 },
++	{ 0x74f8, 0x0000, 0, 2, 0, 0 },
++	{ 0x7506, 0x025e, 0, 2, 0, 0 },
++	{ 0x7508, 0x0266, 0, 2, 0, 0 },
++	{ 0x7522, 0x0000, 0, 2, 0, 0 },
++	{ 0x7524, 0x0000, 0, 2, 0, 0 },
++	{ 0x752a, 0x0000, 0, 2, 0, 0 },
++	{ 0x752c, 0x0000, 0, 2, 0, 0 },
++	{ 0x7532, 0x0000, 0, 2, 0, 0 },
++	{ 0x7534, 0x0000, 0, 2, 0, 0 },
++	{ 0x7572, 0x0000, 0, 2, 0, 0 },
++	{ 0x7574, 0x0000, 0, 2, 0, 0 },
++	{ 0x7576, 0x0000, 0, 2, 0, 0 },
++	{ 0x7578, 0x0000, 0, 2, 0, 0 },
++	{ 0x757a, 0x0000, 0, 2, 0, 0 },
++	{ 0x757c, 0x0000, 0, 2, 0, 0 },
++	{ 0x757e, 0x0000, 0, 2, 0, 0 },
++	{ 0x7580, 0x0000, 0, 2, 0, 0 },
++	{ 0x7582, 0x0000, 0, 2, 0, 0 },
++	{ 0x7584, 0x0000, 0, 2, 0, 0 },
++	{ 0x7586, 0x0000, 0, 2, 0, 0 },
++	{ 0x7588, 0x0000, 0, 2, 0, 0 },
++	{ 0x758a, 0x0000, 0, 2, 0, 0 },
++	{ 0x758c, 0x0000, 0, 2, 0, 0 },
++	{ 0x758e, 0x0000, 0, 2, 0, 0 },
++	{ 0x7590, 0x0000, 0, 2, 0, 0 },
++	{ 0x7592, 0x0000, 0, 2, 0, 0 },
++	{ 0x7594, 0x0000, 0, 2, 0, 0 },
++	{ 0x7596, 0x0000, 0, 2, 0, 0 },
++	{ 0x7598, 0x0000, 0, 2, 0, 0 },
++	{ 0x759a, 0x0000, 0, 2, 0, 0 },
++	{ 0x759c, 0x0000, 0, 2, 0, 0 },
++	{ 0x759e, 0x0000, 0, 2, 0, 0 },
++	{ 0x75a0, 0x0000, 0, 2, 0, 0 },
++	{ 0x75a2, 0x0000, 0, 2, 0, 0 },
++	{ 0x75a4, 0x0000, 0, 2, 0, 0 },
++	{ 0x75a6, 0x0000, 0, 2, 0, 0 },
++	{ 0x75a8, 0x0000, 0, 2, 0, 0 },
++	{ 0x75c6, 0x0000, 0, 2, 0, 0 },
++	{ 0x75c8, 0x0000, 0, 2, 0, 0 },
++	{ 0x75ca, 0x0000, 0, 2, 0, 0 },
++	{ 0x75cc, 0x0000, 0, 2, 0, 0 },
++	{ 0x75ce, 0x0000, 0, 2, 0, 0 },
++	{ 0x75d0, 0x0000, 0, 2, 0, 0 },
++	{ 0x75d2, 0x0000, 0, 2, 0, 0 },
++	{ 0x75d4, 0x0000, 0, 2, 0, 0 },
++	{ 0x75d6, 0x0000, 0, 2, 0, 0 },
++	{ 0x75d8, 0x0000, 0, 2, 0, 0 },
++	{ 0x75da, 0x0000, 0, 2, 0, 0 },
++	{ 0x75dc, 0x0000, 0, 2, 0, 0 },
++	{ 0x75de, 0x0000, 0, 2, 0, 0 },
++	{ 0x75e0, 0x0000, 0, 2, 0, 0 },
++	{ 0x75e6, 0x0000, 0, 2, 0, 0 },
++	{ 0x75e8, 0x0000, 0, 2, 0, 0 },
++	{ 0x75f6, 0x0000, 0, 2, 0, 0 },
++	{ 0x75f8, 0x0000, 0, 2, 0, 0 },
++	{ 0x75fe, 0x0000, 0, 2, 0, 0 },
++	{ 0x7600, 0x0000, 0, 2, 0, 0 },
++	{ 0x7636, 0x0000, 0, 2, 0, 0 },
++	{ 0x7638, 0x0000, 0, 2, 0, 0 },
++	{ 0x763a, 0x0000, 0, 2, 0, 0 },
++	{ 0x763c, 0x0000, 0, 2, 0, 0 },
++	{ 0x7642, 0x0000, 0, 2, 0, 0 },
++	{ 0x7644, 0x0000, 0, 2, 0, 0 },
++	{ 0x764e, 0x0000, 0, 2, 0, 0 },
++	{ 0x7650, 0x0000, 0, 2, 0, 0 },
++	{ 0x765a, 0x0000, 0, 2, 0, 0 },
++	{ 0x765c, 0x0000, 0, 2, 0, 0 },
++	{ 0x767e, 0x0000, 0, 2, 0, 0 },
++	{ 0x7680, 0x0000, 0, 2, 0, 0 },
++	{ 0x768a, 0x0000, 0, 2, 0, 0 },
++	{ 0x768c, 0x0000, 0, 2, 0, 0 },
++	{ 0x76b6, 0x0000, 0, 2, 0, 0 },
++	{ 0x76b8, 0x0000, 0, 2, 0, 0 },
++	{ 0x76c2, 0x0000, 0, 2, 0, 0 },
++	{ 0x76c4, 0x0000, 0, 2, 0, 0 },
++	{ 0x76ee, 0x0000, 0, 2, 0, 0 },
++	{ 0x76f0, 0x0000, 0, 2, 0, 0 },
++	{ 0x76fa, 0x0000, 0, 2, 0, 0 },
++	{ 0x76fc, 0x0000, 0, 2, 0, 0 },
++	{ 0x77dc, 0x0000, 0, 2, 0, 0 },
++	{ 0x77e0, 0x03e2, 0, 2, 0, 0 },
++	{ 0x77e2, 0x0550, 0, 2, 0, 0 },
++	{ 0x77ec, 0x0880, 0, 2, 0, 0 },
++	{ 0x782e, 0x0321, 0, 2, 0, 0 },
++	{ 0x78a8, 0x0008, 0, 2, 0, 0 },
++	{ 0x78b8, 0x0000, 0, 2, 0, 0 },
++	{ 0x78c2, 0x0000, 0, 2, 0, 0 },
++	{ 0x7910, 0x000d, 0, 2, 0, 0 },
++	{ 0x7936, 0x0b0d, 0, 2, 0, 0 },
++	{ 0x7944, 0x0b0d, 0, 2, 0, 0 },
++	{ 0x7950, 0x0000, 0, 2, 0, 0 },
++	{ 0x7954, 0x0000, 0, 2, 0, 0 },
++	{ 0x795e, 0x0000, 0, 2, 0, 0 },
++	{ 0x79fa, 0x7001, 0, 2, 0, 0 },
++	{ 0x7a0e, 0x931c, 0, 2, 0, 0 },
++	{ 0x7a1c, 0xfffc, 0, 2, 0, 0 },
++	{ 0x7a36, 0x18c1, 0, 2, 0, 0 },
++	{ 0x7a3c, 0x0198, 0, 2, 0, 0 },
++	{ 0x7a3e, 0x1df8, 0, 2, 0, 0 },
++	{ 0x7a40, 0x1d98, 0, 2, 0, 0 },
++	{ 0x7a44, 0xff00, 0, 2, 0, 0 },
++	{ 0x7a62, 0x0007, 0, 2, 0, 0 },
++	{ 0x7a7c, 0xf1c7, 0, 2, 0, 0 },
++	{ 0x7a7e, 0xf1c1, 0, 2, 0, 0 },
++	{ 0x7a8a, 0x001c, 0, 2, 0, 0 },
++	{ 0x7a8c, 0x001c, 0, 2, 0, 0 },
++	{ 0x7aaa, 0x00ea, 0, 2, 0, 0 },
++	{ 0x7aae, 0x00a1, 0, 2, 0, 0 },
++	{ 0x7ab0, 0x005f, 0, 2, 0, 0 },
++	{ 0x7ab2, 0x00e8, 0, 2, 0, 0 },
++	{ 0x7ac6, 0x3e00, 0, 2, 0, 0 },
++	{ 0x7b78, 0xb960, 0, 2, 0, 0 },
++	{ 0x7b7a, 0x10f2, 0, 2, 0, 0 },
++	{ 0x7b7c, 0x3080, 0, 2, 0, 0 },
++	{ 0x7b80, 0x0fff, 0, 2, 0, 0 },
++	{ 0x7c0c, 0x000c, 0, 2, 0, 0 },
++	{ 0x7c0e, 0x0193, 0, 2, 0, 0 },
++	{ 0x7c1c, 0x0014, 0, 2, 0, 0 },
++	{ 0x7cb0, 0x0000, 0, 2, 0, 0 },
++	{ 0x7cba, 0x0001, 0, 2, 0, 0 },
++	{ 0x7cbc, 0x0000, 0, 2, 0, 0 },
++	{ 0x7cbe, 0x0000, 0, 2, 0, 0 },
++	{ 0x7cc0, 0x0000, 0, 2, 0, 0 },
++	{ 0x7cc2, 0x0000, 0, 2, 0, 0 },
++	{ 0x7cd0, 0x0080, 0, 2, 0, 0 },
++	{ 0x7cd2, 0xffff, 0, 2, 0, 0 },
++	{ 0x7cd4, 0xffff, 0, 2, 0, 0 },
++	{ 0x7ce2, 0x800f, 0, 2, 0, 0 },
++	{ 0x7cfc, 0x800f, 0, 2, 0, 0 },
++	{ 0x7d0e, 0x003f, 0, 2, 0, 0 },
++	{ 0x7d10, 0x001d, 0, 2, 0, 0 },
++	{ 0x7d14, 0x0014, 0, 2, 0, 0 },
++	{ 0x7d16, 0x0014, 0, 2, 0, 0 },
++	{ 0x7d18, 0x0013, 0, 2, 0, 0 },
++	{ 0x7d1a, 0x0013, 0, 2, 0, 0 },
++	{ 0x7e4a, 0x0000, 0, 2, 0, 0 },
++	{ 0x8680, 0x0001, 0, 2, 0, 0 },
++	{ 0x8682, 0x0001, 0, 2, 0, 0 },
++	{ 0x84c4, 0x0003, 0, 2, 0, 0 },
++	{ 0x8506, 0x0000, 0, 2, 0, 0 },
++	{ 0x8510, 0x0011, 0, 2, 0, 0 },
++	{ 0x8552, 0x0000, 0, 2, 0, 0 },
++	{ 0x85fc, 0xffc5, 0, 2, 0, 0 },
++	{ 0x8600, 0x3fe0, 0, 2, 0, 0 },
++	{ 0x860c, 0x0006, 0, 2, 0, 0 },
++	{ 0x8610, 0x0000, 0, 2, 0, 0 },
++	{ 0x8612, 0x0000, 0, 2, 0, 0 },
++	{ 0x8646, 0x0001, 0, 2, 0, 0 },
++	{ 0x8648, 0x0008, 0, 2, 0, 0 },
++	{ 0x864a, 0x0001, 0, 2, 0, 0 },
++	{ 0x864c, 0x0000, 0, 2, 0, 0 },
++	{ 0x8684, 0x0000, 0, 2, 0, 0 },
++	{ 0x8686, 0x0000, 0, 2, 0, 0 },
++	{ 0x8688, 0x0000, 0, 2, 0, 0 },
++	{ 0x86a0, 0xffff, 0, 2, 0, 0 },
++	{ 0x86c4, 0xffff, 0, 2, 0, 0 },
++	{ 0x86e4, 0x0008, 0, 2, 0, 0 },
++	{ 0x86e8, 0x000c, 0, 2, 0, 0 },
++	{ 0x86f0, 0x0000, 0, 2, 0, 0 },
++	{ 0x94a0, 0x0000, 0, 2, 0, 0 },
++	{ 0x94a2, 0x0000, 0, 2, 0, 0 },
++	{ 0x94a4, 0x0000, 0, 2, 0, 0 },
++	{ 0x94a6, 0x0000, 0, 2, 0, 0 },
++	{ 0x94a8, 0x0000, 0, 2, 0, 0 },
++	{ 0x94aa, 0x0000, 0, 2, 0, 0 },
++	{ 0x94ac, 0x0000, 0, 2, 0, 0 },
++	{ 0x94ae, 0x0000, 0, 2, 0, 0 },
++	{ 0x94b0, 0x0000, 0, 2, 0, 0 },
++	{ 0x94b2, 0x0000, 0, 2, 0, 0 },
++	{ 0x94b4, 0x0000, 0, 2, 0, 0 },
++	{ 0x94b6, 0x0000, 0, 2, 0, 0 },
++	{ 0x94b8, 0x0000, 0, 2, 0, 0 },
++	{ 0x94ba, 0x0000, 0, 2, 0, 0 },
++	{ 0x94bc, 0x0000, 0, 2, 0, 0 },
++	{ 0x94be, 0x0000, 0, 2, 0, 0 },
++	{ 0x94c0, 0x0000, 0, 2, 0, 0 },
++	{ 0x94c2, 0x0000, 0, 2, 0, 0 },
++	{ 0x94c4, 0x0000, 0, 2, 0, 0 },
++	{ 0x94c6, 0x0000, 0, 2, 0, 0 },
++	{ 0x94c8, 0x0000, 0, 2, 0, 0 },
++	{ 0x94ca, 0x0000, 0, 2, 0, 0 },
++	{ 0x94cc, 0x0000, 0, 2, 0, 0 },
++	{ 0x94ce, 0x0000, 0, 2, 0, 0 },
++	{ 0x94d0, 0x0000, 0, 2, 0, 0 },
++	{ 0x94d2, 0x0000, 0, 2, 0, 0 },
++	{ 0x94d4, 0x0000, 0, 2, 0, 0 },
++	{ 0x94d6, 0x0000, 0, 2, 0, 0 },
++	{ 0x94d8, 0x0000, 0, 2, 0, 0 },
++	{ 0x94da, 0x0000, 0, 2, 0, 0 },
++	{ 0x94dc, 0x0000, 0, 2, 0, 0 },
++	{ 0x94de, 0x0000, 0, 2, 0, 0 },
++	{ 0x94e0, 0x0000, 0, 2, 0, 0 },
++	{ 0x94e2, 0x0000, 0, 2, 0, 0 },
++	{ 0x94e4, 0x0000, 0, 2, 0, 0 },
++	{ 0x94e6, 0x0000, 0, 2, 0, 0 },
++	{ 0x94e8, 0x000a, 0, 2, 0, 0 },
++	{ 0x94ea, 0x000a, 0, 2, 0, 0 },
++	{ 0x94ec, 0x000a, 0, 2, 0, 0 },
++	{ 0x94ee, 0x000a, 0, 2, 0, 0 },
++	{ 0x94f0, 0x000a, 0, 2, 0, 0 },
++	{ 0x94f2, 0x000a, 0, 2, 0, 0 },
++	{ 0x94f4, 0x000a, 0, 2, 0, 0 },
++	{ 0x94f6, 0x000a, 0, 2, 0, 0 },
++	{ 0x94f8, 0x000a, 0, 2, 0, 0 },
++	{ 0x94fa, 0x000a, 0, 2, 0, 0 },
++	{ 0x94fc, 0x000a, 0, 2, 0, 0 },
++	{ 0x94fe, 0x000a, 0, 2, 0, 0 },
++	{ 0x9500, 0x000a, 0, 2, 0, 0 },
++	{ 0x9502, 0x000a, 0, 2, 0, 0 },
++	{ 0x9504, 0x000a, 0, 2, 0, 0 },
++	{ 0x9506, 0x000a, 0, 2, 0, 0 },
++	{ 0x9508, 0x000a, 0, 2, 0, 0 },
++	{ 0x950a, 0x000a, 0, 2, 0, 0 },
++	{ 0x950c, 0x000a, 0, 2, 0, 0 },
++	{ 0x950e, 0x000a, 0, 2, 0, 0 },
++	{ 0x9510, 0x000a, 0, 2, 0, 0 },
++	{ 0x9512, 0x000a, 0, 2, 0, 0 },
++	{ 0x9514, 0x000a, 0, 2, 0, 0 },
++	{ 0x9516, 0x000a, 0, 2, 0, 0 },
++	{ 0x9518, 0x000a, 0, 2, 0, 0 },
++	{ 0x951a, 0x000a, 0, 2, 0, 0 },
++	{ 0x951c, 0x000a, 0, 2, 0, 0 },
++	{ 0x951e, 0x000a, 0, 2, 0, 0 },
++	{ 0x9520, 0x000a, 0, 2, 0, 0 },
++	{ 0x9522, 0x000a, 0, 2, 0, 0 },
++	{ 0x9524, 0x000a, 0, 2, 0, 0 },
++	{ 0x9526, 0x000a, 0, 2, 0, 0 },
++	{ 0x9528, 0x000a, 0, 2, 0, 0 },
++	{ 0x952a, 0x000a, 0, 2, 0, 0 },
++	{ 0x952c, 0x000a, 0, 2, 0, 0 },
++	{ 0x952e, 0x000a, 0, 2, 0, 0 },
++	{ 0x96f6, 0x0100, 0, 2, 0, 0 },
++	{ 0x96f8, 0x0200, 0, 2, 0, 0 },
++	{ 0x96fa, 0x0400, 0, 2, 0, 0 },
++	{ 0x96fc, 0x0800, 0, 2, 0, 0 },
++	{ 0x96fe, 0x0c00, 0, 2, 0, 0 },
++	{ 0x9700, 0x1000, 0, 2, 0, 0 },
++	{ 0x9702, 0x0000, 0, 2, 0, 0 },
++	{ 0x9704, 0x0000, 0, 2, 0, 0 },
++	{ 0x9706, 0x0000, 0, 2, 0, 0 },
++	{ 0x9708, 0x0000, 0, 2, 0, 0 },
++	{ 0x970a, 0x0000, 0, 2, 0, 0 },
++	{ 0x970c, 0x0000, 0, 2, 0, 0 },
++	{ 0x970e, 0x0000, 0, 2, 0, 0 },
++	{ 0x9710, 0x0000, 0, 2, 0, 0 },
++	{ 0x9712, 0x0000, 0, 2, 0, 0 },
++	{ 0x9714, 0x0000, 0, 2, 0, 0 },
++	{ 0x9716, 0x0000, 0, 2, 0, 0 },
++	{ 0x9718, 0x0000, 0, 2, 0, 0 },
++	{ 0x971a, 0x0000, 0, 2, 0, 0 },
++	{ 0x971c, 0x0000, 0, 2, 0, 0 },
++	{ 0x971e, 0x0000, 0, 2, 0, 0 },
++	{ 0x9720, 0x0000, 0, 2, 0, 0 },
++	{ 0x9722, 0x0000, 0, 2, 0, 0 },
++	{ 0x9724, 0x0000, 0, 2, 0, 0 },
++	{ 0x9726, 0x0000, 0, 2, 0, 0 },
++	{ 0x9728, 0x0000, 0, 2, 0, 0 },
++	{ 0x972a, 0x0000, 0, 2, 0, 0 },
++	{ 0x972c, 0x0000, 0, 2, 0, 0 },
++	{ 0x972e, 0x0000, 0, 2, 0, 0 },
++	{ 0x9730, 0x0000, 0, 2, 0, 0 },
++	{ 0x9732, 0x0000, 0, 2, 0, 0 },
++	{ 0x9734, 0x0000, 0, 2, 0, 0 },
++	{ 0x9736, 0x0050, 0, 2, 0, 0 },
++	{ 0x9738, 0x0070, 0, 2, 0, 0 },
++	{ 0x973a, 0x0090, 0, 2, 0, 0 },
++	{ 0x973c, 0x00b0, 0, 2, 0, 0 },
++	{ 0x973e, 0x0000, 0, 2, 0, 0 },
++	{ 0x9740, 0x0000, 0, 2, 0, 0 },
++	{ 0x9742, 0x0050, 0, 2, 0, 0 },
++	{ 0x9744, 0x0070, 0, 2, 0, 0 },
++	{ 0x9746, 0x0090, 0, 2, 0, 0 },
++	{ 0x9748, 0x00b0, 0, 2, 0, 0 },
++	{ 0x974a, 0x0000, 0, 2, 0, 0 },
++	{ 0x974c, 0x0000, 0, 2, 0, 0 },
++	{ 0x974e, 0x0050, 0, 2, 0, 0 },
++	{ 0x9750, 0x0080, 0, 2, 0, 0 },
++	{ 0x9752, 0x00a0, 0, 2, 0, 0 },
++	{ 0x9754, 0x00e0, 0, 2, 0, 0 },
++	{ 0x9756, 0x0000, 0, 2, 0, 0 },
++	{ 0x9758, 0x0000, 0, 2, 0, 0 },
++	{ 0x975a, 0x0060, 0, 2, 0, 0 },
++	{ 0x975c, 0x0090, 0, 2, 0, 0 },
++	{ 0x975e, 0x0000, 0, 2, 0, 0 },
++	{ 0x9760, 0x0000, 0, 2, 0, 0 },
++	{ 0x97b0, 0x0000, 0, 2, 0, 0 },
++	{ 0x97b2, 0x0000, 0, 2, 0, 0 },
++	{ 0x97b4, 0x0000, 0, 2, 0, 0 },
++	{ 0x97b6, 0x0000, 0, 2, 0, 0 },
++	{ 0x97b8, 0x0000, 0, 2, 0, 0 },
++	{ 0x97ba, 0x0000, 0, 2, 0, 0 },
++	{ 0x97bc, 0x0000, 0, 2, 0, 0 },
++	{ 0x9802, 0x0001, 0, 2, 0, 0 },
++	{ 0x9882, 0x04b0, 0, 2, 0, 0 },
++	{ 0x98da, 0x0000, 0, 2, 0, 0 },
++	{ 0x98f0, 0x0000, 0, 2, 0, 0 },
++	{ 0x9a08, 0x0001, 0, 2, 0, 0 },
++	{ 0x9a20, 0x0001, 0, 2, 0, 0 },
++	{ 0x9dc0, 0x0001, 0, 2, 0, 0 },
++	{ 0x9e56, 0x0006, 0, 2, 0, 0 },
++	{ 0x9e7c, 0x0000, 0, 2, 0, 0 },
++	{ 0xa1de, 0x0007, 0, 2, 0, 0 },
++	{ 0xc48a, 0x0010, 0, 2, 0, 0 },
++	{ 0xc57c, 0x0000, 0, 2, 0, 0 },
++	{ 0xc57e, 0x0000, 0, 2, 0, 0 },
++	{ 0xc580, 0x0000, 0, 2, 0, 0 },
++	{ 0xc7b2, 0x0066, 0, 2, 0, 0 },
++	{ 0xc7b8, 0x0000, 0, 2, 0, 0 },
++	{ 0xd84c, 0x0007, 0, 2, 0, 0 },
++	{ 0xd852, 0x0007, 0, 2, 0, 0 },
++	{ 0x56e6, 0x0096, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x2001, 0, 2, 0, 0 },
++	{ 0x90fe, 0x0000, 0, 2, 0, 0 },
++	{ 0x9100, 0x0000, 0, 2, 0, 0 },
++	{ 0x9102, 0x0000, 0, 2, 0, 0 },
++	{ 0x9106, 0x0000, 0, 2, 0, 0 },
++	{ 0x9110, 0x0000, 0, 2, 0, 0 },
++	{ 0x9112, 0x0000, 0, 2, 0, 0 },
++	{ 0x9116, 0x0014, 0, 2, 0, 0 },
++	{ 0x9118, 0x0015, 0, 2, 0, 0 },
++	{ 0x911a, 0x0016, 0, 2, 0, 0 },
++	{ 0x911c, 0x001a, 0, 2, 0, 0 },
++	{ 0x911e, 0x001b, 0, 2, 0, 0 },
++	{ 0x9120, 0x001c, 0, 2, 0, 0 },
++	{ 0x9122, 0x0020, 0, 2, 0, 0 },
++	{ 0x9124, 0x0021, 0, 2, 0, 0 },
++	{ 0x9126, 0x0022, 0, 2, 0, 0 },
++	{ 0x98bc, 0x0001, 0, 2, 0, 0 },
++	{ 0x98ce, 0x0042, 0, 2, 0, 0 },
++	{ 0x98d8, 0x00ea, 0, 2, 0, 0 },
++	{ 0x98f6, 0x00e8, 0, 2, 0, 0 },
++	{ 0x9900, 0x0014, 0, 2, 0, 0 },
++	{ 0x990a, 0x0014, 0, 2, 0, 0 },
++	{ 0x9914, 0x0013, 0, 2, 0, 0 },
++	{ 0x991e, 0x0013, 0, 2, 0, 0 },
++	{ 0x9932, 0x0080, 0, 2, 0, 0 },
++	{ 0x993c, 0xffff, 0, 2, 0, 0 },
++	{ 0x9946, 0xffff, 0, 2, 0, 0 },
++	{ 0x9950, 0x0010, 0, 2, 0, 0 },
++	{ 0x9996, 0x003b, 0, 2, 0, 0 },
++	{ 0x9d10, 0xba63, 0, 2, 0, 0 },
++	{ 0x9cfc, 0x0005, 0, 2, 0, 0 },
++	{ 0x9d42, 0x0008, 0, 2, 0, 0 },
++	{ 0x9d92, 0x000b, 0, 2, 0, 0 },
++	{ 0x9d7e, 0x000b, 0, 2, 0, 0 },
++	{ 0x9dc4, 0x000d, 0, 2, 0, 0 },
++	{ 0x9e00, 0x000f, 0, 2, 0, 0 },
++	{ 0x9e46, 0x000f, 0, 2, 0, 0 },
++	{ 0xd1d0, 0x0001, 0, 2, 0, 0 },
++	{ 0xd1d2, 0x3000, 0, 2, 0, 0 },
++	{ 0xd1d4, 0x3000, 0, 2, 0, 0 },
++	{ 0xd1d6, 0x3000, 0, 2, 0, 0 },
++	{ 0xd1d8, 0x3000, 0, 2, 0, 0 },
++	{ 0xd1da, 0x3000, 0, 2, 0, 0 },
++	{ 0xd1dc, 0x3000, 0, 2, 0, 0 },
++	{ 0xd1de, 0x3000, 0, 2, 0, 0 },
++	{ 0xd1e0, 0x3000, 0, 2, 0, 0 },
++	{ 0xd1e2, 0x3000, 0, 2, 0, 0 },
++	{ 0xd1e4, 0x0000, 0, 2, 0, 0 },
++	{ 0xd1e6, 0x0000, 0, 2, 0, 0 },
++	{ 0xd530, 0x0000, 0, 2, 0, 0 },
++	{ 0xd532, 0x0000, 0, 2, 0, 0 },
++	{ 0xd534, 0x0000, 0, 2, 0, 0 },
++	{ 0xd536, 0x0000, 0, 2, 0, 0 },
++	{ 0xd538, 0x0000, 0, 2, 0, 0 },
++	{ 0xd53a, 0x0000, 0, 2, 0, 0 },
++	{ 0xd53c, 0x0000, 0, 2, 0, 0 },
++	{ 0xd53e, 0x0000, 0, 2, 0, 0 },
++	{ 0xd540, 0x0000, 0, 2, 0, 0 },
++	{ 0xd542, 0x0000, 0, 2, 0, 0 },
++	{ 0xd544, 0x0000, 0, 2, 0, 0 },
++	{ 0xd546, 0x0000, 0, 2, 0, 0 },
++	{ 0xd548, 0x0000, 0, 2, 0, 0 },
++	{ 0xd54a, 0x0000, 0, 2, 0, 0 },
++	{ 0xd54c, 0x0000, 0, 2, 0, 0 },
++	{ 0xd54e, 0x0000, 0, 2, 0, 0 },
++	{ 0xd550, 0x0000, 0, 2, 0, 0 },
++	{ 0xd552, 0x0000, 0, 2, 0, 0 },
++	{ 0xd554, 0x0000, 0, 2, 0, 0 },
++	{ 0xd556, 0x0000, 0, 2, 0, 0 },
++	{ 0xd558, 0x0000, 0, 2, 0, 0 },
++	{ 0xd55a, 0x0000, 0, 2, 0, 0 },
++	{ 0xd55c, 0x0000, 0, 2, 0, 0 },
++	{ 0xd55e, 0x0000, 0, 2, 0, 0 },
++	{ 0xd560, 0x0000, 0, 2, 0, 0 },
++	{ 0xd562, 0x0000, 0, 2, 0, 0 },
++	{ 0xd564, 0x0000, 0, 2, 0, 0 },
++	{ 0xd566, 0x0000, 0, 2, 0, 0 },
++	{ 0xd568, 0x0000, 0, 2, 0, 0 },
++	{ 0xd56a, 0x0000, 0, 2, 0, 0 },
++	{ 0xd56c, 0x0000, 0, 2, 0, 0 },
++	{ 0xd56e, 0x0000, 0, 2, 0, 0 },
++	{ 0xd570, 0x0000, 0, 2, 0, 0 },
++	{ 0xd572, 0x0000, 0, 2, 0, 0 },
++	{ 0xd574, 0x0000, 0, 2, 0, 0 },
++	{ 0xd576, 0x0000, 0, 2, 0, 0 },
++	{ 0xd578, 0x0000, 0, 2, 0, 0 },
++	{ 0xd57a, 0x0000, 0, 2, 0, 0 },
++	{ 0xd57c, 0x0000, 0, 2, 0, 0 },
++	{ 0xd57e, 0x0000, 0, 2, 0, 0 },
++	{ 0xd580, 0x0000, 0, 2, 0, 0 },
++	{ 0xd582, 0x0000, 0, 2, 0, 0 },
++	{ 0xd584, 0x0000, 0, 2, 0, 0 },
++	{ 0xd586, 0x0000, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x2000, 0, 2, 0, 0 },
++	{ 0xed32, 0x0100, 0, 2, 0, 0 },
++	{ 0xed34, 0x0100, 0, 2, 0, 0 },
++	{ 0xedaa, 0x0100, 0, 2, 0, 0 },
++	{ 0xedac, 0x0100, 0, 2, 0, 0 },
++	{ 0x1b40, 0x0004, 0, 2, 0, 0 },
++	{ 0x872a, 0x0001, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x2001, 0, 2, 0, 0 },
++	{ 0x90f0, 0x0001, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x2000, 0, 2, 0, 0 },
++	{ 0x8726, 0x0000, 0, 2, 0, 0 },
++	{ 0x873c, 0x0006, 0, 2, 0, 0 },
++	{ 0x873e, 0x000a, 0, 2, 0, 0 },
++	{ 0x872c, 0x07d8, 0, 2, 0, 0 },
++	{ 0x872e, 0x05e0, 0, 2, 0, 0 },
++	{ 0x8738, 0x07d8, 0, 2, 0, 0 },
++	{ 0x873a, 0x05e0, 0, 2, 0, 0 },
++	{ 0x88c4, 0x003f, 0, 2, 0, 0 },
++	{ 0x88cc, 0x0001, 0, 2, 0, 0 },
++	{ 0x88c8, 0x0320, 0, 2, 0, 0 },
++	{ 0x88d0, 0x0000, 0, 2, 0, 0 },
++	{ 0x88c6, 0x0019, 0, 2, 0, 0 },
++	{ 0x88ce, 0x0019, 0, 2, 0, 0 },
++	{ 0x8720, 0x0011, 0, 2, 0, 0 },
++	{ 0x8722, 0x000c, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x2001, 0, 2, 0, 0 },
++	{ 0x90f2, 0x0040, 0, 2, 0, 0 },
++	{ 0x90f6, 0x0000, 0, 2, 0, 0 },
++	{ 0x90f4, 0x0019, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x2002, 0, 2, 0, 0 },
++	{ 0xeb00, 0x0000, 0, 2, 0, 0 },
++	{ 0xeb08, 0x0000, 0, 2, 0, 0 },
++	{ 0xeb10, 0x0005, 0, 2, 0, 0 },
++	{ 0xeb18, 0x0009, 0, 2, 0, 0 },
++	{ 0xeb20, 0x0007, 0, 2, 0, 0 },
++	{ 0xeb28, 0x000a, 0, 2, 0, 0 },
++	{ 0xeb30, 0x0008, 0, 2, 0, 0 },
++	{ 0xeb38, 0x0007, 0, 2, 0, 0 },
++	{ 0xeb40, 0x0007, 0, 2, 0, 0 },
++	{ 0xeb48, 0x0006, 0, 2, 0, 0 },
++	{ 0xeb50, 0xfffe, 0, 2, 0, 0 },
++	{ 0xeb58, 0xfffc, 0, 2, 0, 0 },
++	{ 0xeb60, 0xfff9, 0, 2, 0, 0 },
++	{ 0xeb68, 0xfff2, 0, 2, 0, 0 },
++	{ 0xeb70, 0xffea, 0, 2, 0, 0 },
++	{ 0xeb78, 0xffdf, 0, 2, 0, 0 },
++	{ 0xeb80, 0xffd2, 0, 2, 0, 0 },
++	{ 0xeb88, 0xffff, 0, 2, 0, 0 },
++	{ 0xeb90, 0x0004, 0, 2, 0, 0 },
++	{ 0xeb98, 0x0006, 0, 2, 0, 0 },
++	{ 0xeba0, 0x0007, 0, 2, 0, 0 },
++	{ 0xeba8, 0x0009, 0, 2, 0, 0 },
++	{ 0xebb0, 0x0007, 0, 2, 0, 0 },
++	{ 0xebb8, 0x0006, 0, 2, 0, 0 },
++	{ 0xebc0, 0x0005, 0, 2, 0, 0 },
++	{ 0xebc8, 0x0003, 0, 2, 0, 0 },
++	{ 0xebd0, 0x0003, 0, 2, 0, 0 },
++	{ 0xebd8, 0x0000, 0, 2, 0, 0 },
++	{ 0xebe0, 0xfffb, 0, 2, 0, 0 },
++	{ 0xebe8, 0xfff7, 0, 2, 0, 0 },
++	{ 0xebf0, 0xfff2, 0, 2, 0, 0 },
++	{ 0xebf8, 0xffea, 0, 2, 0, 0 },
++	{ 0xec00, 0xffe5, 0, 2, 0, 0 },
++	{ 0xec08, 0xffdc, 0, 2, 0, 0 },
++	{ 0xec10, 0x0005, 0, 2, 0, 0 },
++	{ 0xec18, 0x0009, 0, 2, 0, 0 },
++	{ 0xec20, 0x000c, 0, 2, 0, 0 },
++	{ 0xec28, 0x000b, 0, 2, 0, 0 },
++	{ 0xec30, 0x000b, 0, 2, 0, 0 },
++	{ 0xec38, 0x000b, 0, 2, 0, 0 },
++	{ 0xec40, 0x000a, 0, 2, 0, 0 },
++	{ 0xec48, 0x0008, 0, 2, 0, 0 },
++	{ 0xec50, 0x0007, 0, 2, 0, 0 },
++	{ 0xec58, 0x0006, 0, 2, 0, 0 },
++	{ 0xec60, 0x0002, 0, 2, 0, 0 },
++	{ 0xec68, 0x0000, 0, 2, 0, 0 },
++	{ 0xec70, 0xfffc, 0, 2, 0, 0 },
++	{ 0xec78, 0xfff8, 0, 2, 0, 0 },
++	{ 0xec80, 0xfff4, 0, 2, 0, 0 },
++	{ 0xec88, 0xffef, 0, 2, 0, 0 },
++	{ 0xec90, 0xffe6, 0, 2, 0, 0 },
++	{ 0xec98, 0x0005, 0, 2, 0, 0 },
++	{ 0xeca0, 0x000a, 0, 2, 0, 0 },
++	{ 0xeca8, 0x000b, 0, 2, 0, 0 },
++	{ 0xecb0, 0x000c, 0, 2, 0, 0 },
++	{ 0xecb8, 0x000d, 0, 2, 0, 0 },
++	{ 0xecc0, 0x000b, 0, 2, 0, 0 },
++	{ 0xecc8, 0x000b, 0, 2, 0, 0 },
++	{ 0xecd0, 0x0006, 0, 2, 0, 0 },
++	{ 0xecd8, 0x0008, 0, 2, 0, 0 },
++	{ 0xece0, 0x0006, 0, 2, 0, 0 },
++	{ 0xece8, 0x0004, 0, 2, 0, 0 },
++	{ 0xecf0, 0x0001, 0, 2, 0, 0 },
++	{ 0xecf8, 0xfffd, 0, 2, 0, 0 },
++	{ 0xed00, 0xfffb, 0, 2, 0, 0 },
++	{ 0xed08, 0xfff6, 0, 2, 0, 0 },
++	{ 0xed10, 0xfff3, 0, 2, 0, 0 },
++	{ 0xed18, 0xffec, 0, 2, 0, 0 },
++	{ 0xed20, 0x0006, 0, 2, 0, 0 },
++	{ 0xed28, 0x000a, 0, 2, 0, 0 },
++	{ 0xed30, 0x000d, 0, 2, 0, 0 },
++	{ 0xed38, 0x000e, 0, 2, 0, 0 },
++	{ 0xed40, 0x000d, 0, 2, 0, 0 },
++	{ 0xed48, 0x000c, 0, 2, 0, 0 },
++	{ 0xed50, 0x000b, 0, 2, 0, 0 },
++	{ 0xed58, 0x000d, 0, 2, 0, 0 },
++	{ 0xed60, 0x0008, 0, 2, 0, 0 },
++	{ 0xed68, 0x0008, 0, 2, 0, 0 },
++	{ 0xed70, 0x0005, 0, 2, 0, 0 },
++	{ 0xed78, 0x0004, 0, 2, 0, 0 },
++	{ 0xed80, 0x0001, 0, 2, 0, 0 },
++	{ 0xed88, 0xffff, 0, 2, 0, 0 },
++	{ 0xed90, 0xfffa, 0, 2, 0, 0 },
++	{ 0xed98, 0xfff9, 0, 2, 0, 0 },
++	{ 0xeda0, 0xfff1, 0, 2, 0, 0 },
++	{ 0xeda8, 0x0006, 0, 2, 0, 0 },
++	{ 0xedb0, 0x0009, 0, 2, 0, 0 },
++	{ 0xedb8, 0x000b, 0, 2, 0, 0 },
++	{ 0xedc0, 0x000c, 0, 2, 0, 0 },
++	{ 0xedc8, 0x000d, 0, 2, 0, 0 },
++	{ 0xedd0, 0x000c, 0, 2, 0, 0 },
++	{ 0xedd8, 0x000c, 0, 2, 0, 0 },
++	{ 0xede0, 0x0009, 0, 2, 0, 0 },
++	{ 0xede8, 0x0009, 0, 2, 0, 0 },
++	{ 0xedf0, 0x0009, 0, 2, 0, 0 },
++	{ 0xedf8, 0x0005, 0, 2, 0, 0 },
++	{ 0xee00, 0x0004, 0, 2, 0, 0 },
++	{ 0xee08, 0x0003, 0, 2, 0, 0 },
++	{ 0xee10, 0x0002, 0, 2, 0, 0 },
++	{ 0xee18, 0xfffd, 0, 2, 0, 0 },
++	{ 0xee20, 0xfffa, 0, 2, 0, 0 },
++	{ 0xee28, 0xfff4, 0, 2, 0, 0 },
++	{ 0xee30, 0x0005, 0, 2, 0, 0 },
++	{ 0xee38, 0x0009, 0, 2, 0, 0 },
++	{ 0xee40, 0x000b, 0, 2, 0, 0 },
++	{ 0xee48, 0x000c, 0, 2, 0, 0 },
++	{ 0xee50, 0x000b, 0, 2, 0, 0 },
++	{ 0xee58, 0x000d, 0, 2, 0, 0 },
++	{ 0xee60, 0x000a, 0, 2, 0, 0 },
++	{ 0xee68, 0x000a, 0, 2, 0, 0 },
++	{ 0xee70, 0x000b, 0, 2, 0, 0 },
++	{ 0xee78, 0x0009, 0, 2, 0, 0 },
++	{ 0xee80, 0x0007, 0, 2, 0, 0 },
++	{ 0xee88, 0x0005, 0, 2, 0, 0 },
++	{ 0xee90, 0x0004, 0, 2, 0, 0 },
++	{ 0xee98, 0xffff, 0, 2, 0, 0 },
++	{ 0xeea0, 0x0001, 0, 2, 0, 0 },
++	{ 0xeea8, 0xfffc, 0, 2, 0, 0 },
++	{ 0xeeb0, 0xfff4, 0, 2, 0, 0 },
++	{ 0xeeb8, 0x0002, 0, 2, 0, 0 },
++	{ 0xeec0, 0x0002, 0, 2, 0, 0 },
++	{ 0xeec8, 0x0007, 0, 2, 0, 0 },
++	{ 0xeed0, 0x0009, 0, 2, 0, 0 },
++	{ 0xeed8, 0x0008, 0, 2, 0, 0 },
++	{ 0xeee0, 0x0007, 0, 2, 0, 0 },
++	{ 0xeee8, 0x0008, 0, 2, 0, 0 },
++	{ 0xeef0, 0x0008, 0, 2, 0, 0 },
++	{ 0xeef8, 0x0007, 0, 2, 0, 0 },
++	{ 0xef00, 0x0004, 0, 2, 0, 0 },
++	{ 0xef08, 0x0005, 0, 2, 0, 0 },
++	{ 0xef10, 0x0002, 0, 2, 0, 0 },
++	{ 0xef18, 0x0001, 0, 2, 0, 0 },
++	{ 0xef20, 0xffff, 0, 2, 0, 0 },
++	{ 0xef28, 0xfffa, 0, 2, 0, 0 },
++	{ 0xef30, 0xfff9, 0, 2, 0, 0 },
++	{ 0xef38, 0xffef, 0, 2, 0, 0 },
++	{ 0xef40, 0xfffb, 0, 2, 0, 0 },
++	{ 0xef48, 0x0000, 0, 2, 0, 0 },
++	{ 0xef50, 0x0002, 0, 2, 0, 0 },
++	{ 0xef58, 0x0003, 0, 2, 0, 0 },
++	{ 0xef60, 0x0002, 0, 2, 0, 0 },
++	{ 0xef68, 0x0003, 0, 2, 0, 0 },
++	{ 0xef70, 0x0003, 0, 2, 0, 0 },
++	{ 0xef78, 0x0004, 0, 2, 0, 0 },
++	{ 0xef80, 0x0001, 0, 2, 0, 0 },
++	{ 0xef88, 0x0001, 0, 2, 0, 0 },
++	{ 0xef90, 0x0000, 0, 2, 0, 0 },
++	{ 0xef98, 0xffff, 0, 2, 0, 0 },
++	{ 0xefa0, 0xfffb, 0, 2, 0, 0 },
++	{ 0xefa8, 0xfffb, 0, 2, 0, 0 },
++	{ 0xefb0, 0xfff7, 0, 2, 0, 0 },
++	{ 0xefb8, 0xfff6, 0, 2, 0, 0 },
++	{ 0xefc0, 0xffed, 0, 2, 0, 0 },
++	{ 0xefc8, 0xfffa, 0, 2, 0, 0 },
++	{ 0xefd0, 0xfff9, 0, 2, 0, 0 },
++	{ 0xefd8, 0xfffd, 0, 2, 0, 0 },
++	{ 0xefe0, 0xfffc, 0, 2, 0, 0 },
++	{ 0xefe8, 0xfffd, 0, 2, 0, 0 },
++	{ 0xeff0, 0xfffc, 0, 2, 0, 0 },
++	{ 0xeff8, 0xfffd, 0, 2, 0, 0 },
++	{ 0xf000, 0xfffe, 0, 2, 0, 0 },
++	{ 0xf008, 0xfffd, 0, 2, 0, 0 },
++	{ 0xf010, 0xfffe, 0, 2, 0, 0 },
++	{ 0xf018, 0xfffc, 0, 2, 0, 0 },
++	{ 0xf020, 0xfffb, 0, 2, 0, 0 },
++	{ 0xf028, 0xfff8, 0, 2, 0, 0 },
++	{ 0xf030, 0xfff3, 0, 2, 0, 0 },
++	{ 0xf038, 0xfff2, 0, 2, 0, 0 },
++	{ 0xf040, 0xffef, 0, 2, 0, 0 },
++	{ 0xf048, 0xffe9, 0, 2, 0, 0 },
++	{ 0xf050, 0xfff4, 0, 2, 0, 0 },
++	{ 0xf058, 0xfff9, 0, 2, 0, 0 },
++	{ 0xf060, 0xfff8, 0, 2, 0, 0 },
++	{ 0xf068, 0xfffa, 0, 2, 0, 0 },
++	{ 0xf070, 0xfff8, 0, 2, 0, 0 },
++	{ 0xf078, 0xfff9, 0, 2, 0, 0 },
++	{ 0xf080, 0xfffd, 0, 2, 0, 0 },
++	{ 0xf088, 0xfffa, 0, 2, 0, 0 },
++	{ 0xf090, 0xfffc, 0, 2, 0, 0 },
++	{ 0xf098, 0xfffa, 0, 2, 0, 0 },
++	{ 0xf0a0, 0xfff8, 0, 2, 0, 0 },
++	{ 0xf0a8, 0xfff8, 0, 2, 0, 0 },
++	{ 0xf0b0, 0xfff5, 0, 2, 0, 0 },
++	{ 0xf0b8, 0xfff1, 0, 2, 0, 0 },
++	{ 0xf0c0, 0xffee, 0, 2, 0, 0 },
++	{ 0xf0c8, 0xffe8, 0, 2, 0, 0 },
++	{ 0xf0d0, 0xffe5, 0, 2, 0, 0 },
++	{ 0xf0d8, 0xfff8, 0, 2, 0, 0 },
++	{ 0xf0e0, 0xfffa, 0, 2, 0, 0 },
++	{ 0xf0e8, 0xfffa, 0, 2, 0, 0 },
++	{ 0xf0f0, 0xfff8, 0, 2, 0, 0 },
++	{ 0xf0f8, 0xfff4, 0, 2, 0, 0 },
++	{ 0xf100, 0xfff5, 0, 2, 0, 0 },
++	{ 0xf108, 0xfff3, 0, 2, 0, 0 },
++	{ 0xf110, 0xfff9, 0, 2, 0, 0 },
++	{ 0xf118, 0xfff4, 0, 2, 0, 0 },
++	{ 0xf120, 0xfff6, 0, 2, 0, 0 },
++	{ 0xf128, 0xfff9, 0, 2, 0, 0 },
++	{ 0xf130, 0xfff3, 0, 2, 0, 0 },
++	{ 0xf138, 0xfff4, 0, 2, 0, 0 },
++	{ 0xf140, 0xffed, 0, 2, 0, 0 },
++	{ 0xf148, 0xffeb, 0, 2, 0, 0 },
++	{ 0xf150, 0xffec, 0, 2, 0, 0 },
++	{ 0xf158, 0xffe1, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x2000, 0, 2, 0, 0 },
++	{ 0x88d2, 0x0006, 0, 2, 0, 0 },
++	{ 0x88d4, 0x0006, 0, 2, 0, 0 },
++	{ 0x88d6, 0x0006, 0, 2, 0, 0 },
++	{ 0x88d8, 0x0006, 0, 2, 0, 0 },
++	{ 0x88da, 0x0006, 0, 2, 0, 0 },
++	{ 0x88dc, 0x0006, 0, 2, 0, 0 },
++	{ 0x88de, 0x0006, 0, 2, 0, 0 },
++	{ 0x88e0, 0x0006, 0, 2, 0, 0 },
++	{ 0x88e2, 0x0006, 0, 2, 0, 0 },
++	{ 0x88e4, 0x0006, 0, 2, 0, 0 },
++	{ 0x88e6, 0x0006, 0, 2, 0, 0 },
++	{ 0x88e8, 0x0006, 0, 2, 0, 0 },
++	{ 0x88ea, 0x0006, 0, 2, 0, 0 },
++	{ 0x88ec, 0x0006, 0, 2, 0, 0 },
++	{ 0x88ee, 0x0006, 0, 2, 0, 0 },
++	{ 0x88f0, 0x0006, 0, 2, 0, 0 },
++	{ 0x88f2, 0x0400, 0, 2, 0, 0 },
++	{ 0x88f4, 0x0400, 0, 2, 0, 0 },
++	{ 0x88f6, 0x0400, 0, 2, 0, 0 },
++	{ 0x88f8, 0x0400, 0, 2, 0, 0 },
++	{ 0x88fa, 0x0400, 0, 2, 0, 0 },
++	{ 0x88fc, 0x0400, 0, 2, 0, 0 },
++	{ 0x88fe, 0x0400, 0, 2, 0, 0 },
++	{ 0x8900, 0x0400, 0, 2, 0, 0 },
++	{ 0x8902, 0x0400, 0, 2, 0, 0 },
++	{ 0x8904, 0x0400, 0, 2, 0, 0 },
++	{ 0x8906, 0x0400, 0, 2, 0, 0 },
++	{ 0x8908, 0x0400, 0, 2, 0, 0 },
++	{ 0x890a, 0x0400, 0, 2, 0, 0 },
++	{ 0x890c, 0x0400, 0, 2, 0, 0 },
++	{ 0x890e, 0x0400, 0, 2, 0, 0 },
++	{ 0x8910, 0x0400, 0, 2, 0, 0 },
++	{ 0x8912, 0x0400, 0, 2, 0, 0 },
++	{ 0x8914, 0x0400, 0, 2, 0, 0 },
++	{ 0x8916, 0x0400, 0, 2, 0, 0 },
++	{ 0x8918, 0x0400, 0, 2, 0, 0 },
++	{ 0x891a, 0x0400, 0, 2, 0, 0 },
++	{ 0x891c, 0x0400, 0, 2, 0, 0 },
++	{ 0x891e, 0x0400, 0, 2, 0, 0 },
++	{ 0x8920, 0x0400, 0, 2, 0, 0 },
++	{ 0x8922, 0x0400, 0, 2, 0, 0 },
++	{ 0x8924, 0x0400, 0, 2, 0, 0 },
++	{ 0x8926, 0x0400, 0, 2, 0, 0 },
++	{ 0x8928, 0x0400, 0, 2, 0, 0 },
++	{ 0x892a, 0x0400, 0, 2, 0, 0 },
++	{ 0x892c, 0x0400, 0, 2, 0, 0 },
++	{ 0x892e, 0x0400, 0, 2, 0, 0 },
++	{ 0x8930, 0x0400, 0, 2, 0, 0 },
++	{ 0x8932, 0x0400, 0, 2, 0, 0 },
++	{ 0x8934, 0x0400, 0, 2, 0, 0 },
++	{ 0x8936, 0x0400, 0, 2, 0, 0 },
++	{ 0x8938, 0x0400, 0, 2, 0, 0 },
++	{ 0x893a, 0x0400, 0, 2, 0, 0 },
++	{ 0x893c, 0x0400, 0, 2, 0, 0 },
++	{ 0x893e, 0x0400, 0, 2, 0, 0 },
++	{ 0x8940, 0x0400, 0, 2, 0, 0 },
++	{ 0x8942, 0x0400, 0, 2, 0, 0 },
++	{ 0x8944, 0x0400, 0, 2, 0, 0 },
++	{ 0x8946, 0x0400, 0, 2, 0, 0 },
++	{ 0x8948, 0x0400, 0, 2, 0, 0 },
++	{ 0x894a, 0x0400, 0, 2, 0, 0 },
++	{ 0x894c, 0x0400, 0, 2, 0, 0 },
++	{ 0x894e, 0x0400, 0, 2, 0, 0 },
++	{ 0x8950, 0x0400, 0, 2, 0, 0 },
++	{ 0xfcfc, 0x4000, 0, 2, 0, 0 },
++	{ 0x0000, 0x1ad6, 0, 2, 0, 0 },
++};
+ static const struct cam_reg hm6_mode4[2264] = {
+ 	{ 0xfcfc, 0x4000, 0, 2, 0, 0 },
+ 	{ 0x0b30, 0x01ff, 0, 2, 0, 0 },

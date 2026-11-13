@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <mach/mach_time.h>
 
 #define PANEL_W 1080
 #define PANEL_H 2400
@@ -39,19 +40,47 @@ contact(int down, double x, double y)
 	return inject(what);
 }
 
+/*
+ * A sample every 4 ms on an absolute grid, as the touch driver reads the IC with a finger down (250 a
+ * second): the drag takes MS, whatever each injection costs. (It was 8 ms of sleep after each sample, which
+ * with the sysctl's own time made 13.6 ms a sample, 74 a second: a drag measured at most 64 frames a second
+ * because no more touches came.)
+ */
+#define STEP_US 4000
+
+static uint64_t
+now_us(void)
+{
+	static mach_timebase_info_data_t tb;
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	return mach_absolute_time() * tb.numer / tb.denom / 1000;
+}
+
+static void
+sleep_until(uint64_t t)
+{
+	uint64_t now = now_us();
+	if (t > now) {
+		usleep((useconds_t)(t - now));
+	}
+}
+
 static int
 drag(double x0, double y0, double x1, double y1, unsigned ms)
 {
-	unsigned steps = ms / 8 ? ms / 8 : 1;
+	unsigned steps = ms * 1000 / STEP_US ? ms * 1000 / STEP_US : 1;
+	uint64_t t0 = now_us();
 
 	if (contact(1, x0, y0) != 0) {
 		return -1;
 	}
 	for (unsigned i = 1; i <= steps; i++) {
-		usleep(8000);
+		sleep_until(t0 + (uint64_t)i * STEP_US);
 		contact(1, x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps);
 	}
-	usleep(8000);
+	sleep_until(t0 + (uint64_t)(steps + 1) * STEP_US);
 	return contact(0, x1, y1);
 }
 

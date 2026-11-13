@@ -1,0 +1,36 @@
+7400.WWDC_2022 (iOS 16.7.16 root fs, /Library/Wallpaper/Collections/iOS_16~iphone.wallpaperCollection/Wallpapers/)
+Variants present: 375w-812h@3x, 393w-852h@3x, 430w-932h@3x (all ~iphone). No @2x variant exists.
+Raw copies of the 375w-812h@3x folder: raw/7400.WWDC_2022-375w-812h@3x~iphone.wallpaper/
+Collection-level plists (binary originals in raw/collection/, XML dumps *.xml.txt here).
+
+HEIC references (only in main.caml; index.xml / assetManifest.caml / Wallpaper.plist never name assets):
+
+Background .ca/main.caml
+  line 31: <CALayer ... bounds="0 0 520 455.3333" ... name="Leg.HEIC" position="260 227.166666666665">
+  line 32:   <contents type="CGImage" src="assets/Leg.HEIC"/>
+  line 42: <CALayer ... bounds="0 0 433.3333 455.3333" ... literalContentsCenter="0" name="Head Mask.HEIC" position="303 227.5">
+  line 43:   <contents type="CGImage" src="assets/Head%20Mask.HEIC"/>      (space is URL-escaped as %20)
+           its sublayer "Subtransform" (#6) has <compositingFilter type="CAFilter" filter="sourceAtop" name="sourceAtop"/>
+  line 48: <CALayer id="#5" ... bounds="0 0 433.3333 455.3333" ... name="Head.HEIC" ...>
+  line 49:   <contents type="CGImage" src="assets/Head.HEIC"/>
+Floating .ca/main.caml
+  line 15: <CALayer ... bounds="0 0 520 520.3333" ... name="Arm.HEIC" position="260 259.5">
+  line 16:   <contents type="CGImage" src="assets/Arm.HEIC"/>
+Foreground .ca/main.caml
+  line 16: <CALayer ... bounds="0 0 498.6667 715.3333" ... name="Body.HEIC" position="270 401.5">
+  line 17:   <contents type="CGImage" src="assets/Body.HEIC"/>
+
+The name="X.HEIC" attributes are just layer names (cosmetic); the load-bearing string is src="assets/....HEIC".
+No contentsScale / contentsGravity attributes: contents are stretched to layer bounds, so pixel size vs.
+point size is not tied to @3x (e.g. Body 1271x1823 px in 498.67x715.33 pt = ~2.55 px/pt).
+
+Wallpaper.plist (375w-812h@3x): logicalScreenClass = "375w-812h@3x~iphone"; assets.lockAndHome.default:
+  backgroundAnimationFileName  = 7400.WWDC_2022_Background-375w-812h@3x~iphone.ca
+  floatingAnimationFileNameKey = 7400.WWDC_2022_Floating-375w-812h@3x~iphone.ca
+  foregroundAnimationFileName  = 7400.WWDC_2022_Foreground-375w-812h@3x~iphone.ca
+  identifier 7400, name "WWDC 2022", type LayeredAnimation, family WWDC22, appearanceAware false, version 1.
+index.xml (each .ca): documentWidth 375, documentHeight 812, rootDocument main.caml,
+  assetManifest assetManifest.caml, publishedObjectNames = [Background|Floating|Foreground].
+assetManifest.caml (each .ca): empty MicaAssetManifest (<modules type="NSArray"/>).
+WallpaperCollection.plist: identifier 23EC2CF1-0188-49FC-B214-EC1AB37FE5C4, order [7400].
+DefaultWallpapers~iphone.plist: default = {collection 23EC2CF1-..., wallpaper 7400} (+ iPhone15,2/15,3 overrides -> 7600).

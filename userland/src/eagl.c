@@ -144,6 +144,9 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 #define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME 0x8cd1
 #define GL_COLOR_ATTACHMENT0            0x8ce0
 #define GL_FRAMEBUFFER_COMPLETE         0x8cd5
+#ifndef GL_COLOR_WRITEMASK
+#define GL_COLOR_WRITEMASK              0x0c23
+#endif
 #define GL_FRAMEBUFFER                  0x8d40
 #define GL_SYNC_GPU_COMMANDS_COMPLETE   0x9117
 #define GL_SYNC_FLUSH_COMMANDS_BIT      0x00000001
@@ -155,6 +158,9 @@ struct eagl;
 static int eagl_tracing;                /* this frame's calls are written down (boot-arg gltrace=FIRST-LAST) */
 static int frame_lines;                 /* boot-arg glframes=1: a line for every frame (see frame_end()) */
 static int latency_lines;               /* boot-arg touch_lat=1: when every frame began and ended (see frame_end()) */
+static int blank_fills = 1;             /* blank_to_texture() (/redwood/glnoblank: off) */
+static int lazy_slices = 1;             /* surface_changed_all(): slices added up later (/redwood/glnolazy: off) */
+static int orphan_uploads = 1;          /* surface_to_texture(): new memory for a texture filled again (/redwood/glnoorphan: off) */
 static uint64_t slow_calls_us;          /* boot-arg glslow=US: a line for every call that takes longer (eagl_leave()) */
 static uint64_t call_began_us;          /* (when the call in progress began) */
 /*
@@ -262,6 +268,8 @@ struct image {
 	unsigned looked;                /* ... the frame in which that memory was last looked at, */
 	uint64_t sum;                   /* ... what a word in every SUM_STRIDE bytes of it added up to, */
 	uint64_t slice_sum[SUM_SLICES]; /* ... and what each slice of it added up to, word by word */
+	bool blank;                     /* ... and when it was last added up in full, it was all zero */
+	uint32_t slice_known;           /* ... which of slice_sum[] hold a sum yet (lazy_slices) */
 	unsigned slice_next;            /* ... the slice to add up next, */
 	unsigned quiet, look_again;     /* ... looks in a row that found no change, and the frame of the next one */
 	GLenum to, internal, format, type;
@@ -282,11 +290,24 @@ struct eagl {
 	uint32_t frame_fence_of[8];     /* ... and the frame it follows */
 	unsigned frame_fence_next;
 	unsigned premirrored;           /* copies into display surfaces made before the frame's glFlush (my_glFlush) */
+	unsigned blank_fills;           /* textures cleared instead of filled (blank_to_texture()) */
+	unsigned mirror_fills;          /* textures filled by the GPU from their mirror (mirror_to_texture()) */
 	uint64_t ahead_wait_us;         /* waiting for the GPU at frame_end (frames_ahead), for the frame lines */
 	struct image *images;           /* sapphire: IMAGES_MAX of them (256 ran out: text came out as boxes) */
 	uint32_t *image_index;          /* ... and texture name -> 1 + its place there, for names below IMAGE_NAMES */
 	unsigned image_count;
 	GLuint framebuffer;             /* the one bound */
+	/*
+	 * The colour texture of each framebuffer, by name modulo FB_COLOURS, as this bridge saw it attached
+	 * (my_glFramebufferTexture2D, my_glFramebufferRenderbuffer): glBindFramebuffer asked the library
+	 * with two glGetFramebufferAttachmentParameteriv, which Mesa's glthread does not answer itself, so
+	 * each bind of a framebuffer waited for (or ran on this thread) everything queued before it.
+	 * A name not found is asked as before.
+	 */
+	struct {
+		GLuint framebuffer, colour;
+	} fb_colour[256];
+	unsigned fb_asked;              /* binds that had to ask the library */
 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
 	GLuint reader;                  /* a framebuffer of ours, to read a texture back */
 	GLuint writer;                  /* ... and one to copy a frame into its surface with (blit_targets) */
@@ -1169,34 +1190,47 @@ surface_shared(struct eagl *e, struct image *image)
  * SUM_SLICES frames. Everything is added up when the texture is made (all, below).
  */
 /*
- * Four sums side by side, each of every fourth word: one chain of multiplies kept the processor
- * waiting on the last one, and on one load at a time where the words are SUM_STRIDE apart.
+ * Eight sums side by side, each of every eighth word: one chain of multiplies kept the processor
+ * waiting on the last one, and on one load at a time where the words are SUM_STRIDE apart -- every
+ * word of the strided pass is a line of its own, out of the cache: three quarters of the time of
+ * surface_changed_all() was that pass waiting for memory (glsample, by pc). Eight loads in flight
+ * and the lines of the next round asked for ahead (prfm) keep the memory busy instead.
  */
 #define ADD_UP_STEP(s, w) do { (s) = ((s) ^ (w)) * 0x9e3779b97f4a7c15ull; (s) ^= (s) >> 29; } while (0)
+static uint64_t add_up_ored;    /* every word add_up() has read, ORed: 0 if all were zero (blank_to_texture()) */
 static uint64_t
 add_up(const uint8_t *base, size_t from, size_t to, size_t stride, uint64_t sum)
 {
-	uint64_t word, w[4], s[4] = { sum, sum + 1, sum + 2, sum + 3 };
+	uint64_t word, w[8], s[8], ored = 0;
 	size_t at = from;
 
-	for (; at + 3 * stride + 8 <= to; at += 4 * stride) {
-		memcpy(&w[0], base + at, 8);
-		memcpy(&w[1], base + at + stride, 8);
-		memcpy(&w[2], base + at + 2 * stride, 8);
-		memcpy(&w[3], base + at + 3 * stride, 8);
-		ADD_UP_STEP(s[0], w[0]);
-		ADD_UP_STEP(s[1], w[1]);
-		ADD_UP_STEP(s[2], w[2]);
-		ADD_UP_STEP(s[3], w[3]);
+	for (int i = 0; i < 8; i++) {
+		s[i] = sum + (uint64_t)i;
+	}
+	for (; at + 7 * stride + 8 <= to; at += 8 * stride) {
+		if (stride >= 64 && at + 15 * stride + 8 <= to) {
+			for (int i = 8; i < 16; i++) {
+				__builtin_prefetch(base + at + (size_t)i * stride);
+			}
+		}
+		for (int i = 0; i < 8; i++) {
+			memcpy(&w[i], base + at + (size_t)i * stride, 8);
+		}
+		for (int i = 0; i < 8; i++) {
+			ored |= w[i];
+			ADD_UP_STEP(s[i], w[i]);
+		}
 	}
 	for (; at + 8 <= to; at += stride) {
 		memcpy(&word, base + at, 8);
+		ored |= word;
 		ADD_UP_STEP(s[0], word);
 	}
+	add_up_ored |= ored;
 	sum = s[0];
-	ADD_UP_STEP(sum, s[1]);
-	ADD_UP_STEP(sum, s[2]);
-	ADD_UP_STEP(sum, s[3]);
+	for (int i = 1; i < 8; i++) {
+		ADD_UP_STEP(sum, s[i]);
+	}
 	return sum;
 }
 
@@ -1216,18 +1250,33 @@ surface_changed_all(struct eagl *e, struct image *image, bool all)
 		return false;
 	}
 	image->looked = e->frames + 1;
+	add_up_ored = 0;
 	sum = add_up(base, 0, size, SUM_STRIDE, size);
 	if (sum != image->sum) {
 		image->sum = sum;
 		changed = true;
 	}
+	/*
+	 * When a texture is made (all): the slices in full only if the strided words were all zero (it may be
+	 * blank: blank_to_texture() needs every word). Otherwise they are added up later, one a look as usual,
+	 * the first sum of each kept without counting as a change: reading all of a 750 x 1624 surface from
+	 * memory the processor does not cache cost 3-9 ms of every attach, a hitch when applications open.
+	 * (/redwood/glnolazy: all of it at once, as before)
+	 */
+	bool every = all && (!lazy_slices || add_up_ored == 0);
+	if (all) {
+		image->slice_known = 0;
+	}
 	image->slice_next++;
 	for (unsigned n = 0; n < SUM_SLICES; n++) {
-		if (!all && n != (image->slice_next + (unsigned)(uintptr_t)image / 64) % SUM_SLICES) {
+		if (!every && (all || n != (image->slice_next + (unsigned)(uintptr_t)image / 64) % SUM_SLICES)) {
 			continue;
 		}
 		sum = add_up(base, n * slice, (n + 1) * slice < size ? (n + 1) * slice : size, 8, n);
-		if (sum != image->slice_sum[n]) {
+		if (!(image->slice_known & (1u << n))) {
+			image->slice_sum[n] = sum;
+			image->slice_known |= 1u << n;
+		} else if (sum != image->slice_sum[n]) {
 			image->slice_sum[n] = sum;
 			changed = true;
 		}
@@ -1238,6 +1287,7 @@ surface_changed_all(struct eagl *e, struct image *image, bool all)
 	 * second frame, then every fourth; a change brings it back to every frame. (A seed that
 	 * moves is seen at once all the same: my_glBindTexture.)
 	 */
+	image->blank = every && add_up_ored == 0 && (size & 7) == 0;  /* (every word of it read, all zero) */
 	image->quiet = changed || all ? 0 : image->quiet + 1;
 	image->look_again = e->frames + 1 + (image->quiet < 4 ? 1 : image->quiet < 8 ? 2 : 4);
 	return changed;
@@ -1293,6 +1343,18 @@ surface_to_texture(struct eagl *e, struct image *image)
 	glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(row / pixel));
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	/*
+	 * A texture filled again keeps its name, and Mesa kept its memory: memory the GPU, or the
+	 * frame queued for Mesa's driver thread, still had in use -- the upload then waited for the
+	 * driver thread to finish everything queued (tc_sync) and for the GPU besides: 10-47 ms for a
+	 * 22 x 27 picture, the hitches when an application opens and closes (glslow, slow-attach).
+	 * Made 1 x 1 first, the texture gets new memory that nobody uses, filled at once from this
+	 * thread; the old memory goes when the GPU is done with it. (/redwood/glnoorphan: as before)
+	 */
+	if (orphan_uploads) {
+		tex_image(image->to, 0, (GLint)internal_format(image->internal, image->format), 1, 1, 0, image->format, image->type,
+		    NULL);
+	}
 	tex_image(image->to, 0, (GLint)internal_format(image->internal, image->format), image->width, image->height, 0,
 	    image->format, image->type, base);
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
@@ -1638,7 +1700,7 @@ frame_begin(struct eagl *e)
 	e->began = now_us();
 	gpu_query_begin();
 	eagl_tracing = e->frames + 1 >= trace_first && e->frames + 1 <= trace_last;
-	if ((trace_at != 0 && e->began >= trace_at) || (trace_draws != 0 && e->last_draws == trace_draws) || trace_function_met) {
+	if ((trace_at != 0 && e->began >= trace_at) || (trace_draws != 0 && e->last_draws >= trace_draws) || trace_function_met) {
 		trace_left = trace_frames;      /* (once) */
 		trace_at = 0;
 		trace_draws = 0;
@@ -1731,6 +1793,7 @@ smp_cmp_total(const void *a, const void *b)
 }
 
 static bool smp_waiting(uint64_t pc);
+static void smp_dump(const char *who, uint64_t (*pcs)[SMP_DEPTH], unsigned n);
 
 static void
 smp_report(const char *who, uint64_t (*pcs)[SMP_DEPTH], unsigned n, unsigned idle)
@@ -1801,6 +1864,41 @@ smp_report(const char *who, uint64_t (*pcs)[SMP_DEPTH], unsigned n, unsigned idl
 		say("redwood-gl:  %s total %5.1f%%  %s\n", who, 100.0 * slot[i].total / n, name);
 	}
 	free(slot);
+}
+
+/*
+ * Every sample of a thread, as library+offset frames, one sample a line, into /var/tmp/glsample-NAME.txt:
+ * Mesa's own functions are not exported (LTO, stripped), dladdr names them all after a few exported
+ * ones; the offsets are put to names off the phone, against the unstripped build.
+ */
+static void
+smp_dump(const char *who, uint64_t (*pcs)[SMP_DEPTH], unsigned n)
+{
+	char path[128];
+	snprintf(path, sizeof(path), "/var/tmp/glsample-%s.txt", who);
+	for (char *c = path + 18; *c; c++) {
+		if (*c == ':' || *c == ' ' || *c == '/') {
+			*c = '_';
+		}
+	}
+	FILE *f = fopen(path, "w");
+	if (f == NULL) {
+		return;
+	}
+	for (unsigned k = 0; k < n; k++) {
+		for (int i = 0; i < SMP_DEPTH && pcs[k][i] != 0; i++) {
+			Dl_info info;
+			uint64_t pc = pcs[k][i] - (i > 0 ? 4 : 0);
+			if (dladdr((const void *)pc, &info) && info.dli_fname != NULL) {
+				const char *base = strrchr(info.dli_fname, '/');
+				fprintf(f, "%s%s+%llx", i ? " " : "", base ? base + 1 : info.dli_fname, pc - (uint64_t)info.dli_fbase);
+			} else {
+				fprintf(f, "%s?+%llx", i ? " " : "", pc);
+			}
+		}
+		fputc('\n', f);
+	}
+	fclose(f);
 }
 
 /* a pc in a kernel trap stub: the thread waits (mach_msg, psynch, select, ...) */
@@ -1908,6 +2006,7 @@ sampler_main(void *arg)
 		/* only threads that did something */
 		if (cnt[k] != 0 && idle[k] * 100 / cnt[k] < 95) {
 			smp_report(tname[k], pcs[k], cnt[k], idle[k]);
+			smp_dump(tname[k], pcs[k], cnt[k]);
 		}
 		free(pcs[k]);
 	}
@@ -1939,6 +2038,94 @@ sampler_maybe_start(struct eagl *e)
 }
 
 static void frame_functions(struct eagl *e);
+/*
+ * Mesa's driver thread ("gdrv", the threaded context's) ran at the default priority, 31, while the window
+ * server's render thread, 55, waited for it in every glFlush (tc_sync: a quarter of that thread's time when
+ * applications open and close quickly) -- and SpringBoard's threads, 47, took the processor from it the
+ * while: preempted at every mutex it dropped (spindump: thread_preempted_in_kernel). It gets the render
+ * thread's band (/redwood/glnoboost: as before).
+ */
+static int boost_driver = 1;
+static void
+boost_driver_threads(void)
+{
+	thread_act_array_t list;
+	mach_msg_type_number_t n = 0;
+	unsigned boosted = 0;
+
+	if (task_threads(mach_task_self(), &list, &n) != KERN_SUCCESS) {
+		return;
+	}
+	for (mach_msg_type_number_t i = 0; i < n; i++) {
+		pthread_t pt = pthread_from_mach_thread_np(list[i]);
+		char name[64] = "";
+		if (pt != NULL) {
+			(void)pthread_getname_np(pt, name, sizeof(name));
+		}
+		if (pt != NULL && strstr(name, ":gdrv") != NULL) {
+			struct sched_param sp = { .sched_priority = 54 };
+			int policy = 0;
+			struct sched_param old = { 0 };
+			(void)pthread_getschedparam(pt, &policy, &old);
+			int r = pthread_setschedparam(pt, SCHED_OTHER, &sp);
+			say("redwood-gl: Mesa's driver thread %s: priority %d -> 54: %s\n", name, old.sched_priority, r == 0 ? "done" : strerror(r));
+			boosted++;
+		}
+		mach_port_deallocate(mach_task_self(), list[i]);
+	}
+	vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(list[0]));
+	if (boosted == 0) {
+		say("redwood-gl: no Mesa driver thread to raise\n");
+	}
+}
+
+/*
+ * gltrace_dump=1: at the end of a traced frame, what every framebuffer's texture holds, as raw RGBA, into
+ * /var/tmp/gldump-FRAME-fbN-texT-WxH.rgba (tools: scratchpad dump2png.py) -- to see which picture of a
+ * frame comes out wrong, where a pixel or two of each draw (gltrace_look) does not tell.
+ */
+static int trace_dump;
+static void
+dump_framebuffers(struct eagl *e)
+{
+	GLint old = 0, old_texture = 0;
+	glGetIntegerv(0x8ca6 /* GL_FRAMEBUFFER_BINDING */, &old);
+	glGetIntegerv(0x8069 /* GL_TEXTURE_BINDING_2D */, &old_texture);
+	for (GLuint f = 1; f < 160; f++) {
+		GLint type = 0, name = 0, w = 0, h = 0;
+		if (!glIsFramebuffer(f)) {
+			continue;
+		}
+		glBindFramebuffer(GL_FRAMEBUFFER, f);
+		glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 0x8cd0 /* ..._OBJECT_TYPE */, &type);
+		if (type != GL_TEXTURE || glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+			continue;
+		}
+		glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+		glBindTexture(GL_TEXTURE_2D, (GLuint)name);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+		if (w <= 0 || h <= 0 || w > 4096 || h > 4096) {
+			continue;
+		}
+		uint8_t *px = malloc((size_t)w * (size_t)h * 4);
+		if (px == NULL) {
+			continue;
+		}
+		glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+		char path[160];
+		snprintf(path, sizeof(path), "/var/tmp/gldump-%u-fb%u-tex%d-%dx%d.rgba", e->frames + 1, f, name, w, h);
+		int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (fd >= 0) {
+			(void)write(fd, px, (size_t)w * (size_t)h * 4);
+			close(fd);
+		}
+		free(px);
+	}
+	glBindTexture(GL_TEXTURE_2D, (GLuint)old_texture);
+	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)old);
+}
+
 static void
 frame_end(struct eagl *e, bool finished)
 {
@@ -1948,6 +2135,12 @@ frame_end(struct eagl *e, bool finished)
 
 	e->premirrored = 0;
 	clear_now(e);
+	if (boost_driver && (e->frames == 2 || e->frames == 300) && strcmp(getprogname(), "backboardd") == 0) {
+		boost_driver_threads();
+	}
+	if (eagl_tracing && trace_dump) {
+		dump_framebuffers(e);
+	}
 	before = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
@@ -2048,8 +2241,8 @@ frame_end(struct eagl *e, bool finished)
 	}
 	if (e->frames == 30 || e->frames % 200 == 0) {
 		summary(e);
-		say("redwood-gl: %llu us a frame waited for the GPU to be at most %u frames behind\n",
-		    e->ahead_wait_us / (e->frames == 30 ? 30 : 200), frames_ahead);
+		say("redwood-gl: %llu us a frame waited for the GPU to be at most %u frames behind; %u framebuffer binds asked the library\n",
+		    e->ahead_wait_us / (e->frames == 30 ? 30 : 200), frames_ahead, e->fb_asked);
 		e->ahead_wait_us = 0;
 	}
 	gpu_query_collect();
@@ -4152,6 +4345,37 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 	}
 }
 
+/*
+ * gltrace_gpu=1: in a traced frame, what each draw cost the GPU (a GL_TIME_ELAPSED query around it, waited
+ * for: the frame is slow, the numbers are right) -- which draws a heavy frame's GPU time goes to.
+ */
+static int trace_gpu;
+static GLuint trace_gpu_query;
+static bool
+trace_gpu_begin(void)
+{
+	if (!eagl_tracing || !trace_gpu || gpu_query_open != ~0u) {
+		return false;
+	}
+	if (trace_gpu_query == 0) {
+		glGenQueries(1, &trace_gpu_query);
+	}
+	glBeginQuery(0x88bf /* GL_TIME_ELAPSED */, trace_gpu_query);
+	return true;
+}
+
+static void
+trace_gpu_end(bool begun)
+{
+	GLuint ns = 0;
+	if (!begun) {
+		return;
+	}
+	glEndQuery(0x88bf);
+	glGetQueryObjectuiv(trace_gpu_query, 0x8866 /* GL_QUERY_RESULT */, &ns);
+	eagl_trace("    gpu %u us\n", ns / 1000);
+}
+
 static void
 my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
@@ -4174,9 +4398,12 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 	if (skipping != 0 && skip_draw(e)) {
 		/* glskip=N: see my_glDrawArrays */
 	} else if (group_draw_begin(e, enabled)) {
+		bool q = trace_gpu_begin();
 		glDrawElements(mode, count, type, indices);
+		trace_gpu_end(q);
 		group_draw_end(e, enabled);
 	} else {
+		bool q = trace_gpu_begin();
 		plain = plain_draw_begin(e, enabled);
 		if (!plain) {
 			use_program(e, e->program);     /* (see my_glDrawArrays) */
@@ -4185,6 +4412,7 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 		if (plain) {
 			plain_draw_end(e, enabled);
 		}
+		trace_gpu_end(q);
 	}
 	if (trace_listed) {
 		trace_placed_look(e);
@@ -4344,6 +4572,11 @@ my_glDeleteTextures(void *context, GLsizei n, const GLuint *textures)
 		group_forget(e, textures[i]);
 		if (textures[i] == e->colour) {
 			e->colour = 0;          /* (a texture that is deleted leaves the framebuffer bound) */
+		}
+		for (unsigned k = 0; textures[i] != 0 && k < 256; k++) {
+			if (e->fb_colour[k].colour == textures[i]) {
+				e->fb_colour[k].colour = 0;     /* (and detached from every framebuffer) */
+			}
 		}
 	}
 	glDeleteTextures(n, textures);
@@ -4637,14 +4870,23 @@ my_glBindFramebuffer(void *context, GLenum target, GLuint framebuffer)
 	e->framebuffer = framebuffer;
 	e->colour = 0;
 	if (framebuffer != 0) {
-		GLint kind = 0, name = 0;
+		unsigned k = framebuffer % 256;
 
-		glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-		    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &kind);
-		if (kind == GL_TEXTURE) {
+		if (e->fb_colour[k].framebuffer == framebuffer) {
+			e->colour = e->fb_colour[k].colour;
+		} else {
+			GLint kind = 0, name = 0;
+
 			glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-			    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
-			e->colour = (GLuint)name;
+			    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &kind);
+			if (kind == GL_TEXTURE) {
+				glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+				    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+				e->colour = (GLuint)name;
+			}
+			e->fb_colour[k].framebuffer = framebuffer;
+			e->fb_colour[k].colour = e->colour;
+			e->fb_asked++;
 		}
 	}
 	EAGL_LEAVE(e, 0x1508);
@@ -4659,6 +4901,10 @@ my_glFramebufferTexture2D(void *context, GLenum target, GLenum attachment, GLenu
 	clear_now(e);
 	if (attachment == GL_COLOR_ATTACHMENT0 && target != GL_READ_FRAMEBUFFER) {
 		e->colour = texture;
+		if (e->framebuffer != 0) {
+			e->fb_colour[e->framebuffer % 256].framebuffer = e->framebuffer;
+			e->fb_colour[e->framebuffer % 256].colour = texture;
+		}
 	}
 	if (eagl_tracing) {
 		eagl_trace("glFramebufferTexture2D(%#x, %#x, %#x, %u, %d)\n", target, attachment, to, texture, level);
@@ -4678,9 +4924,33 @@ my_glDeleteFramebuffers(void *context, GLsizei n, const GLuint *framebuffers)
 		if (framebuffers[i] == e->framebuffer) {
 			e->framebuffer = e->colour = 0;
 		}
+		if (framebuffers[i] != 0 && e->fb_colour[framebuffers[i] % 256].framebuffer == framebuffers[i]) {
+			e->fb_colour[framebuffers[i] % 256].framebuffer = 0;
+		}
 	}
 	glDeleteFramebuffers(n, framebuffers);
 	EAGL_LEAVE(e, 0x1510);
+}
+
+static void
+my_glFramebufferRenderbuffer(void *context, GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer)
+{
+	struct eagl *e = context;
+
+	EAGL_ENTER(e, 0x1540);
+	clear_now(e);
+	if (attachment == GL_COLOR_ATTACHMENT0 && target != GL_READ_FRAMEBUFFER) {
+		e->colour = 0;                  /* (no texture is drawn into) */
+		if (e->framebuffer != 0) {
+			e->fb_colour[e->framebuffer % 256].framebuffer = e->framebuffer;
+			e->fb_colour[e->framebuffer % 256].colour = 0;
+		}
+	}
+	if (eagl_tracing) {
+		eagl_trace("glFramebufferRenderbuffer(%#x, %#x, %#x, %u)\n", target, attachment, renderbuffertarget, renderbuffer);
+	}
+	glFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer);
+	EAGL_LEAVE(e, 0x1540);
 }
 
 /* A private entry of iOS's library (CA::OGL::GLESContext::set_surface calls it); nobody else has it. */
@@ -5111,6 +5381,126 @@ my_getMacroContextPrivate(id self, SEL selector)
 	return e ? e->table : NULL;     /* (16.5's layout: QuartzCore reads table[0] and the slots as they were) */
 }
 
+/*
+ * A surface that is all zero -- just made: the pictures CoreAnimation draws into when an
+ * application opens or closes, 750 x 1624 -- needs no upload: its texture is cleared to zero by
+ * the GPU instead of 4.8 MB read by the processor from memory it does not cache (2-8 ms in the
+ * middle of the animation, slow-attach). The same picture either way. (/redwood/glnoblank: off)
+ */
+static bool
+blank_to_texture(struct eagl *e, struct image *image)
+{
+	GLint draw = 0;
+	GLfloat colour[4];
+	GLboolean mask[4], scissor;
+
+	if (!blank_fills || !image->blank || image->shared || image->plane != 0 || IOSurfaceGetPlaneCount(image->surface) > 0) {
+		return false;
+	}
+	tex_image(image->to, 0, (GLint)internal_format(image->internal, image->format), image->width, image->height, 0,
+	    image->format, image->type, NULL);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	glGetFloatv(GL_COLOR_CLEAR_VALUE, colour);
+	glGetBooleanv(GL_COLOR_WRITEMASK, mask);
+	scissor = glIsEnabled(GL_SCISSOR_TEST);
+	if (e->writer == 0) {
+		glGenFramebuffers(1, &e->writer);
+	}
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
+	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
+	if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+		return false;   /* (surface_to_texture() fills it after all) */
+	}
+	glDisable(GL_SCISSOR_TEST);
+	glColorMask(1, 1, 1, 1);
+	glClearColor(0, 0, 0, 0);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glClearColor(colour[0], colour[1], colour[2], colour[3]);
+	glColorMask(mask[0], mask[1], mask[2], mask[3]);
+	if (scissor) {
+		glEnable(GL_SCISSOR_TEST);
+	}
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+	image->seed = IOSurfaceGetSeed(image->surface);
+	e->blank_fills++;
+	return true;
+}
+
+/*
+ * A surface drawn into that has a mirror (surface_mirrored(): its own memory as a second texture, for the
+ * GPU's copy of every frame into it) is filled the other way round, by the GPU: the texture is made and the
+ * mirror copied into it. Read and added up by the processor instead, from memory it does not cache, a
+ * 750 x 1624 picture cost 8-25 ms when an application opened or closed (slow-attach), a hitch each time --
+ * and its sums are never looked at again: a mirrored surface is drawn by the GPU only. (/redwood/glnomirrorfill: off)
+ */
+static int mirror_fills = 1;
+static bool
+mirror_to_texture(struct eagl *e, struct image *image)
+{
+	GLint read = 0, draw = 0;
+
+	if (!mirror_fills || image->mirror == 0 || image->shared) {
+		return false;
+	}
+	tex_image(image->to, 0, (GLint)internal_format(image->internal, image->format), image->width, image->height, 0,
+	    image->format, image->type, NULL);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	if (e->reader == 0) {
+		glGenFramebuffers(1, &e->reader);
+	}
+	if (e->writer == 0) {
+		glGenFramebuffers(1, &e->writer);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, e->reader);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->mirror, 0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
+	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
+	bool ok = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE &&
+	    glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+	if (ok) {
+		GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+		if (scissor) {
+			glDisable(GL_SCISSOR_TEST);
+		}
+		/* (the mirror is the surface the way it is shown: upside down if the texture is drawn so) */
+		glBlitFramebuffer(0, image->invert ? image->height : 0, image->width, image->invert ? 0 : image->height,
+		    0, 0, image->width, image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		if (scissor) {
+			glEnable(GL_SCISSOR_TEST);
+		}
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+	if (!ok) {
+		return false;
+	}
+	image->seed = IOSurfaceGetSeed(image->surface);
+	e->mirror_fills++;
+	return true;
+}
+
+/* With glslow=US: a slow attach, step by step (making the mirror or sharing, adding up, filling the texture) */
+static void
+attach_timing(struct eagl *e, const char *what, struct image *image, uint64_t began, uint64_t t_share, uint64_t t_sum)
+{
+	uint64_t end = now_us();
+
+	(void)e;
+	if (slow_calls_us == 0 || end - began < slow_calls_us) {
+		return;
+	}
+	uint32_t pf = IOSurfaceGetPixelFormat(image->surface);
+	say("tl: slow-attach %s %dx%d%s%s: %llu us: mirror/share %llu, add up %llu, fill %llu; format %#x type %#x internal %#x%s%s, "
+	    "surface '%.4s' %zux%zu, %zu a row\n", what, image->width,
+	    image->height, image->mirror != 0 ? " (mirrored)" : image->shared ? " (shared)" : "", image->blank ? " blank" : "", end - began,
+	    (t_share ? t_share : end) - began, t_share ? t_sum - t_share : 0, t_share ? end - t_sum : 0, image->format, image->type,
+	    image->internal, image->invert ? " inverted" : "", image->alpha_first ? " alpha-first" : "",
+	    (const char *)&(uint32_t){ __builtin_bswap32(pf) }, IOSurfaceGetWidth(image->surface), IOSurfaceGetHeight(image->surface),
+	    IOSurfaceGetBytesPerRow(image->surface));
+}
+
 /* (the types are the method's own: the last three arrive on the stack, where sizes matter) */
 static BOOL
 my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long target, unsigned long internal,
@@ -5151,10 +5541,16 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	}
 	image->wrapped = IOSurfaceGetPixelFormat(surface) == 0;
 	began = now_us();
+	uint64_t t_share = 0, t_sum = 0;
 	if (!surface_shared(e, image)) {
+		t_share = now_us();
 		surface_changed_all(e, image, true);    /* (what it adds up to now) */
-		surface_to_texture(e, image);
+		t_sum = now_us();
+		if (!blank_to_texture(e, image)) {
+			surface_to_texture(e, image);
+		}
 	}
+	attach_timing(e, "texImageIOSurface", image, began, t_share, t_sum);
 	e->attaching += now_us() - began;
 	eagl_leave(e, 0x970);
 	return YES;
@@ -5211,10 +5607,19 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	 * around, to be shown): a texture that is not the surface's memory starts with what the surface holds.
 	 */
 	began = now_us();
-	if (surface_mirrored(e, image) || !surface_shared(e, image)) {
+	uint64_t t_share = 0, t_sum = 0;
+	bool mirrored = surface_mirrored(e, image);
+	if (mirrored && mirror_to_texture(e, image)) {
+		/* (filled by the GPU from the surface itself) */
+	} else if (mirrored || !surface_shared(e, image)) {
+		t_share = now_us();
 		surface_changed_all(e, image, true);    /* (what it adds up to now) */
-		surface_to_texture(e, image);
+		t_sum = now_us();
+		if (!blank_to_texture(e, image)) {
+			surface_to_texture(e, image);
+		}
 	}
+	attach_timing(e, "attachImage", image, began, t_share, t_sum);
 	e->attaching += now_us() - began;
 	if (attached++ < 24) {
 		say("redwood-gl: -attachImage: texture %d is IOSurface %u ('%.4s' %d x %d, %zu bytes a row)%s%s\n", texture,
@@ -5911,6 +6316,25 @@ install(void)
 		close(extra_fd);
 	}
 	if (got) {
+		/*
+		 * gltrace_file=PATH: this process's stderr -- the traces, every "redwood-gl" line -- into PATH instead
+		 * of the kernel's console, whose network copy loses lines when a trace writes thousands a second
+		 */
+		if ((argument = strstr(arguments, "gltrace_file=")) != NULL) {
+			char path[256];
+			size_t k = 0;
+			for (argument += 13; *argument && *argument != ' ' && *argument != 10 && k < sizeof(path) - 1; argument++) {
+				path[k++] = *argument;
+			}
+			path[k] = 0;
+			int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+			if (fd >= 0) {
+				dup2(fd, 2);
+				close(fd);
+			}
+		}
+		trace_dump = strstr(arguments, "gltrace_dump=1") != NULL;
+		trace_gpu = strstr(arguments, "gltrace_gpu=1") != NULL;
 		if ((argument = strstr(arguments, "gltrace=")) != NULL) {
 			trace_last = trace_first = (unsigned)strtoul(argument + 8, (char **)&argument, 10);
 			if (*argument == '-') {
@@ -5970,6 +6394,11 @@ install(void)
 		}
 		/* likewise /redwood/glframes: a line for every frame */
 		frame_lines |= access("/redwood/glframes", F_OK) == 0;
+		orphan_uploads = access("/redwood/glnoorphan", F_OK) != 0;
+		blank_fills = access("/redwood/glnoblank", F_OK) != 0;
+		boost_driver = access("/redwood/glnoboost", F_OK) != 0;
+		mirror_fills = access("/redwood/glnomirrorfill", F_OK) != 0;
+		lazy_slices = access("/redwood/glnolazy", F_OK) != 0;
 		gpu_time_on = access("/redwood/glgputime", F_OK) == 0;
 		FILE *ahead = fopen("/redwood/glahead", "r");
 		if (ahead != NULL) {

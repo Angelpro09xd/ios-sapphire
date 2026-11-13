@@ -1,0 +1,358 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0279: camera: every mapping once, at op 1
+
+op 9 after a long preview session panicked in a first-time ml_io_map ("kmem_alloc
+(..., 16384): failed with 3"): the kernel's mapping space was used up, and op 11
+mapped a CSIPHY again on every call. Every register window and pin the camera
+code uses is now mapped once at op 1 (cam_premap: the camera pins, CCI, CPAS,
+CSIPHY0-2, PPI, CSID/TFE, the SMMU, the frame pool) and kept; GCC is three small
+windows (0x17000, 0x51000-0x59fff, 0x7D000) instead of one 512 KB mapping.
+cam_io() counts the mappings and every op's last log line shows the count, which
+must not grow after op 1. The preview thread and op 9 make no mappings or
+allocations; the SPMI path maps each channel once and the RPM helper only while
+its link is down.
+---
+ bsd/dev/sweet_cam.c | 183 ++++++++++++++++++++++++++++++++++++++++------------
+ 1 file changed, 143 insertions(+), 40 deletions(-)
+
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index c008e6a..cc5cda3 100755
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -19,6 +19,7 @@
+  *     a still waits for a whole frame; long exposures lengthen the frame (up to 65535 lines).
+  *     0278: op 10 slots 1 (OV16A1Q, CSIPHY2), 2 (S5K4H7, CSIPHY1) and 3 (SC202PCS, CSIPHY1 one lane);
+  *     op 11 restarts the sensor's stream after the receiver is set up.
++ *     0279: every mapping made once at op 1 (counted in each op's last line).
+  *     kern.sweet_cam_seek + kern.sweet_cam_frame: the frame in
+  *     1 MB reads, kern.sweet_cam_frame_len its size.
+  *   kern.sweet_cam_log: the log of the last request (also in the kernel log, "SWEET CAM:").
+@@ -106,7 +107,7 @@ static int64_t cam_seek;
+ static uint32_t cam_frame_len, cam_frame_off;
+ static uint64_t cam_frame_ns;                   /* 0277: the HM6 frame time in use (exposure, frame length) */
+ static uint8_t *cam_pool;
+-static vm_offset_t cam_phy, cam_ppi, cam_csid, cam_smmu;
++static vm_offset_t cam_phy, cam_ppi, cam_csid, cam_smmu, cam_phys[3];
+ static bool slot_up[4], cam_streaming, cam_csid_up;
+ static struct { unsigned slot, mode, w, h, phy, settle, lanes; uint32_t rxcfg0; bool cphy; } cs;
+ static int cam_last = -1;
+@@ -138,61 +139,118 @@ static inline void wr(vm_offset_t b, uint32_t o, uint32_t v)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++/*
++ * 0279: every mapping is made once, at op 1, and kept (cam_premap); cam_io() counts them and
++ * every op's last log line shows the count, which must stay the same. 0278 mapped a CSIPHY on
++ * every op 11/30, and a late first mapping (a pin op 9 had not used yet) found the kernel's
++ * mapping space exhausted: "kmem_alloc(..., 16384): failed with 3" panic. GCC is no longer one
++ * 512 KB mapping but three windows: 0x17000 (camera AHB/XO), 0x51000-0x59fff (camss clocks,
++ * GDSC), 0x7D000 (TBU GDSC votes).
++ */
++static unsigned cam_maps;
++static uint64_t cam_map_bytes;
++
++static vm_offset_t
++cam_io(uint64_t pa, uint64_t size)
++{
++	vm_offset_t va = ml_io_map((vm_offset_t)pa, (vm_size_t)size);
++	if (va != 0) {
++		cam_maps++;
++		cam_map_bytes += size;
++	}
++	return va;
++}
++
++static vm_offset_t gcc_a, gcc_b, gcc_c;
++
++static inline vm_offset_t
++gcc_va(uint32_t o)
++{
++	if (o >= 0x51000 && o < 0x5A000 && gcc_b) {
++		return gcc_b + (o - 0x51000);
++	}
++	if (o >= 0x17000 && o < 0x18000 && gcc_a) {
++		return gcc_a + (o - 0x17000);
++	}
++	if (o >= 0x7D000 && o < 0x7E000 && gcc_c) {
++		return gcc_c + (o - 0x7D000);
++	}
++	return 0;
++}
++
++static inline uint32_t
++gccr(uint32_t o)
++{
++	vm_offset_t v = gcc_va(o);
++	return v ? *(volatile uint32_t *)v : 0xDEADDEADu;
++}
++
++static inline void
++gccw(uint32_t o, uint32_t val)
++{
++	vm_offset_t v = gcc_va(o);
++	if (v) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++		*(volatile uint32_t *)v = val;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++}
++
+ /* ---------------------------------------------------------------- GCC */
+ 
+ static bool
+ gdsc_on(void)
+ {
+-	uint32_t v = rd(gcc, GDSC_CAMSS);
++	uint32_t v = gccr(GDSC_CAMSS);
+ 	camlog("GDSC camss_top %#x: before %#x", GCC_PA + GDSC_CAMSS, v);
+-	wr(gcc, GDSC_CAMSS, v & ~1u);                   /* SW_COLLAPSE off */
++	gccw(GDSC_CAMSS, v & ~1u);                   /* SW_COLLAPSE off */
+ 	for (int i = 0; i < 100; i++) {
+-		if (rd(gcc, GDSC_CAMSS) & (1u << 31)) {
+-			camlog("GDSC camss_top: PWR_ON (%#x) after %d x 10 us", rd(gcc, GDSC_CAMSS), i);
++		if (gccr(GDSC_CAMSS) & (1u << 31)) {
++			camlog("GDSC camss_top: PWR_ON (%#x) after %d x 10 us", gccr(GDSC_CAMSS), i);
+ 			return true;
+ 		}
+ 		IODelay(10);
+ 	}
+-	camlog("GDSC camss_top: NO PWR_ON after 1 ms (%#x): stop", rd(gcc, GDSC_CAMSS));
++	camlog("GDSC camss_top: NO PWR_ON after 1 ms (%#x): stop", gccr(GDSC_CAMSS));
+ 	return false;
+ }
+ 
+ static bool
+ rcg_set(const char *name, uint32_t rcg, uint32_t cfg)
+ {
+-	wr(gcc, rcg + 4, cfg);
+-	wr(gcc, rcg, rd(gcc, rcg) | 1);                 /* UPDATE */
++	gccw(rcg + 4, cfg);
++	gccw(rcg, gccr(rcg) | 1);                 /* UPDATE */
+ 	for (int i = 0; i < 100; i++) {
+-		if ((rd(gcc, rcg) & 1) == 0) {
+-			camlog("RCG %s: cfg %#x, cmd %#x", name, rd(gcc, rcg + 4), rd(gcc, rcg));
++		if ((gccr(rcg) & 1) == 0) {
++			camlog("RCG %s: cfg %#x, cmd %#x", name, gccr(rcg + 4), gccr(rcg));
+ 			return true;
+ 		}
+ 		IODelay(10);
+ 	}
+-	camlog("RCG %s: update did not complete (cmd %#x cfg %#x): stop", name, rd(gcc, rcg), rd(gcc, rcg + 4));
++	camlog("RCG %s: update did not complete (cmd %#x cfg %#x): stop", name, gccr(rcg), gccr(rcg + 4));
+ 	return false;
+ }
+ 
+ static bool
+ branch_on(const char *name, uint32_t cbcr)
+ {
+-	wr(gcc, cbcr, rd(gcc, cbcr) | 1);
++	gccw(cbcr, gccr(cbcr) | 1);
+ 	for (int i = 0; i < 100; i++) {
+-		if ((rd(gcc, cbcr) & (1u << 31)) == 0) {
+-			camlog("branch %s on (%#x)", name, rd(gcc, cbcr));
++		if ((gccr(cbcr) & (1u << 31)) == 0) {
++			camlog("branch %s on (%#x)", name, gccr(cbcr));
+ 			return true;
+ 		}
+ 		IODelay(10);
+ 	}
+-	camlog("branch %s: still off after 1 ms (%#x): stop", name, rd(gcc, cbcr));
++	camlog("branch %s: still off after 1 ms (%#x): stop", name, gccr(cbcr));
+ 	return false;
+ }
+ 
+ static void
+ branch_off(const char *name, uint32_t cbcr)
+ {
+-	wr(gcc, cbcr, rd(gcc, cbcr) & ~1u);
+-	camlog("branch %s off (%#x)", name, rd(gcc, cbcr));
++	gccw(cbcr, gccr(cbcr) & ~1u);
++	camlog("branch %s off (%#x)", name, gccr(cbcr));
+ }
+ 
+ /* ---------------------------------------------------------------- TLMM and PMIC GPIOs */
+@@ -208,7 +266,7 @@ tlmm_pin(unsigned gpio)
+ 	}
+ 	if (map[gpio] == 0) {
+ 		uint64_t base = tile[gpio] == 'S' ? 0x00900000ull : tile[gpio] == 'E' ? 0x00D00000ull : 0x00500000ull;
+-		map[gpio] = ml_io_map(base + gpio * 0x1000ull, 0x1000);
++		map[gpio] = cam_io(base + gpio * 0x1000ull, 0x1000);
+ 	}
+ 	return (volatile uint32_t *)map[gpio];
+ }
+@@ -471,11 +529,18 @@ static bool
+ cam_map(void)
+ {
+ 	if (gcc == 0) {
+-		gcc = ml_io_map(GCC_PA, GCC_SIZE);
++		gcc_a = cam_io(GCC_PA + 0x17000, 0x1000);
++		gcc_b = cam_io(GCC_PA + 0x51000, 0x9000);
++		gcc_c = cam_io(GCC_PA + 0x7D000, 0x1000);
++		gcc = gcc_a && gcc_b && gcc_c ? gcc_b : 0;
+ 	}
+ 	return gcc != 0;
+ }
+ 
++static bool cam_pool_map(void);
++
++static bool cam_premap(void);
++
+ /* op 1 */
+ static int
+ camss_on(void)
+@@ -484,11 +549,14 @@ camss_on(void)
+ 		camlog("GCC not mapped");
+ 		return EIO;
+ 	}
++	if (!cam_premap()) {
++		return EIO;
++	}
+ 	/* the always-on camera AHB/XO branches gcc-khaje turns on at probe (nobody does here) */
+-	camlog("gcc_camera_ahb_clk %#x, gcc_camera_xo_clk %#x", rd(gcc, 0x17008), rd(gcc, 0x17028));
++	camlog("gcc_camera_ahb_clk %#x, gcc_camera_xo_clk %#x", gccr(0x17008), gccr(0x17028));
+ 	/* their CLK_OFF bit only clears once the camss domain is powered: enable now, check after the GDSC */
+-	wr(gcc, 0x17008, rd(gcc, 0x17008) | 1);
+-	wr(gcc, 0x17028, rd(gcc, 0x17028) | 1);
++	gccw(0x17008, gccr(0x17008) | 1);
++	gccw(0x17028, gccr(0x17028) | 1);
+ 	if (!gdsc_on()) {
+ 		return EIO;
+ 	}
+@@ -497,14 +565,14 @@ camss_on(void)
+ 	    !branch_on("nrt_axi", CBCR_NRT_AXI) || !rcg_set("cci_0 37.5 MHz", RCG_CCI, 0x20F) || !branch_on("cci_0", CBCR_CCI)) {
+ 		return EIO;
+ 	}
+-	camlog("after the GDSC and top clocks: gcc_camera_ahb_clk %#x, gcc_camera_xo_clk %#x", rd(gcc, 0x17008),
+-	    rd(gcc, 0x17028));
++	camlog("after the GDSC and top clocks: gcc_camera_ahb_clk %#x, gcc_camera_xo_clk %#x", gccr(0x17008),
++	    gccr(0x17028));
+ 	if (!branch_on("camera_ahb", 0x17008)) {
+ 		return EIO;
+ 	}
+ 	if (cci == 0) {
+-		cci = ml_io_map(CCI_PA, 0x1000);
+-		cpas = ml_io_map(CPAS_PA, 0x1000);
++		cci = cam_io(CCI_PA, 0x1000);
++		cpas = cam_io(CPAS_PA, 0x1000);
+ 	}
+ 	if (cci == 0 || cpas == 0) {
+ 		camlog("CCI/CPAS not mapped");
+@@ -668,8 +736,8 @@ cam_off(void)
+ 		branch_off("top_ahb", CBCR_TOP_AHB);
+ 		camss_up = false;
+ 	}
+-	wr(gcc, GDSC_CAMSS, rd(gcc, GDSC_CAMSS) | 1);   /* SW_COLLAPSE */
+-	camlog("everything off (GDSC %#x)", rd(gcc, GDSC_CAMSS));
++	gccw(GDSC_CAMSS, gccr(GDSC_CAMSS) | 1);   /* SW_COLLAPSE */
++	camlog("everything off (GDSC %#x)", gccr(GDSC_CAMSS));
+ 	return 0;
+ }
+ 
+@@ -982,11 +1050,7 @@ cam_link_on(void)
+ 	    !branch_on("tfe_0", 0x5201Cu)) {
+ 		return EIO;
+ 	}
+-	cam_phy = ml_io_map(CSIPHY_PA(n), 0x2000);
+-	if (cam_ppi == 0) {
+-		cam_ppi = ml_io_map(PPI_PA, 0x1000);
+-		cam_csid = ml_io_map(CSID0_PA, 0x5000);
+-	}
++	cam_phy = cam_phys[n];                          /* 0279: mapped once at op 1 */
+ 	if (cam_phy == 0 || cam_ppi == 0 || cam_csid == 0) {
+ 		camlog("CSIPHY/PPI/CSID not mapped");
+ 		return EIO;
+@@ -1090,7 +1154,7 @@ static void
+ cam_smmu_report(const char *when)
+ {
+ 	if (cam_smmu == 0) {
+-		cam_smmu = ml_io_map(SMMU_PA, 0x80000);
++		cam_smmu = cam_io(SMMU_PA, 0x80000);
+ 	}
+ 	if (cam_smmu == 0) {
+ 		return;
+@@ -1362,7 +1426,7 @@ cam_smmu_stage(void)
+ 	}
+ 	if (cam_smmu == 0) {
+ 		step("mapping the apps SMMU %#x (0x80000)", SMMU_PA);
+-		cam_smmu = ml_io_map(SMMU_PA, 0x80000);
++		cam_smmu = cam_io(SMMU_PA, 0x80000);
+ 	}
+ 	if (cam_smmu == 0 || !cam_map()) {
+ 		return EIO;
+@@ -1373,7 +1437,7 @@ cam_smmu_stage(void)
+ 	uint32_t psize = (id1 & (1u << 31)) ? 0x10000 : 0x1000, npage = 1u << (((id1 >> 28) & 7) + 1);
+ 	camlog("SMMU %#x: sCR0 %#x ID0 %#x ID1 %#x: %u SMRs, %u banks, page %#x x %u; sGFSR %#x", SMMU_PA, rd(s, 0x0), id0, id1,
+ 	    nsmr, ncb, psize, npage, rd(s, 0x48));
+-	camlog("GCC hlos1_vote_mm_snoc_mmu_tbu_rt_gdsc (0x147d074, the TBU of streams 0x400-0x7ff) %#x", rd(gcc, 0x7D074));
++	camlog("GCC hlos1_vote_mm_snoc_mmu_tbu_rt_gdsc (0x147d074, the TBU of streams 0x400-0x7ff) %#x", gccr(0x7D074));
+ 	uint32_t slot = ~0u, cb = ~0u, valid = 0;
+ 	uint64_t used = 0;
+ 	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
+@@ -1462,9 +1526,9 @@ cam_tfe_read(void)
+ 		camlog("op 21: CSID not up (op 11 first: it also turns on tfe_0)");
+ 		return EAGAIN;
+ 	}
+-	camlog("TFE clocks: tfe_0 CBCR %#x, tfe_0_csid %#x, tfe_0_cphy_rx %#x, top_ahb %#x, axi %#x, rt_axi %#x", rd(gcc, 0x5201C),
+-	    rd(gcc, 0x520AC), rd(gcc, 0x5207C), rd(gcc, CBCR_TOP_AHB), rd(gcc, CBCR_AXI), rd(gcc, CBCR_RT_AXI));
+-	if ((rd(gcc, 0x5201C) >> 31) != 0) {
++	camlog("TFE clocks: tfe_0 CBCR %#x, tfe_0_csid %#x, tfe_0_cphy_rx %#x, top_ahb %#x, axi %#x, rt_axi %#x", gccr(0x5201C),
++	    gccr(0x520AC), gccr(0x5207C), gccr(CBCR_TOP_AHB), gccr(CBCR_AXI), gccr(CBCR_RT_AXI));
++	if ((gccr(0x5201C) >> 31) != 0) {
+ 		camlog("op 21: tfe_0 is off: stop");
+ 		return EIO;
+ 	}
+@@ -2098,6 +2162,45 @@ cam_bus_check(void)
+ 	return ok ? 0 : EIO;
+ }
+ 
++/* 0279: every register window and pin the camera code will ever touch, mapped once */
++static bool
++cam_premap(void)
++{
++	static bool done;
++	static const unsigned pins[] = { 18, 19, 20, 21, 22, 23, 24, 26, 27, 28, 29, 30, 34, 54, 68, 85, 83 };
++	if (done) {
++		return true;
++	}
++	unsigned before = cam_maps;
++	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
++		if (tlmm_pin(pins[i]) == NULL) {
++			camlog("premap: gpio%u failed", pins[i]);
++			return false;
++		}
++	}
++	if (cci == 0) {
++		cci = cam_io(CCI_PA, 0x1000);
++		cpas = cam_io(CPAS_PA, 0x1000);
++	}
++	for (unsigned n = 0; n < 3; n++) {
++		if (cam_phys[n] == 0) {
++			cam_phys[n] = cam_io(CSIPHY_PA(n), 0x2000);
++		}
++	}
++	if (cam_ppi == 0) {
++		cam_ppi = cam_io(PPI_PA, 0x1000);
++		cam_csid = cam_io(CSID0_PA, 0x5000);
++	}
++	if (cam_smmu == 0) {
++		cam_smmu = cam_io(SMMU_PA, 0x80000);
++	}
++	bool ok = cci && cpas && cam_phys[0] && cam_phys[1] && cam_phys[2] && cam_ppi && cam_csid && cam_smmu && cam_pool_map();
++	camlog("premap: %u new mappings (%u in all, %llu KB) + the pool: %s", cam_maps - before, cam_maps, cam_map_bytes >> 10,
++	    ok ? "ok" : "FAILED");
++	done = ok;
++	return ok;
++}
++
+ static int
+ sysctl_sweet_cam SYSCTL_HANDLER_ARGS
+ {
+@@ -2167,7 +2270,7 @@ sysctl_sweet_cam SYSCTL_HANDLER_ARGS
+ 		r = EINVAL;
+ 		break;
+ 	}
+-	camlog("op %d: %d", v, r);
++	camlog("op %d: %d (mappings %u, %llu KB)", v, r, cam_maps, cam_map_bytes >> 10);
+ 	cam_last = r;
+ 	lck_mtx_unlock(&sweet_cam_mtx);
+ 	return r;

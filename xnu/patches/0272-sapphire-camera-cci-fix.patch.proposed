@@ -1,0 +1,106 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0272: camera CCI fixes (queue start, lock, init)
+
+Every CCI read timed out with IRQ status 0: CCI_QUEUE_START is at 0x008
+(camera.ko cam_cci_read), not 0x00C. Also as camera.ko does: reads are
+SET_PARAM, LOCK, WRITE_DISABLE_P, READ, UNLOCK; writes LOCK after SET_PARAM
+and UNLOCK before the REPORT; the reset writes 0x0F73F3F7 then 1 and, after
+the reset done bit, IRQ_MASK_0/CLEAR_0 = 0x7FFF7FF7 and IRQ_MASK_1/CLEAR_1 =
+0x110000 (the mask is also set before the reset, for its acknowledge). A
+failed queue logs its word count, command and report status.
+---
+ bsd/dev/sweet_cam.c | 28 +++++++++++++++++++++++-----
+ 1 file changed, 23 insertions(+), 5 deletions(-)
+
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index 6ebd8c4..d4cc942 100755
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -51,7 +51,7 @@ static const uint32_t cbcr_mclk[4] = { 0x51018u, 0x51034u, 0x51050u, 0x5106Cu };
+ /* CCI v1.2 (Linux i2c-qcom-cci) */
+ #define CCI_HW_VERSION  0x000
+ #define CCI_RESET_CMD   0x004
+-#define CCI_QUEUE_START 0x00C
++#define CCI_QUEUE_START 0x008                 /* 0272: camera.ko cam_cci_read (0x00C was wrong) */
+ #define CCI_M(m)        (0x100u + 0x100u * (m))
+ #define CCI_Q(m, q)     (0x300u + 0x200u * (m) + 0x100u * (q))
+ #define CCI_IRQ_GCLEAR  0xC00
+@@ -268,12 +268,25 @@ cci_wait(uint32_t bit, uint32_t errmask, const char *what)
+ 	return false;
+ }
+ 
++/*
++ * 0272: as camera.ko's cam_cci_init: reset (0x0F73F3F7, then 1), wait for the reset done bit, then
++ * IRQ_MASK_0/CLEAR_0 = 0x7FFF7FF7, IRQ_MASK_1/CLEAR_1 (0xC10/0xC14) = 0x110000, global clear.
++ * The mask is also set before the reset so that its acknowledge shows.
++ */
+ static bool
+ cci_reset(void)
+ {
+ 	cci_clear(0xffffffffu);
++	wr(cci, CCI_IRQ_MASK0, 0x7FFF7FF7u);
+ 	wr(cci, CCI_RESET_CMD, 0x0F73F3F7u);
+-	return cci_wait(CCI_RST_DONE, 0, "reset");
++	wr(cci, CCI_RESET_CMD, 0x1u);
++	bool ok = cci_wait(CCI_RST_DONE, 0, "reset");
++	wr(cci, CCI_IRQ_MASK0, 0x7FFF7FF7u);
++	wr(cci, CCI_IRQ_CLEAR0, 0x7FFF7FF7u);
++	wr(cci, 0xC10, 0x110000u);
++	wr(cci, 0xC14, 0x110000u);
++	wr(cci, CCI_IRQ_GCLEAR, 1);
++	return ok;
+ }
+ 
+ static bool
+@@ -285,8 +298,6 @@ cci_init(void)
+ 			return false;
+ 		}
+ 	}
+-	wr(cci, CCI_IRQ_MASK0, 0x1u | 0x10u | 0x100u | 0x1000u | 0x10000u | 0x100000u | CCI_RST_DONE | (3u << 25) |
+-	    CCI_M0_ERROR | CCI_M1_ERROR);
+ 	if (!cci_reset()) {
+ 		camlog("CCI: no reset acknowledge: stop");
+ 		return false;
+@@ -298,7 +309,7 @@ cci_init(void)
+ 		wr(cci, CCI_M(m) + 0x0C, t400[6]);                      /* SDA_CTL_2 tbuf */
+ 		wr(cci, CCI_M(m) + 0x10, t400[7] << 4 | t400[8]);      /* MISC_CTL trdhld, tsp */
+ 	}
+-	camlog("CCI: reset, both masters at 400 kHz (cci clock 37.5 MHz)");
++	camlog("CCI: reset, both masters at 400 kHz (cci clock 37.5 MHz), irq mask %#x", rd(cci, CCI_IRQ_MASK0));
+ 	return true;
+ }
+ 
+@@ -308,6 +319,9 @@ cci_run(unsigned m, unsigned q, uint32_t donebit, const char *what)
+ 	wr(cci, CCI_Q(m, q) + 0x0, rd(cci, CCI_Q(m, q) + 0x4));    /* EXEC_WORD_CNT = CUR_WORD_CNT */
+ 	wr(cci, CCI_QUEUE_START, 1u << (m * 2 + q));
+ 	if (!cci_wait(donebit, m == 0 ? CCI_M0_ERROR : CCI_M1_ERROR, what)) {
++		camlog("CCI m%u q%u: cur words %u, cur cmd %#x, report status %#x, irq mask %#x, read level %u", m, q,
++		    rd(cci, CCI_Q(m, q) + 0x4), rd(cci, CCI_Q(m, q) + 0x8), rd(cci, CCI_Q(m, q) + 0xC), rd(cci, CCI_IRQ_MASK0),
++		    rd(cci, CCI_M(m) + 0x1C));
+ 		(void)cci_reset();
+ 		return false;
+ 	}
+@@ -323,8 +337,10 @@ cci_read(unsigned m, unsigned addr, unsigned reg, uint8_t *buf, unsigned n)
+ 		return false;
+ 	}
+ 	wr(cci, CCI_Q(m, q) + 0x10, 0x1u | (addr & 0x7f) << 4 | 3u << 16);              /* SET_PARAM, 3 retries */
++	wr(cci, CCI_Q(m, q) + 0x10, 0x6u);                                               /* LOCK */
+ 	wr(cci, CCI_Q(m, q) + 0x10, 0xBu | 2u << 4 | ((reg >> 8) & 0xff) << 8 | (reg & 0xff) << 16);   /* WRITE_DISABLE_P */
+ 	wr(cci, CCI_Q(m, q) + 0x10, 0xAu | n << 4);                                      /* READ */
++	wr(cci, CCI_Q(m, q) + 0x10, 0x7u);                                               /* UNLOCK */
+ 	if (!cci_run(m, q, m == 0 ? 1u << 0 : 1u << 12, "read")) {
+ 		return false;
+ 	}
+@@ -363,10 +379,12 @@ cci_write(unsigned m, unsigned addr, unsigned reg, uint32_t val, unsigned n)
+ 	}
+ 	unsigned len = 2 + n;
+ 	wr(cci, CCI_Q(m, q) + 0x10, 0x1u | (addr & 0x7f) << 4 | 3u << 16);
++	wr(cci, CCI_Q(m, q) + 0x10, 0x6u);                                               /* LOCK */
+ 	wr(cci, CCI_Q(m, q) + 0x10, 0x9u | len << 4 | (uint32_t)b[0] << 8 | (uint32_t)b[1] << 16 | (uint32_t)b[2] << 24);
+ 	if (len > 3) {
+ 		wr(cci, CCI_Q(m, q) + 0x10, b[3]);
+ 	}
++	wr(cci, CCI_Q(m, q) + 0x10, 0x7u);                                               /* UNLOCK */
+ 	wr(cci, CCI_Q(m, q) + 0x10, 0x8u | 1u << 8);                                     /* REPORT, IRQ */
+ 	return cci_run(m, q, m == 0 ? 1u << 4 : 1u << 16, "write");
+ }

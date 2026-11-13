@@ -1,0 +1,340 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0269: HID sensor services (off by default), fixed for backboardd
+
+Replaces 0268 (not applied with it). Six HID event services as the iPhone X
+publishes them: accelerometer (0xff00/3), gyro (0xff00/9), compass
+(0xff00/0xA), proximity (0xff00/8), ambient light (0xff00/4) and device
+orientation (sensor page 0x8A, orientation events of type CMUsage,
+0xff0c/0x64-0x6a), fed from user space through kern.sweet_sensor. 0268
+crash-looped backboardd: its prox matcher wraps only a service with
+Placement = 1 and puts a placeholder that cannot take applyUIMode: in its
+list otherwise; the proximity service now has Placement = 1. The services
+exist only with boot-arg sweet_sensorhid=1 (sweet_sensorhid_mask picks the
+kinds, sweet_nosensorhid=1 turns them all off). The sensors PD asks
+sns_registry_skel for ro.boot.hwname: answered "sapphire".
+---
+--- a/bsd/dev/sweet_inject.c	2026-10-30 00:53:07.115265000 +0100
++++ b/bsd/dev/sweet_inject.c	2026-10-30 01:17:27.685153100 +0100
+@@ -63,4 +63,43 @@
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_inject, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_inject, "A", "a synthetic touch (t FINGER DOWN X Y) or button (k KEY DOWN)");
++
++/*
++ * 0268: kern.sweet_sensor, samples for the motion/environment HID services (SweetHID.cpp) from sensord.
++ * Write: one or more records {int32 kind, int32 v[4]} (kind 0 accel, 1 gyro, 2 compass: x y z in 16.16
++ * g / rad/s / uT; 3 proximity: near, level; 4 ALS: lux; 5 orientation: the CM usage 0x64-0x6a).
++ * Read: "name present clients interval-us samples" per service.
++ */
++extern int sweet_hid_sensor(int kind, const int32_t *v);
++extern int sweet_hid_sensor_status(char *buf, size_t len);
++
++static int
++sysctl_sweet_sensor SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (req->newptr == USER_ADDR_NULL) {
++		char st[512];
++		int n = sweet_hid_sensor_status(st, sizeof(st));
++		return SYSCTL_OUT(req, st, (size_t)(n > 0 ? n : 0) + 1);
++	}
++	int32_t rec[16][5];
++	size_t len = req->newlen;
++	if (len == 0 || len % sizeof(rec[0]) != 0 || len > sizeof(rec)) {
++		return EINVAL;
++	}
++	int error = SYSCTL_IN(req, rec, len);
++	if (error != 0) {
++		return error;
++	}
++	for (size_t i = 0; i < len / sizeof(rec[0]); i++) {
++		error = sweet_hid_sensor(rec[i][0], &rec[i][1]);
++		if (error != 0) {
++			return error;
++		}
++	}
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_sensor, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_sensor, "S", "sensor samples for the HID sensor services; read: their state");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/iokit/Kernel/arm/TopazModem.cpp	2026-10-30 00:53:07.235035000 +0100
++++ b/iokit/Kernel/arm/TopazModem.cpp	2026-10-30 01:17:27.736770800 +0100
+@@ -12917,6 +12917,7 @@
+ #define FS_FILES        64
+ #define FS_DIRS         16
+ #define FR_H_STD        0x5d0                   /* our handle for apps_std */
++#define FR_H_REG        0x5d1                   /* 0268: sns_registry_skel (properties) */
+ #define FR_EFAIL        1                       /* AEE_EFAILED */
+ 
+ struct fs_ent { char path[FS_PATH]; uint8_t *data; uint32_t size, cap; bool written; };
+@@ -13111,10 +13112,13 @@
+ 	char name[64] = "";
+ 	if (r->method == 0 && r->nin >= 2 && r->nout >= 1 && r->outl[0] >= 8) {
+ 		fs_norm(name, r->in[1], MIN(r->inl[1], (uint32_t)sizeof(name)));
+-		bool std = strcmp(name, "apps_std") == 0;
+-		put32(r->out[0], 0, std ? FR_H_STD : 0);
+-		put32(r->out[0], 1, std ? 0 : FR_UNSUPPORTED);
+-		STDLOG("remotectl open \"%s\" -> %s", name, std ? "apps_std" : "not here");
++		bool std = strcmp(name, "apps_std") == 0, reg = false;
++		for (const char *q = name; *q && !reg; q++) {
++			reg = strncmp(q, "sns_reg", 7) == 0;
++		}
++		put32(r->out[0], 0, std ? FR_H_STD : reg ? FR_H_REG : 0);
++		put32(r->out[0], 1, std || reg ? 0 : FR_UNSUPPORTED);
++		STDLOG("remotectl open \"%s\" -> %s", name, std ? "apps_std" : reg ? "sns_registry properties" : "not here");
+ 		return 0;
+ 	}
+ 	if (r->method == 1) {
+@@ -13163,6 +13167,28 @@
+ 	return &fs_tab[fs_fh[fh - 1].ent];
+ }
+ 
++/*
++ * 0268: sns_registry_skel's get_property(name, rout value) (sscrpcd: libsns_registry_skel.so), method 0,
++ * in {len(name), len(value)} + name, out value: Android's properties the PD asks for.
++ */
++static int
++fr_property(struct fr_rev *r)
++{
++	char name[64] = "";
++	if (r->method != 0 || r->nin < 2 || r->nout < 1) {
++		fr_logf("sns_registry method %u (in %u out %u): not here", r->method, r->nin, r->nout);
++		return FR_UNSUPPORTED;
++	}
++	fs_norm(name, r->in[1], MIN(r->inl[1], (uint32_t)sizeof(name)));
++	const char *v = strcmp(name, "ro.boot.hwname") == 0 ? "sapphire" : NULL;
++	STDLOG("property \"%s\" -> %s", name, v ? v : "(none)");
++	if (v == NULL || r->outl[0] <= strlen(v)) {
++		return FR_EFAIL;
++	}
++	strlcpy((char *)r->out[0], v, r->outl[0]);
++	return 0;
++}
++
+ /* apps_std (Lunaris libadsprpc's skel: methods 0-30, 31+ through method 31 with the id first) */
+ static int
+ fr_std_locked(struct fr_rev *r)
+@@ -13543,6 +13569,8 @@
+ 		fr_plen = 0;
+ 	} else if (r.handle == 0) {
+ 		result = fr_remotectl(&r);
++	} else if (r.handle == FR_H_REG || (r.handle == 0xffffffffu && r.sc == 0x00020100u)) {
++		result = fr_property(&r);
+ 	} else if (r.handle == FR_H_STD) {
+ 		IOLock *l = a_lock_get(&fs_lock);
+ 		IOLockLock(l);
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp	2026-10-30 00:53:06.893867800 +0100
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp	2026-10-30 01:17:27.620248300 +0100
+@@ -13,7 +13,7 @@
+  *   SweetHIDTouch    the built-in touch screen (digitizer collections)
+  *
+  * Hardware drivers feed them through the C entry points sweet_hid_key()
+- * and sweet_hid_touch(). Boot-arg sweethidtest=N (seconds) presses Home
++ * and sweet_hid_touch(); 0268 adds the motion/environment sensors (sweet_hid_sensor()). Boot-arg sweethidtest=N (seconds) presses Home
+  * every N seconds, to test the event path without input hardware.
+  */
+ #include <IOKit/IOLib.h>
+@@ -559,3 +559,162 @@
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}
+ }
++
++/*
++ * 0268: motion and environment sensors, as the iPhone X's AOP publishes them (d22ap.adt: accel 0xff00/3,
++ * gyro 0xff00/9, compass 0xff00/0xA, prox 0xff00/8; ALS 0xff00/4) plus the device orientation the
++ * AOP computes (sensor page 0x20, usage 0x8A; kIOHIDEventTypeOrientation of kind CMUsage, usages
++ * 0xff0c/0x64 ambiguous .. 0x6a face down, as IOHIDEventDriver reports them). The samples come from
++ * user space (sensord, which reads the ADSP's sensor core) through kern.sweet_sensor
++ * (bsd/dev/sweet_inject.c) and sweet_hid_sensor().
++ *
++ * 0269: off unless boot-arg sweet_sensorhid=1 (sweet_sensorhid_mask=bits of the kinds below, default all;
++ * sweet_nosensorhid=1 wins): 0268's services crash-looped backboardd. Its prox matcher
++ * (+[BKHIDUISensorConfiguratorFactory _proximityServiceWrapper], services with DeviceUsagePage 0xff00 /
++ * DeviceUsage 8) wraps a service only if its "Placement" property is 1 (top); otherwise the wrapper block
++ * gives nil, the matcher's list gets a placeholder, and -[BKHIDUISensorServiceMatchingWrapper
++ * _applyUIMode:toWrappers:] sends it -applyUIMode: (unrecognized selector, abort). The proximity service
++ * now says Placement = 1 (NeedsHostState absent: the discrete prox wrapper).
++ */
++#include <sys/errno.h>
++
++enum { SWS_ACCEL, SWS_GYRO, SWS_COMPASS, SWS_PROX, SWS_ALS, SWS_ORIENT, SWS_N };
++
++class SweetHIDSensor : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDSensor);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	virtual int kind() { return -1; }
++	void sample(const int32_t *v);
++	unsigned clientCount() { return _clients != NULL ? _clients->getCount() : 0; }
++	uint32_t fInterval;                         /* the last ReportInterval a client asked for (us) */
++	uint32_t fCount;
++};
++OSDefineMetaClassAndStructors(SweetHIDSensor, IOHIDEventService);
++
++static SweetHIDSensor *gSweetSensor[SWS_N];
++
++#define SWEET_SENSOR_CLASS(cls, k, page, usage, pid) \
++class cls : public SweetHIDSensor { \
++	OSDeclareDefaultStructors(cls); \
++public: \
++	virtual int kind() APPLE_KEXT_OVERRIDE { return k; } \
++protected: \
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return page; } \
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return usage; } \
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return pid; } \
++}; \
++OSDefineMetaClassAndStructors(cls, SweetHIDSensor);
++
++SWEET_SENSOR_CLASS(SweetHIDAccel, SWS_ACCEL, 0xff00, 0x03, 0x10)
++SWEET_SENSOR_CLASS(SweetHIDGyro, SWS_GYRO, 0xff00, 0x09, 0x11)
++SWEET_SENSOR_CLASS(SweetHIDCompass, SWS_COMPASS, 0xff00, 0x0a, 0x12)
++SWEET_SENSOR_CLASS(SweetHIDProx, SWS_PROX, 0xff00, 0x08, 0x13)
++SWEET_SENSOR_CLASS(SweetHIDALS, SWS_ALS, 0xff00, 0x04, 0x14)
++SWEET_SENSOR_CLASS(SweetHIDOrientation, SWS_ORIENT, 0x20, 0x8a, 0x15)
++
++bool
++SweetHIDSensor::start(IOService *provider)
++{
++	int k = kind();
++	uint32_t on = 0, off = 0, mask = 0x3f;
++	PE_parse_boot_argn("sweet_sensorhid", &on, sizeof(on));
++	PE_parse_boot_argn("sweet_nosensorhid", &off, sizeof(off));
++	PE_parse_boot_argn("sweet_sensorhid_mask", &mask, sizeof(mask));
++	if (k < 0 || k >= SWS_N || on == 0 || off != 0 || (mask & (1u << k)) == 0) {
++		return false;
++	}
++	if (k == SWS_PROX) {
++		/* backboardd's discrete prox wrapper takes only a service at the top of the display */
++		setProperty("Placement", 1ULL, 32);
++	}
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	gSweetSensor[k] = this;
++	registerService();
++	IOLog("SWEET HID: %s registered\n", getName());
++	return true;
++}
++
++IOReturn
++SweetHIDSensor::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (d == NULL) {
++		return kIOReturnBadArgument;
++	}
++	OSNumber *n = OSDynamicCast(OSNumber, d->getObject(kIOHIDReportIntervalKey));
++	if (n != NULL) {
++		fInterval = n->unsigned32BitValue();
++		IOLog("SWEET HID: %s report interval %u us\n", getName(), fInterval);
++	}
++	return kIOReturnSuccess;
++}
++
++/* v: accel/gyro/compass x y z (16.16: g, rad/s, uT); prox near, level; ALS lux; orientation usage */
++void
++SweetHIDSensor::sample(const int32_t *v)
++{
++	uint64_t now = mach_absolute_time();
++	IOHIDEvent *e = NULL;
++
++	switch (kind()) {
++	case SWS_ACCEL:
++		e = IOHIDEvent::accelerometerEvent(now, v[0], v[1], v[2], 0, 0, fCount);
++		break;
++	case SWS_GYRO:
++		e = IOHIDEvent::gyroEvent(now, v[0], v[1], v[2], 0, 0, fCount);
++		break;
++	case SWS_COMPASS:
++		e = IOHIDEvent::compassEvent(now, v[0], v[1], v[2], 0, 0, fCount);
++		break;
++	case SWS_PROX:
++		e = IOHIDEvent::proximityEvent(now, v[0] ? (IOHIDProximityDetectionMask)(kIOHIDProximityDetectionReceiver |
++		    kIOHIDProximityDetectionLargeBodyContact) : (IOHIDProximityDetectionMask)0, (UInt32)v[1]);
++		break;
++	case SWS_ALS:
++		e = IOHIDEvent::ambientLightSensorEvent(now, (UInt32)(v[0] < 0 ? 0 : v[0]));
++		break;
++	case SWS_ORIENT:
++		e = IOHIDEvent::orientationEvent(now, kIOHIDOrientationTypeCMUsage);
++		if (e != NULL) {
++			e->setIntegerValue(kIOHIDEventFieldOrientationDeviceOrientationUsage, v[0]);
++		}
++		break;
++	default:
++		break;
++	}
++	if (e != NULL) {
++		fCount++;
++		dispatchEvent(e);
++		e->release();
++	}
++}
++
++extern "C" int
++sweet_hid_sensor(int kind, const int32_t *v)
++{
++	if (kind < 0 || kind >= SWS_N || gSweetSensor[kind] == NULL) {
++		return ENODEV;
++	}
++	gSweetSensor[kind]->sample(v);
++	return 0;
++}
++
++/* kern.sweet_sensor (read): per service "kind clients interval-us samples" */
++extern "C" int
++sweet_hid_sensor_status(char *buf, size_t len)
++{
++	static const char *names[SWS_N] = { "accel", "gyro", "compass", "prox", "als", "orientation" };
++	size_t n = 0;
++	buf[0] = 0;
++	for (int k = 0; k < SWS_N && n < len; k++) {
++		SweetHIDSensor *s = gSweetSensor[k];
++		unsigned clients = s != NULL ? s->clientCount() : 0;
++		n += snprintf(buf + n, len - n, "%s %d %u %u %u\n", names[k], s != NULL, clients, s ? s->fInterval : 0,
++		    s ? s->fCount : 0);
++	}
++	return (int)n;
++}
+--- a/iokit/KernelConfigTables.cpp	2026-10-30 00:53:06.990480300 +0100
++++ b/iokit/KernelConfigTables.cpp	2026-10-30 01:17:27.651643000 +0100
+@@ -78,6 +78,36 @@
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
+     "   {"
++    "     'IOClass'         = SweetHIDAccel;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDAccel;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDGyro;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDGyro;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDCompass;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDCompass;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDProx;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDProx;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDALS;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDALS;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDOrientation;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDOrientation;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"

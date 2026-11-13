@@ -218,6 +218,23 @@ static void line(int y, const char *s, int scale, uint32_t fg, unsigned char_ms)
 	}
 }
 
+/* the animated boot screen's still frame ("SPL2", make_splash.py): full screen, with its own lines */
+static int picture2(void)
+{
+	const uint32_t *b = splash_bin;
+	if (b[0] != 0x324c5053U || b[1] != FB_W || b[2] != FB_H)	/* "SPL2" */
+		return 0;
+	const volatile uint32_t *px = (const volatile uint32_t *)(b + 20);	/* behind the 80-byte header */
+	for (uint32_t y = 0; y < FB_H; y++) {
+		volatile uint32_t *dst = con_fb + y * (FB_STRIDE / 4);
+		for (uint32_t x = 0; x < FB_W; x++)
+			dst[x] = px[y * FB_W + x];
+		if ((y & 63) == 0 && volup_poll())
+			want_recovery = 1;
+	}
+	return 1;
+}
+
 static void picture(int y0)
 {
 	const uint32_t *b = splash_bin;
@@ -321,8 +338,10 @@ void splash_run(void)
 	volup_init();
 	fb_cache_flush();
 	fill(BLACK);
-	picture(380);	/* (xnu draws it at the same place, with the lines: splash in sweet_splash_thread) */
-	line(FB_H - 150, "Hold VOL+ for Recovery", 2, GREY, 0);
+	if (!picture2()) {	/* SPL2: xnu animates it (0309) */
+		picture(380);	/* (xnu draws it at the same place, with the lines: splash in sweet_splash_thread) */
+		line(FB_H - 150, "Hold VOL+ for Recovery", 2, GREY, 0);
+	}
 
 	wait_ms(100);	/* Volume up already held: three polls */
 	if (want_recovery)

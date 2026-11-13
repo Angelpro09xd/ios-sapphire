@@ -1,0 +1,55 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0301: AppleCLCD publishes IOMFBDisplayRefresh (the 120 Hz CoreAnimation clocks by)
+
+The modes said 120 Hz (sweetfb_hz=120) but without IOMFBDisplayRefresh CoreAnimation takes a built-in
+panel for a 60 Hz one: "internal_panel (fixed)" at 60, UIScreen's maximumFramesPerSecond 60.
+Published now with the panel's one rate: displayMinRefreshInterval, displayMaxRefreshInterval and
+displayRefreshStep in 2^-32 s, displayRefreshStepMachTime in mach_absolute_time ticks (after HackiOS
+MiniIOMobileFramebuffer publishRefresh(), b6c1f82 + 0dedaec, APSL 2.0: given ticks everywhere
+CoreAnimation answered 26844 Hz).
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a612e70..b7e5b6f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -635,6 +635,37 @@ AppleCLCD::publishModes(void)
+ 		setProperty("ColorElements", colors);
+ 		IOLog("SWEET FB: modes published: %ux%u at %u Hz\n", fLogicalW, fLogicalH, fRateHz);
+ 	}
++	/*
++	 * sapphire 0301: the refresh the window server clocks its frames by, IOMFBDisplayRefresh: the
++	 * shortest interval between refreshes, the longest and the step (QuartzCore's
++	 * displayMinRefreshInterval / displayRefreshStepMachTime, CoreMedia's displayMaxRefreshInterval /
++	 * displayRefreshStep). Without it CoreAnimation takes a built-in panel for a 60 Hz one whatever its
++	 * timings say ("internal_panel (fixed)" at 60, UIScreen's maximumFramesPerSecond 60). The intervals
++	 * are in 2^-32 s; only the step named MachTime is in mach_absolute_time ticks. One fixed rate here,
++	 * sweetfb_hz's. (After HackiOS MiniIOMobileFramebuffer publishRefresh(), b6c1f82 + 0dedaec, APSL 2.0.)
++	 */
++	OSDictionary *refresh = OSDictionary::withCapacity(4);
++	if (refresh != NULL) {
++		uint64_t interval = (1ULL << 32) / fRateHz, ticks = 0;
++		nanoseconds_to_absolutetime(NSEC_PER_SEC / fRateHz, &ticks);
++		const char *keys[] = { "displayMinRefreshInterval", "displayMaxRefreshInterval", "displayRefreshStep" };
++		for (unsigned i = 0; i < 3; i++) {
++			OSNumber *n = OSNumber::withNumber(interval, 64);
++			if (n != NULL) {
++				refresh->setObject(keys[i], n);
++				n->release();
++			}
++		}
++		OSNumber *t = OSNumber::withNumber(ticks, 64);
++		if (t != NULL) {
++			refresh->setObject("displayRefreshStepMachTime", t);
++			t->release();
++		}
++		setProperty("IOMFBDisplayRefresh", refresh);
++		refresh->release();
++		IOLog("SWEET FB: IOMFBDisplayRefresh: %u Hz, an interval of %llu (2^-32 s), %llu ticks\n",
++		    fRateHz, interval, ticks);
++	}
+ 	OSSafeReleaseNULL(timings);
+ 	OSSafeReleaseNULL(colors);
+ 	OSSafeReleaseNULL(timing);

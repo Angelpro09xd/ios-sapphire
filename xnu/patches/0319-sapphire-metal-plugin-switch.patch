@@ -1,0 +1,100 @@
+0319: kern.sweet_metal (and boot-arg sweetmetal=2): the accelerator names HackiOS's HakiosMetal (Metal straight on
+the A610 through hakios-metal) instead of SapphireMetal (1), switchable at run time; 0 names none.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -372,6 +372,41 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * 0319: the Metal plug-in the accelerator names: 1 SapphireMetal (metal/ in the repository: Metal over the GL bridge),
++ * 2 HakiosMetal (HackiOS's hakios-metal, ported to the A610: Metal straight on the GPU). boot-arg sweetmetal=N at boot,
++ * sysctl kern.sweet_metal=N at run time (each process that asks for a device afterwards gets that one; backboardd must
++ * be restarted to change the one CoreAnimation uses). 0 takes both names away.
++ */
++static IOAcceleratorES *sweet_accel;
++static uint32_t sweet_metal_now;
++
++static void
++sweet_metal_name(IOAcceleratorES *accel, uint32_t metal)
++{
++	if (metal == 2) {
++		accel->setProperty("MetalPluginName", "HakiosMetal");
++		accel->setProperty("MetalPluginClassName", "HakiosMetalDevice");
++	} else if (metal) {
++		accel->setProperty("MetalPluginName", "SapphireMetal");
++		accel->setProperty("MetalPluginClassName", "SapphireMTLDevice");
++	} else {
++		accel->removeProperty("MetalPluginName");
++		accel->removeProperty("MetalPluginClassName");
++	}
++	sweet_metal_now = metal;
++}
++
++extern "C" int
++sweet_metal_plugin(int set)
++{
++	if (set >= 0 && sweet_accel != NULL) {
++		sweet_metal_name(sweet_accel, (uint32_t)set);
++		IOLog("SWEET FB: Metal driver now %s\n", set == 2 ? "HakiosMetal" : set ? "SapphireMetal" : "none");
++	}
++	return (int)sweet_metal_now;
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -504,12 +539,13 @@
+ 		uint32_t metal = 0;
+ 		(void)PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal));
+ 		if (metal) {
+-			accel->setProperty("MetalPluginName", "SapphireMetal");
+-			accel->setProperty("MetalPluginClassName", "SapphireMTLDevice");
++			sweet_metal_name(accel, metal);
+ 		}
+ 		if (accel->attach(this)) {
++			sweet_accel = accel;
++			sweet_accel->retain();
+ 			accel->registerService();
+-			IOLog("SWEET FB: IOAcceleratorES published, %s\n", metal ? "Metal driver SapphireMetal" :
++			IOLog("SWEET FB: IOAcceleratorES published, %s\n", metal == 2 ? "Metal driver HakiosMetal" : metal ? "Metal driver SapphireMetal" :
+ 			    "empty (no 30 s wait in CAMetalContextCreate)");
+ 		}
+ 	}
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -7,6 +7,8 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -209,3 +211,24 @@
+ 	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
++
++/* 0319: which Metal plug-in the accelerator names (SweetFramebuffer.cpp sweet_metal_plugin): 1 SapphireMetal, 2 HakiosMetal */
++extern int sweet_metal_plugin(int set);
++
++static int
++sysctl_sweet_metal SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = sweet_metal_plugin(-1), changed = 0;
++	int error = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (v < 0 || v > 2) {
++		return EINVAL;
++	}
++	(void)sweet_metal_plugin(v);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_metal, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_metal, "I", "sapphire: the Metal plug-in the accelerator names: 0 none, 1 SapphireMetal, 2 HakiosMetal");

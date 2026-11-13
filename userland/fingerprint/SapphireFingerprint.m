@@ -9,7 +9,7 @@
  *   - with the passcode keypad up (-[SBLockScreenManager _isPasscodeVisible]): a second one added to the
  *     keypad's own view (the first SBUIPasscodeLockView* found in the cover sheet / SpringBoard's windows;
  *     not over a full keyboard), in the free space under the "0" key. The sensor works there too.
- * Nothing is hooked. While a glyph may show, a 0.3 s timer follows the keypad; it stops when the screen
+ * Nothing else is hooked (see Sensors below). While a glyph may show, a 0.3 s timer follows the keypad; it stops when the screen
  * blanks or the UI unlocks.
  * Look: prefs in /var/mobile/Library/Preferences/com.sapphire.fingerprint.plist (written by the Huella app,
  * re-read on com.sapphire.fp.prefs): glyphStyle touchid|symbol|ring|dot, glyphColor white|blue|red|green|
@@ -26,6 +26,12 @@
  * com.sapphire.fp.locked_out: glyphs hidden, "Introduce el código". com.sapphire.fp.wake (a press with the
  * screen off, fpd's screenOffWake): the screen lit the tap-to-wake way, -[SBLockScreenManager
  * _wakeScreenForTapToWake].
+ *
+ * Sensors (sensord): com.sapphire.sensor.pickup with the screen off, the UI locked, fingerprint unlock available,
+ * the "raiseToShow" pref on (default on) and the proximity far: the screen is lit the same tap-to-wake way, so the
+ * lock screen and the glyph come up when the phone is picked up. Pocket mode: while com.sapphire.sensor.prox's state
+ * is 1 (near) nothing here wakes the screen, and the one hook in this file,
+ * -[SBNCScreenController _turnOnScreen] (what notifications light the screen with), does nothing.
  *
  * Everything on the main queue from notify_register_dispatch (the prefs file is read on a background
  * queue); no sysctl, no IPC of its own beyond notifyd, no haptics or HUD.
@@ -44,7 +50,7 @@
 #define MAX_FAILS       5
 
 /* prefs */
-static BOOL p_unlock = YES, p_keypad = YES, p_fade = YES, p_success = YES, p_screen_off;
+static BOOL p_unlock = YES, p_keypad = YES, p_fade = YES, p_success = YES, p_screen_off, p_raise = YES;
 static NSString *p_style = @"touchid", *p_color = @"white", *p_anim = @"pulse";
 static CGFloat p_size, p_opacity = 0.9;
 
@@ -53,7 +59,7 @@ static __weak UIView *kp_host;
 static CFAbsoluteTime kp_searched;
 static UILabel *g_msg;
 static BOOL ready, locked_out, blanked;
-static int tok_state = -1, tok_blank = -1, tok_fails = -1;
+static int tok_state = -1, tok_blank = -1, tok_fails = -1, tok_prox = -1;
 static NSTimer *follow;
 
 static id
@@ -489,20 +495,63 @@ unlock_ui(int attempt)
 	});
 }
 
+/* sensord's proximity: something covers the top of the phone (pocket, face down on the hand...) */
+static BOOL
+prox_near(void)
+{
+	uint64_t v = 0;
+	return tok_prox >= 0 && notify_get_state(tok_prox, &v) == NOTIFY_STATUS_OK && v != 0;
+}
+
 static void
-wake_screen(void)
+wake_screen_for(const char *why)
 {
 	if (!blanked) {
+		return;
+	}
+	if (prox_near()) {
+		NSLog(@TAG "%s with the screen off: proximity near (pocket), screen left off", why);
 		return;
 	}
 	id m = lock_manager();
 	SEL tap = sel_registerName("_wakeScreenForTapToWake");
 	if (m != nil && [m respondsToSelector:tap]) {
-		NSLog(@TAG "press on the sensor with the screen off: waking (tap-to-wake path)");
+		NSLog(@TAG "%s with the screen off: waking (tap-to-wake path)", why);
 		((void (*)(id, SEL))objc_msgSend)(m, tap);
 	} else {
 		NSLog(@TAG "no -[SBLockScreenManager _wakeScreenForTapToWake]: screen left off");
 	}
+}
+
+static void
+wake_screen(void)
+{
+	wake_screen_for("press on the sensor");
+}
+
+/* pocket mode for notifications: -[SBNCScreenController _turnOnScreen] skipped while the proximity is near */
+static IMP orig_nc_turn_on;
+
+static void
+nc_turn_on(id self, SEL cmd)
+{
+	if (prox_near()) {
+		NSLog(@TAG "notification: proximity near (pocket), screen left off");
+		return;
+	}
+	((void (*)(id, SEL))orig_nc_turn_on)(self, cmd);
+}
+
+static void
+hook_pocket(void)
+{
+	Class c = objc_getClass("SBNCScreenController");
+	Method m = c != Nil ? class_getInstanceMethod(c, sel_registerName("_turnOnScreen")) : NULL;
+	if (m == NULL) {
+		NSLog(@TAG "no -[SBNCScreenController _turnOnScreen]: no pocket mode for notifications");
+		return;
+	}
+	orig_nc_turn_on = method_setImplementation(m, (IMP)nc_turn_on);
 }
 
 /* ------------------------------------------------------------------ state and prefs */
@@ -548,6 +597,7 @@ apply_prefs(NSDictionary *d)
 	p_fade = pbool(d, @"fadeIn", YES);
 	p_success = pbool(d, @"successAnimation", YES);
 	p_screen_off = pbool(d, @"screenOffWake", NO);
+	p_raise = pbool(d, @"raiseToShow", YES);
 	NSString *s = d[@"glyphStyle"], *c = d[@"glyphColor"], *a = d[@"pressAnimation"];
 	p_style = [s isKindOfClass:[NSString class]] ? s : @"touchid";
 	p_color = [c isKindOfClass:[NSString class]] ? c : @"white";
@@ -640,6 +690,16 @@ sfp_init(void)
 		read_state();
 		wake_screen();
 	});
+	watch_note("com.sapphire.sensor.prox", &tok_prox, ^{
+		NSLog(@TAG "proximity %s", prox_near() ? "near" : "far");
+	});
+	watch_note("com.sapphire.sensor.pickup", NULL, ^{
+		read_state();
+		if (p_raise && p_unlock && ready && !locked_out && msg_bool(lock_manager(), "isUILocked", NO)) {
+			wake_screen_for("picked up");
+		}
+	});
+	hook_pocket();
 	/* fpd may have published its state before SpringBoard started */
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
 		read_state();

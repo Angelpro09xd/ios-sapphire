@@ -1,0 +1,13 @@
+0318: SweetSurface: a plane's bytes per row also at +0x10 of its lock-result entry, where iOS 16's
+IOSurfaceGetBytesPerRowOfPlane reads it (it read 0 for every plane of a multi-plane surface).
+
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -725,6 +725,7 @@
+ 		put32(p, 0x00, pl->width);
+ 		put32(p, 0x04, pl->height);
+ 		put32(p, 0x08, pl->bytesPerRow);
++		put32(p, 0x10, pl->bytesPerRow);   /* 0318: where IOSurfaceGetBytesPerRowOfPlane reads it (width + 0x10) */
+ 		put32(p, 0x0c, pl->offset);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);

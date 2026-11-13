@@ -1,0 +1,16 @@
+/Applications/AppStore.app/PlugIns/AppStoreWidgetsExtension.appex
+/System/Library/AppPlaceholders/AppleTV.app/PlugIns/TVWidgetExtension.appex
+/System/Library/AppPlaceholders/Books.app/PlugIns/BooksWidgetExtension.appex
+/System/Library/AppPlaceholders/Home.app/PlugIns/HomeWidget.appex
+/System/Library/AppPlaceholders/Home.app/PlugIns/HomeWidgetSingleAccessoryIntent.appex
+/System/Library/AppPlaceholders/Music.app/PlugIns/MusicWidgets.appex
+/System/Library/AppPlaceholders/Passbook.app/PlugIns/PassbookWidgetsExtension-iPhone.appex
+/System/Library/AppPlaceholders/Stocks.app/PlugIns/StocksDetailIntents.appex
+/System/Library/AppPlaceholders/Weather.app/PlugIns/WeatherWidget.appex
+/System/Library/CoreServices/AegirProxyApp.app/PlugIns/AegirPoster.appex
+/System/Library/PrivateFrameworks/CalendarWidget.framework/PlugIns/IntentsExtension.appex
+/System/Library/PrivateFrameworks/EmojiPoster.framework/PlugIns/EmojiPosterExtension.appex
+/System/Library/PrivateFrameworks/MacinTalk.framework/PlugIns/MacinTalkAUSP.appex
+/System/Library/PrivateFrameworks/MobileTimer.framework/PlugIns/MobileTimerIntents.appex
+/System/Library/PrivateFrameworks/SiriTTSService.framework/PlugIns/SiriTTSSynthesizerAU.appex
+/System/Library/PrivateFrameworks/TextToSpeechKonaSupport.framework/PlugIns/KonaSynthesizer.appex

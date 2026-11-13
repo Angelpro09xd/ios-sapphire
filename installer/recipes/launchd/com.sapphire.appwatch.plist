@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Apps installed or removed by Sileo/Zebra/dpkg reach the home screen on their own: launchd runs uicache
+     whenever /var/jb/Applications or /Applications changes (a package manager that forgets uicache, or a
+     .deb whose postinst does not run it). -->
+<plist version="1.0">
+<dict>
+	<key>Action</key>
+	<string>add</string>
+	<key>Job</key>
+	<dict>
+		<key>Label</key>
+		<string>com.sapphire.appwatch</string>
+		<key>ProgramArguments</key>
+		<array>
+			<string>/var/jb/bin/bash</string>
+			<string>/redwood/bin/sapphire-appwatch.sh</string>
+		</array>
+		<key>WatchPaths</key>
+		<array>
+			<string>/var/jb/Applications</string>
+			<string>/Applications</string>
+		</array>
+		<key>ThrottleInterval</key>
+		<integer>10</integer>
+		<key>RunAtLoad</key>
+		<false/>
+		<key>UserName</key>
+		<string>root</string>
+		<key>StandardOutPath</key>
+		<string>/var/tmp/appwatch.log</string>
+		<key>StandardErrorPath</key>
+		<string>/var/tmp/appwatch.log</string>
+	</dict>
+	<key>Key</key>
+	<string>/System/Library/LaunchDaemons/com.sapphire.appwatch.plist</string>
+</dict>
+</plist>

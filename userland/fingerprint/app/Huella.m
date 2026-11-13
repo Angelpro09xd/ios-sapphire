@@ -1,6 +1,6 @@
 /*
  * Huella: manage fingerprint unlock (fpd) -- enrolled fingers, enrollment, a test screen, the lock-screen
- * glyph's look, the log. Spanish UI. Installed with TrollStore (no sandbox, platform-application) so it
+ * glyph's look, the log. Spanish or English UI. Installed with TrollStore (no sandbox, platform-application) so it
  * can reach fpd's control socket /var/run/fpd.sock (protocol: fpd.c) and write its prefs file
  * /var/mobile/Library/Preferences/com.sapphire.fingerprint.plist directly (not through cfprefsd: fpd and
  * the SpringBoard tweak read the file), announced with the darwin notification com.sapphire.fp.prefs.
@@ -20,6 +20,18 @@
 #define SENSOR_X    (540.0 / 1080.0)
 #define SENSOR_Y    (2109.0 / 2400.0)
 #define SENSOR_R    (105.0 / 1080.0)
+
+/* Spanish or English, as the phone's language */
+static NSString *
+T(NSString *es, NSString *en)
+{
+	static int spanish = -1;
+	if (spanish < 0) {
+		NSString *l = [NSLocale preferredLanguages].firstObject ?: @"en";
+		spanish = [l hasPrefix:@"es"];
+	}
+	return spanish ? es : en;
+}
 
 /* ================================================================== fpd connection */
 
@@ -71,9 +83,9 @@ fp_request(NSString *cmd, void (^done)(NSArray<NSString *> *lines, NSString *err
 		NSString *err = nil;
 		int fd = fp_connect(25);
 		if (fd < 0) {
-			err = @"El servicio de huella (fpd) no responde.";
+			err = T(@"El servicio de huella (fpd) no responde.", @"The fingerprint service (fpd) is not responding.");
 		} else if (!fp_write(fd, cmd)) {
-			err = @"No se pudo enviar la orden.";
+			err = T(@"No se pudo enviar la orden.", @"The command could not be sent.");
 		} else {
 			NSMutableData *buf = [NSMutableData data];
 			BOOL end = NO;
@@ -81,7 +93,7 @@ fp_request(NSString *cmd, void (^done)(NSArray<NSString *> *lines, NSString *err
 				char b[2048];
 				ssize_t r = read(fd, b, sizeof b);
 				if (r <= 0) {
-					err = @"Sin respuesta del servicio.";
+					err = T(@"Sin respuesta del servicio.", @"No response from the service.");
 					break;
 				}
 				[buf appendBytes:b length:(NSUInteger)r];
@@ -261,21 +273,21 @@ pref_set(NSString *k, id v)
 static NSArray *
 style_options(void)
 {
-	return @[ @[ @"touchid", @"Huella en un círculo" ], @[ @"symbol", @"Solo la huella" ], @[ @"ring", @"Solo un anillo" ],
-		  @[ @"dot", @"Un punto" ] ];
+	return @[ @[ @"touchid", T(@"Huella en un círculo", @"Fingerprint in a circle") ], @[ @"symbol", T(@"Solo la huella", @"Fingerprint only") ], @[ @"ring", T(@"Solo un anillo", @"Ring only") ],
+		  @[ @"dot", T(@"Un punto", @"A dot") ] ];
 }
 
 static NSArray *
 color_options(void)
 {
-	return @[ @[ @"white", @"Blanco" ], @[ @"blue", @"Azul" ], @[ @"red", @"Rojo" ], @[ @"green", @"Verde" ],
-		  @[ @"purple", @"Morado" ], @[ @"orange", @"Naranja" ], @[ @"pink", @"Rosa" ], @[ @"teal", @"Turquesa" ] ];
+	return @[ @[ @"white", T(@"Blanco", @"White") ], @[ @"blue", T(@"Azul", @"Blue") ], @[ @"red", T(@"Rojo", @"Red") ], @[ @"green", T(@"Verde", @"Green") ],
+		  @[ @"purple", T(@"Morado", @"Purple") ], @[ @"orange", T(@"Naranja", @"Orange") ], @[ @"pink", T(@"Rosa", @"Pink") ], @[ @"teal", T(@"Turquesa", @"Teal") ] ];
 }
 
 static NSArray *
 anim_options(void)
 {
-	return @[ @[ @"pulse", @"Latido" ], @[ @"ripple", @"Onda" ], @[ @"none", @"Ninguna" ] ];
+	return @[ @[ @"pulse", T(@"Latido", @"Pulse") ], @[ @"ripple", T(@"Onda", @"Ripple") ], @[ @"none", T(@"Ninguna", @"None") ] ];
 }
 
 static NSString *
@@ -302,22 +314,22 @@ static NSString *
 fpd_error_text(NSString *line)
 {
 	if ([line hasPrefix:@"ERR locked"]) {
-		return @"Desbloquea el iPhone primero.";
+		return T(@"Desbloquea el iPhone primero.", @"Unlock the iPhone first.");
 	}
 	if ([line hasPrefix:@"ERR full"]) {
-		return @"Ya hay 5 huellas registradas. Elimina una para añadir otra.";
+		return T(@"Ya hay 5 huellas registradas. Elimina una para añadir otra.", @"There are already 5 fingerprints. Delete one to add another.");
 	}
 	if ([line hasPrefix:@"ERR busy"]) {
-		return @"El sensor está ocupado. Inténtalo de nuevo en unos segundos.";
+		return T(@"El sensor está ocupado. Inténtalo de nuevo en unos segundos.", @"The sensor is busy. Try again in a few seconds.");
 	}
 	if ([line hasPrefix:@"ERR sensor"]) {
-		return @"El sensor no está disponible (mira el registro).";
+		return T(@"El sensor no está disponible (mira el registro).", @"The sensor is not available (check the log).");
 	}
 	if ([line hasPrefix:@"ERR nofingers"]) {
-		return @"No hay ninguna huella registrada.";
+		return T(@"No hay ninguna huella registrada.", @"No fingerprints are enrolled.");
 	}
 	if ([line hasPrefix:@"ERR noslot"]) {
-		return @"Esa huella ya no existe.";
+		return T(@"Esa huella ya no existe.", @"That fingerprint no longer exists.");
 	}
 	return line;
 }
@@ -453,20 +465,20 @@ sensor_ring(UIView *v)
 {
 	[super viewDidLoad];
 	self.view.backgroundColor = [UIColor systemBackgroundColor];
-	self.title = @"Añadir huella";
-	self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Cancelar"
+	self.title = T(@"Añadir huella", @"Add Fingerprint");
+	self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:T(@"Cancelar", @"Cancel")
 	    style:UIBarButtonItemStylePlain target:self action:@selector(cancel)];
 	_total = 15;
 	_slot = -1;
 	_title = [UILabel new];
 	_title.font = [UIFont systemFontOfSize:28 weight:UIFontWeightBold];
 	_title.textAlignment = NSTextAlignmentCenter;
-	_title.text = @"Huella dactilar";
+	_title.text = T(@"Huella dactilar", @"Fingerprint");
 	_text = [UILabel new];
 	_text.font = [UIFont systemFontOfSize:17];
 	_text.numberOfLines = 0;
 	_text.textAlignment = NSTextAlignmentCenter;
-	_text.text = @"Conectando con el sensor…";
+	_text.text = T(@"Conectando con el sensor…", @"Connecting to the sensor…");
 	_hint = [UILabel new];
 	_hint.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
 	_hint.textColor = [UIColor systemRedColor];
@@ -508,11 +520,11 @@ sensor_ring(UIView *v)
 	_s.onClose = ^{
 		EnrollVC *me = weak;
 		if (me != nil && !me->_done && !me->_failed) {
-			[me fail:@"Se perdió la conexión con el servicio de huella."];
+			[me fail:T(@"Se perdió la conexión con el servicio de huella.", @"The connection to the fingerprint service was lost.")];
 		}
 	};
 	if (![_s openWith:@"ENROLL_BEGIN"]) {
-		[self fail:@"El servicio de huella (fpd) no responde."];
+		[self fail:T(@"El servicio de huella (fpd) no responde.", @"The fingerprint service (fpd) is not responding.")];
 	}
 }
 
@@ -528,13 +540,13 @@ sensor_ring(UIView *v)
 {
 	NSArray *w = [line componentsSeparatedByString:@" "];
 	if ([line hasPrefix:@"OK"]) {
-		[self setInstruction:@"Apoya el dedo sobre el círculo rojo de la pantalla y levántalo. Repítelo varias veces."];
+		[self setInstruction:T(@"Apoya el dedo sobre el círculo rojo de la pantalla y levántalo. Repítelo varias veces.", @"Place your finger on the red circle on the screen and lift it. Repeat several times.")];
 		_hint.text = @"";
 	} else if ([line hasPrefix:@"ERR"]) {
 		[self fail:fpd_error_text(line)];
 	} else if ([line isEqualToString:@"PRESS"]) {
 		_hint.textColor = [UIColor secondaryLabelColor];
-		_hint.text = @"Leyendo…";
+		_hint.text = T(@"Leyendo…", @"Reading…");
 	} else if ([line hasPrefix:@"PROGRESS"] && w.count >= 3) {
 		int rem = [w[1] intValue], code = [w[2] intValue], first = w.count >= 4 ? [w[3] intValue] : -1;
 		if (first > 0) {
@@ -547,11 +559,11 @@ sensor_ring(UIView *v)
 			[_fp setProgress:p animated:YES];
 			_hint.text = @"";
 			if (rem == 0) {
-				[self setInstruction:@"Guardando la huella…"];
+				[self setInstruction:T(@"Guardando la huella…", @"Saving the fingerprint…")];
 			} else if (p < 0.5) {
-				[self setInstruction:_touches < 3 ? @"Apoya y levanta el dedo." : @"Mueve un poco el dedo entre un toque y otro."];
+				[self setInstruction:_touches < 3 ? T(@"Apoya y levanta el dedo.", @"Place and lift your finger.") : T(@"Mueve un poco el dedo entre un toque y otro.", @"Move your finger slightly between touches.")];
 			} else {
-				[self setInstruction:@"Ajusta los bordes: apoya ahora los bordes de la yema del dedo."];
+				[self setInstruction:T(@"Ajusta los bordes: apoya ahora los bordes de la yema del dedo.", @"Adjust your grip: now place the edges of your fingertip.")];
 			}
 		} else {
 			[_fp shake];
@@ -562,30 +574,30 @@ sensor_ring(UIView *v)
 		_done = YES;
 		_slot = w.count >= 2 ? [w[1] intValue] : -1;
 		[_fp setDone];
-		_title.text = @"Completado";
+		_title.text = T(@"Completado", @"Complete");
 		_hint.text = @"";
-		[self setInstruction:@"La huella está lista para desbloquear el iPhone."];
+		[self setInstruction:T(@"La huella está lista para desbloquear el iPhone.", @"The fingerprint is ready to unlock the iPhone.")];
 		self.navigationItem.leftBarButtonItem = nil;
-		self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Continuar"
+		self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:T(@"Continuar", @"Continue")
 		    style:UIBarButtonItemStyleDone target:self action:@selector(finish)];
 		[_s close];
 	} else if ([line hasPrefix:@"FAILED"]) {
 		NSString *why = w.count >= 2 ? w[1] : @"";
-		[self fail:[why isEqualToString:@"timeout"] ? @"Tiempo agotado: no se tocó el sensor durante un rato."
-		          : [NSString stringWithFormat:@"No se pudo guardar la huella (%@).", why]];
+		[self fail:[why isEqualToString:@"timeout"] ? T(@"Tiempo agotado: no se tocó el sensor durante un rato.", @"Timed out: the sensor was not touched for a while.")
+		          : [NSString stringWithFormat:T(@"No se pudo guardar la huella (%@).", @"The fingerprint could not be saved (%@)."), why]];
 	}
 }
 
 - (NSString *)errorText:(int)code
 {
 	switch (code) {
-	case 1047: return @"Mueve el dedo un poco: esa zona ya está registrada.";
-	case 1015: return @"Esta huella ya está registrada.";
-	case 1013: return @"Apoya el dedo entero sobre el círculo.";
-	case 1014: return @"Limpia la pantalla y el dedo.";
-	case 1096: return @"Mantén el dedo apoyado un momento más.";
-	case 1007: return @"Se alcanzó el límite de huellas.";
-	default: return [NSString stringWithFormat:@"No se pudo leer (código %d). Vuelve a intentarlo.", code];
+	case 1047: return T(@"Mueve el dedo un poco: esa zona ya está registrada.", @"Move your finger a little: that area is already enrolled.");
+	case 1015: return T(@"Esta huella ya está registrada.", @"This fingerprint is already enrolled.");
+	case 1013: return T(@"Apoya el dedo entero sobre el círculo.", @"Place your whole finger on the circle.");
+	case 1014: return T(@"Limpia la pantalla y el dedo.", @"Clean the screen and your finger.");
+	case 1096: return T(@"Mantén el dedo apoyado un momento más.", @"Keep your finger down a moment longer.");
+	case 1007: return T(@"Se alcanzó el límite de huellas.", @"The fingerprint limit was reached.");
+	default: return [NSString stringWithFormat:T(@"No se pudo leer (código %d). Vuelve a intentarlo.", @"Could not read it (code %d). Try again."), code];
 	}
 }
 
@@ -596,7 +608,7 @@ sensor_ring(UIView *v)
 	}
 	_failed = YES;
 	[_s close];
-	UIAlertController *a = [UIAlertController alertControllerWithTitle:@"No se pudo registrar la huella" message:why
+	UIAlertController *a = [UIAlertController alertControllerWithTitle:T(@"No se pudo registrar la huella", @"Could Not Enroll Fingerprint") message:why
 	    preferredStyle:UIAlertControllerStyleAlert];
 	[a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
 		(void)x;
@@ -617,18 +629,18 @@ sensor_ring(UIView *v)
 - (void)finish
 {
 	int slot = _slot;
-	UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Nombre de la huella"
-	    message:@"Por ejemplo: «Pulgar derecho»." preferredStyle:UIAlertControllerStyleAlert];
+	UIAlertController *a = [UIAlertController alertControllerWithTitle:T(@"Nombre de la huella", @"Fingerprint Name")
+	    message:T(@"Por ejemplo: «Pulgar derecho».", @"For example: \"Right thumb\".") preferredStyle:UIAlertControllerStyleAlert];
 	[a addTextFieldWithConfigurationHandler:^(UITextField *t) {
-		t.placeholder = [NSString stringWithFormat:@"Huella %d", slot + 1];
+		t.placeholder = [NSString stringWithFormat:T(@"Huella %d", @"Finger %d"), slot + 1];
 		t.autocapitalizationType = UITextAutocapitalizationTypeSentences;
 	}];
 	void (^close)(void) = ^{ [self dismissViewControllerAnimated:YES completion:self.finished]; };
-	[a addAction:[UIAlertAction actionWithTitle:@"Omitir" style:UIAlertActionStyleCancel handler:^(UIAlertAction *x) {
+	[a addAction:[UIAlertAction actionWithTitle:T(@"Omitir", @"Skip") style:UIAlertActionStyleCancel handler:^(UIAlertAction *x) {
 		(void)x;
 		close();
 	}]];
-	[a addAction:[UIAlertAction actionWithTitle:@"Guardar" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+	[a addAction:[UIAlertAction actionWithTitle:T(@"Guardar", @"Save") style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
 		(void)x;
 		NSString *n = [a.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 		if (n.length > 0 && slot >= 0) {
@@ -662,7 +674,7 @@ sensor_ring(UIView *v)
 {
 	[super viewDidLoad];
 	self.view.backgroundColor = [UIColor systemBackgroundColor];
-	self.title = @"Probar huella";
+	self.title = T(@"Probar huella", @"Test Fingerprint");
 	UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:90 weight:UIImageSymbolWeightThin];
 	_icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"touchid" withConfiguration:cfg]];
 	_icon.tintColor = [UIColor systemGray2Color];
@@ -671,7 +683,7 @@ sensor_ring(UIView *v)
 	_text.textAlignment = NSTextAlignmentCenter;
 	_text.font = [UIFont systemFontOfSize:19 weight:UIFontWeightMedium];
 	_again = [UIButton buttonWithType:UIButtonTypeSystem];
-	[_again setTitle:@"Probar otra vez" forState:UIControlStateNormal];
+	[_again setTitle:T(@"Probar otra vez", @"Try Again") forState:UIControlStateNormal];
 	_again.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
 	[_again addTarget:self action:@selector(start) forControlEvents:UIControlEventTouchUpInside];
 	UILabel *note = [UILabel new];
@@ -679,7 +691,7 @@ sensor_ring(UIView *v)
 	note.textAlignment = NSTextAlignmentCenter;
 	note.font = [UIFont systemFontOfSize:13];
 	note.textColor = [UIColor secondaryLabelColor];
-	note.text = @"Comprueba si el sensor reconoce tu dedo. No desbloquea nada y no cuenta como intento fallido.";
+	note.text = T(@"Comprueba si el sensor reconoce tu dedo. No desbloquea nada y no cuenta como intento fallido.", @"Checks whether the sensor recognizes your finger. It does not unlock anything and does not count as a failed attempt.");
 	for (UIView *v in @[ _icon, _text, _again, note ]) {
 		v.translatesAutoresizingMaskIntoConstraints = NO;
 		[self.view addSubview:v];
@@ -735,7 +747,7 @@ sensor_ring(UIView *v)
 	[_s close];
 	_again.hidden = YES;
 	_icon.tintColor = [UIColor systemGray2Color];
-	_text.text = @"Apoya el dedo sobre el círculo rojo.";
+	_text.text = T(@"Apoya el dedo sobre el círculo rojo.", @"Place your finger on the red circle.");
 	__weak TestVC *weak = self;
 	FPStream *s = [FPStream new];
 	_s = s;
@@ -746,25 +758,25 @@ sensor_ring(UIView *v)
 		}
 		NSArray *w = [line componentsSeparatedByString:@" "];
 		if ([line isEqualToString:@"PRESS"]) {
-			me->_text.text = @"Comprobando…";
+			me->_text.text = T(@"Comprobando…", @"Checking…");
 		} else if ([line hasPrefix:@"TEST MATCH"]) {
 			NSString *name = w.count >= 5 ? [[w subarrayWithRange:NSMakeRange(4, w.count - 4)] componentsJoinedByString:@" "] : @"";
-			[me result:name.length ? [NSString stringWithFormat:@"Reconocida: %@", name] : @"Huella reconocida"
+			[me result:name.length ? [NSString stringWithFormat:T(@"Reconocida: %@", @"Recognized: %@"), name] : T(@"Huella reconocida", @"Fingerprint recognized")
 			     color:[UIColor systemGreenColor]];
 		} else if ([line hasPrefix:@"TEST NOMATCH"]) {
-			[me result:@"No reconocida" color:[UIColor systemRedColor]];
+			[me result:T(@"No reconocida", @"Not recognized") color:[UIColor systemRedColor]];
 		} else if ([line hasPrefix:@"TEST LIFTED"]) {
-			[me result:@"Has levantado el dedo demasiado pronto." color:[UIColor systemOrangeColor]];
+			[me result:T(@"Has levantado el dedo demasiado pronto.", @"You lifted your finger too soon.") color:[UIColor systemOrangeColor]];
 		} else if ([line hasPrefix:@"TEST TIMEOUT"]) {
-			[me result:@"Tiempo agotado." color:[UIColor systemGray2Color]];
+			[me result:T(@"Tiempo agotado.", @"Timed out.") color:[UIColor systemGray2Color]];
 		} else if ([line hasPrefix:@"TEST ERR"]) {
-			[me result:[NSString stringWithFormat:@"Error del sensor (%@).", w.count >= 3 ? w[2] : @"?"] color:[UIColor systemOrangeColor]];
+			[me result:[NSString stringWithFormat:T(@"Error del sensor (%@).", @"Sensor error (%@)."), w.count >= 3 ? w[2] : @"?"] color:[UIColor systemOrangeColor]];
 		} else if ([line hasPrefix:@"ERR"]) {
 			[me result:fpd_error_text(line) color:[UIColor systemGray2Color]];
 		}
 	};
 	if (![s openWith:@"TEST"]) {
-		[self result:@"El servicio de huella (fpd) no responde." color:[UIColor systemGray2Color]];
+		[self result:T(@"El servicio de huella (fpd) no responde.", @"The fingerprint service (fpd) is not responding.") color:[UIColor systemGray2Color]];
 	}
 }
 @end
@@ -781,7 +793,7 @@ sensor_ring(UIView *v)
 - (void)viewDidLoad
 {
 	[super viewDidLoad];
-	self.title = @"Registro";
+	self.title = T(@"Registro", @"Log");
 	self.view.backgroundColor = [UIColor systemBackgroundColor];
 	_tv = [[UITextView alloc] initWithFrame:self.view.bounds];
 	_tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -790,14 +802,14 @@ sensor_ring(UIView *v)
 	[self.view addSubview:_tv];
 	self.navigationItem.rightBarButtonItems = @[
 		[[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(reload)],
-		[[UIBarButtonItem alloc] initWithTitle:@"Copiar" style:UIBarButtonItemStylePlain target:self action:@selector(copyAll)],
+		[[UIBarButtonItem alloc] initWithTitle:T(@"Copiar", @"Copy") style:UIBarButtonItemStylePlain target:self action:@selector(copyAll)],
 	];
 	[self reload];
 }
 
 - (void)reload
 {
-	_tv.text = @"Cargando…";
+	_tv.text = T(@"Cargando…", @"Loading…");
 	fp_request(@"LOG 250", ^(NSArray<NSString *> *lines, NSString *err) {
 		NSMutableString *s = [NSMutableString string];
 		for (NSString *l in lines) {
@@ -805,7 +817,7 @@ sensor_ring(UIView *v)
 				[s appendFormat:@"%@\n", [l substringFromIndex:2]];
 			}
 		}
-		self->_tv.text = err ?: (s.length ? s : @"(vacío)");
+		self->_tv.text = err ?: (s.length ? s : T(@"(vacío)", @"(empty)"));
 		[self->_tv scrollRangeToVisible:NSMakeRange(self->_tv.text.length, 0)];
 	});
 }
@@ -871,7 +883,7 @@ enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_VIB, S_SENSORS, S_STATUS, S_COUNT };
 - (void)viewDidLoad
 {
 	[super viewDidLoad];
-	self.title = @"Huella dactilar";
+	self.title = T(@"Huella dactilar", @"Fingerprint");
 	self.navigationController.navigationBar.prefersLargeTitles = YES;
 	self.refreshControl = [UIRefreshControl new];
 	[self.refreshControl addTarget:self action:@selector(refresh) forControlEvents:UIControlEventValueChanged];
@@ -928,8 +940,8 @@ enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_VIB, S_SENSORS, S_STATUS, S_COUNT };
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s
 {
 	(void)tv;
-	NSArray *t = @[ @"Huellas", @"Usar huella para", @"Icono en la pantalla bloqueada", @"Pantalla apagada", @"Vibración",
-		        @"Sensores", @"Estado" ];
+	NSArray *t = @[ T(@"Huellas", @"Fingerprints"), T(@"Usar huella para", @"Use Fingerprint For"), T(@"Icono en la pantalla bloqueada", @"Lock Screen Icon"), T(@"Pantalla apagada", @"Screen Off"), T(@"Vibración", @"Vibration"),
+		        T(@"Sensores", @"Sensors"), T(@"Estado", @"Status") ];
 	return t[(NSUInteger)s];
 }
 
@@ -938,17 +950,24 @@ enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_VIB, S_SENSORS, S_STATUS, S_COUNT };
 	(void)tv;
 	switch (s) {
 	case S_FINGERS:
-		return _error ?: @"Hasta 5 huellas. Para registrar o eliminar huellas el iPhone debe estar desbloqueado.";
+		return _error ?: T(@"Hasta 5 huellas. Para registrar o eliminar huellas el iPhone debe estar desbloqueado.", @"Up to 5 fingerprints. The iPhone must be unlocked to add or delete fingerprints.");
 	case S_USE:
-		return @"Tras reiniciar, la primera vez hay que usar el código. Después de 5 intentos fallidos se pide el código.";
+		return T(@"Tras reiniciar, la primera vez hay que usar el código. Después de 5 intentos fallidos se pide el código.", @"After a restart, the passcode is needed the first time. After 5 failed attempts the passcode is required.");
 	case S_OFF:
-		return @"Experimental: funciona si el panel táctil sigue informando con la pantalla apagada (se ve en el "
-		       @"Registro). El indicador con la pantalla apagada aún no tiene efecto: el panel está apagado.";
+		return T(@"Experimental: funciona si el panel táctil sigue informando con la pantalla apagada (se ve en el "
+		       @"Registro). El indicador con la pantalla apagada aún no tiene efecto: el panel está apagado.",
+			   @"Experimental: works if the touch panel keeps reporting with the screen off (it shows in the "
+			     @"Log). The screen-off indicator has no effect yet: the panel is off.");
 	case S_VIB:
-		return @"El motor de este iPhone da pulsos cortos: la respuesta háptica se imita con toques breves. "
-		       @"Las llamadas y notificaciones siguen los ajustes de vibrar en modo sonido / silencio.";
+		return T(@"El motor de este iPhone da pulsos cortos: la respuesta háptica se imita con toques breves. "
+		       @"Las llamadas y notificaciones siguen los ajustes de vibrar en modo sonido / silencio.",
+			   @"This iPhone's motor gives short pulses: haptic feedback is imitated with brief taps. "
+			     @"Calls and notifications follow the vibrate on ring / silent settings.");
 	case S_SENSORS:
-		return @"Requiere los sensores de movimiento, que aún no funcionan en este iPhone.";
+		return T(@"Con la pantalla apagada, al levantar el iPhone se enciende la pantalla de bloqueo con la huella. "
+		       @"Si el sensor de proximidad está tapado (bolsillo) no se enciende y la huella no responde.",
+			   @"With the screen off, raising the iPhone turns on the lock screen with the fingerprint icon. "
+			     @"If the proximity sensor is covered (pocket), it does not turn on and the fingerprint does not respond.");
 	}
 	return nil;
 }
@@ -1044,70 +1063,70 @@ enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_VIB, S_SENSORS, S_STATUS, S_COUNT };
 		UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
 		if (r == (NSInteger)_fingers.count) {
 			BOOL can = _fingers.count < MAX_FINGERS && _error == nil;
-			c.textLabel.text = can ? @"Añadir una huella…" : @"Añadir una huella (máximo 5)";
+			c.textLabel.text = can ? T(@"Añadir una huella…", @"Add a Fingerprint…") : T(@"Añadir una huella (máximo 5)", @"Add a Fingerprint (maximum 5)");
 			c.textLabel.textColor = can ? self.view.tintColor : [UIColor secondaryLabelColor];
 		} else {
-			c.textLabel.text = @"Eliminar todas las huellas";
+			c.textLabel.text = T(@"Eliminar todas las huellas", @"Delete All Fingerprints");
 			c.textLabel.textColor = [UIColor systemRedColor];
 		}
 		return c;
 	}
 	case S_USE:
 		if (r == 0) {
-			return [self switchCell:@"Desbloquear el iPhone" key:@"unlockEnabled" dflt:YES enabled:YES];
+			return [self switchCell:T(@"Desbloquear el iPhone", @"Unlock iPhone") key:@"unlockEnabled" dflt:YES enabled:YES];
 		}
-		return [self switchCell:@"Apps y compras (próximamente)" key:@"appsEnabled" dflt:NO enabled:NO];
+		return [self switchCell:T(@"Apps y compras (próximamente)", @"Apps and Purchases (coming soon)") key:@"appsEnabled" dflt:NO enabled:NO];
 	case S_LOOK:
 		switch (r) {
-		case 0: return [self valueCell:@"Estilo" value:option_label(style_options(), pref_string(@"glyphStyle", @"touchid")) link:YES];
+		case 0: return [self valueCell:T(@"Estilo", @"Style") value:option_label(style_options(), pref_string(@"glyphStyle", @"touchid")) link:YES];
 		case 1: return [self valueCell:@"Color" value:option_label(color_options(), pref_string(@"glyphColor", @"white")) link:YES];
-		case 2: return [self sliderCell:@"Tamaño" key:@"glyphSize" min:50 max:110 dflt:73];
-		case 3: return [self sliderCell:@"Opacidad" key:@"glyphOpacity" min:0.2f max:1.0f dflt:0.9f];
-		case 4: return [self valueCell:@"Al tocar" value:option_label(anim_options(), pref_string(@"pressAnimation", @"pulse")) link:YES];
-		case 5: return [self switchCell:@"Mostrar también sobre el teclado del código" key:@"showOnKeypad" dflt:YES enabled:YES];
-		default: return [self switchCell:@"Animaciones al aparecer y al desbloquear" key:@"fadeIn" dflt:YES enabled:YES];
+		case 2: return [self sliderCell:T(@"Tamaño", @"Size") key:@"glyphSize" min:50 max:110 dflt:73];
+		case 3: return [self sliderCell:T(@"Opacidad", @"Opacity") key:@"glyphOpacity" min:0.2f max:1.0f dflt:0.9f];
+		case 4: return [self valueCell:T(@"Al tocar", @"On Touch") value:option_label(anim_options(), pref_string(@"pressAnimation", @"pulse")) link:YES];
+		case 5: return [self switchCell:T(@"Mostrar también sobre el teclado del código", @"Also show over the passcode keypad") key:@"showOnKeypad" dflt:YES enabled:YES];
+		default: return [self switchCell:T(@"Animaciones al aparecer y al desbloquear", @"Animations when appearing and unlocking") key:@"fadeIn" dflt:YES enabled:YES];
 		}
 	case S_OFF:
 		if (r == 0) {
-			return [self switchCell:@"Desbloquear tocando con la pantalla apagada" key:@"screenOffWake" dflt:NO enabled:YES];
+			return [self switchCell:T(@"Desbloquear tocando con la pantalla apagada", @"Unlock by touching with the screen off") key:@"screenOffWake" dflt:NO enabled:YES];
 		}
-		return [self switchCell:@"Indicador con la pantalla apagada" key:@"alwaysOnIndicator" dflt:NO enabled:YES];
+		return [self switchCell:T(@"Indicador con la pantalla apagada", @"Indicator with the screen off") key:@"alwaysOnIndicator" dflt:NO enabled:YES];
 	case S_VIB:
 		switch (r) {
-		case 0: return [self switchCell:@"Vibrar al reconocer o fallar la huella" key:@"haptics" dflt:YES enabled:YES];
-		case 1: return [self switchCell:@"Respuesta háptica del sistema" key:@"uiHaptics" dflt:YES enabled:YES];
-		case 2: return [self switchCell:@"Vibración del teclado" key:@"keyboardHaptics" dflt:NO enabled:YES];
-		case 3: return [self switchCell:@"Vibrar con llamadas y notificaciones" key:@"alertVibration" dflt:YES enabled:YES];
-		default: return [self valueCell:@"Probar vibración" value:@"" link:YES];
+		case 0: return [self switchCell:T(@"Vibrar al reconocer o fallar la huella", @"Vibrate on fingerprint match or failure") key:@"haptics" dflt:YES enabled:YES];
+		case 1: return [self switchCell:T(@"Respuesta háptica del sistema", @"System haptics") key:@"uiHaptics" dflt:YES enabled:YES];
+		case 2: return [self switchCell:T(@"Vibración del teclado", @"Keyboard vibration") key:@"keyboardHaptics" dflt:NO enabled:YES];
+		case 3: return [self switchCell:T(@"Vibrar con llamadas y notificaciones", @"Vibrate for calls and notifications") key:@"alertVibration" dflt:YES enabled:YES];
+		default: return [self valueCell:T(@"Probar vibración", @"Test Vibration") value:@"" link:YES];
 		}
 	case S_SENSORS:
-		return [self switchCell:@"Mostrar solo al mover el iPhone (requiere sensores)" key:@"raiseToShow" dflt:NO enabled:NO];
+		return [self switchCell:T(@"Mostrar la huella al levantar el iPhone", @"Show the fingerprint when raising the iPhone") key:@"raiseToShow" dflt:YES enabled:YES];
 	case S_STATUS: {
 		NSDictionary *st = _status;
 		switch (r) {
 		case 0:
-			return [self valueCell:@"Servicio" value:st == nil ? @"No responde" : [st[@"sensor"] isEqualToString:@"1"] ? @"Activo"
-			                                                                    : @"Sensor no disponible" link:NO];
+			return [self valueCell:T(@"Servicio", @"Service") value:st == nil ? T(@"No responde", @"Not responding") : [st[@"sensor"] isEqualToString:@"1"] ? T(@"Activo", @"Active")
+			                                                                    : T(@"Sensor no disponible", @"Sensor unavailable") link:NO];
 		case 1: {
 			NSString *v;
 			if (st == nil) {
 				v = @"—";
 			} else if ([st[@"lockedout"] isEqualToString:@"1"]) {
-				v = @"Bloqueado: usa el código";
+				v = T(@"Bloqueado: usa el código", @"Locked: use the passcode");
 			} else {
-				v = [NSString stringWithFormat:@"%@ de %d", st[@"fails"] ?: @"0", MAX_FAILS];
+				v = [NSString stringWithFormat:T(@"%@ de %d", @"%@ of %d"), st[@"fails"] ?: @"0", MAX_FAILS];
 			}
-			return [self valueCell:@"Intentos fallidos" value:v link:NO];
+			return [self valueCell:T(@"Intentos fallidos", @"Failed attempts") value:v link:NO];
 		}
 		case 2:
-			return [self valueCell:@"Desbloqueos con huella" value:st ? [NSString stringWithFormat:@"%@ (fallos %@)",
+			return [self valueCell:T(@"Desbloqueos con huella", @"Fingerprint unlocks") value:st ? [NSString stringWithFormat:T(@"%@ (fallos %@)", @"%@ (%@ failed)"),
 			    st[@"unlocks"] ?: @"0", st[@"nomatch"] ?: @"0"] : @"—" link:NO];
 		case 3:
-			return [self valueCell:@"Toques con la pantalla apagada" value:st[@"offpresses"] ?: @"—" link:NO];
+			return [self valueCell:T(@"Toques con la pantalla apagada", @"Screen-off touches") value:st[@"offpresses"] ?: @"—" link:NO];
 		case 4:
-			return [self valueCell:@"Probar huella" value:@"" link:YES];
+			return [self valueCell:T(@"Probar huella", @"Test Fingerprint") value:@"" link:YES];
 		default:
-			return [self valueCell:@"Registro" value:@"" link:YES];
+			return [self valueCell:T(@"Registro", @"Log") value:@"" link:YES];
 		}
 	}
 	}
@@ -1133,7 +1152,7 @@ enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_VIB, S_SENSORS, S_STATUS, S_COUNT };
 	fp_request(cmd, ^(NSArray<NSString *> *lines, NSString *err) {
 		NSString *last = lines.lastObject;
 		if (err != nil || ![last hasPrefix:@"OK"]) {
-			[self presentViewController:simple_alert(@"No se pudo completar", err ?: fpd_error_text(last ?: @"")) animated:YES
+			[self presentViewController:simple_alert(T(@"No se pudo completar", @"Could Not Complete"), err ?: fpd_error_text(last ?: @"")) animated:YES
 			    completion:nil];
 		}
 		[self refresh];
@@ -1142,13 +1161,13 @@ enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_VIB, S_SENSORS, S_STATUS, S_COUNT };
 
 - (void)confirmDelete:(NSArray *)f
 {
-	UIAlertController *a = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"¿Eliminar «%@»?", f[2]]
+	UIAlertController *a = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:T(@"¿Eliminar «%@»?", @"Delete \"%@\"?"), f[2]]
 	    message:nil preferredStyle:UIAlertControllerStyleActionSheet];
-	[a addAction:[UIAlertAction actionWithTitle:@"Eliminar huella" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
+	[a addAction:[UIAlertAction actionWithTitle:T(@"Eliminar huella", @"Delete Fingerprint") style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
 		(void)x;
 		[self run:[NSString stringWithFormat:@"DELETE %@", f[0]]];
 	}]];
-	[a addAction:[UIAlertAction actionWithTitle:@"Cancelar" style:UIAlertActionStyleCancel handler:nil]];
+	[a addAction:[UIAlertAction actionWithTitle:T(@"Cancelar", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
 	[self presentViewController:a animated:YES completion:nil];
 }
 
@@ -1156,16 +1175,16 @@ enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_VIB, S_SENSORS, S_STATUS, S_COUNT };
 {
 	UIAlertController *a = [UIAlertController alertControllerWithTitle:f[2] message:nil
 	    preferredStyle:UIAlertControllerStyleActionSheet];
-	[a addAction:[UIAlertAction actionWithTitle:@"Cambiar nombre" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+	[a addAction:[UIAlertAction actionWithTitle:T(@"Cambiar nombre", @"Rename") style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
 		(void)x;
-		UIAlertController *r = [UIAlertController alertControllerWithTitle:@"Nombre de la huella" message:nil
+		UIAlertController *r = [UIAlertController alertControllerWithTitle:T(@"Nombre de la huella", @"Fingerprint Name") message:nil
 		    preferredStyle:UIAlertControllerStyleAlert];
 		[r addTextFieldWithConfigurationHandler:^(UITextField *t) {
 			t.text = f[2];
 			t.clearButtonMode = UITextFieldViewModeWhileEditing;
 		}];
-		[r addAction:[UIAlertAction actionWithTitle:@"Cancelar" style:UIAlertActionStyleCancel handler:nil]];
-		[r addAction:[UIAlertAction actionWithTitle:@"Guardar" style:UIAlertActionStyleDefault handler:^(UIAlertAction *y) {
+		[r addAction:[UIAlertAction actionWithTitle:T(@"Cancelar", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
+		[r addAction:[UIAlertAction actionWithTitle:T(@"Guardar", @"Save") style:UIAlertActionStyleDefault handler:^(UIAlertAction *y) {
 			(void)y;
 			NSString *n = [r.textFields.firstObject.text
 			    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -1176,11 +1195,11 @@ enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_VIB, S_SENSORS, S_STATUS, S_COUNT };
 		}]];
 		[self presentViewController:r animated:YES completion:nil];
 	}]];
-	[a addAction:[UIAlertAction actionWithTitle:@"Eliminar huella" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
+	[a addAction:[UIAlertAction actionWithTitle:T(@"Eliminar huella", @"Delete Fingerprint") style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
 		(void)x;
 		[self confirmDelete:f];
 	}]];
-	[a addAction:[UIAlertAction actionWithTitle:@"Cancelar" style:UIAlertActionStyleCancel handler:nil]];
+	[a addAction:[UIAlertAction actionWithTitle:T(@"Cancelar", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
 	[self presentViewController:a animated:YES completion:nil];
 }
 
@@ -1212,29 +1231,29 @@ enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_VIB, S_SENSORS, S_STATUS, S_COUNT };
 			n.modalPresentationStyle = UIModalPresentationFullScreen;
 			[self presentViewController:n animated:YES completion:nil];
 		} else {
-			UIAlertController *a = [UIAlertController alertControllerWithTitle:@"¿Eliminar todas las huellas?"
-			    message:@"El iPhone solo se podrá desbloquear con el código." preferredStyle:UIAlertControllerStyleActionSheet];
-			[a addAction:[UIAlertAction actionWithTitle:@"Eliminar todas" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
+			UIAlertController *a = [UIAlertController alertControllerWithTitle:T(@"¿Eliminar todas las huellas?", @"Delete all fingerprints?")
+			    message:T(@"El iPhone solo se podrá desbloquear con el código.", @"The iPhone will only unlock with the passcode.") preferredStyle:UIAlertControllerStyleActionSheet];
+			[a addAction:[UIAlertAction actionWithTitle:T(@"Eliminar todas", @"Delete All") style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
 				(void)x;
 				[self run:@"DELETE_ALL"];
 			}]];
-			[a addAction:[UIAlertAction actionWithTitle:@"Cancelar" style:UIAlertActionStyleCancel handler:nil]];
+			[a addAction:[UIAlertAction actionWithTitle:T(@"Cancelar", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
 			[self presentViewController:a animated:YES completion:nil];
 		}
 	} else if (ip.section == S_LOOK) {
 		if (r == 0) {
-			[self pick:@"Estilo" options:style_options() key:@"glyphStyle" dflt:@"touchid"];
+			[self pick:T(@"Estilo", @"Style") options:style_options() key:@"glyphStyle" dflt:@"touchid"];
 		} else if (r == 1) {
 			[self pick:@"Color" options:color_options() key:@"glyphColor" dflt:@"white"];
 		} else if (r == 4) {
-			[self pick:@"Al tocar" options:anim_options() key:@"pressAnimation" dflt:@"pulse"];
+			[self pick:T(@"Al tocar", @"On Touch") options:anim_options() key:@"pressAnimation" dflt:@"pulse"];
 		}
 	} else if (ip.section == S_VIB && r == 4) {
-		UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Probar vibración" message:nil
+		UIAlertController *a = [UIAlertController alertControllerWithTitle:T(@"Probar vibración", @"Test Vibration") message:nil
 		    preferredStyle:UIAlertControllerStyleActionSheet];
-		NSArray *opts = @[ @[ @"selection", @"Selección" ], @[ @"light", @"Toque suave" ], @[ @"medium", @"Toque medio" ],
-				   @[ @"heavy", @"Toque fuerte" ], @[ @"success", @"Éxito" ], @[ @"warning", @"Aviso" ],
-				   @[ @"error", @"Error" ], @[ @"notify", @"Notificación" ], @[ @"long", @"Larga" ] ];
+		NSArray *opts = @[ @[ @"selection", T(@"Selección", @"Selection") ], @[ @"light", T(@"Toque suave", @"Light tap") ], @[ @"medium", T(@"Toque medio", @"Medium tap") ],
+				   @[ @"heavy", T(@"Toque fuerte", @"Heavy tap") ], @[ @"success", T(@"Éxito", @"Success") ], @[ @"warning", T(@"Aviso", @"Warning") ],
+				   @[ @"error", @"Error" ], @[ @"notify", T(@"Notificación", @"Notification") ], @[ @"long", T(@"Larga", @"Long") ] ];
 		for (NSArray *o in opts) {
 			NSString *name = [@"com.sapphire.vib." stringByAppendingString:o[0]];
 			[a addAction:[UIAlertAction actionWithTitle:o[1] style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
@@ -1242,7 +1261,7 @@ enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_VIB, S_SENSORS, S_STATUS, S_COUNT };
 				notify_post(name.UTF8String);
 			}]];
 		}
-		[a addAction:[UIAlertAction actionWithTitle:@"Cancelar" style:UIAlertActionStyleCancel handler:nil]];
+		[a addAction:[UIAlertAction actionWithTitle:T(@"Cancelar", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
 		[self presentViewController:a animated:YES completion:nil];
 	} else if (ip.section == S_STATUS) {
 		if (r == 4) {

@@ -1,0 +1,17 @@
+/System/Library/CoreServices/AccessibilityUIServer.app
+/System/Library/CoreServices/AegirProxyApp.app
+/System/Library/CoreServices/AssistiveTouch.app
+/System/Library/CoreServices/BluetoothUIService.app
+/System/Library/CoreServices/CMPluginApp.app
+/System/Library/CoreServices/CarPlay.app
+/System/Library/CoreServices/CarPlayTemplateUIHost.app
+/System/Library/CoreServices/ClarityBoard.app
+/System/Library/CoreServices/CommandAndControl.app
+/System/Library/CoreServices/DeviceOMatic.app
+/System/Library/CoreServices/EscrowSecurityAlert.app
+/System/Library/CoreServices/FullKeyboardAccess.app
+/System/Library/CoreServices/LiveTranscriptionUI.app
+/System/Library/CoreServices/OverlayUI.app
+/System/Library/CoreServices/ScreenSharingServer.app
+/System/Library/CoreServices/SpringBoard.app
+/System/Library/CoreServices/VoiceOverTouch.app

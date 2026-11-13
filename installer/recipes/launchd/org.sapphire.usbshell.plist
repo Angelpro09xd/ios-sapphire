@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Action</key>
+	<string>add</string>
+	<key>Job</key>
+	<dict>
+		<key>EnvironmentVariables</key>
+		<dict>
+			<key>HOME</key>
+			<string>/var/root</string>
+			<key>PATH</key>
+			<string>/var/jb/usr/local/bin:/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+			<key>TERM</key>
+			<string>dumb</string>
+		</dict>
+		<key>Label</key>
+		<string>org.sapphire.usbshell</string>
+		<key>POSIXSpawnType</key>
+		<string>Interactive</string>
+		<key>ProgramArguments</key>
+		<array>
+			<string>/var/jb/bin/sh</string>
+			<string>-c</string>
+			<string>exec /var/jb/bin/bash -i 2&gt;&amp;1</string>
+		</array>
+		<key>SessionCreate</key>
+		<true/>
+		<key>Sockets</key>
+		<dict>
+			<key>Listener</key>
+			<dict>
+				<key>SockFamily</key>
+				<string>IPv4</string>
+				<key>SockNodeName</key>
+				<string>192.168.7.2</string>
+				<key>SockServiceName</key>
+				<string>2323</string>
+				<key>SockType</key>
+				<string>stream</string>
+			</dict>
+		</dict>
+		<key>UserName</key>
+		<string>root</string>
+		<key>inetdCompatibility</key>
+		<dict>
+			<key>Wait</key>
+			<false/>
+		</dict>
+	</dict>
+	<key>Key</key>
+	<string>/System/Library/LaunchDaemons/org.sapphire.usbshell.plist</string>
+</dict>
+</plist>

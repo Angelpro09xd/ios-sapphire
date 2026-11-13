@@ -1,0 +1,355 @@
+From 0000000000000000000000000000000000000308 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 9 Nov 2026 11:30:00 +0100
+Subject: [PATCH] sapphire-0308: modem firmware found by name in modem_a's FAT
+ when no table matches (any HyperOS, not only 2.0.208)
+
+---
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -242,6 +242,10 @@
+ static unsigned fw_phone;                   /* index into fw_tables */
+ static unsigned fw_count = sizeof(fw_topaz) / sizeof(fw_topaz[0]);
+ static bool fw_picked;                      /* fw_pick() ran (0248: SweetQsee.cpp may run it) */
++#define FW_FAT 2                            /* fw_phone: no table matched, the files were found in the FAT (0308) */
++static bool fw_fat_build(void);
++static int64_t fw_fat_size(const char *name);
++static int64_t fw_fat_read(const char *name, void *dst, uint64_t max);
+ 
+ static int
+ fw_find(const char *name)
+@@ -257,6 +261,9 @@
+ static int64_t
+ fw_size(const char *name)
+ {
++	if (fw_phone == FW_FAT) {
++		return fw_fat_size(name);
++	}
+ 	int i = fw_find(name);
+ 	return i < 0 ? -1 : (int64_t)fw_files[i].size;
+ }
+@@ -287,6 +294,11 @@
+ 		}
+ 	}
+ 	IOFree(mdt, max);
++	if (fw_fat_build()) {
++		fw_phone = FW_FAT;
++		LOG("firmware: %s matches no table: its files are read by name from its FAT", fw_part);
++		return;
++	}
+ 	LOG("firmware: %s matches no table, trying the topaz one", fw_part);
+ }
+ 
+@@ -294,6 +306,9 @@
+ static int64_t
+ fw_read(const char *name, void *dst, uint64_t max)
+ {
++	if (fw_phone == FW_FAT) {
++		return fw_fat_read(name, dst, max);
++	}
+ 	int i = fw_find(name), err;
+ 
+ 	if (i < 0 || fw_files[i].size > max) {
+@@ -3785,10 +3800,10 @@
+ };
+ 
+ /* the tables of the phone fw_pick() found (same order as fw_tables) */
+-static const struct fw_extent *const fw_ext_tab[] = { fw_ext_topaz, fw_ext_sapphire };
+-static const struct fw_all_file *const fw_all_tab[] = { fw_all_topaz, fw_all_sapphire };
+-static const unsigned fw_all_count[] = {
+-	sizeof(fw_all_topaz) / sizeof(fw_all_topaz[0]), sizeof(fw_all_sapphire) / sizeof(fw_all_sapphire[0]),
++static const struct fw_extent *fw_ext_tab[3] = { fw_ext_topaz, fw_ext_sapphire, NULL };
++static const struct fw_all_file *fw_all_tab[3] = { fw_all_topaz, fw_all_sapphire, NULL };
++static unsigned fw_all_count[3] = {
++	sizeof(fw_all_topaz) / sizeof(fw_all_topaz[0]), sizeof(fw_all_sapphire) / sizeof(fw_all_sapphire[0]), 0,
+ };
+ #define fw_ext (fw_ext_tab[fw_phone])
+ #define fw_all (fw_all_tab[fw_phone])
+@@ -3800,6 +3815,17 @@
+ 		if (strcmp(fw_all[i].path, path) == 0) {
+ 			return (int)i;
+ 		}
++		if (fw_phone == FW_FAT) {
++			/* the FAT's names were lower-cased: FAT itself ignores case */
++			const char *a = fw_all[i].path, *b = path;
++			while (*a && *b && *a == ((*b >= 'A' && *b <= 'Z') ? *b + 32 : *b)) {
++				a++;
++				b++;
++			}
++			if (*a == 0 && *b == 0) {
++				return (int)i;
++			}
++		}
+ 	}
+ 	return -1;
+ }
+@@ -3824,6 +3850,259 @@
+ }
+ 
+ /*
++ * sapphire 0308: firmware no table knows (a newer HyperOS than 2.0.208, any phone's): the partition is a
++ * FAT16/FAT32 volume, so its files are found by name. Every file under it becomes an fw_all entry
++ * (lower-case path, extents from its cluster chain), the modem's own files ("modem.mdt", "modem.bNN")
++ * are read through them, and the QSEE / TFTP users get the same table. Read-only, as before.
++ */
++#define FW_FAT_MAX_FILES    2048
++#define FW_FAT_MAX_EXT      8192
++
++static struct fw_extent *fat_ext;
++static struct fw_all_file *fat_all;
++static unsigned fat_next, fat_nfiles;
++static uint8_t *fat_tab;                        /* the whole FAT */
++static uint32_t fat_bits, fat_bps, fat_clus_bytes, fat_nclus;
++static uint64_t fat_data_off, fat_root_off;
++static uint32_t fat_root_bytes, fat_root_clus;
++
++static uint32_t
++fat_le(const uint8_t *p, int n)
++{
++	uint32_t v = 0;
++	for (int i = n - 1; i >= 0; i--) {
++		v = v << 8 | p[i];
++	}
++	return v;
++}
++
++static uint32_t
++fat_get(uint32_t c)
++{
++	if (fat_bits == 16) {
++		return fat_le(fat_tab + 2 * c, 2);
++	}
++	return fat_le(fat_tab + 4 * c, 4) & 0x0FFFFFFF;
++}
++
++static bool
++fat_eoc(uint32_t c)
++{
++	return c < 2 || c >= (fat_bits == 16 ? 0xFFF8u : 0x0FFFFFF8u) || c >= fat_nclus + 2;
++}
++
++static uint64_t
++fat_clus_off(uint32_t c)
++{
++	return fat_data_off + (uint64_t)(c - 2) * fat_clus_bytes;
++}
++
++/* a file's clusters as extents in fat_ext; false when the tables are full or the chain is broken */
++static bool
++fat_add_file(const char *path, uint32_t first, uint32_t size)
++{
++	if (fat_nfiles == FW_FAT_MAX_FILES) {
++		return false;
++	}
++	unsigned start = fat_next, guard = 0;
++	uint32_t left = size, c = first;
++	while (left > 0) {
++		if (fat_eoc(c) || fat_next == FW_FAT_MAX_EXT || ++guard > fat_nclus) {
++			return false;
++		}
++		uint32_t run = 1;
++		while (run * fat_clus_bytes < left && !fat_eoc(fat_get(c + run - 1)) && fat_get(c + run - 1) == c + run) {
++			run++;
++		}
++		uint32_t len = (uint32_t)MIN((uint64_t)run * fat_clus_bytes, (uint64_t)left);
++		fat_ext[fat_next].off = (uint32_t)fat_clus_off(c);
++		fat_ext[fat_next].len = len;
++		fat_next++;
++		left -= len;
++		c = fat_get(c + run - 1);
++	}
++	size_t pl = strlen(path) + 1;
++	char *p = (char *)IOMalloc(pl);
++	if (p == NULL) {
++		return false;
++	}
++	memcpy(p, path, pl);
++	fat_all[fat_nfiles].path = p;
++	fat_all[fat_nfiles].size = size;
++	fat_all[fat_nfiles].ext = (uint16_t)start;
++	fat_all[fat_nfiles].next = (uint16_t)(fat_next - start);
++	fat_nfiles++;
++	return true;
++}
++
++/* one directory (the FAT16 root when clus == 0) into the tables, sub-directories after */
++static void
++fat_walk(uint32_t clus, const char *prefix, int depth)
++{
++	uint8_t *buf = (uint8_t *)IOMalloc(fat_clus_bytes > fat_root_bytes ? fat_clus_bytes : fat_root_bytes);
++	if (buf == NULL || depth > 16) {
++		if (buf) IOFree(buf, fat_clus_bytes > fat_root_bytes ? fat_clus_bytes : fat_root_bytes);
++		return;
++	}
++	const uint32_t bsz = fat_clus_bytes > fat_root_bytes ? fat_clus_bytes : fat_root_bytes;
++	char lfn[256];
++	bool have_lfn = false;
++	uint32_t c = clus, guard = 0;
++	bool root16 = clus == 0;
++	for (;;) {
++		uint32_t n = root16 ? fat_root_bytes : fat_clus_bytes;
++		uint64_t off = root16 ? fat_root_off : fat_clus_off(c);
++		if (sweet_ufs_read_part(fw_part, off, buf, n) != 0) {
++			break;
++		}
++		for (uint32_t e = 0; e + 32 <= n; e += 32) {
++			const uint8_t *d = buf + e;
++			if (d[0] == 0) {
++				goto done;
++			}
++			if (d[0] == 0xE5) {
++				have_lfn = false;
++				continue;
++			}
++			if (d[11] == 0x0F) {                    /* long name piece: 13 UCS-2 characters */
++				int seq = (d[0] & 0x1F) - 1;
++				static const uint8_t at[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
++				if (d[0] & 0x40) {
++					memset(lfn, 0, sizeof(lfn));
++					have_lfn = true;
++				}
++				for (int k = 0; k < 13 && seq >= 0 && seq * 13 + k < 255; k++) {
++					uint16_t ch = (uint16_t)(d[at[k]] | d[at[k] + 1] << 8);
++					if (ch == 0 || ch == 0xFFFF) {
++						break;
++					}
++					lfn[seq * 13 + k] = ch < 0x80 ? (char)((ch >= 'A' && ch <= 'Z') ? ch + 32 : ch) : '_';
++				}
++				continue;
++			}
++			if (d[11] & 0x08) {                     /* the volume label */
++				have_lfn = false;
++				continue;
++			}
++			char name[256];
++			if (have_lfn) {
++				strlcpy(name, lfn, sizeof(name));
++			} else {
++				unsigned k = 0;
++				for (int i = 0; i < 8 && d[i] != ' '; i++) {
++					name[k++] = (char)((d[i] >= 'A' && d[i] <= 'Z') ? d[i] + 32 : d[i]);
++				}
++				if (d[8] != ' ') {
++					name[k++] = '.';
++					for (int i = 8; i < 11 && d[i] != ' '; i++) {
++						name[k++] = (char)((d[i] >= 'A' && d[i] <= 'Z') ? d[i] + 32 : d[i]);
++					}
++				}
++				name[k] = 0;
++			}
++			have_lfn = false;
++			if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
++				continue;
++			}
++			uint32_t first = fat_le(d + 26, 2) | (fat_bits == 32 ? fat_le(d + 20, 2) << 16 : 0);
++			char path[300];
++			snprintf(path, sizeof(path), "%s%s%s", prefix, *prefix ? "/" : "", name);
++			if (d[11] & 0x10) {
++				if (first >= 2) {
++					fat_walk(first, path, depth + 1);
++				}
++			} else if (!fat_add_file(path, first, fat_le(d + 28, 4))) {
++				LOG("firmware: FAT: %s not added (tables full or broken chain)", path);
++			}
++		}
++		if (root16) {
++			break;
++		}
++		c = fat_get(c);
++		if (fat_eoc(c) || ++guard > fat_nclus) {
++			break;
++		}
++	}
++done:
++	IOFree(buf, bsz);
++}
++
++static bool
++fw_fat_build(void)
++{
++	uint8_t bs[512];
++	if (sweet_ufs_read_part(fw_part, 0, bs, sizeof(bs)) != 0 || bs[510] != 0x55 || bs[511] != 0xAA) {
++		return false;
++	}
++	fat_bps = fat_le(bs + 11, 2);
++	uint32_t spc = bs[13], rsvd = fat_le(bs + 14, 2), nfats = bs[16], rootent = fat_le(bs + 17, 2);
++	uint32_t total = fat_le(bs + 19, 2) ? fat_le(bs + 19, 2) : fat_le(bs + 32, 4);
++	uint32_t fatsz = fat_le(bs + 22, 2) ? fat_le(bs + 22, 2) : fat_le(bs + 36, 4);
++	if (fat_bps < 512 || fat_bps > 4096 || spc == 0 || nfats == 0 || fatsz == 0 || total == 0) {
++		return false;
++	}
++	fat_root_bytes = rootent * 32;
++	uint32_t root_secs = (fat_root_bytes + fat_bps - 1) / fat_bps;
++	uint32_t data_sec = rsvd + nfats * fatsz + root_secs;
++	fat_nclus = (total - data_sec) / spc;
++	fat_bits = fat_nclus < 4085 ? 12 : fat_nclus < 65525 ? 16 : 32;
++	if (fat_bits == 12) {
++		return false;
++	}
++	fat_clus_bytes = spc * fat_bps;
++	fat_root_off = (uint64_t)(rsvd + nfats * fatsz) * fat_bps;
++	fat_data_off = (uint64_t)data_sec * fat_bps;
++	fat_root_clus = fat_bits == 32 ? fat_le(bs + 44, 4) : 0;
++	uint32_t fat_bytes = fatsz * fat_bps;
++	fat_tab = (uint8_t *)IOMalloc(fat_bytes);
++	fat_ext = (struct fw_extent *)IOMalloc(sizeof(*fat_ext) * FW_FAT_MAX_EXT);
++	fat_all = (struct fw_all_file *)IOMalloc(sizeof(*fat_all) * FW_FAT_MAX_FILES);
++	if (fat_tab == NULL || fat_ext == NULL || fat_all == NULL ||
++	    sweet_ufs_read_part(fw_part, (uint64_t)rsvd * fat_bps, fat_tab, fat_bytes) != 0) {
++		LOG("firmware: FAT: no memory or the FAT is not readable");
++		return false;
++	}
++	fat_walk(fat_root_clus, "", 0);
++	IOFree(fat_tab, fat_bytes);
++	fat_tab = NULL;
++	if (fat_nfiles == 0) {
++		return false;
++	}
++	fw_ext_tab[FW_FAT] = fat_ext;
++	fw_all_tab[FW_FAT] = fat_all;
++	fw_all_count[FW_FAT] = fat_nfiles;
++	LOG("firmware: FAT%u volume, %u files, %u extents, cluster %u bytes", fat_bits, fat_nfiles, fat_next, fat_clus_bytes);
++	return true;
++}
++
++/* the modem's own files ("modem.mdt", "modem.b03") when the tables came from the FAT */
++static int64_t
++fw_fat_size(const char *name)
++{
++	char path[64];
++	snprintf(path, sizeof(path), "image/%s", name);
++	int i = fw_all_find(path);
++	return i < 0 ? -1 : (int64_t)fw_all[i].size;
++}
++
++static int64_t
++fw_fat_read(const char *name, void *dst, uint64_t max)
++{
++	char path[64];
++	snprintf(path, sizeof(path), "image/%s", name);
++	int i = fw_all_find(path);
++	if (i < 0 || fw_all[i].size > max) {
++		LOG("%s: not in %s or too big", name, fw_part);
++		return -1;
++	}
++	if (!fw_all_read(i, 0, dst, fw_all[i].size)) {
++		LOG("%s: read from %s failed", name, fw_part);
++		return -1;
++	}
++	return fw_all[i].size;
++}
++
++/*
+  * 0248: the modem partition's files for SweetQsee.cpp (the goodixfp TrustZone app). fw_pick()
+  * runs here first when the modem thread has not run it (no modem= / audio=). Size: bytes, -1 not
+  * in the table, -2 the partition not readable (yet).
+@@ -3855,7 +4134,7 @@
+ extern "C" const char *
+ topaz_fw_phone(void)
+ {
+-	return fw_picked ? fw_tables[fw_phone].phone : "(not picked)";
++	return !fw_picked ? "(not picked)" : fw_phone == FW_FAT ? "FAT" : fw_tables[fw_phone].phone;
+ }
+ 
+ /* QMI */

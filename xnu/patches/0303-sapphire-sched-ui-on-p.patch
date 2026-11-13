@@ -1,0 +1,204 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0303: kern.sweet_sched: the UI's threads on the A73s, background work on the A53s
+
+Without Apple's CLPC nothing ever recommends a cluster to a thread group, so every QoS of every thread
+group prefers the boot cluster (the four A73s), background work included, and the A53s get work only by
+taking it: the default P->E edges allow migration and stealing, so whenever the A73s are all busy for a
+moment an idle A53 takes what waits -- often backboardd's or SpringBoard's threads in the middle of an
+animation, at about a third of the speed. Measured during home screen swipes: each A73 55% busy and a
+quarter of all the work on the A53s.
+
+kern.sweet_sched (boot-arg sweetsched), bits: 1 utility and background QoS prefer the efficiency cluster,
+2 default QoS too, 4 no P->E migration or stealing, 8 an idle A73 may take waiting efficiency-cluster
+work. Written at run time it is applied to every thread group at once (running and runnable threads
+moved); new thread groups take it when they are made. 0, the default, is the stock behaviour.
+---
+diff --git a/bsd/kern/kern_sysctl.c b/bsd/kern/kern_sysctl.c
+index 9ba4ffb..401ce21 100644
+--- a/bsd/kern/kern_sysctl.c
++++ b/bsd/kern/kern_sysctl.c
+@@ -2519,6 +2519,25 @@ extern int sched_amp_pcores_preempt_immediate_ipi;
+ SYSCTL_INT(_kern, OID_AUTO, sched_amp_pcores_preempt_immediate_ipi,
+     CTLFLAG_KERN | CTLFLAG_RW | CTLFLAG_LOCKED,
+     &sched_amp_pcores_preempt_immediate_ipi, 0, "");
++#if CONFIG_SCHED_EDGE
++/* sapphire: where threads run without CLPC (osfmk/kern/sched_clutch.c sweet_sched_set) */
++extern uint32_t sweet_sched_mode;
++extern void sweet_sched_set(uint32_t mode);
++static int
++sysctl_sweet_sched SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int mode = (int)sweet_sched_mode, changed = 0;
++	int error = sysctl_io_number(req, mode, sizeof(mode), &mode, &changed);
++	if (error == 0 && changed) {
++		sweet_sched_set((uint32_t)mode);
++	}
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_sched,
++    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_sched, "I",
++    "sapphire: 1 UT/BG prefer E, 2 DF too, 4 no P->E migration/steal, 8 idle P steals E work");
++#endif /* CONFIG_SCHED_EDGE */
+ #endif /* __AMP__ */
+ #endif /* __arm64__ */
+ 
+diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
+index 3657d83..766abd0 100644
+--- a/osfmk/kern/sched_clutch.c
++++ b/osfmk/kern/sched_clutch.c
+@@ -1118,6 +1118,10 @@ sched_clutch_bucket_init(
+  *
+  * Initializer for clutch bucket groups.
+  */
++#if CONFIG_SCHED_EDGE
++uint32_t sweet_sched_bucket_cluster(sched_bucket_t bucket);
++#endif /* CONFIG_SCHED_EDGE */
++
+ static void
+ sched_clutch_bucket_group_init(
+ 	sched_clutch_bucket_group_t clutch_bucket_group,
+@@ -1136,7 +1140,11 @@ sched_clutch_bucket_group_init(
+ 
+ 	os_atomic_store(&clutch_bucket_group->scbg_timeshare_tick, 0, relaxed);
+ 	os_atomic_store(&clutch_bucket_group->scbg_pri_shift, INT8_MAX, relaxed);
++#if CONFIG_SCHED_EDGE
++	os_atomic_store(&clutch_bucket_group->scbg_preferred_cluster, sweet_sched_bucket_cluster(bucket), relaxed);
++#else /* CONFIG_SCHED_EDGE */
+ 	os_atomic_store(&clutch_bucket_group->scbg_preferred_cluster, pset0.pset_cluster_id, relaxed);
++#endif /* CONFIG_SCHED_EDGE */
+ 	/*
+ 	 * All thread groups should be initialized to be interactive; this allows the newly launched
+ 	 * thread groups to fairly compete with already running thread groups.
+@@ -4843,6 +4851,84 @@ sched_edge_pset_made_schedulable(__unused processor_t processor, processor_set_t
+  * Callback routine from the platform layer once all CPUs/clusters have been initialized. This
+  * provides an opportunity for the edge scheduler to initialize all the edge parameters.
+  */
++/*
++ * sapphire: where threads run on a phone without Apple's CLPC (kern.sweet_sched, boot-arg sweetsched).
++ *
++ * Nothing here ever recommends a cluster to a thread group (CLPC does that on an iPhone), so every QoS of
++ * every thread group prefers the boot cluster -- the four A73s -- background work included, and the A53s
++ * only get work by taking it: P->E edges allow migration and stealing, so whenever the four A73s are busy
++ * for a moment an idle A53 takes whatever waits, often the window server's or SpringBoard's threads in the
++ * middle of an animation, at a third of the speed. Measured during home screen swipes: the A73s 55% busy
++ * each, a quarter of all the work on the A53s. Bits of the mode:
++ *   1  utility and background QoS prefer the efficiency cluster
++ *   2  default QoS too
++ *   4  P->E: no migration and no stealing (what prefers the A73s stays there)
++ *   8  E->P stealing: an idle A73 takes waiting efficiency-cluster work
++ * 0 is the stock behaviour. Applied at once to every thread group (running and runnable threads moved).
++ */
++uint32_t sweet_sched_mode;
++
++static uint32_t
++sweet_sched_cluster_of_type(cluster_type_t type)
++{
++	for (int i = 0; i < sched_edge_max_clusters; i++) {
++		if (pset_array[i] != NULL && pset_array[i]->pset_type == type) {
++			return i;
++		}
++	}
++	return pset0.pset_cluster_id;
++}
++
++uint32_t
++sweet_sched_bucket_cluster(sched_bucket_t bucket)
++{
++	uint32_t mode = os_atomic_load(&sweet_sched_mode, relaxed);
++	bool efficiency = false;
++	if (bucket == TH_BUCKET_SHARE_UT || bucket == TH_BUCKET_SHARE_BG) {
++		efficiency = (mode & 1) != 0;
++	} else if (bucket == TH_BUCKET_SHARE_DF) {
++		efficiency = (mode & 2) != 0;
++	}
++	return efficiency ? sweet_sched_cluster_of_type(CLUSTER_TYPE_E) : pset0.pset_cluster_id;
++}
++
++static void
++sweet_sched_edges(uint32_t mode)
++{
++	spl_t s = splsched();
++	for (int src = 0; src < sched_edge_max_clusters; src++) {
++		processor_set_t src_pset = pset_array[src];
++		if (src_pset == NULL) {
++			continue;
++		}
++		pset_lock(src_pset);
++		for (int dst = 0; dst < sched_edge_max_clusters; dst++) {
++			processor_set_t dst_pset = pset_array[dst];
++			if (dst == src || dst_pset == NULL || src_pset->pset_type == dst_pset->pset_type) {
++				continue;
++			}
++			if (src_pset->pset_type == CLUSTER_TYPE_P) {
++				uint32_t allowed = (mode & 4) ? 0 : 1;
++				sched_edge_config_set(src, dst, (sched_clutch_edge){.sce_migration_weight = 64, .sce_migration_allowed = allowed, .sce_steal_allowed = allowed});
++			} else {
++				sched_edge_config_set(src, dst, (sched_clutch_edge){.sce_migration_weight = 0, .sce_migration_allowed = 0, .sce_steal_allowed = (mode & 8) ? 1 : 0});
++			}
++		}
++		pset_unlock(src_pset);
++	}
++	splx(s);
++}
++
++extern void thread_group_sweet_sched_apply(void);
++
++void
++sweet_sched_set(uint32_t mode)
++{
++	os_atomic_store(&sweet_sched_mode, mode, relaxed);
++	sweet_sched_edges(mode);
++	thread_group_sweet_sched_apply();
++}
++
+ static void
+ sched_edge_cpu_init_completed(void)
+ {
+@@ -4886,6 +4972,15 @@ sched_edge_cpu_init_completed(void)
+ 		pset_unlock(src_pset);
+ 	}
+ 	splx(s);
++
++	uint32_t mode = 0;
++	if (PE_parse_boot_argn("sweetsched", &mode, sizeof(mode))) {
++		/* thread groups made from here on take it at their creation; the few older ones keep the boot cluster */
++		os_atomic_store(&sweet_sched_mode, mode, relaxed);
++		sweet_sched_edges(mode);
++		printf("SWEET SCHED: mode %#x (P cluster %u, E cluster %u)\n", mode,
++		    sweet_sched_cluster_of_type(CLUSTER_TYPE_P), sweet_sched_cluster_of_type(CLUSTER_TYPE_E));
++	}
+ }
+ 
+ static bool
+diff --git a/osfmk/kern/thread_group.c b/osfmk/kern/thread_group.c
+index f04b813..a865c94 100644
+--- a/osfmk/kern/thread_group.c
++++ b/osfmk/kern/thread_group.c
+@@ -1331,6 +1331,26 @@ sched_perfcontrol_thread_group_recommend(__unused void *machine_data, __unused c
+ 	sched_edge_tg_preferred_cluster_change(tg, tg_bucket_preferred_cluster, options);
+ }
+ 
++/* sapphire: kern.sweet_sched (sched_clutch.c) applied to every thread group there is */
++extern uint32_t sweet_sched_bucket_cluster(sched_bucket_t bucket);
++
++void
++thread_group_sweet_sched_apply(void)
++{
++	uint32_t preferred[TH_BUCKET_SCHED_MAX];
++	struct thread_group *tg;
++
++	for (sched_bucket_t bucket = TH_BUCKET_FIXPRI; bucket < TH_BUCKET_SCHED_MAX; bucket++) {
++		preferred[bucket] = sweet_sched_bucket_cluster(bucket);
++	}
++	lck_mtx_lock(&tg_lock);
++	qe_foreach_element(tg, &tg_queue, tg_queue_chain) {
++		sched_edge_tg_preferred_cluster_change(tg, preferred,
++		    SCHED_PERFCONTROL_PREFERRED_CLUSTER_MIGRATE_RUNNING | SCHED_PERFCONTROL_PREFERRED_CLUSTER_MIGRATE_RUNNABLE);
++	}
++	lck_mtx_unlock(&tg_lock);
++}
++
+ void
+ sched_perfcontrol_edge_matrix_get(sched_clutch_edge *edge_matrix, bool *edge_request_bitmap, uint64_t flags, uint64_t matrix_order)
+ {

@@ -16,4 +16,11 @@ W='LaunchDaemons:/System/Library/LaunchDaemons/com.sapphire.wifidkick.plist'
 if [ -n "$($P $C get "$W:Label" 2>/dev/null)" ]; then
 	$P $C put "$W" /redwood/share/com.sapphire.wifidkick.cache-job.plist
 fi
-echo "0.1.8: fairplayd -> $($P $C get "$F:Program")"
+# Home-screen edit mode drew icons cut off, and a few apps left stale pieces on screen (the stopwatch's old hands):
+# CoreAnimation's partial updates (dirty regions) assume a frame buffer still holds what was drawn into it before,
+# which this display path does not keep; every frame is drawn whole instead (costs a few fps on swipes)
+B='LaunchDaemons:/System/Library/LaunchDaemons/com.apple.backboardd.plist'
+if [ -n "$($P $C get "$B:Label" 2>/dev/null)" ]; then
+	$P $C set "$B:EnvironmentVariables:CA_DISABLE_DIRTY_REGIONS" string 1
+fi
+echo "0.1.8: fairplayd -> $($P $C get "$F:Program"), backboardd CA_DISABLE_DIRTY_REGIONS=$($P $C get "$B:EnvironmentVariables:CA_DISABLE_DIRTY_REGIONS")"

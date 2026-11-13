@@ -1,0 +1,79 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0275: camera SMMU: FSR FORMAT bits are not a fault
+
+Op 23 stopped on "FSR 0x400" before enabling anything: FSR bits 10:9 are the
+FORMAT of the fault record (0b10, AArch64), not a fault. Only the fault bits
+(MULTI, SS, UUT, ASF, TLBLKF, TLBMCF, EF, PF, AFF, TF: 0xC00001FE) count now;
+the FSR is cleared (written back) at the end of op 20 and before the capture,
+and a fault found before WM7 is enabled is logged, not fatal.
+---
+ bsd/dev/sweet_cam.c | 29 ++++++++++++++++++++++++-----
+ 1 file changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index d3deb13..7ada2bf 100755
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -1288,6 +1288,7 @@ extern void sweet_log_sync(unsigned max_ms);     /* bsd/dev/sweet_ufs.c */
+ 
+ static vm_offset_t s_cbp;                       /* the bank op 20 programmed */
+ static bool s_ready, w_ready;
++static void smmu_fsr_clear(const char *when);
+ 
+ static void
+ step(const char *fmt, ...)
+@@ -1397,6 +1398,7 @@ cam_smmu_stage(void)
+ 	camlog("SMMU: SMR%u %#x S2CR %#x; bank %u SCTLR %#x TTBR0 %#x TCR %#x CBAR %#x FSR %#x: %s", slot, smr, s2cr, cb,
+ 	    rd(cbp, 0x0), rd(cbp, 0x20), rd(cbp, 0x30), rd(gr1, 4 * cb), rd(cbp, 0x58), s_ready ? "as written" : "NOT as written");
+ 	s_cbp = s_ready ? cbp : 0;
++	smmu_fsr_clear("after programming");
+ 	sweet_log_sync(500);
+ 	return s_ready ? 0 : EIO;
+ }
+@@ -1471,14 +1473,32 @@ cam_wm_config(void)
+ 	return w_ready ? 0 : EIO;
+ }
+ 
++/*
++ * 0275: FSR bits 10:9 are FORMAT (0b10: the AArch64 format of the record), not a fault: 0274 read
++ * 0x400 as one. The fault bits are MULTI, SS, UUT, ASF, TLBLKF, TLBMCF, EF, PF, AFF, TF
++ * (Linux ARM_SMMU_FSR_FAULT); they are cleared by writing them back.
++ */
++#define SMMU_FSR_FAULT  0xC00001FEu
++
++static void
++smmu_fsr_clear(const char *when)
++{
++	if (s_cbp == 0) {
++		return;
++	}
++	uint32_t fsr = rd(s_cbp, 0x58);
++	wr(s_cbp, 0x58, fsr);
++	camlog("SMMU FSR %s: %#x, cleared -> %#x", when, fsr, rd(s_cbp, 0x58));
++}
++
+ static bool
+ smmu_fault(const char *when)
+ {
+ 	uint32_t fsr = s_cbp ? rd(s_cbp, 0x58) : 0;
+-	if (fsr != 0) {
++	if ((fsr & SMMU_FSR_FAULT) != 0) {
+ 		camlog("SMMU FAULT %s: FSR %#x FAR %#x%08x FSYNR0 %#x", when, fsr, rd(s_cbp, 0x64), rd(s_cbp, 0x60), rd(s_cbp, 0x68));
+ 	}
+-	return fsr != 0;
++	return (fsr & SMMU_FSR_FAULT) != 0;
+ }
+ 
+ /* op 23 */
+@@ -1494,9 +1514,8 @@ cam_capture_staged(void)
+ 	memset(cam_pool, 0xA5, 4096);
+ 	memset(cam_pool + bytes - 4096, 0xA5, 4096);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	if (smmu_fault("before")) {
+-		return EIO;
+-	}
++	(void)smmu_fault("before (not fatal)");
++	smmu_fsr_clear("before the capture");
+ 	step("CSID RDI0 halt");
+ 	wr(t, 0x308, 0);
+ 	step("TFE RDI0 path on (0x1460=1, epoch 0x1470)");

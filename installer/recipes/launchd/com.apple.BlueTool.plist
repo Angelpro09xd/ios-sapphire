@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Action</key>
+	<string>replace</string>
+	<key>Job</key>
+	<dict>
+		<key>EnablePressuredExit</key>
+		<true/>
+		<key>Label</key>
+		<string>com.apple.BlueTool</string>
+		<key>MachServices</key>
+		<dict>
+			<key>com.apple.BlueTool</key>
+			<true/>
+		</dict>
+		<key>POSIXSpawnType</key>
+		<string>Adaptive</string>
+		<key>ProgramArguments</key>
+		<array>
+			<string>/redwood/bin/btshim</string>
+			<string>bluetool</string>
+		</array>
+		<key>StandardErrorPath</key>
+		<string>/var/tmp/btshim-bluetool.out</string>
+		<key>StandardOutPath</key>
+		<string>/var/tmp/btshim-bluetool.out</string>
+		<key>ThrottleInterval</key>
+		<integer>0</integer>
+		<key>UserName</key>
+		<string>mobile</string>
+	</dict>
+	<key>Key</key>
+	<string>/System/Library/LaunchDaemons/com.apple.BlueTool.plist</string>
+</dict>
+</plist>

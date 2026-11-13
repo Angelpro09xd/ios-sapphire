@@ -1,0 +1,298 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>LocProvenance</key>
+	<dict>
+		<key>ar</key>
+		<integer>1</integer>
+		<key>bg</key>
+		<integer>1</integer>
+		<key>ca</key>
+		<integer>1</integer>
+		<key>cs</key>
+		<integer>1</integer>
+		<key>da</key>
+		<integer>1</integer>
+		<key>de</key>
+		<integer>1</integer>
+		<key>el</key>
+		<integer>1</integer>
+		<key>en</key>
+		<integer>1</integer>
+		<key>en_AU</key>
+		<integer>1</integer>
+		<key>en_GB</key>
+		<integer>1</integer>
+		<key>es</key>
+		<integer>1</integer>
+		<key>es_419</key>
+		<integer>1</integer>
+		<key>fi</key>
+		<integer>1</integer>
+		<key>fr</key>
+		<integer>1</integer>
+		<key>fr_CA</key>
+		<integer>1</integer>
+		<key>he</key>
+		<integer>1</integer>
+		<key>hi</key>
+		<integer>1</integer>
+		<key>hr</key>
+		<integer>1</integer>
+		<key>hu</key>
+		<integer>1</integer>
+		<key>id</key>
+		<integer>1</integer>
+		<key>it</key>
+		<integer>1</integer>
+		<key>ja</key>
+		<integer>1</integer>
+		<key>kk</key>
+		<integer>1</integer>
+		<key>ko</key>
+		<integer>1</integer>
+		<key>ms</key>
+		<integer>1</integer>
+		<key>nl</key>
+		<integer>1</integer>
+		<key>no</key>
+		<integer>1</integer>
+		<key>none</key>
+		<integer>2</integer>
+		<key>pl</key>
+		<integer>1</integer>
+		<key>pt</key>
+		<integer>1</integer>
+		<key>pt_PT</key>
+		<integer>1</integer>
+		<key>ro</key>
+		<integer>1</integer>
+		<key>ru</key>
+		<integer>1</integer>
+		<key>sk</key>
+		<integer>1</integer>
+		<key>sv</key>
+		<integer>1</integer>
+		<key>th</key>
+		<integer>1</integer>
+		<key>tr</key>
+		<integer>1</integer>
+		<key>uk</key>
+		<integer>1</integer>
+		<key>vi</key>
+		<integer>1</integer>
+		<key>zh_CN</key>
+		<integer>1</integer>
+		<key>zh_HK</key>
+		<integer>1</integer>
+		<key>zh_TW</key>
+		<integer>1</integer>
+	</dict>
+	<key>ar</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>bg</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>ca</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>cs</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>da</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>de</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>el</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>en</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>en_AU</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>en_GB</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>es</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>es_419</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>fi</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>fr</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>fr_CA</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>he</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>‏iOS 16</string>
+	</dict>
+	<key>hi</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>hr</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>hu</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>id</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>it</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>ja</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>kk</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>ko</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>ms</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>nl</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>no</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>pl</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>pt</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>pt_PT</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>ro</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>ru</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>sk</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>sv</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>th</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>tr</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>uk</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>vi</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>zh_CN</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>zh_HK</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+	<key>zh_TW</key>
+	<dict>
+		<key>iOS 16</key>
+		<string>iOS 16</string>
+	</dict>
+</dict>
+</plist>

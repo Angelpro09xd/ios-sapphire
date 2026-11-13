@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Action</key>
+	<string>add</string>
+	<key>Job</key>
+	<dict>
+		<key>KeepAlive</key>
+		<false/>
+		<key>Label</key>
+		<string>com.sapphire.firstboot</string>
+		<key>ProgramArguments</key>
+		<array>
+			<string>/var/jb/bin/bash</string>
+			<string>/redwood/bin/sapphire-firstboot.sh</string>
+		</array>
+		<key>RunAtLoad</key>
+		<true/>
+		<key>StandardErrorPath</key>
+		<string>/var/tmp/firstboot.log</string>
+		<key>StandardOutPath</key>
+		<string>/var/tmp/firstboot.log</string>
+		<key>UserName</key>
+		<string>root</string>
+	</dict>
+	<key>Key</key>
+	<string>/System/Library/LaunchDaemons/com.sapphire.firstboot.plist</string>
+</dict>
+</plist>

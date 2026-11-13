@@ -15,8 +15,10 @@
  * gets the bridge from the Metal bundle as before (metal/SapphireMetal). GLLOAD_DEBUG=1 in the
  * environment: what it decided, on stderr.
  */
+#include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
+#include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +27,61 @@
 #define TWEAK_LOADER    "/var/jb/usr/lib/TweakLoader.dylib"
 #define MOBILE_SAFETY   "/var/jb/usr/lib/ellekit/MobileSafety.dylib"
 #define NO_TWEAKS       "/var/jb/var/sapphire-notweaks"
+
+/*
+ * Tweak filters, fast. ElleKit's TweakLoader checks each "Bundles" filter entry with
+ * CFBundleGetBundleWithIdentifier(); for a bundle not loaded in this process (another app's identifier,
+ * com.apple.springboard in Settings, or a framework the app does not link) CoreFoundation then walks every
+ * framework and app on the system reading their Info.plists: about 1.4-1.8 s of CPU in every app launch
+ * (measured: Settings 2.8 s -> 0.9 s of CPU without it), once a single such filter exists. While the loader
+ * runs, the answer comes from what is loaded here instead: the app's own bundle, or a loaded image whose
+ * bundle directory is named like the identifier's last component (then CoreFoundation's own answer, cheap
+ * for a loaded bundle); anything else is not loaded here, which is all the filter asks.
+ */
+static int in_tweak_loader;
+
+static int
+loaded_bundle_named(const char *name)
+{
+	size_t n = strlen(name);
+	for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+		const char *p = _dyld_get_image_name(i);
+		for (const char *q = p; p != NULL && (q = strchr(q, '/')) != NULL; q++) {
+			if (strncasecmp(q + 1, name, n) == 0 && q[1 + n] == '.' &&
+			    (strncmp(q + 2 + n, "framework/", 10) == 0 || strncmp(q + 2 + n, "bundle/", 7) == 0 ||
+			    strncmp(q + 2 + n, "appex/", 6) == 0 || strncmp(q + 2 + n, "app/", 4) == 0)) {
+				return 1;
+			}
+		}
+	}
+	return 0;
+}
+
+static CFBundleRef
+fast_bundle_with_identifier(CFStringRef ident)
+{
+	if (!in_tweak_loader || ident == NULL) {
+		return CFBundleGetBundleWithIdentifier(ident);
+	}
+	CFBundleRef main = CFBundleGetMainBundle();
+	CFStringRef mid = main != NULL ? CFBundleGetIdentifier(main) : NULL;
+	if (mid != NULL && CFEqual(mid, ident)) {
+		return main;
+	}
+	char id[256];
+	if (!CFStringGetCString(ident, id, sizeof(id), kCFStringEncodingUTF8)) {
+		return CFBundleGetBundleWithIdentifier(ident);
+	}
+	const char *last = strrchr(id, '.');
+	last = last != NULL ? last + 1 : id;
+	return loaded_bundle_named(last) ? CFBundleGetBundleWithIdentifier(ident) : NULL;
+}
+
+__attribute__((used, section("__DATA,__interpose"))) static const struct {
+	const void *replacement, *original;
+} interposers[] = {
+	{ (const void *)fast_bundle_with_identifier, (const void *)CFBundleGetBundleWithIdentifier },
+};
 
 __attribute__((constructor)) static void
 load_bridge(void)
@@ -36,7 +93,9 @@ load_bridge(void)
 	int debug = getenv("GLLOAD_DEBUG") != NULL;
 	void *gl = NULL, *bridge = NULL, *safety = NULL, *tweaks = NULL;
 
-	if (program == NULL || strstr(program, ".app/") == NULL || strstr(program, "/backboardd") != NULL) {
+	/* (apps, and app extensions: the kernel puts this library into both, 0316) */
+	if (program == NULL || (strstr(program, ".app/") == NULL && strstr(program, ".appex/") == NULL) ||
+	    strstr(program, "/backboardd") != NULL) {
 		if (debug) {
 			fprintf(stderr, "glload: %s: not an app\n", program ? program : "?");
 		}
@@ -50,7 +109,9 @@ load_bridge(void)
 		if (strstr(program, "/SpringBoard.app/SpringBoard") != NULL && access(MOBILE_SAFETY, F_OK) == 0) {
 			safety = dlopen(MOBILE_SAFETY, RTLD_NOW);
 		}
+		in_tweak_loader = 1;
 		tweaks = dlopen(TWEAK_LOADER, RTLD_NOW);
+		in_tweak_loader = 0;
 	}
 	if (debug) {
 		fprintf(stderr, "glload: %s: OpenGLES %s, bridge %s; safe mode %s, tweaks %s\n", program,

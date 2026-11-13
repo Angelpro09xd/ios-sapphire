@@ -8,7 +8,13 @@ CC=aarch64-linux-gnu-gcc
 OBJCOPY=aarch64-linux-gnu-objcopy
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
 mkdir -p out
-python3 gen_splash.py splash/splash.png out/splash.bin
+# the boot screen: the animated SPL2 frame (make_splash.py: drawn from nothing, needs numpy and the
+# Windows fonts under /mnt/c), else the old still picture (SPLASH=old forces it)
+if [ "${SPLASH:-}" != old ] && python3 splash/make_splash.py out/spl2 >/dev/null; then
+	cp out/spl2/splash2.bin out/splash.bin
+else
+	python3 gen_splash.py splash/splash.png out/splash.bin
+fi
 for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c splash.c splash_data.S; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o
 done

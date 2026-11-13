@@ -1,0 +1,52 @@
+# What the release's overlay (sapphire-overlay.tar.gz) carries: paths of the phone's iOS root, read from
+# Android by HfsTar (android/dualboot/test/HfsTar.java), minus exclude.txt. MANIFEST.md part 1.
+# Apple's own files are never here: what Sapphire changes in them is a recipe (recovery/sapphire.sh).
+
+# the GL bridge, Mesa, the telephony/Bluetooth/camera/sensor bridges, daemons, tuning
+/redwood
+
+# our apps
+/Applications/Android.app
+/Applications/Reproductor.app
+/Applications/GLSpin.app
+
+# the jailbreak: Procursus bootstrap, ElleKit, our tweaks (TweakInject), Sileo/Zebra and their packages
+/private/var/jb
+
+# our stub in place of Apple's (loads /redwood/lib/libsapphire-fpfix.dylib)
+/System/Library/Frameworks/FileProvider.framework/PlugIns/LocalStorageFileProvider.appex/LocalStorageFileProvider
+
+# the jailbreak's bash as /bin/sh and /bin/bash
+/bin/sh
+/bin/bash
+
+# what our daemons read from /var/root (firmware and settings; Xiaomi firmware may be redistributed)
+/private/var/root/btfw
+/private/var/root/sensors
+/private/var/root/sensfiles
+/private/var/root/camd.conf
+/private/var/root/voice_handset.arp
+/private/var/root/voice_speaker.arp
+/private/var/root/record_mic.arp
+
+# tools used by the daemons, the post-boot steps and the docs
+/private/var/root/sensload
+/private/var/root/snsprobe
+/private/var/root/fpload
+/private/var/root/fpsave
+/private/var/root/hidtouch
+/private/var/root/pdpnet
+/private/var/root/mkb
+/private/var/root/qmitool
+/private/var/root/camdump
+/private/var/root/rawtool
+/private/var/root/machnow
+/private/var/root/cpuload
+/private/var/root/hfsgrow
+/private/var/root/hfsshrink
+/private/var/root/appopen
+/private/var/root/scr2
+/private/var/root/code.sh
+/private/var/root/btpower
+/private/var/root/arplay
+/private/var/root/displayinfo

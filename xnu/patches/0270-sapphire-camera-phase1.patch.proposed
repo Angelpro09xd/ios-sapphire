@@ -1,0 +1,732 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0270: camera phase 1: camss power, CCI, sensor chip ids
+
+New bsd/dev/sweet_cam.c (research/camera.md), idle until asked:
+kern.sweet_cam op 1 powers the camss GDSC, top_ahb (80 MHz) and axi/rt/nrt
+(300 MHz) from GPLL0 and cci_0 (37.5 MHz), reads the CCI and CPAS versions
+(after their clocks, stopping if they look wrong), sets the CCI pins and resets
+the CCI with 400 kHz timings on both masters; ops 2-5 power slot 0-3 (main
+S5KHM6, front OV16A1Q/GC16B3C, ultra wide S5K4H7, macro SC202PCS) with the
+sensormodule power-up sequence (TLMM rails and resets, PM6125 GPIO2 / PM7250B
+GPIO3 over SPMI, MCLK 19.2 MHz from XO) and read the chip id and 16 EEPROM
+bytes over CCI; op 9 turns everything off in reverse order.
+kern.sweet_cam_log holds the last request's log, kern.sweet_cam_i2c does
+ad-hoc CCI reads and writes. sweet_spmi_write allows the two PMIC GPIOs. No
+CSIPHY, CSID, TFE or SMMU yet.
+---
+ bsd/conf/files       |   1 +
+ bsd/dev/sweet_cam.c  | 679 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_spmi.c |   3 +-
+ 3 files changed, 682 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index c29da8d..8f82666 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,6 +117,7 @@ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_vibrate.c			standard
++bsd/dev/sweet_cam.c			standard
+ bsd/dev/sweet_audio_ctl.c		standard
+ bsd/dev/sweet_audio_dev.c		standard
+ bsd/dev/sweet_qmi_dev.c			standard
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+new file mode 100755
+index 0000000..84c5427
+--- /dev/null
++++ b/bsd/dev/sweet_cam.c
+@@ -0,0 +1,679 @@
++/*
++ * sapphire 0270: camera bring-up, phase 1 (research/camera.md): the camss power domain and
++ * clocks, the CCI (camera I2C) and each sensor's power-up sequence, ending in a chip-id read.
++ * Nothing runs at boot; everything is a request through sysctls:
++ *   kern.sweet_cam = op: 1 camss on (GDSC, top_ahb/axi/rt_axi/nrt_axi/cci_0, CCI and CPAS
++ *     versions, CCI pins, reset, 400 kHz timings on both masters); 2..5 power slot 0..3 (main
++ *     S5KHM6, front OV16A1Q/GC16B3C, ultra wide S5K4H7, macro SC202PCS) with the DT sequence,
++ *     then its chip id and 16 bytes of its EEPROM; 9 everything off, in reverse order.
++ *     Reading it gives the last result (0 ok, else an errno).
++ *   kern.sweet_cam_log: the log of the last request (also in the kernel log, "SWEET CAM:").
++ *   kern.sweet_cam_i2c = "m addr reg" reads 2 bytes, "m addr reg val" writes val (1 byte if
++ *     <= 0xff, else 2), all hex, addr 7-bit, reg 16-bit; the answer goes to kern.sweet_cam_log.
++ * Rules (camera.md): nothing in 0x5C00000-0x5CFFFFF before the GDSC and top_ahb/axi are on,
++ * each block's clock before its registers, every wait bounded, stop at the first wrong-looking
++ * read. No CSIPHY/CSID/TFE/SMMU here. TLMM writes keep the eGPIO enable (bit 12) when bit 11
++ * says the pin has one; GPIO14-17 (the fingerprint's SPI, TZ-owned) are never touched.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/errno.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <stdarg.h>
++#include "sweet_spmi.h"
++
++extern void IODelay(unsigned microseconds);
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void IOSleep(unsigned milliseconds);
++int sweet_spmi_read_any(unsigned sid, unsigned addr, uint8_t *out);
++
++#define GCC_PA          0x01400000u
++#define GCC_SIZE        0x80000u
++#define GDSC_CAMSS      0x58004u
++#define CPAS_PA         0x05C11000u
++#define CCI_PA          0x05C1B000u
++
++/* RCG (CMD at +0, CFG at +4) and branch (CBCR) offsets in GCC */
++#define RCG_TOP_AHB     0x58010u
++#define CBCR_TOP_AHB    0x58028u
++#define RCG_AXI         0x5802Cu
++#define CBCR_AXI        0x58044u
++#define CBCR_RT_AXI     0x5805Cu
++#define CBCR_NRT_AXI    0x58054u
++#define RCG_CCI         0x56000u
++#define CBCR_CCI        0x56018u
++static const uint32_t rcg_mclk[4] = { 0x51000u, 0x5101Cu, 0x51038u, 0x51054u };
++static const uint32_t cbcr_mclk[4] = { 0x51018u, 0x51034u, 0x51050u, 0x5106Cu };
++
++/* CCI v1.2 (Linux i2c-qcom-cci) */
++#define CCI_HW_VERSION  0x000
++#define CCI_RESET_CMD   0x004
++#define CCI_QUEUE_START 0x00C
++#define CCI_M(m)        (0x100u + 0x100u * (m))
++#define CCI_Q(m, q)     (0x300u + 0x200u * (m) + 0x100u * (q))
++#define CCI_IRQ_GCLEAR  0xC00
++#define CCI_IRQ_MASK0   0xC04
++#define CCI_IRQ_CLEAR0  0xC08
++#define CCI_IRQ_STATUS0 0xC0C
++#define CCI_RST_DONE    (1u << 24)
++#define CCI_M0_ERROR    0x18000ee6u
++#define CCI_M1_ERROR    0x60ee6000u
++
++/* pins (camera.md, dtbo fragment@28/@29) */
++#define GPIO_VIO        54
++#define GPIO_CSI_MUX    34
++static const unsigned cci_pins[4] = { 22, 23, 29, 30 };
++static const unsigned mclk_pin[4] = { 20, 21, 27, 28 };
++static const unsigned reset_pin[4] = { 18, 24, 19, 68 };
++#define GPIO_MAIN_VANA  26
++#define GPIO_MAIN_VDIG  85
++
++/* PMIC GPIOs: PM6125 GPIO2 (SID 0, 0xC100) = front/UW/macro AVDD, PM7250B GPIO3 (SID 2, 0xC200) = DVDD */
++#define AVDD_SID        0
++#define AVDD_BASE       0xC100u
++#define DVDD_SID        2
++#define DVDD_BASE       0xC200u
++
++static LCK_GRP_DECLARE(sweet_cam_grp, "sweet_cam");
++static LCK_MTX_DECLARE(sweet_cam_mtx, &sweet_cam_grp);
++static vm_offset_t gcc, cci, cpas;
++static bool camss_up;
++static int cam_last = -1;
++static char cam_log[8192];
++static size_t cam_log_len;
++
++static void
++camlog(const char *fmt, ...)
++{
++	char line[256];
++	va_list ap;
++	va_start(ap, fmt);
++	int n = vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++	if (n < 0) {
++		return;
++	}
++	printf("SWEET CAM: %s\n", line);
++	if (cam_log_len + strlen(line) + 2 < sizeof(cam_log)) {
++		cam_log_len += (size_t)snprintf(cam_log + cam_log_len, sizeof(cam_log) - cam_log_len, "%s\n", line);
++	}
++}
++
++static inline uint32_t rd(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void wr(vm_offset_t b, uint32_t o, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(b + o) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* ---------------------------------------------------------------- GCC */
++
++static bool
++gdsc_on(void)
++{
++	uint32_t v = rd(gcc, GDSC_CAMSS);
++	camlog("GDSC camss_top %#x: before %#x", GCC_PA + GDSC_CAMSS, v);
++	wr(gcc, GDSC_CAMSS, v & ~1u);                   /* SW_COLLAPSE off */
++	for (int i = 0; i < 100; i++) {
++		if (rd(gcc, GDSC_CAMSS) & (1u << 31)) {
++			camlog("GDSC camss_top: PWR_ON (%#x) after %d x 10 us", rd(gcc, GDSC_CAMSS), i);
++			return true;
++		}
++		IODelay(10);
++	}
++	camlog("GDSC camss_top: NO PWR_ON after 1 ms (%#x): stop", rd(gcc, GDSC_CAMSS));
++	return false;
++}
++
++static bool
++rcg_set(const char *name, uint32_t rcg, uint32_t cfg)
++{
++	wr(gcc, rcg + 4, cfg);
++	wr(gcc, rcg, rd(gcc, rcg) | 1);                 /* UPDATE */
++	for (int i = 0; i < 100; i++) {
++		if ((rd(gcc, rcg) & 1) == 0) {
++			camlog("RCG %s: cfg %#x, cmd %#x", name, rd(gcc, rcg + 4), rd(gcc, rcg));
++			return true;
++		}
++		IODelay(10);
++	}
++	camlog("RCG %s: update did not complete (cmd %#x cfg %#x): stop", name, rd(gcc, rcg), rd(gcc, rcg + 4));
++	return false;
++}
++
++static bool
++branch_on(const char *name, uint32_t cbcr)
++{
++	wr(gcc, cbcr, rd(gcc, cbcr) | 1);
++	for (int i = 0; i < 100; i++) {
++		if ((rd(gcc, cbcr) & (1u << 31)) == 0) {
++			camlog("branch %s on (%#x)", name, rd(gcc, cbcr));
++			return true;
++		}
++		IODelay(10);
++	}
++	camlog("branch %s: still off after 1 ms (%#x): stop", name, rd(gcc, cbcr));
++	return false;
++}
++
++static void
++branch_off(const char *name, uint32_t cbcr)
++{
++	wr(gcc, cbcr, rd(gcc, cbcr) & ~1u);
++	camlog("branch %s off (%#x)", name, rd(gcc, cbcr));
++}
++
++/* ---------------------------------------------------------------- TLMM and PMIC GPIOs */
++
++static volatile uint32_t *
++tlmm_pin(unsigned gpio)
++{
++	/* the TLMM tile of each GPIO (pinctrl-sm6115.c): S 0x900000, E 0xd00000, W 0x500000 */
++	static const char tile[] = "WWWWWWWWEEEEWWWWWWEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEWWWWWWWSSSSSSSSWWWWWWWEEWEEWWWWWWSSSSSSSSSSSSSSS";
++	static vm_offset_t map[sizeof(tile)];       /* mapped once per pin */
++	if (gpio >= sizeof(tile) - 1 || (gpio >= 14 && gpio <= 17)) {
++		return NULL;
++	}
++	if (map[gpio] == 0) {
++		uint64_t base = tile[gpio] == 'S' ? 0x00900000ull : tile[gpio] == 'E' ? 0x00D00000ull : 0x00500000ull;
++		map[gpio] = ml_io_map(base + gpio * 0x1000ull, 0x1000);
++	}
++	return (volatile uint32_t *)map[gpio];
++}
++
++/* func, pull (0 none, 1 down, 3 up), output enable + level; drive 2 mA; the eGPIO enable kept */
++static bool
++pin_cfg(unsigned gpio, unsigned func, unsigned pull, int out)
++{
++	volatile uint32_t *g = tlmm_pin(gpio);
++	if (g == NULL) {
++		camlog("gpio%u: not mapped (or off limits): stop", gpio);
++		return false;
++	}
++	uint32_t ctl = g[0], io = g[1];
++	uint32_t nv = (func << 2) | pull | (out >= 0 ? (1u << 9) : 0) | ((ctl & (1u << 11)) ? (1u << 12) : 0);
++	if (out >= 0) {
++		g[1] = out ? 2 : 0;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	g[0] = nv;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	camlog("gpio%u: ctl %#x io %#x -> ctl %#x io %#x", gpio, ctl, io, g[0], g[1]);
++	return true;
++}
++
++static bool pin_out(unsigned gpio, int high) { return pin_cfg(gpio, 0, 0, high); }
++
++/* a PM6125/PM7250B LV/MV GPIO as a plain output (pinctrl-spmi-gpio lv_mv layout) */
++static bool
++pmic_gpio(unsigned sid, unsigned base, int high, const char *name)
++{
++	uint8_t type = 0, sub = 0, mode = 0, src = 0, en = 0, vin = 0;
++	if (sweet_spmi_init() != 0 || sweet_spmi_read_any(sid, base + 0x04, &type) != 0 ||
++	    sweet_spmi_read_any(sid, base + 0x05, &sub) != 0) {
++		camlog("%s (sid %u %#x): not readable: stop", name, sid, base);
++		return false;
++	}
++	(void)sweet_spmi_read_any(sid, base + 0x40, &mode);
++	(void)sweet_spmi_read_any(sid, base + 0x41, &vin);
++	(void)sweet_spmi_read_any(sid, base + 0x44, &src);
++	(void)sweet_spmi_read_any(sid, base + 0x46, &en);
++	if (type != 0x10 || sub < 0x10 || sub > 0x13) {
++		camlog("%s (sid %u %#x): type %#x subtype %#x is not an LV/MV GPIO: stop", name, sid, base, type, sub);
++		return false;
++	}
++	int r = sweet_spmi_write(sid, base + 0x41, 0x00);                       /* DIG_VIN_CTL: VIN0 */
++	r = r ? r : sweet_spmi_write(sid, base + 0x40, 0x01);                   /* MODE_CTL: output */
++	r = r ? r : sweet_spmi_write(sid, base + 0x44, high ? 0x80 : 0x00);     /* DIG_OUT_SOURCE_CTL: level, normal */
++	r = r ? r : sweet_spmi_write(sid, base + 0x46, 0x80);                   /* EN_CTL: enabled */
++	uint8_t mode2 = 0, src2 = 0, en2 = 0, st = 0;
++	(void)sweet_spmi_read_any(sid, base + 0x40, &mode2);
++	(void)sweet_spmi_read_any(sid, base + 0x44, &src2);
++	(void)sweet_spmi_read_any(sid, base + 0x46, &en2);
++	(void)sweet_spmi_read_any(sid, base + 0x08, &st);
++	camlog("%s (sid %u %#x, subtype %#x, vin %#x): mode %#x src %#x en %#x -> mode %#x src %#x en %#x status %#x: %s%s",
++	    name, sid, base, sub, vin, mode, src, en, mode2, src2, en2, st, high ? "high" : "low", r ? " WRITE FAILED" : "");
++	return r == 0;
++}
++
++/* ---------------------------------------------------------------- CCI */
++
++static void
++cci_clear(uint32_t bits)
++{
++	wr(cci, CCI_IRQ_CLEAR0, bits);
++	wr(cci, CCI_IRQ_GCLEAR, 1);
++}
++
++static bool
++cci_wait(uint32_t bit, uint32_t errmask, const char *what)
++{
++	uint32_t st = 0;
++	for (int i = 0; i < 500; i++) {                 /* 50 ms */
++		st = rd(cci, CCI_IRQ_STATUS0);
++		if (st & (bit | errmask)) {
++			break;
++		}
++		IODelay(100);
++	}
++	cci_clear(st);
++	if ((st & bit) && !(st & errmask)) {
++		return true;
++	}
++	camlog("CCI %s: status %#x (%s)", what, st, (st & errmask) ? "error/NACK" : "timeout");
++	return false;
++}
++
++static bool
++cci_reset(void)
++{
++	cci_clear(0xffffffffu);
++	wr(cci, CCI_RESET_CMD, 0x0F73F3F7u);
++	return cci_wait(CCI_RST_DONE, 0, "reset");
++}
++
++static bool
++cci_init(void)
++{
++	static const uint32_t t400[9] = { 0x26, 0x38, 0x28, 0x28, 0x16, 0x23, 0x3E, 6, 3 };
++	for (unsigned i = 0; i < 4; i++) {
++		if (!pin_cfg(cci_pins[i], 1, 3, -1)) {
++			return false;
++		}
++	}
++	wr(cci, CCI_IRQ_MASK0, 0x1u | 0x10u | 0x100u | 0x1000u | 0x10000u | 0x100000u | CCI_RST_DONE | (3u << 25) |
++	    CCI_M0_ERROR | CCI_M1_ERROR);
++	if (!cci_reset()) {
++		camlog("CCI: no reset acknowledge: stop");
++		return false;
++	}
++	for (unsigned m = 0; m < 2; m++) {
++		wr(cci, CCI_M(m) + 0x00, t400[0] << 16 | t400[1]);     /* SCL_CTL thigh, tlow */
++		wr(cci, CCI_M(m) + 0x04, t400[2] << 16 | t400[3]);     /* SDA_CTL_0 tsu_sto, tsu_sta */
++		wr(cci, CCI_M(m) + 0x08, t400[4] << 16 | t400[5]);     /* SDA_CTL_1 thd_dat, thd_sta */
++		wr(cci, CCI_M(m) + 0x0C, t400[6]);                      /* SDA_CTL_2 tbuf */
++		wr(cci, CCI_M(m) + 0x10, t400[7] << 4 | t400[8]);      /* MISC_CTL trdhld, tsp */
++	}
++	camlog("CCI: reset, both masters at 400 kHz (cci clock 37.5 MHz)");
++	return true;
++}
++
++static bool
++cci_run(unsigned m, unsigned q, uint32_t donebit, const char *what)
++{
++	wr(cci, CCI_Q(m, q) + 0x0, rd(cci, CCI_Q(m, q) + 0x4));    /* EXEC_WORD_CNT = CUR_WORD_CNT */
++	wr(cci, CCI_QUEUE_START, 1u << (m * 2 + q));
++	if (!cci_wait(donebit, m == 0 ? CCI_M0_ERROR : CCI_M1_ERROR, what)) {
++		(void)cci_reset();
++		return false;
++	}
++	return true;
++}
++
++/* n bytes from a 16-bit register of the 7-bit address addr on master m (queue 1) */
++static bool
++cci_read(unsigned m, unsigned addr, unsigned reg, uint8_t *buf, unsigned n)
++{
++	unsigned q = 1;
++	if (n == 0 || n > 16) {
++		return false;
++	}
++	wr(cci, CCI_Q(m, q) + 0x10, 0x1u | (addr & 0x7f) << 4 | 3u << 16);              /* SET_PARAM, 3 retries */
++	wr(cci, CCI_Q(m, q) + 0x10, 0xBu | 2u << 4 | ((reg >> 8) & 0xff) << 8 | (reg & 0xff) << 16);   /* WRITE_DISABLE_P */
++	wr(cci, CCI_Q(m, q) + 0x10, 0xAu | n << 4);                                      /* READ */
++	if (!cci_run(m, q, m == 0 ? 1u << 0 : 1u << 12, "read")) {
++		return false;
++	}
++	uint32_t words = rd(cci, CCI_M(m) + 0x1C), got = 0;
++	bool first = true;
++	for (uint32_t w = 0; w < words && w < 8; w++) {
++		uint32_t v = rd(cci, CCI_M(m) + 0x18);
++		for (int i = 0; i < 4; i++, v >>= 8) {
++			if (first) {
++				first = false;                  /* the slave address echo */
++				continue;
++			}
++			if (got < n) {
++				buf[got++] = (uint8_t)v;
++			}
++		}
++	}
++	if (got < n) {
++		camlog("CCI m%u %#x reg %#x: %u of %u bytes (%u words)", m, addr, reg, got, n, words);
++		return false;
++	}
++	return true;
++}
++
++/* n (1..2) bytes to a 16-bit register (queue 0) */
++static bool
++cci_write(unsigned m, unsigned addr, unsigned reg, uint32_t val, unsigned n)
++{
++	unsigned q = 0;
++	uint8_t b[4] = { (uint8_t)(reg >> 8), (uint8_t)reg, 0, 0 };
++	if (n == 1) {
++		b[2] = (uint8_t)val;
++	} else {
++		b[2] = (uint8_t)(val >> 8);
++		b[3] = (uint8_t)val;
++	}
++	unsigned len = 2 + n;
++	wr(cci, CCI_Q(m, q) + 0x10, 0x1u | (addr & 0x7f) << 4 | 3u << 16);
++	wr(cci, CCI_Q(m, q) + 0x10, 0x9u | len << 4 | (uint32_t)b[0] << 8 | (uint32_t)b[1] << 16 | (uint32_t)b[2] << 24);
++	if (len > 3) {
++		wr(cci, CCI_Q(m, q) + 0x10, b[3]);
++	}
++	wr(cci, CCI_Q(m, q) + 0x10, 0x8u | 1u << 8);                                     /* REPORT, IRQ */
++	return cci_run(m, q, m == 0 ? 1u << 4 : 1u << 16, "write");
++}
++
++/* ---------------------------------------------------------------- the requests */
++
++static bool
++cam_map(void)
++{
++	if (gcc == 0) {
++		gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	}
++	return gcc != 0;
++}
++
++/* op 1 */
++static int
++camss_on(void)
++{
++	if (!cam_map()) {
++		camlog("GCC not mapped");
++		return EIO;
++	}
++	/* the always-on camera AHB/XO branches gcc-khaje turns on at probe (nobody does here) */
++	camlog("gcc_camera_ahb_clk %#x, gcc_camera_xo_clk %#x", rd(gcc, 0x17008), rd(gcc, 0x17028));
++	if (!branch_on("camera_ahb", 0x17008) || !branch_on("camera_xo", 0x17028)) {
++		return EIO;
++	}
++	if (!gdsc_on()) {
++		return EIO;
++	}
++	if (!rcg_set("top_ahb 80 MHz", RCG_TOP_AHB, 0x10E) || !branch_on("top_ahb", CBCR_TOP_AHB) ||
++	    !rcg_set("axi 300 MHz", RCG_AXI, 0x201) || !branch_on("axi", CBCR_AXI) || !branch_on("rt_axi", CBCR_RT_AXI) ||
++	    !branch_on("nrt_axi", CBCR_NRT_AXI) || !rcg_set("cci_0 37.5 MHz", RCG_CCI, 0x20F) || !branch_on("cci_0", CBCR_CCI)) {
++		return EIO;
++	}
++	if (cci == 0) {
++		cci = ml_io_map(CCI_PA, 0x1000);
++		cpas = ml_io_map(CPAS_PA, 0x1000);
++	}
++	if (cci == 0 || cpas == 0) {
++		camlog("CCI/CPAS not mapped");
++		return EIO;
++	}
++	uint32_t cv = rd(cci, CCI_HW_VERSION);
++	camlog("CCI hw version %#x", cv);
++	if (cv == 0 || cv == 0xffffffffu) {
++		camlog("CCI version looks wrong: stop");
++		return EIO;
++	}
++	uint32_t p0 = rd(cpas, 0x0), p4 = rd(cpas, 0x4);
++	camlog("CPAS top +0 %#x, +4 %#x", p0, p4);
++	if ((p0 == 0 && p4 == 0) || p0 == 0xffffffffu) {
++		camlog("CPAS version looks wrong: stop");
++		return EIO;
++	}
++	if (!cci_init()) {
++		return EIO;
++	}
++	camss_up = true;
++	camlog("camss up");
++	return 0;
++}
++
++static bool
++mclk_on(unsigned slot)
++{
++	static const char *const names[4] = { "mclk0", "mclk1", "mclk2", "mclk3" };
++	return rcg_set(names[slot], rcg_mclk[slot], 0x001) && branch_on(names[slot], cbcr_mclk[slot]) &&
++	       pin_cfg(mclk_pin[slot], 1, 0, -1);
++}
++
++static bool
++avdd(int on) { return pmic_gpio(AVDD_SID, AVDD_BASE, on, "AVDD PM6125 GPIO2"); }
++static bool
++dvdd(int on) { return pmic_gpio(DVDD_SID, DVDD_BASE, on, "DVDD PM7250B GPIO3"); }
++
++/* the chip id (and its alternative for the front slot), then 16 bytes of the EEPROM */
++static int
++slot_probe(unsigned slot)
++{
++	static const struct { unsigned m, addr, reg, id; const char *name; unsigned reg2, id2; const char *name2; unsigned eeprom; } t[4] = {
++		{ 0, 0x10, 0x0000, 0x1AD6, "S5KHM6", 0, 0, NULL, 0x51 },
++		{ 1, 0x10, 0x300B, 0x1641, "OV16A1Q", 0x03F0, 0x16B3, "GC16B3C", 0x51 },
++		{ 1, 0x2D, 0x0000, 0x487B, "S5K4H7", 0, 0, NULL, 0x50 },
++		{ 0, 0x36, 0x3107, 0xEB52, "SC202PCS", 0, 0, NULL, 0x52 },
++	};
++	uint8_t b[16];
++	int r = ENODEV;
++	if (cci_read(t[slot].m, t[slot].addr, t[slot].reg, b, 2)) {
++		unsigned id = (unsigned)b[0] << 8 | b[1];
++		camlog("slot %u: m%u %#x reg %#06x = %#06x (%s %#06x)%s", slot, t[slot].m, t[slot].addr, t[slot].reg, id,
++		    t[slot].name, t[slot].id, id == t[slot].id ? ": FOUND" : "");
++		r = id == t[slot].id ? 0 : ENODEV;
++	}
++	if (r != 0 && t[slot].name2 != NULL && cci_read(t[slot].m, t[slot].addr, t[slot].reg2, b, 2)) {
++		unsigned id = (unsigned)b[0] << 8 | b[1];
++		camlog("slot %u: m%u %#x reg %#06x = %#06x (%s %#06x)%s", slot, t[slot].m, t[slot].addr, t[slot].reg2, id,
++		    t[slot].name2, t[slot].id2, id == t[slot].id2 ? ": FOUND" : "");
++		r = id == t[slot].id2 ? 0 : ENODEV;
++	}
++	if (cci_read(t[slot].m, t[slot].eeprom, 0x0000, b, 16)) {
++		camlog("slot %u: EEPROM m%u %#x @0: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
++		    slot, t[slot].m, t[slot].eeprom, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11],
++		    b[12], b[13], b[14], b[15]);
++	} else {
++		camlog("slot %u: EEPROM m%u %#x not readable", slot, t[slot].m, t[slot].eeprom);
++	}
++	return r;
++}
++
++/* ops 2..5: power slot 0..3 with its sensormodule powerUpSequence, then probe it */
++static int
++slot_on(unsigned slot)
++{
++	if (!camss_up) {
++		int r = camss_on();
++		if (r != 0) {
++			return r;
++		}
++	}
++	unsigned rst = reset_pin[slot];
++	bool ok = true;
++	camlog("slot %u: power-up", slot);
++	switch (slot) {
++	case 0:     /* S5KHM6: RESET 0 (1), VIO (1), VANA (1), VDIG (1), RESET 1 (5), MCLK (20) */
++		ok = pin_out(rst, 0); IOSleep(1);
++		ok = ok && pin_out(GPIO_VIO, 1); IOSleep(1);
++		ok = ok && pin_out(GPIO_MAIN_VANA, 1); IOSleep(1);
++		ok = ok && pin_out(GPIO_MAIN_VDIG, 1); IOSleep(1);
++		ok = ok && pin_out(rst, 1); IOSleep(5);
++		ok = ok && mclk_on(0); IOSleep(25);
++		break;
++	case 1:     /* OV16A1Q / GC16B3C: RESET 0 (2), AVDD, VIO, DVDD, MCLK (5), RESET 1 (5) */
++		ok = pin_out(rst, 0); IOSleep(2);
++		ok = ok && avdd(1);
++		ok = ok && pin_out(GPIO_VIO, 1);
++		ok = ok && dvdd(1);
++		ok = ok && mclk_on(1); IOSleep(5);
++		ok = ok && pin_out(rst, 1); IOSleep(10);
++		break;
++	case 2:     /* S5K4H7: RESET 0 (1), DVDD (1), AVDD (1), VIO (1), RESET 1 (5), MCLK (10) */
++		ok = pin_out(rst, 0); IOSleep(1);
++		ok = ok && dvdd(1); IOSleep(1);
++		ok = ok && avdd(1); IOSleep(1);
++		ok = ok && pin_out(GPIO_VIO, 1); IOSleep(1);
++		ok = ok && pin_out(rst, 1); IOSleep(5);
++		ok = ok && mclk_on(2); IOSleep(15);
++		break;
++	case 3:     /* SC202PCS: RESET 0 (5), CSI mux GPIO34 1 (5), VIO (5), AVDD (5), RESET 1 (5), MCLK (5) */
++		ok = pin_out(rst, 0); IOSleep(5);
++		ok = ok && pin_out(GPIO_CSI_MUX, 1); IOSleep(5);
++		ok = ok && pin_out(GPIO_VIO, 1); IOSleep(5);
++		ok = ok && avdd(1); IOSleep(5);
++		ok = ok && pin_out(rst, 1); IOSleep(5);
++		ok = ok && mclk_on(3); IOSleep(10);
++		break;
++	}
++	if (!ok) {
++		camlog("slot %u: power-up stopped", slot);
++		return EIO;
++	}
++	return slot_probe(slot);
++}
++
++/* op 9: everything off, in reverse order */
++static int
++cam_off(void)
++{
++	if (!cam_map()) {
++		return EIO;
++	}
++	for (int s = 3; s >= 0; s--) {
++		branch_off("mclk", cbcr_mclk[s]);
++		(void)pin_out(mclk_pin[s], 0);
++		(void)pin_out(reset_pin[s], 0);
++	}
++	(void)pin_out(GPIO_CSI_MUX, 0);
++	(void)pin_out(GPIO_MAIN_VDIG, 0);
++	(void)pin_out(GPIO_MAIN_VANA, 0);
++	(void)dvdd(0);
++	(void)avdd(0);
++	(void)pin_out(GPIO_VIO, 0);
++	if (camss_up) {
++		branch_off("cci_0", CBCR_CCI);
++		branch_off("nrt_axi", CBCR_NRT_AXI);
++		branch_off("rt_axi", CBCR_RT_AXI);
++		branch_off("axi", CBCR_AXI);
++		branch_off("top_ahb", CBCR_TOP_AHB);
++		camss_up = false;
++	}
++	wr(gcc, GDSC_CAMSS, rd(gcc, GDSC_CAMSS) | 1);   /* SW_COLLAPSE */
++	camlog("everything off (GDSC %#x)", rd(gcc, GDSC_CAMSS));
++	return 0;
++}
++
++static int
++sysctl_sweet_cam SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = cam_last;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, NULL);
++	if (err != 0 || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	lck_mtx_lock(&sweet_cam_mtx);
++	cam_log_len = 0;
++	cam_log[0] = 0;
++	camlog("op %d", v);
++	int r;
++	switch (v) {
++	case 1:
++		r = camss_on();
++		break;
++	case 2: case 3: case 4: case 5:
++		r = slot_on((unsigned)(v - 2));
++		break;
++	case 9:
++		r = cam_off();
++		break;
++	default:
++		r = EINVAL;
++		break;
++	}
++	camlog("op %d: %d", v, r);
++	cam_last = r;
++	lck_mtx_unlock(&sweet_cam_mtx);
++	return r;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cam, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_cam, "I", "camera: 1 camss on, 2-5 slot 0-3 on + chip id, 9 all off");
++
++static int
++sysctl_sweet_cam_log SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	lck_mtx_lock(&sweet_cam_mtx);
++	int err = SYSCTL_OUT(req, cam_log, cam_log_len + 1);
++	lck_mtx_unlock(&sweet_cam_mtx);
++	return err;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cam_log, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_cam_log, "A", "the log of the last camera request");
++
++static unsigned
++hexnum(const char **p, bool *ok)
++{
++	unsigned v = 0;
++	bool any = false;
++	while (**p == ' ') {
++		(*p)++;
++	}
++	if ((*p)[0] == '0' && ((*p)[1] == 'x' || (*p)[1] == 'X')) {
++		*p += 2;
++	}
++	for (;; (*p)++) {
++		char c = **p;
++		unsigned d = c >= '0' && c <= '9' ? (unsigned)(c - '0') : c >= 'a' && c <= 'f' ? (unsigned)(c - 'a' + 10) :
++		    c >= 'A' && c <= 'F' ? (unsigned)(c - 'A' + 10) : 16;
++		if (d == 16) {
++			break;
++		}
++		v = v * 16 + d;
++		any = true;
++	}
++	*ok = any;
++	return v;
++}
++
++static int
++sysctl_sweet_cam_i2c SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[64] = "";
++	int err = sysctl_handle_string(oidp, buf, sizeof(buf), req);
++	if (err != 0 || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	const char *p = buf;
++	bool o1, o2, o3, o4;
++	unsigned m = hexnum(&p, &o1), addr = hexnum(&p, &o2), reg = hexnum(&p, &o3), val = hexnum(&p, &o4);
++	if (!o1 || !o2 || !o3 || m > 1 || addr > 0x7f || reg > 0xffff) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_cam_mtx);
++	cam_log_len = 0;
++	cam_log[0] = 0;
++	int r = 0;
++	if (!camss_up) {
++		camlog("i2c: camss is off (op 1 first)");
++		r = EAGAIN;
++	} else if (o4) {
++		bool ok = cci_write(m, addr, reg, val, val > 0xff ? 2 : 1);
++		camlog("i2c: m%u %#x reg %#06x <- %#x: %s", m, addr, reg, val, ok ? "ok" : "FAILED");
++		r = ok ? 0 : EIO;
++	} else {
++		uint8_t b[2];
++		bool ok = cci_read(m, addr, reg, b, 2);
++		camlog("i2c: m%u %#x reg %#06x = %02x %02x%s", m, addr, reg, ok ? b[0] : 0, ok ? b[1] : 0, ok ? "" : " (FAILED)");
++		r = ok ? 0 : EIO;
++	}
++	lck_mtx_unlock(&sweet_cam_mtx);
++	return r;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cam_i2c, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_cam_i2c, "A", "camera I2C: \"m addr reg\" reads 2 bytes, \"m addr reg val\" writes (hex)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index f0a6cf6..4cd8ce2 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -167,7 +167,8 @@ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
+ 	unsigned peripheral = addr >> 8;
+ 	/* 0263: + SID 3 0x5300-0x53ff, the PM7250B LDO vibrator (sweet_vibrate.c) */
+ 	if (!(sid == 0 && peripheral == 0x08) && !(sid == 2 && peripheral >= 0x10 && peripheral <= 0x16) &&
+-	    !(sid == 3 && peripheral == 0x53)) {
++	    !(sid == 3 && peripheral == 0x53) &&
++	    !(sid == 0 && peripheral == 0xC1) && !(sid == 2 && peripheral == 0xC2)) {   /* 0270: camera AVDD/DVDD GPIOs */
+ 		return -1;
+ 	}
+ 	if (!sp_ready && sweet_spmi_init() != 0) {

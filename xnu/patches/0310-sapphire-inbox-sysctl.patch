@@ -1,0 +1,96 @@
+From: x <x@x>
+Subject: [PATCH] sapphire-0310: kern.sweet_inbox: iOS reads the inbox after the root volume (updates, apps),
+ read-only, root only, bounded to [V, P - LOG)
+
+---
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -40,6 +40,7 @@
+ #include <libkern/libkern.h>
+ #include <machine/atomic.h>
+ #include <sys/sysctl.h>
++#include <sys/kauth.h>
+ #include "sweet_slot.h"
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -1429,3 +1430,80 @@
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_boot_lun, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_boot_lun, "I", "sapphire: the UFS bBootLunEn attribute (1 = slot a's XBL, 2 = slot b's)");
++
++/*
++ * sapphire 0310: the inbox, read from iOS. The raw space of the root partition after its HFS volume (the
++ * Windows installer and the Android app write there: updates, apps; installer/recovery/sapphire.sh,
++ * android/dualboot IpaInbox.java) is read through this, never through /dev/rufsroot0. Read-only, root
++ * only, and only inside [V, P - LOG): V = the volume size the installer gives the volume
++ * ((P - LOG - INBOX) rounded down to 1 MiB), P = the partition, LOG = the console ring at its end.
++ *
++ *   kern.sweet_inbox: new = u64 offset from the partition start, old = up to 1 MiB from there
++ *   (with no old buffer: the length of the inbox space)
++ */
++#define INBOX_LOG_BYTES   4198400ull      /* 1025 x 4 KiB */
++#define INBOX_BYTES       134217728ull
++#define INBOX_MIB         1048576ull
++
++static int
++sysctl_sweet_inbox SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char want[64] = "userdata";
++	uint64_t off = 0;
++	unsigned slot = 0;
++	int error;
++
++	if (!kauth_cred_issuser(kauth_cred_get())) {
++		return EPERM;
++	}
++	if (req->newptr == USER_ADDR_NULL || req->newlen != sizeof(off)) {
++		return EINVAL;
++	}
++	error = SYSCTL_IN(req, &off, sizeof(off));
++	if (error) {
++		return error;
++	}
++	if (!su.ready) {
++		return EAGAIN;
++	}
++	PE_parse_boot_argn("ufsroot", want, sizeof(want));
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_lookup_part(want, &slot);
++	uint64_t p = error ? 0 : part_cache[slot].nblocks * UFS_BLOCK;
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (error) {
++		return error;
++	}
++	if (p < INBOX_LOG_BYTES + INBOX_BYTES + 64 * INBOX_MIB) {
++		return ENOSPC;
++	}
++	uint64_t lo = (p - INBOX_LOG_BYTES - INBOX_BYTES) / INBOX_MIB * INBOX_MIB;
++	uint64_t hi = p - INBOX_LOG_BYTES;
++	if (req->oldptr == USER_ADDR_NULL) {
++		req->oldidx = (size_t)(hi - lo);
++		return 0;
++	}
++	uint64_t len = req->oldlen;
++	if (len > BOUNCE_SIZE) {
++		len = BOUNCE_SIZE;
++	}
++	if (off < lo || off >= hi) {
++		return ERANGE;
++	}
++	if (len > hi - off) {
++		len = hi - off;
++	}
++	void *buf = kalloc_data((vm_size_t)len, Z_WAITOK);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	error = sweet_ufs_read_part(want, off, buf, len);
++	if (!error) {
++		error = SYSCTL_OUT(req, buf, (size_t)len);
++	}
++	kfree_data(buf, (vm_size_t)len);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_inbox, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_inbox, "S", "sapphire: the inbox after the root volume (new: u64 offset; old: up to 1 MiB)");

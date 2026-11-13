@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- English (the default); Spanish in values-es. The texts built in code pick theirs with L.t. -->
+<resources>
+    <string name="app_name">Sapphire Dual Boot</string>
+    <string name="tile_label">Restart to iOS</string>
+</resources>

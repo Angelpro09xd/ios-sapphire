@@ -1,0 +1,22 @@
+d          4 .
+d          4 ./7400.WWDC_2022_Background-375w-812h@3x~iphone.ca
+f        177 ./7400.WWDC_2022_Background-375w-812h@3x~iphone.ca/assetManifest.caml
+d          3 ./7400.WWDC_2022_Background-375w-812h@3x~iphone.ca/assets
+f      65125 ./7400.WWDC_2022_Background-375w-812h@3x~iphone.ca/assets/Head Mask.HEIC
+f     608897 ./7400.WWDC_2022_Background-375w-812h@3x~iphone.ca/assets/Head.HEIC
+f     310057 ./7400.WWDC_2022_Background-375w-812h@3x~iphone.ca/assets/Leg.HEIC
+f       1470 ./7400.WWDC_2022_Background-375w-812h@3x~iphone.ca/index.xml
+f      18842 ./7400.WWDC_2022_Background-375w-812h@3x~iphone.ca/main.caml
+d          4 ./7400.WWDC_2022_Floating-375w-812h@3x~iphone.ca
+f        177 ./7400.WWDC_2022_Floating-375w-812h@3x~iphone.ca/assetManifest.caml
+d          1 ./7400.WWDC_2022_Floating-375w-812h@3x~iphone.ca/assets
+f     677535 ./7400.WWDC_2022_Floating-375w-812h@3x~iphone.ca/assets/Arm.HEIC
+f       1468 ./7400.WWDC_2022_Floating-375w-812h@3x~iphone.ca/index.xml
+f      11589 ./7400.WWDC_2022_Floating-375w-812h@3x~iphone.ca/main.caml
+d          4 ./7400.WWDC_2022_Foreground-375w-812h@3x~iphone.ca
+f        177 ./7400.WWDC_2022_Foreground-375w-812h@3x~iphone.ca/assetManifest.caml
+d          1 ./7400.WWDC_2022_Foreground-375w-812h@3x~iphone.ca/assets
+f     808440 ./7400.WWDC_2022_Foreground-375w-812h@3x~iphone.ca/assets/Body.HEIC
+f       1470 ./7400.WWDC_2022_Foreground-375w-812h@3x~iphone.ca/index.xml
+f      11646 ./7400.WWDC_2022_Foreground-375w-812h@3x~iphone.ca/main.caml
+f        536 ./Wallpaper.plist

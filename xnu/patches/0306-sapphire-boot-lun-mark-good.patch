@@ -1,0 +1,336 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0306: the UFS boot LUN switched with the slot; iOS marks its slot good
+
+0305's switch to Android changed the GPT the way fastboot set_active does, and the bootloader still
+loaded nothing (Device Error): it also checks the GPT's active slot against the UFS bBootLunEn
+attribute, the boot LU the XBL came from (FindBootableSlot: "Boot lun ... and BootableSlot ... do not
+match"); set_active and Android's boot HAL change both. Now a UFS QUERY REQUEST writes bBootLunEn
+(1 = slot a, 2 = slot b) first and reads it back; the GPT is written only when that took (and the LUN is
+put back if it did not). kern.sweet_boot_lun reads it.
+
+And iOS now marks its slot good 90 s after boot, as Android's update_verifier does: boot_X (X the active
+slot, when the boot LUN agrees) gets 7 retries and the successful bit, so the bootloader stops counting
+its boots down (it would have dropped back to Android at the 7th). sweetmarkgood=0 leaves it.
+sweet_slot_mark_good() is checked by userland/dualboot/test_slot.c like the switch.
+---
+diff --git a/bsd/dev/sweet_slot.c b/bsd/dev/sweet_slot.c
+index 8a8c824..3b77a50 100644
+--- a/bsd/dev/sweet_slot.c
++++ b/bsd/dev/sweet_slot.c
+@@ -134,6 +134,55 @@ sweet_slot_active(const uint8_t *ents, uint32_t n)
+ 	return aa == ba ? -1 : aa ? 'a' : 'b';
+ }
+ 
++/* both headers' entry CRC and header CRC recomputed after ENTS changed (and copied to BENTS) */
++static void
++sweet_slot_reseal(uint8_t *hdr, uint8_t *ents, uint8_t *bhdr, uint8_t *bents, uint32_t n)
++{
++	uint32_t bytes = n * 128;
++	for (uint32_t i = 0; i < bytes; i++) {
++		bents[i] = ents[i];
++	}
++	uint32_t crc = sweet_slot_crc32(ents, bytes);
++	uint8_t *hs[2] = { hdr, bhdr };
++	for (int h = 0; h < 2; h++) {
++		uint32_t size = le32(hs[h] + 12);
++		put32(hs[h] + 88, crc);
++		put32(hs[h] + 16, 0);
++		put32(hs[h] + 16, sweet_slot_crc32(hs[h], size));
++	}
++}
++
++int
++sweet_slot_mark_good(uint8_t *hdr, uint8_t *ents, uint8_t *bhdr, uint8_t *bents, uint64_t backup_lba, char slot)
++{
++	struct sweet_slot_gpt p, b;
++	int err;
++
++	if ((err = sweet_slot_check_header(hdr, 1, &p)) != 0 || (err = sweet_slot_check_header(bhdr, backup_lba, &b)) != 0) {
++		return err;
++	}
++	uint32_t bytes = p.count * 128;
++	if (p.alt_lba != backup_lba || p.count != b.count || sweet_slot_crc32(ents, bytes) != p.entries_crc ||
++	    sweet_slot_crc32(bents, bytes) != b.entries_crc) {
++		return SWEET_SLOT_EENTCRC;
++	}
++	if (sweet_slot_active(ents, p.count) != slot) {
++		return SWEET_SLOT_EUNCLEAR;
++	}
++	char boot[7] = { 'b', 'o', 'o', 't', '_', slot, 0 };
++	int i = find(ents, p.count, boot);
++	if (i < 0) {
++		return SWEET_SLOT_EUNCLEAR;
++	}
++	uint64_t at = le64(ents + i * 128 + 48);
++	if ((at & SUCCESSFUL) && !(at & UNBOOTABLE) && (at & RETRY_MASK) == RETRY_MASK) {
++		return SWEET_SLOT_ALREADY;
++	}
++	put64(ents + i * 128 + 48, (at & ~UNBOOTABLE & ~RETRY_MASK) | SUCCESSFUL | (7ull << 51));
++	sweet_slot_reseal(hdr, ents, bhdr, bents, p.count);
++	return 0;
++}
++
+ int
+ sweet_slot_switch(uint8_t *hdr, uint8_t *ents, uint8_t *bhdr, uint8_t *bents, uint64_t backup_lba,
+     char slot, bool successful)
+@@ -222,16 +271,6 @@ sweet_slot_switch(uint8_t *hdr, uint8_t *ents, uint8_t *bhdr, uint8_t *bents, ui
+ 		}
+ 		put64(ents + i * 128 + 48, at);
+ 	}
+-	for (uint32_t i = 0; i < bytes; i++) {
+-		bents[i] = ents[i];
+-	}
+-	uint32_t crc = sweet_slot_crc32(ents, bytes);
+-	uint8_t *hs[2] = { hdr, bhdr };
+-	for (int h = 0; h < 2; h++) {
+-		uint32_t size = le32(hs[h] + 12);
+-		put32(hs[h] + 88, crc);
+-		put32(hs[h] + 16, 0);
+-		put32(hs[h] + 16, sweet_slot_crc32(hs[h], size));
+-	}
++	sweet_slot_reseal(hdr, ents, bhdr, bents, n);
+ 	return 0;
+ }
+diff --git a/bsd/dev/sweet_slot.h b/bsd/dev/sweet_slot.h
+index 2fe4ae6..1b51a8e 100644
+--- a/bsd/dev/sweet_slot.h
++++ b/bsd/dev/sweet_slot.h
+@@ -21,8 +21,16 @@ enum {
+ 	SWEET_SLOT_EMISMATCH,           /* the two copies differ */
+ 	SWEET_SLOT_EUNCLEAR,            /* boot_a/boot_b do not say which slot is active */
+ 	SWEET_SLOT_EPAIRS,              /* too few X_a/X_b pairs: not the A/B LUN */
++	SWEET_SLOT_ALREADY,             /* sweet_slot_mark_good: nothing to do */
+ };
+ 
++/*
++ * boot_SLOT marked successful (7 retries, not unbootable) when SLOT is the active one -- what Android's
++ * update_verifier/boot HAL markBootSuccessful does for Android; the bootloader then stops counting the
++ * slot's retries down. 0, SWEET_SLOT_ALREADY, or an error (nothing changed).
++ */
++int sweet_slot_mark_good(uint8_t *hdr, uint8_t *ents, uint8_t *bhdr, uint8_t *bents, uint64_t backup_lba, char slot);
++
+ struct sweet_slot_gpt {
+ 	uint64_t alt_lba, entries_lba;
+ 	uint32_t count, size, entries_crc;
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 7f7d010..1d1825a 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1032,9 +1032,12 @@ sweet_log_panic_flush(void)
+ 	    error ? "NOT written" : "written", total);
+ }
+ 
++void sweet_slot_mark_start(void);
++
+ static void
+ sweet_log_start(void)
+ {
++	sweet_slot_mark_start();
+ 	uint32_t on = 1;
+ 	thread_t thread;
+ 
+@@ -1114,6 +1117,76 @@ ufs_write_from(uint8_t lun, uint64_t lba, uint32_t count, const uint8_t *src)
+ 
+ static int sweet_slot_active_cached;
+ 
++/*
++ * sapphire 0306: UFS QUERY REQUEST for a device attribute (UFS 2.1 10.7.8): opcode 3 read, 4 write.
++ * IDN 0 is bBootLunEn, the boot well-known LUN the primary boot loader (XBL) is read from: 1 = Boot LU A
++ * (xbl_a, slot a), 2 = Boot LU B. Qualcomm's bootloader checks it against the GPT's active slot
++ * (FindBootableSlot: "Boot lun ... and BootableSlot ... do not match") and loads nothing when they
++ * differ; fastboot set_active and Android's boot HAL change both. With sweet_ufs_lock held.
++ */
++static int
++ufs_query_attr(bool write, uint8_t idn, uint32_t *value)
++{
++	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
++	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
++	uint64_t ucd_pa = su.dma_pa + DMA_UCD;
++
++	bzero(utrd, sizeof(*utrd));
++	bzero(ucd, sizeof(*ucd));
++	ucd->cmd[0] = 0x16;                             /* QUERY REQUEST UPIU */
++	ucd->cmd[3] = ++su.tag;
++	ucd->cmd[5] = write ? 0x81 : 0x01;              /* standard write / read request */
++	ucd->cmd[12] = write ? 0x04 : 0x03;             /* WRITE / READ ATTRIBUTE */
++	ucd->cmd[13] = idn;
++	if (write) {
++		ucd->cmd[20] = (uint8_t)(*value >> 24);
++		ucd->cmd[21] = (uint8_t)(*value >> 16);
++		ucd->cmd[22] = (uint8_t)(*value >> 8);
++		ucd->cmd[23] = (uint8_t)*value;
++	}
++	utrd->dw0 = (1u << 28) | (1u << 24);            /* UFS storage command type, interrupt; no data */
++	utrd->dw2 = 0x0f;
++	utrd->ucdba = (uint32_t)ucd_pa;
++	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
++	utrd->resp = (512u / 4) << 16 | (512u / 4);
++	dma_clean(DMA_UTRL, sizeof(*utrd));
++	dma_clean(DMA_UCD, 32);
++	dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_UTRLDBR, 1);
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	while (ufs_rd(REG_UTRLDBR) & 1) {
++		if (mach_absolute_time() > deadline) {
++			ufs_wr(REG_UTRLCLR, ~1u);
++			printf("SWEET UFS: query %s attribute %u timed out\n", write ? "write" : "read", idn);
++			return ETIMEDOUT;
++		}
++		delay(10);
++	}
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++	dma_sync(DMA_UTRL, sizeof(*utrd));
++	dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
++	uint32_t ocs = utrd->dw2 & 0xff;
++	if (ocs || ucd->resp[0] != 0x36 || ucd->resp[6] != 0) {
++		printf("SWEET UFS: query %s attribute %u failed: ocs 0x%x upiu 0x%x response 0x%x\n",
++		    write ? "write" : "read", idn, ocs, ucd->resp[0], ucd->resp[6]);
++		return EIO;
++	}
++	if (!write) {
++		*value = (uint32_t)ucd->resp[20] << 24 | (uint32_t)ucd->resp[21] << 16 | (uint32_t)ucd->resp[22] << 8 | ucd->resp[23];
++	}
++	return 0;
++}
++
++static int
++ufs_boot_lun(uint32_t *lun)
++{
++	return ufs_query_attr(false, 0x00, lun);
++}
++
+ static int
+ sweet_ufs_slot(int target, bool successful, int *active_out)
+ {
+@@ -1176,6 +1249,25 @@ sweet_ufs_slot(int target, bool successful, int *active_out)
+ 	}
+ 	printf("SWEET SLOT: LUN %u: slot %c -> %c (entries %llu+%u, backup %llu+%u, header %llu)\n", lun, now, target,
+ 	    g.entries_lba, span, bg.entries_lba, span, g.alt_lba);
++	/* 0306: the boot LUN first (the bootloader loads nothing while it and the GPT disagree), read back */
++	uint32_t boot_lun_old = 0, boot_lun_new = target == 'a' ? 1 : 2, boot_lun_now = 0;
++	if ((error = ufs_boot_lun(&boot_lun_old)) != 0) {
++		printf("SWEET SLOT: boot LUN unreadable (%d): nothing written\n", error);
++		goto out;
++	}
++	if (boot_lun_old != boot_lun_new) {
++		if ((error = ufs_query_attr(true, 0x00, &boot_lun_new)) != 0 ||
++		    (error = ufs_boot_lun(&boot_lun_now)) != 0 || boot_lun_now != boot_lun_new) {
++			printf("SWEET SLOT: boot LUN %u -> %u failed (%d, reads %u): GPT not written\n", boot_lun_old,
++			    boot_lun_new, error, boot_lun_now);
++			if (boot_lun_now != boot_lun_old) {
++				(void)ufs_query_attr(true, 0x00, &boot_lun_old);
++			}
++			error = error ? error : EIO;
++			goto out;
++		}
++	}
++	printf("SWEET SLOT: boot LUN %u -> %u\n", boot_lun_old, boot_lun_new);
+ 	if ((error = ufs_write_from(lun, bg.entries_lba, span, bents)) != 0 ||
+ 	    (error = ufs_write_from(lun, g.alt_lba, 1, bhdr)) != 0 ||
+ 	    (error = ufs_write_from(lun, g.entries_lba, span, ents)) != 0 ||
+@@ -1236,3 +1328,101 @@ sysctl_sweet_boot_android SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_boot_android, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_boot_android, "I", "sapphire: 1 = make the other A/B slot (Android) active and reboot, 2 = without the reboot");
++
++/*
++ * sapphire 0306: iOS marks its slot good, as Android's update_verifier does: 90 s after the UFS driver is up
++ * (iOS running), if the GPT's active slot is the one the boot LUN says the bootloader came from, boot_X is
++ * given its 7 retries and marked successful -- the bootloader then stops counting them down, so iOS stays
++ * the system booted (without it, the 7th boot would have fallen back to Android). Boot-arg sweetmarkgood=0
++ * leaves it.
++ */
++static void
++sweet_slot_mark_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	extern void IOSleep(unsigned int);
++	IOSleep(90 * 1000);
++	unsigned ps = 0;
++	uint32_t blun = 0;
++	const uint32_t blk = UFS_BLOCK;
++	uint8_t *hdr = kalloc_data(blk, Z_WAITOK | Z_ZERO), *bhdr = kalloc_data(blk, Z_WAITOK | Z_ZERO);
++	uint8_t *ents = kalloc_data(8 * blk, Z_WAITOK | Z_ZERO), *bents = kalloc_data(8 * blk, Z_WAITOK | Z_ZERO);
++	if (!hdr || !bhdr || !ents || !bents) {
++		goto free;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	uint8_t saved = su.lun;
++	struct sweet_slot_gpt g, bg;
++	int r = -1;
++	if (ufs_lookup_part("boot_a", &ps) != 0) {
++		goto out;
++	}
++	uint8_t lun = part_cache[ps].lun;
++	su.lun = lun;
++	if (ufs_boot_lun(&blun) != 0 || ufs_read_into(1, 1, hdr) != 0 || sweet_slot_check_header(hdr, 1, &g) != 0) {
++		goto out;
++	}
++	uint32_t span = (g.count * 128 + blk - 1) / blk;
++	if (span > 8 || ufs_read_into(g.entries_lba, span, ents) != 0 || ufs_read_into(g.alt_lba, 1, bhdr) != 0 ||
++	    sweet_slot_check_header(bhdr, g.alt_lba, &bg) != 0 || bg.entries_lba + span > g.alt_lba ||
++	    ufs_read_into(bg.entries_lba, span, bents) != 0) {
++		goto out;
++	}
++	int act = sweet_slot_active(ents, g.count);
++	if (act != (blun == 1 ? 'a' : blun == 2 ? 'b' : 0)) {
++		printf("SWEET SLOT: not marking: active slot %c, boot LUN %u\n", act > 0 ? act : '?', blun);
++		goto out;
++	}
++	r = sweet_slot_mark_good(hdr, ents, bhdr, bents, g.alt_lba, (char)act);
++	if (r == 0) {
++		int e = 0;
++		if ((e = ufs_write_from(lun, bg.entries_lba, span, bents)) == 0 &&
++		    (e = ufs_write_from(lun, g.alt_lba, 1, bhdr)) == 0 &&
++		    (e = ufs_write_from(lun, g.entries_lba, span, ents)) == 0) {
++			e = ufs_write_from(lun, 1, 1, hdr);
++		}
++		(void)ufs_sync_cache();
++		printf("SWEET SLOT: slot %c marked good%s\n", act, e ? " -- WRITE FAILED" : "");
++	} else {
++		printf("SWEET SLOT: slot %c %s (%d)\n", act, r == SWEET_SLOT_ALREADY ? "already good" : "not marked", r);
++	}
++out:
++	su.lun = saved;
++	lck_mtx_unlock(&sweet_ufs_lock);
++free:
++	if (hdr) kfree_data(hdr, blk);
++	if (bhdr) kfree_data(bhdr, blk);
++	if (ents) kfree_data(ents, 8 * blk);
++	if (bents) kfree_data(bents, 8 * blk);
++}
++
++void sweet_slot_mark_start(void);
++void
++sweet_slot_mark_start(void)
++{
++	uint32_t on = 1;
++	thread_t t;
++	(void)PE_parse_boot_argn("sweetmarkgood", &on, sizeof(on));
++	if (on && su.ready && su.writable && kernel_thread_start(sweet_slot_mark_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++
++static int
++sysctl_sweet_boot_lun SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint32_t v = 0;
++	int error = EAGAIN;
++	if (su.ready) {
++		lck_mtx_lock(&sweet_ufs_lock);
++		error = ufs_boot_lun(&v);
++		lck_mtx_unlock(&sweet_ufs_lock);
++	}
++	if (error) {
++		return error;
++	}
++	int out = (int)v;
++	return SYSCTL_OUT(req, &out, sizeof(out));
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_boot_lun, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_boot_lun, "I", "sapphire: the UFS bBootLunEn attribute (1 = slot a's XBL, 2 = slot b's)");

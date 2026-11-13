@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Action</key>
+	<string>add</string>
+	<key>Job</key>
+	<dict>
+		<key>Label</key>
+		<string>com.sapphire.glload</string>
+		<key>LaunchOnlyOnce</key>
+		<true/>
+		<key>POSIXSpawnType</key>
+		<string>Interactive</string>
+		<key>ProgramArguments</key>
+		<array>
+			<string>/var/jb/bin/sh</string>
+			<string>-c</string>
+			<string>[ -f /redwood/lib/libredwood-glload.dylib ] &amp;&amp; /var/jb/usr/sbin/sysctl -w kern.sweet_glload=1</string>
+		</array>
+		<key>RunAtLoad</key>
+		<true/>
+		<key>UserName</key>
+		<string>root</string>
+	</dict>
+	<key>Key</key>
+	<string>/System/Library/LaunchDaemons/com.sapphire.glload.plist</string>
+</dict>
+</plist>

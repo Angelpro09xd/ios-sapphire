@@ -1,0 +1,33 @@
+From: x <x@x>
+Subject: [PATCH] sapphire-0311: kern.sweet_boot_android = 3: Android slot made active and a restart into its
+ recovery (OrangeFox), for the installers update mode
+
+---
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1316,7 +1316,7 @@
+ 	if (error || !changed) {
+ 		return error;
+ 	}
+-	if (v != 1 && v != 2) {
++	if (v != 1 && v != 2 && v != 3) {
+ 		return EINVAL;
+ 	}
+ 	if (active != 'a' && active != 'b') {
+@@ -1328,10 +1328,15 @@
+ 		sweet_reboot_mode_set(0);
+ 		(void)reboot_kernel(0, (char *)"sweet: to Android");
+ 	}
++	if (!error && v == 3) {
++		/* 0311: to Android slot recovery (OrangeFox), where the installers apply Sapphire updates */
++		sweet_reboot_mode_set(1);
++		(void)reboot_kernel(0, (char *)"sweet: to recovery");
++	}
+ 	return error;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_boot_android, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+-    0, 0, sysctl_sweet_boot_android, "I", "sapphire: 1 = make the other A/B slot (Android) active and reboot, 2 = without the reboot");
++    0, 0, sysctl_sweet_boot_android, "I", "sapphire: 1 = make the other A/B slot (Android) active and reboot, 2 = without the reboot, 3 = and reboot into its recovery");
+ 
+ /*
+  * sapphire 0306: iOS marks its slot good, as Android's update_verifier does: 90 s after the UFS driver is up

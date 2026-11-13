@@ -1,0 +1,37 @@
+# Left out of the overlay even inside include.txt's paths: personal data, caches, logs, experiments.
+# Biometrics (/var/root/fp) and camera dumps (/var/root/cam) are never under an included path.
+
+# the jailbreak's runtime state: rebuilt on the phone
+/private/var/jb/tmp
+/private/var/jb/var/tmp
+/private/var/jb/var/log
+/private/var/jb/var/cache
+/private/var/jb/var/run
+/private/var/jb/var/lib/apt/lists
+/private/var/jb/var/mobile
+/private/var/jb/var/root
+/private/var/jb/var/backups
+/private/var/jb/var/sapphire-notweaks
+
+# per-phone state of tweaks and package managers (the user's own settings, history, accounts)
+/private/var/jb/var/mobile/Library
+/private/var/jb/Library/Preferences
+/private/var/jb/etc/ssh/ssh_host_ecdsa_key
+/private/var/jb/etc/ssh/ssh_host_ed25519_key
+/private/var/jb/etc/ssh/ssh_host_rsa_key
+/private/var/jb/etc/ssh/ssh_host_ecdsa_key.pub
+/private/var/jb/etc/ssh/ssh_host_ed25519_key.pub
+/private/var/jb/etc/ssh/ssh_host_rsa_key.pub
+
+# GL bridge experiments and debug switches
+/redwood/glsample
+/redwood/glprofile
+/redwood/gllat
+/redwood/glenv
+/redwood/glnoorphan
+/redwood/glnoblank
+/redwood/glslow
+/redwood/glframes
+/redwood/glgputime
+/redwood/glasync
+/redwood/glthread

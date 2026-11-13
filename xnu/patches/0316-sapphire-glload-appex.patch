@@ -1,0 +1,21 @@
+From: x <x@x>
+Subject: [PATCH] sapphire-0316: kern.sweet_glload also for app extensions (.appex/): tweaks reach
+ CollectionsPoster and the other extensions
+
+---
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5777,7 +5777,12 @@
+ 			sweet_glload = 1;
+ 		}
+ 	}
+-	if (sweet_glload && strnstr(imgp->ip_strings, ".app/", strlen(EXECUTABLE_KEY) + MAXPATHLEN) != NULL) {
++	/*
++	 * 0316: app extensions too (".appex/", outside any .app: WallpaperKit's CollectionsPoster draws the lock
++	 * screen's wallpaper, and tweaks -- SapphireHEIF, its HEIC pictures decoded -- never reached it).
++	 */
++	if (sweet_glload && (strnstr(imgp->ip_strings, ".app/", strlen(EXECUTABLE_KEY) + MAXPATHLEN) != NULL ||
++	    strnstr(imgp->ip_strings, ".appex/", strlen(EXECUTABLE_KEY) + MAXPATHLEN) != NULL)) {
+ 		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(SWEET_GLLOAD_ENV), UIO_SYSSPACE, TRUE);
+ 		if (error) {
+ 			goto bad;

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Action</key>
+	<string>add</string>
+	<key>Job</key>
+	<dict>
+		<key>EnablePressuredExit</key>
+		<false/>
+		<key>EnableTransactions</key>
+		<false/>
+		<key>JetsamProperties</key>
+		<dict>
+			<key>JetsamMemoryLimit</key>
+			<integer>32</integer>
+			<key>JetsamPriority</key>
+			<integer>18</integer>
+		</dict>
+		<key>KeepAlive</key>
+		<true/>
+		<key>Label</key>
+		<string>com.sapphire.fpd</string>
+		<key>POSIXSpawnType</key>
+		<string>Interactive</string>
+		<key>ProcessType</key>
+		<string>Interactive</string>
+		<key>ProgramArguments</key>
+		<array>
+			<string>/redwood/bin/fpd</string>
+		</array>
+		<key>RunAtLoad</key>
+		<true/>
+		<key>StandardErrorPath</key>
+		<string>/var/tmp/fpd.out</string>
+		<key>StandardOutPath</key>
+		<string>/var/tmp/fpd.out</string>
+		<key>ThrottleInterval</key>
+		<integer>30</integer>
+		<key>UserName</key>
+		<string>root</string>
+	</dict>
+	<key>Key</key>
+	<string>/System/Library/LaunchDaemons/com.sapphire.fpd.plist</string>
+</dict>
+</plist>

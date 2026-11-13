@@ -1,0 +1,86 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0300: touch: a contact the IC keeps repeating one frame for is released
+
+Now and then a finger stayed "down" after it was lifted: an icon kept pressed, a page held. A real
+finger never gives the same bytes for long (fraction bits, area byte). With a contact down and the
+FT3519T returning a frame identical byte for byte for sweettouch_stale_ms (default 1000; 0 turns it
+off), every contact is released and that frame is not acted on again until a different one comes.
+kern.sweet_touch_stale counts the releases (each also logged with the frame's first bytes);
+kern.sweet_touch_same_ms is the longest identical run seen with a contact down, to tune the
+threshold against long presses.
+---
+ bsd/dev/sweet_touch.c | 47 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 47 insertions(+)
+
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 4ffbaf1..09f20fd 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -455,6 +455,22 @@ touch_fod(uint32_t mask, const int *x, const int *y)
+ 	sweet_fod_press = in;
+ }
+ 
++/*
++ * sapphire 0300: a finger left "down" after it was lifted (now and then an icon stayed pressed, or
++ * a page kept being held). A real finger never gives the same bytes for long: its positions carry
++ * fraction bits and its area byte, and they move. When, with a contact down, the IC returns a frame
++ * identical byte for byte for sweettouch_stale_ms (default 1000), it is taken as stuck: every
++ * contact is released, and that frame is not acted on again until a different one comes.
++ * kern.sweet_touch_stale: releases so far; kern.sweet_touch_same_ms: the longest identical run seen
++ * with a contact down (to tune the threshold against long presses).
++ */
++static unsigned touch_stale_ms = 1000;
++static int sweet_touch_stale, sweet_touch_same_ms;
++SYSCTL_INT(_kern, OID_AUTO, sweet_touch_stale, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_touch_stale, 0,
++    "contacts released because the touch IC repeated one frame (0300)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_touch_same_ms, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_touch_same_ms, 0,
++    "longest run of identical touch frames with a contact down, ms (0300)");
++
+ static void
+ touch_report(uint32_t mask, const int *x, const int *y)
+ {
+@@ -545,6 +561,36 @@ touch_focaltech(void)
+ 	if (err) {
+ 		return err;
+ 	}
++	/* 0300: a frame repeated for too long with a contact down is a stuck one */
++	static uint8_t last[sizeof(buf)];
++	static uint64_t same_since;
++	static bool stale;
++	uint64_t now = mach_absolute_time();
++	if (memcmp(buf, last, sizeof(buf)) != 0) {
++		memcpy(last, buf, sizeof(buf));
++		same_since = now;
++		stale = false;
++	} else if (stale) {
++		return 0;               /* the stuck frame again: nothing new */
++	} else if (st.active) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(now - same_since, &ns);
++		unsigned ms = (unsigned)(ns / NSEC_PER_MSEC);
++		if ((int)ms > sweet_touch_same_ms) {
++			sweet_touch_same_ms = (int)ms;
++		}
++		if (touch_stale_ms != 0 && ms >= touch_stale_ms) {
++			stale = true;
++			sweet_touch_stale++;
++			printf("SWEET TOUCH: one frame for %u ms with contacts %#x down: released (stuck) | "
++			    "%02x %02x %02x | %02x %02x %02x %02x %02x %02x\n", ms, st.active,
++			    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]);
++			touch_report(0, x, y);
++			return 0;
++		}
++	} else {
++		same_since = now;
++	}
+ 	unsigned n = buf[2] & 15u, active = 0;
+ 	if (n || !st.s_frames) {
+ 		memcpy(st.s_raw, buf, sizeof(st.s_raw)); /* keep the last frame with contacts */
+@@ -847,6 +893,7 @@ sweet_touch_init(void)
+ 	(void)PE_parse_boot_argn("sweettouch_rx", &st.rx, sizeof(st.rx));
+ 	(void)PE_parse_boot_argn("sweettouch_ry", &st.ry, sizeof(st.ry));
+ 	(void)PE_parse_boot_argn("sweettouch_rawlog", &st.rawlog, sizeof(st.rawlog));
++	(void)PE_parse_boot_argn("sweettouch_stale_ms", &touch_stale_ms, sizeof(touch_stale_ms));
+ 	if (st.fbits != 4u) {
+ 		st.fbits = 2;
+ 	}

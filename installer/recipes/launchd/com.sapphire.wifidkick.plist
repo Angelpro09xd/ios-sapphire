@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Action</key>
+	<string>add</string>
+	<key>Job</key>
+	<dict>
+		<key>Label</key>
+		<string>com.sapphire.wifidkick</string>
+		<key>LaunchOnlyOnce</key>
+		<true/>
+		<key>ProgramArguments</key>
+		<array>
+			<string>/var/jb/bin/bash</string>
+			<string>-c</string>
+			<string>sleep 20; /var/jb/usr/bin/killall -9 wifid; echo "wifidkick: wifid restarted 20 s after boot" &gt; /dev/console</string>
+		</array>
+		<key>RunAtLoad</key>
+		<true/>
+		<key>UserName</key>
+		<string>root</string>
+	</dict>
+	<key>Key</key>
+	<string>/System/Library/LaunchDaemons/com.sapphire.wifidkick.plist</string>
+</dict>
+</plist>

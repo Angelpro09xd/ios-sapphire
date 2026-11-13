@@ -1,0 +1,97 @@
+From: x <x@x>
+Subject: [PATCH] sapphire-0314: touch: a frame that stays the same with no IRQ for 30 ms is a lifted finger
+ the IC did not report (released); 6 s only as the last resort
+
+---
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -470,6 +470,19 @@
+  */
+ static unsigned touch_stale_ms = 6000;
+ static int sweet_touch_stale, sweet_touch_same_ms;
++/*
++ * 0314: at 6 s a finger that the IC never reported lifted stayed "down" for 6 s (animations held,
++ * the next touches odd). What tells a still finger from a stuck frame is the IRQ line (GPIO80, low
++ * while the IC has a frame for us): with a finger on the glass the IC keeps scanning and
++ * interrupting even when the frame comes out the same; stuck, it has gone quiet. So: the same frame
++ * with a contact down AND no IRQ for touch_quiet_ms (30) is a stuck one; 6 s stays as the last
++ * resort (and the only rule with sweettouchirq=0). kern.sweet_touch_quiet_ms / _stale_ms set both;
++ * kern.sweet_touch_quiet: releases by this rule; kern.sweet_touch_irq_gap_ms: the longest time
++ * without IRQ seen inside an identical run that ended on its own (a held finger: should stay small).
++ */
++static unsigned touch_quiet_ms = 30;      /* held fingers: IRQ gaps of 2-4 ms seen; most lifts end this way */
++static int sweet_touch_quiet, sweet_touch_irq_gap_ms;
++static uint64_t touch_irq_last;         /* when the IRQ line was last seen low */
+ static uint64_t touch_rate_down_abs;
+ static unsigned touch_rate_new, touch_rate_reads, touch_irq_reads, touch_late_reads;
+ /*
+@@ -504,6 +517,14 @@
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_touch_rate, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+     sysctl_sweet_touch_rate, "A", "touch: new IC frames per second of contact (write anything: reset) (0312)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_touch_quiet_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &touch_quiet_ms, 0,
++    "touch: same frame + no IRQ this long with a contact down = stuck (0314; 0 off)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_touch_stale_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &touch_stale_ms, 0,
++    "touch: same frame this long with a contact down = stuck, IRQ or not (0314)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_touch_quiet, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_touch_quiet, 0,
++    "touch: contacts released because the IC went quiet (0314)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_touch_irq_gap_ms, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_touch_irq_gap_ms, 0,
++    "touch: longest IRQ gap inside an identical run that ended by itself (0314)");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_touch_stale, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_touch_stale, 0,
+     "contacts released because the touch IC repeated one frame (0300)");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_touch_same_ms, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_touch_same_ms, 0,
+@@ -612,8 +633,21 @@
+ 	static uint8_t last[sizeof(buf)];
+ 	static uint64_t same_since;
+ 	static bool stale;
++	static uint64_t run_gap_max;            /* 0314: the longest IRQ gap inside this identical run */
+ 	uint64_t now = mach_absolute_time();
+ 	if (memcmp(buf, last, sizeof(buf)) != 0) {
++		if (!stale && run_gap_max != 0) {
++			uint64_t gns;
++			absolutetime_to_nanoseconds(run_gap_max, &gns);
++			if ((int)(gns / NSEC_PER_MSEC) > sweet_touch_irq_gap_ms) {
++				sweet_touch_irq_gap_ms = (int)(gns / NSEC_PER_MSEC);
++				uint64_t rns;
++				absolutetime_to_nanoseconds(now - same_since, &rns);
++				printf("SWEET TOUCH: an identical run of %u ms ended by itself; longest IRQ gap in it %d ms\n",
++				    (unsigned)(rns / NSEC_PER_MSEC), sweet_touch_irq_gap_ms);
++			}
++		}
++		run_gap_max = 0;
+ 		memcpy(last, buf, sizeof(buf));
+ 		same_since = now;
+ 		stale = false;
+@@ -630,6 +664,22 @@
+ 		if ((int)ms > sweet_touch_same_ms) {
+ 			sweet_touch_same_ms = (int)ms;
+ 		}
++		/* 0314: the IC quiet as well as the frame the same */
++		uint64_t gap = touch_irq_last != 0 && now > touch_irq_last ? now - touch_irq_last : 0, gns;
++		if (gap > run_gap_max) {
++			run_gap_max = gap;
++		}
++		absolutetime_to_nanoseconds(gap, &gns);
++		unsigned quiet = (unsigned)(gns / NSEC_PER_MSEC);
++		if (st.irq_hint && touch_quiet_ms != 0 && touch_irq_last != 0 && ms >= touch_quiet_ms &&
++		    quiet >= touch_quiet_ms) {
++			stale = true;
++			sweet_touch_quiet++;
++			printf("SWEET TOUCH: same frame for %u ms and no IRQ for %u ms with contacts %#x down: released (IC quiet)\n",
++			    ms, quiet, st.active);
++			touch_report(0, x, y);
++			return 0;
++		}
+ 		if (touch_stale_ms != 0 && ms >= touch_stale_ms) {
+ 			stale = true;
+ 			sweet_touch_stale++;
+@@ -899,6 +949,9 @@
+ 		/* Optional IRQ hint still reads every 100ms, and always while down. */
+ 		bool fast = touch_fast && st.irq_hint && st.kind == TOUCH_FTS && st.active;
+ 		bool irq_low = st.irq_hint && !(touch_rd(st.west, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)) & 1u);
++		if (irq_low) {
++			touch_irq_last = mach_absolute_time();  /* 0314 */
++		}
+ 		bool want;
+ 		if (fast) {
+ 			/* 0313: as soon as the IC has a frame, or 6 ms after the last read anyway */

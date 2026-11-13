@@ -1,0 +1,508 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0305: kern.sweet_boot_android: iOS hands the phone back to Android (A/B slot switch)
+
+Dual boot: Android in one A/B slot, iOS's boot image in the other; the slot booted is what Qualcomm's
+bootloader keeps in the GPT of the LUN holding boot_a/boot_b (sde). It is not only the active bit of
+every _a/_b partition: fastboot set_active also swaps the type GUIDs of each X_a/X_b pair (the active
+slot's partitions carry the real types, the inactive slot's a parked one), and the bootloader's
+ValidateSlotGuids refuses to load any image -- "Device Error", every slot, even fastboot boot -- when
+the two disagree. A switch that moved only the bits did exactly that to this phone (restored from the
+saved GPT, then fastboot set_active).
+
+bsd/dev/sweet_slot.c (shared with userland/dualboot, where test_slot.c checks it against GPTs this
+phone's ABL wrote itself) does what set_active does: GUIDs swapped, bits moved, the new boot priority
+3 and 7 retries, the old priority 2. sweet_ufs.c reads both copies of that LUN's GPT, checks headers,
+CRCs and that the copies agree, changes them, writes backup then primary (only those sectors, only on
+that LUN) and reads them back. kern.sweet_boot_android (anybody may write it): 1 = the other slot
+active and reboot, 2 = without the reboot; reading gives the active slot ('a'/'b').
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index afd499d..8ac65fd 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/sweet_slot.c			standard
+ bsd/dev/sapphire_net.c			standard
+ bsd/dev/sapphire_sta.c			standard
+ bsd/dev/sapphire_apple80211.c		standard
+diff --git a/bsd/dev/sweet_slot.c b/bsd/dev/sweet_slot.c
+new file mode 100644
+index 0000000..8a8c824
+--- /dev/null
++++ b/bsd/dev/sweet_slot.c
+@@ -0,0 +1,237 @@
++/*
++ * sweet_slot.c: the A/B slot switch of Qualcomm's bootloader, on the GPT copies of the LUN that holds
++ * boot_a/boot_b (sde on sapphire). No I/O here: the caller reads the primary and backup headers and
++ * entry arrays, this checks and changes them, the caller writes them back (backup first). Shared by
++ * xnu (kern.sweet_boot_android, patch 0305) and the PC-side test (test_slot.c), which checks it against
++ * what this phone's ABL wrote itself after `fastboot set_active` (backup-persist/gpt/sde-*).
++ *
++ * What fastboot set_active does here (QcomModulePkg SetActiveSlot, confirmed on the phone): the type GUIDs
++ * of every X_a/X_b pair swapped (the active slot's partitions carry the real types, the inactive slot's a
++ * parked one; ValidateSlotGuids refuses to load anything when they disagree with the active bits: Device
++ * Error for every image, even fastboot boot), bit 50 (active) moved, the new slot's boot given priority 3
++ * and 7 retries and cleared of unbootable, the old slot's boot priority 2 and 7 retries.
++ */
++#include "sweet_slot.h"
++
++#define ACTIVE          (1ull << 50)
++#define SUCCESSFUL      (1ull << 54)
++#define UNBOOTABLE      (1ull << 55)
++#define RETRY_MASK      (7ull << 51)
++#define PRIORITY_MASK   (3ull << 48)
++
++uint32_t
++sweet_slot_crc32(const uint8_t *p, size_t n)
++{
++	uint32_t c = 0xffffffffu;
++	for (size_t i = 0; i < n; i++) {
++		c ^= p[i];
++		for (int k = 0; k < 8; k++) {
++			c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1)));
++		}
++	}
++	return ~c;
++}
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static uint64_t
++le64(const uint8_t *p)
++{
++	return (uint64_t)le32(p) | (uint64_t)le32(p + 4) << 32;
++}
++
++static void
++put32(uint8_t *p, uint32_t v)
++{
++	for (int i = 0; i < 4; i++) {
++		p[i] = (uint8_t)(v >> (8 * i));
++	}
++}
++
++static void
++put64(uint8_t *p, uint64_t v)
++{
++	put32(p, (uint32_t)v);
++	put32(p + 4, (uint32_t)(v >> 32));
++}
++
++/* The entry's name, ASCII only (GPT names are UTF-16LE), into out[36+1]. */
++static void
++name_of(const uint8_t *e, char *out)
++{
++	int i;
++	for (i = 0; i < 36; i++) {
++		uint16_t ch = (uint16_t)(e[56 + 2 * i] | e[57 + 2 * i] << 8);
++		if (ch == 0 || ch > 0x7e) {
++			break;
++		}
++		out[i] = (char)ch;
++	}
++	out[i] = 0;
++}
++
++static int
++find(const uint8_t *ents, uint32_t n, const char *want)
++{
++	char nm[37];
++	for (uint32_t i = 0; i < n; i++) {
++		name_of(ents + i * 128, nm);
++		const char *a = nm, *b = want;
++		while (*a && *a == *b) {
++			a++, b++;
++		}
++		if (*a == 0 && *b == 0) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++int
++sweet_slot_check_header(const uint8_t *hdr, uint64_t my_lba, struct sweet_slot_gpt *g)
++{
++	static const char sig[8] = { 'E', 'F', 'I', ' ', 'P', 'A', 'R', 'T' };
++	for (int i = 0; i < 8; i++) {
++		if (hdr[i] != (uint8_t)sig[i]) {
++			return SWEET_SLOT_EBADHDR;
++		}
++	}
++	uint32_t hs = le32(hdr + 12);
++	if (hs < 92 || hs > 512 || le64(hdr + 24) != my_lba) {
++		return SWEET_SLOT_EBADHDR;
++	}
++	uint8_t tmp[512];
++	for (uint32_t i = 0; i < hs; i++) {
++		tmp[i] = hdr[i];
++	}
++	put32(tmp + 16, 0);
++	if (sweet_slot_crc32(tmp, hs) != le32(hdr + 16)) {
++		return SWEET_SLOT_EHDRCRC;
++	}
++	g->alt_lba = le64(hdr + 32);
++	g->entries_lba = le64(hdr + 72);
++	g->count = le32(hdr + 80);
++	g->size = le32(hdr + 84);
++	g->entries_crc = le32(hdr + 88);
++	if (g->size != 128 || g->count == 0 || g->count > SWEET_SLOT_MAX_ENTRIES) {
++		return SWEET_SLOT_EBADHDR;
++	}
++	return 0;
++}
++
++int
++sweet_slot_active(const uint8_t *ents, uint32_t n)
++{
++	int a = find(ents, n, "boot_a"), b = find(ents, n, "boot_b");
++	if (a < 0 || b < 0) {
++		return -1;
++	}
++	bool aa = (le64(ents + a * 128 + 48) & ACTIVE) != 0, ba = (le64(ents + b * 128 + 48) & ACTIVE) != 0;
++	return aa == ba ? -1 : aa ? 'a' : 'b';
++}
++
++int
++sweet_slot_switch(uint8_t *hdr, uint8_t *ents, uint8_t *bhdr, uint8_t *bents, uint64_t backup_lba,
++    char slot, bool successful)
++{
++	struct sweet_slot_gpt p, b;
++	int err;
++
++	if (slot != 'a' && slot != 'b') {
++		return SWEET_SLOT_EINVAL;
++	}
++	if ((err = sweet_slot_check_header(hdr, 1, &p)) != 0 ||
++	    (err = sweet_slot_check_header(bhdr, backup_lba, &b)) != 0) {
++		return err;
++	}
++	if (p.alt_lba != backup_lba || p.count != b.count || p.entries_crc != b.entries_crc) {
++		return SWEET_SLOT_EMISMATCH;
++	}
++	uint32_t n = p.count, bytes = n * 128;
++	if (sweet_slot_crc32(ents, bytes) != p.entries_crc || sweet_slot_crc32(bents, bytes) != b.entries_crc) {
++		return SWEET_SLOT_EENTCRC;
++	}
++	for (uint32_t i = 0; i < bytes; i++) {
++		if (ents[i] != bents[i]) {
++			return SWEET_SLOT_EMISMATCH;
++		}
++	}
++	int now = sweet_slot_active(ents, n);
++	if (now < 0) {
++		return SWEET_SLOT_EUNCLEAR;
++	}
++	for (int pass = 0; now != slot && pass < 2; pass++) {
++		/* pass 0 counts the pairs, pass 1 swaps them: nothing is changed if there are too few */
++		int pairs = 0;
++		char nm[37], other[37];
++		for (uint32_t i = 0; i < n; i++) {
++			name_of(ents + i * 128, nm);
++			size_t l = 0;
++			while (nm[l]) {
++				l++;
++			}
++			if (l < 3 || nm[l - 2] != '_' || nm[l - 1] != 'a') {
++				continue;
++			}
++			for (size_t k = 0; k <= l; k++) {
++				other[k] = nm[k];
++			}
++			other[l - 1] = 'b';
++			int j = find(ents, n, other);
++			if (j < 0) {
++				continue;
++			}
++			for (int k = 0; pass == 1 && k < 16; k++) {
++				uint8_t t = ents[i * 128 + k];
++				ents[i * 128 + k] = ents[j * 128 + k];
++				ents[j * 128 + k] = t;
++			}
++			pairs++;
++		}
++		if (pass == 0 && pairs < 10) {
++			return SWEET_SLOT_EPAIRS;
++		}
++	}
++	char nm[37], mine_boot[7] = { 'b', 'o', 'o', 't', '_', slot, 0 };
++	char old_boot[7] = { 'b', 'o', 'o', 't', '_', slot == 'a' ? 'b' : 'a', 0 };
++	for (uint32_t i = 0; i < n; i++) {
++		name_of(ents + i * 128, nm);
++		size_t l = 0;
++		while (nm[l]) {
++			l++;
++		}
++		if (l < 3 || nm[l - 2] != '_' || (nm[l - 1] != 'a' && nm[l - 1] != 'b')) {
++			continue;
++		}
++		uint64_t at = le64(ents + i * 128 + 48);
++		at = nm[l - 1] == slot ? at | ACTIVE : at & ~ACTIVE;
++		bool is_mine = true, is_old = true;
++		for (int k = 0; k < 7; k++) {
++			is_mine &= nm[k] == mine_boot[k];
++			is_old &= nm[k] == old_boot[k];
++		}
++		if (is_mine) {
++			at = (at & ~UNBOOTABLE & ~RETRY_MASK & ~PRIORITY_MASK) | (7ull << 51) | (3ull << 48);
++			at = successful ? at | SUCCESSFUL : at & ~SUCCESSFUL;
++		} else if (is_old && now != slot) {
++			at = (at & ~PRIORITY_MASK & ~RETRY_MASK) | (2ull << 48) | (7ull << 51);
++		}
++		put64(ents + i * 128 + 48, at);
++	}
++	for (uint32_t i = 0; i < bytes; i++) {
++		bents[i] = ents[i];
++	}
++	uint32_t crc = sweet_slot_crc32(ents, bytes);
++	uint8_t *hs[2] = { hdr, bhdr };
++	for (int h = 0; h < 2; h++) {
++		uint32_t size = le32(hs[h] + 12);
++		put32(hs[h] + 88, crc);
++		put32(hs[h] + 16, 0);
++		put32(hs[h] + 16, sweet_slot_crc32(hs[h], size));
++	}
++	return 0;
++}
+diff --git a/bsd/dev/sweet_slot.h b/bsd/dev/sweet_slot.h
+new file mode 100644
+index 0000000..2fe4ae6
+--- /dev/null
++++ b/bsd/dev/sweet_slot.h
+@@ -0,0 +1,44 @@
++/* sweet_slot.h: Qualcomm A/B slot switch on a GPT held in memory (see sweet_slot.c). */
++#ifndef SWEET_SLOT_H
++#define SWEET_SLOT_H
++
++#ifdef KERNEL
++#include <sys/types.h>
++#include <stdbool.h>
++#else
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#endif
++
++#define SWEET_SLOT_MAX_ENTRIES  256
++
++enum {
++	SWEET_SLOT_EINVAL = 1,          /* slot is not 'a' or 'b' */
++	SWEET_SLOT_EBADHDR,             /* not a GPT header, or one with odd fields */
++	SWEET_SLOT_EHDRCRC,             /* header CRC wrong */
++	SWEET_SLOT_EENTCRC,             /* entry array CRC wrong */
++	SWEET_SLOT_EMISMATCH,           /* the two copies differ */
++	SWEET_SLOT_EUNCLEAR,            /* boot_a/boot_b do not say which slot is active */
++	SWEET_SLOT_EPAIRS,              /* too few X_a/X_b pairs: not the A/B LUN */
++};
++
++struct sweet_slot_gpt {
++	uint64_t alt_lba, entries_lba;
++	uint32_t count, size, entries_crc;
++};
++
++uint32_t sweet_slot_crc32(const uint8_t *p, size_t n);
++int sweet_slot_check_header(const uint8_t *hdr, uint64_t my_lba, struct sweet_slot_gpt *g);
++/* 'a', 'b', or -1 */
++int sweet_slot_active(const uint8_t *ents, uint32_t n);
++/*
++ * HDR/BHDR: the primary (LBA 1) and backup (BACKUP_LBA) headers, a sector each; ENTS/BENTS: the two entry
++ * arrays (count * 128 bytes). Checked, then changed in place to make SLOT active; SUCCESSFUL also marks
++ * boot_SLOT successful (its retries are then not counted down). 0 or SWEET_SLOT_E*; nothing is changed on
++ * an error. Already active: only boot_SLOT's attributes are refreshed.
++ */
++int sweet_slot_switch(uint8_t *hdr, uint8_t *ents, uint8_t *bhdr, uint8_t *bents, uint64_t backup_lba,
++    char slot, bool successful);
++
++#endif
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 42ed7df..7f7d010 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -39,6 +39,8 @@
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+ #include <machine/atomic.h>
++#include <sys/sysctl.h>
++#include "sweet_slot.h"
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+@@ -1066,3 +1068,171 @@ sweet_ufs_rootdev(dev_t *dev)
+ 	return 0;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
++
++/*
++ * sapphire 0305: the phone handed back to Android. The A/B slot that is booted is kept in the GPT of the
++ * LUN holding boot_a/boot_b (sde): the active bit of every _a/_b partition and the type GUIDs, which
++ * Qualcomm's bootloader swaps between each X_a/X_b pair when it changes slots (fastboot set_active) and
++ * checks before it loads anything. sweet_slot_switch() does what it does (checked against the GPTs this
++ * phone's ABL wrote, userland/dualboot/test_slot.c); here both copies are read, checked, changed, written
++ * back -- backup first, primary last, only those sectors, only on that LUN -- and read again.
++ *
++ * kern.sweet_boot_android (anybody may write it; the iOS app does): 1 = the other slot (Android's) active,
++ * then reboot; 2 = the same without the reboot (a test). Reads: 'a' or 'b', the active slot, 0 unknown.
++ */
++static int
++ufs_write_slot_blocks(uint8_t lun, uint64_t lba, uint32_t count)
++{
++	if (!su.writable || su.lun != lun || count == 0 || count > 8 || lba > UINT32_MAX) {
++		return EPERM;
++	}
++	uint8_t cdb[10] = {
++		0x2a, 0,
++		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
++		0, (uint8_t)(count >> 8), (uint8_t)count, 0
++	};
++	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
++}
++
++/* LBA's COUNT blocks into DST (COUNT * UFS_BLOCK bytes), on the current LUN */
++static int
++ufs_read_into(uint64_t lba, uint32_t count, uint8_t *dst)
++{
++	int error = ufs_read_blocks(lba, count);
++	if (!error) {
++		memcpy(dst, (const void *)(su.dma + DMA_BOUNCE), count * UFS_BLOCK);
++	}
++	return error;
++}
++
++static int
++ufs_write_from(uint8_t lun, uint64_t lba, uint32_t count, const uint8_t *src)
++{
++	memcpy((void *)(su.dma + DMA_BOUNCE), src, count * UFS_BLOCK);
++	return ufs_write_slot_blocks(lun, lba, count);
++}
++
++static int sweet_slot_active_cached;
++
++static int
++sweet_ufs_slot(int target, bool successful, int *active_out)
++{
++	unsigned ps = 0;
++	int error;
++	const uint32_t blk = UFS_BLOCK;
++	uint8_t *hdr = kalloc_data(blk, Z_WAITOK | Z_ZERO), *bhdr = kalloc_data(blk, Z_WAITOK | Z_ZERO);
++	uint8_t *ents = kalloc_data(8 * blk, Z_WAITOK | Z_ZERO), *bents = kalloc_data(8 * blk, Z_WAITOK | Z_ZERO);
++	uint8_t *check = kalloc_data(8 * blk, Z_WAITOK | Z_ZERO);
++
++	if (!su.ready || !hdr || !bhdr || !ents || !bents || !check) {
++		error = EAGAIN;
++		goto out_free;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	uint8_t saved = su.lun;
++	error = ufs_lookup_part("boot_a", &ps);
++	if (error) {
++		goto out;
++	}
++	uint8_t lun = part_cache[ps].lun;
++	su.lun = lun;
++	struct sweet_slot_gpt g, bg;
++	if ((error = ufs_read_into(1, 1, hdr)) != 0) {
++		goto out;
++	}
++	if (sweet_slot_check_header(hdr, 1, &g) != 0) {
++		error = EFTYPE;
++		goto out;
++	}
++	uint32_t span = (g.count * 128 + blk - 1) / blk;
++	if (span > 8 || g.entries_lba < 2 || g.alt_lba <= g.entries_lba + span) {
++		error = EFTYPE;
++		goto out;
++	}
++	if ((error = ufs_read_into(g.entries_lba, span, ents)) != 0 || (error = ufs_read_into(g.alt_lba, 1, bhdr)) != 0) {
++		goto out;
++	}
++	if (sweet_slot_check_header(bhdr, g.alt_lba, &bg) != 0 || bg.entries_lba + span > g.alt_lba ||
++	    bg.entries_lba <= g.entries_lba + span) {
++		error = EFTYPE;
++		goto out;
++	}
++	if ((error = ufs_read_into(bg.entries_lba, span, bents)) != 0) {
++		goto out;
++	}
++	int now = sweet_slot_active(ents, g.count);
++	sweet_slot_active_cached = now > 0 ? now : 0;
++	if (active_out) {
++		*active_out = sweet_slot_active_cached;
++	}
++	if (target == 0) {
++		goto out;                       /* only asked which slot is active */
++	}
++	int r = sweet_slot_switch(hdr, ents, bhdr, bents, g.alt_lba, (char)target, successful);
++	if (r != 0) {
++		printf("SWEET SLOT: GPT of LUN %u refused (%d): nothing written\n", lun, r);
++		error = EFTYPE;
++		goto out;
++	}
++	printf("SWEET SLOT: LUN %u: slot %c -> %c (entries %llu+%u, backup %llu+%u, header %llu)\n", lun, now, target,
++	    g.entries_lba, span, bg.entries_lba, span, g.alt_lba);
++	if ((error = ufs_write_from(lun, bg.entries_lba, span, bents)) != 0 ||
++	    (error = ufs_write_from(lun, g.alt_lba, 1, bhdr)) != 0 ||
++	    (error = ufs_write_from(lun, g.entries_lba, span, ents)) != 0 ||
++	    (error = ufs_write_from(lun, 1, 1, hdr)) != 0) {
++		printf("SWEET SLOT: write failed (%d)\n", error);
++		goto out;
++	}
++	(void)ufs_sync_cache();
++	if ((error = ufs_read_into(g.entries_lba, span, check)) == 0 && memcmp(check, ents, span * blk) != 0) {
++		error = EIO;
++	}
++	if (!error && (error = ufs_read_into(1, 1, check)) == 0 && memcmp(check, hdr, blk) != 0) {
++		error = EIO;
++	}
++	if (!error) {
++		sweet_slot_active_cached = target;
++		if (active_out) {
++			*active_out = target;
++		}
++	}
++	printf("SWEET SLOT: %s\n", error ? "read back DIFFERS" : "written and read back");
++out:
++	su.lun = saved;
++	lck_mtx_unlock(&sweet_ufs_lock);
++out_free:
++	if (hdr) kfree_data(hdr, blk);
++	if (bhdr) kfree_data(bhdr, blk);
++	if (ents) kfree_data(ents, 8 * blk);
++	if (bents) kfree_data(bents, 8 * blk);
++	if (check) kfree_data(check, 8 * blk);
++	return error;
++}
++
++extern int reboot_kernel(int howto, char *message);
++
++static int
++sysctl_sweet_boot_android SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int active = 0;
++	(void)sweet_ufs_slot(0, false, &active);
++	int v = active, changed = 0;
++	int error = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (v != 1 && v != 2) {
++		return EINVAL;
++	}
++	if (active != 'a' && active != 'b') {
++		return EFTYPE;
++	}
++	error = sweet_ufs_slot(active == 'a' ? 'b' : 'a', false, NULL);
++	if (!error && v == 1) {
++		(void)reboot_kernel(0, (char *)"sweet: to Android");
++	}
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_boot_android, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_boot_android, "I", "sapphire: 1 = make the other A/B slot (Android) active and reboot, 2 = without the reboot");

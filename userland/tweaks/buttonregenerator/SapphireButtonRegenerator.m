@@ -23,15 +23,18 @@
  * So a tap changes the volume at release instead of at press, a hold 250 ms later, and a chord never
  * touches it -- nothing to undo. -cancelVolumePress (screenshot, SOS) drops a held-back down.
  *
- * Screen off: a chord with the display asleep (-[SBBacklightController screenIsOn] NO) first lights it
- * the way tap-to-wake does, -[SBLockScreenManager _wakeScreenForTapToWake] (-unlockUIFromSource:
- * TapToWake withOptions: TurnOnScreenFirst + StartFadeIn: the lock screen, still locked), so the
- * ringer HUD is seen; if the screen is still off 0.4 s later, -[SBBacklightController
- * turnOnScreenFullyWithBacklightSource:] is tried. 3 s after the chord it is put back to sleep as the
- * idle timer does, -[SBBacklightController _startFadeOutAnimationFromLockSource:] (IdleTimer, 13;
- * SBScreenSleepCoordinator -sleepAndLockUIFromSource:completion:), unless meanwhile the screen was
- * touched (-[SpringBoard sendEvent:], touch events), a volume button was pressed again, the UI was
- * unlocked or the screen went off by itself.
+ * The toggle runs on the next main-queue turn, after the button event has been handled.
+ *
+ * Screen off (WAKE_SCREEN_OFF, 0 by default: twice SpringBoard hung after a chord, once with this
+ * wake, once without it, both times after the ringer HUD came up; not understood yet). With it set,
+ * a chord with the display asleep (-[SBBacklightController screenIsOn] NO) first lights it the way
+ * tap-to-wake does, -[SBLockScreenManager _wakeScreenForTapToWake] (-unlockUIFromSource:TapToWake
+ * withOptions: TurnOnScreenFirst + StartFadeIn: the lock screen, still locked), waits for the screen to
+ * be on (up to 1.5 s) and only then toggles the ringer, so the unblank and the HUD/haptic do not
+ * overlap. 3 s later it is put back to sleep as the idle timer does, -[SBBacklightController
+ * _startFadeOutAnimationFromLockSource:] (IdleTimer, 13), unless meanwhile the screen was touched
+ * (-[SpringBoard sendEvent:]), a volume button was pressed again, the UI was unlocked or the screen
+ * went off by itself. With it 0 the chord does what the switch does with the screen off: no wake.
  */
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -39,6 +42,9 @@
 #include <dlfcn.h>
 
 #define WINDOW_NS (250 * NSEC_PER_MSEC)
+#ifndef WAKE_SCREEN_OFF
+#define WAKE_SCREEN_OFF 0
+#endif
 
 enum { VUP, VDOWN };
 static const char *names[2] = { "vol+", "vol-" };
@@ -113,7 +119,6 @@ toggle_ringer(void)
 /* screen-off chord: wake, then sleep again unless the user did something */
 
 #define LOCK_SOURCE_IDLE_TIMER 13
-#define BACKLIGHT_SOURCE_UNKNOWN 0
 
 static BOOL sleep_armed;                /* screen was lit by a chord, not yet put back */
 static BOOL user_acted;                 /* touch / new button press since then */
@@ -161,57 +166,62 @@ sleep_back(unsigned g)
 		NSLog(@"SapphireButtonRegenerator: no -_startFadeOutAnimationFromLockSource:, screen left on");
 	}
 }
-
+/* the screen is lit (or 1.5 s passed): toggle, and arm the sleep-back only if it did light */
 static void
-check_lit(unsigned g)
+after_wake(unsigned g, int tries)
 {
 	if (g != wake_generation) {
 		return;
 	}
 	id bc = shared("SBBacklightController");
-	if (get_bool(bc, "screenIsOn")) {
-		NSLog(@"SapphireButtonRegenerator: screen on (backlight state %lld)", backlight_state(bc));
+	BOOL on = get_bool(bc, "screenIsOn");
+	if (!on && tries < 15) {
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ after_wake(g, tries + 1); });
 		return;
 	}
-	SEL full = sel_registerName("turnOnScreenFullyWithBacklightSource:");
-	if ([bc respondsToSelector:full]) {
-		NSLog(@"SapphireButtonRegenerator: still off after tap-to-wake (state %lld), trying turnOnScreenFullyWithBacklightSource:",
-		    backlight_state(bc));
-		((void (*)(id, SEL, long long))objc_msgSend)(bc, full, BACKLIGHT_SOURCE_UNKNOWN);
+	NSLog(@"SapphireButtonRegenerator: screen %s %d ms after wake (backlight state %lld)", on ? "on" : "STILL OFF", tries * 100,
+	    backlight_state(bc));
+	toggle_ringer();
+	if (on) {
+		sleep_armed = YES;
+		user_acted = NO;
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ sleep_back(g); });
 	}
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-		id b = shared("SBBacklightController");
-		NSLog(@"SapphireButtonRegenerator: after fallback screen on=%d (state %lld)", get_bool(b, "screenIsOn"), backlight_state(b));
-	});
 }
 
-/* before the ringer toggles: light an asleep screen, arm the sleep-back */
-static void
+/* returns YES if it started a wake (the toggle then comes from after_wake) */
+static BOOL
 wake_if_off(void)
 {
 	id bc = shared("SBBacklightController"), lsm = shared("SBLockScreenManager");
 	if (bc == nil || lsm == nil) {
-		return;
+		return NO;
 	}
 	BOOL on = get_bool(bc, "screenIsOn");
 	NSLog(@"SapphireButtonRegenerator: screen before chord: %s (backlight state %lld, locked=%d)", on ? "on" : "off",
 	    backlight_state(bc), get_bool(lsm, "isUILocked"));
-	if (on) {
-		return;                         /* lit already (perhaps by an earlier chord): leave the timer as is */
-	}
 	SEL tap = sel_registerName("_wakeScreenForTapToWake");
-	if (![lsm respondsToSelector:tap]) {
-		NSLog(@"SapphireButtonRegenerator: no -_wakeScreenForTapToWake");
+	if (on || ![lsm respondsToSelector:tap]) {
+		return NO;
+	}
+	NSLog(@"SapphireButtonRegenerator: waking screen (tap-to-wake path)");
+	((void (*)(id, SEL))objc_msgSend)(lsm, tap);
+	NSLog(@"SapphireButtonRegenerator: tap-to-wake returned");
+	unsigned g = ++wake_generation;
+	sleep_armed = NO;
+	dispatch_async(dispatch_get_main_queue(), ^{ after_wake(g, 0); });
+	return YES;
+}
+
+static void
+chord_action(void)
+{
+	if (WAKE_SCREEN_OFF && wake_if_off()) {
 		return;
 	}
-	((void (*)(id, SEL))objc_msgSend)(lsm, tap);
-	NSLog(@"SapphireButtonRegenerator: woke screen (tap-to-wake path)");
-	unsigned g = ++wake_generation;
-	sleep_armed = YES;
-	user_acted = NO;
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ check_lit(g); });
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ sleep_back(g); });
+	toggle_ringer();
 }
+
 
 static void
 my_send_event(id self, SEL sel, id event)
@@ -246,8 +256,7 @@ press_down(id self, int b, long long mods)
 		pending = -1;
 		swallowed[VUP] = swallowed[VDOWN] = YES;
 		NSLog(@"SapphireButtonRegenerator: %s+%s chord", names[other], names[b]);
-		wake_if_off();
-		toggle_ringer();
+		dispatch_async(dispatch_get_main_queue(), ^{ chord_action(); });
 		return;
 	}
 	if (pending == b) {
@@ -331,7 +340,7 @@ install(void)
 	orig_cancel = method_setImplementation(m[4], (IMP)my_cancel);
 	Class sb = objc_getClass("SpringBoard");
 	SEL se = sel_registerName("sendEvent:");
-	Method sm = sb != Nil ? class_getInstanceMethod(sb, se) : NULL;
+	Method sm = (WAKE_SCREEN_OFF && sb != Nil) ? class_getInstanceMethod(sb, se) : NULL;
 	if (sm != NULL) {                       /* on SpringBoard itself, not on UIApplication */
 		IMP inherited = method_getImplementation(sm);
 		if (class_addMethod(sb, se, (IMP)my_send_event, method_getTypeEncoding(sm))) {
@@ -339,7 +348,7 @@ install(void)
 		} else {
 			orig_send_event = method_setImplementation(sm, (IMP)my_send_event);
 		}
-	} else {
+	} else if (WAKE_SCREEN_OFF) {
 		NSLog(@"SapphireButtonRegenerator: no -[SpringBoard sendEvent:], touches not watched");
 	}
 	NSLog(@"SapphireButtonRegenerator: volume buttons hooked (vol+ & vol- together toggles silent mode)");

@@ -1,0 +1,46 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0304: no 10 MB cache flush of the flip buffer after every 2x frame
+
+After each scaled GPU copy of a 2x frame (0239) the whole back flip buffer, 1080x2400x4 = 10.4 MB,
+was cleaned and invalidated by virtual address: ~162k dc civac on backboardd's (or Mesa's driver)
+thread on every frame. It dates from when the flip buffers were cacheable memory (0147); since 0233
+they come from the low pool mapped write-combined (Normal non-cacheable), no CPU cache holds them and
+the MDP reads what the GPU wrote, so the flush did nothing. kern.sweet_fb_flipflush=1 puts it back
+(for comparison).
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1c52108..6ee7240 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -150,6 +150,13 @@ class IOMobileFramebufferUserClient;
+  * write-combined like the modem's pool: the MDP sees every write, the cache cleans become no-ops.
+  */
+ #define SWEET_FB_LOW_PA         0xE2000000ull
++/*
++ * sapphire 0304: the flip buffers come from the low pool mapped write-combined (Normal non-cacheable,
++ * SweetLowBuf::alloc): no CPU cache holds them, the MDP reads what the GPU wrote. The invalidate of the
++ * whole back buffer after each scaled GPU copy (0239, from when the flip buffers were cacheable, 0147)
++ * cost ~162k dc civac, 10.4 MB, on every frame for nothing. kern.sweet_fb_flipflush=1 puts it back.
++ */
++static int sweet_fb_flipflush = 0;
+ #define SWEET_FB_LOW_SIZE       0x03000000ull
+ static uint64_t sweet_fb_low_used;
+ 
+@@ -1631,7 +1638,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 				    (uint32_t)((uint64_t)fWidth * kx / SWEET_FB_LOGICAL_W), (uint32_t)((uint64_t)fHeight * ky / SWEET_FB_LOGICAL_H),
+ 				    dbase, fRowBytes, fWidth, fHeight, dbase, (uint64_t)fRowBytes * fHeight);
+ 				if (shown) {
+-					if (fFlip[0] != NULL) {
++					if (fFlip[0] != NULL && sweet_fb_flipflush) {
+ 						sweet_dcache_flush((vm_offset_t)dst, (unsigned)((uint64_t)fHeight * fRowBytes));
+ 					}
+ 					gpu_used = true;
+@@ -2271,6 +2278,8 @@ sweet_fb_frame_sysctl SYSCTL_HANDLER_ARGS
+ 	}
+ 	return error;
+ }
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_flipflush, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_flipflush, 0,
++    "sapphire 0304: 1 = flush the whole flip buffer after each 2x GPU copy (as before)");
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_frame_await, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     NULL, 0, sweet_fb_frame_sysctl, "I", "a frame of this surface is being sent to the GPU");
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_frame_sent, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,

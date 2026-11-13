@@ -44,6 +44,8 @@
  * /var/mobile/Library/Preferences/com.sapphire.fingerprint.plist (unlockEnabled, screenOffWake, haptics: vibd
  * presets success on unlock, error on no match, long on lockout, light / warning per enroll touch);
  * /var/root/fp/fpd.noscreen = ignore the screen state.
+ * Pocket mode: while sensord's com.sapphire.sensor.prox state is 1 (proximity near) presses are ignored, screen
+ * on or off.
  * Log: os_log (subsystem com.sapphire.fpd) and /var/root/fp/fpd.log (256 KB, then fpd.log.1).
  */
 #include <stdio.h>
@@ -111,6 +113,7 @@
 #define N_KB_LOCK       "com.apple.mobile.keybagd.lock_status"
 #define N_KB_FIRST      "com.apple.mobile.keybagd.first_unlock"
 #define N_SB_LOCK       "com.apple.springboard.lockstate"
+#define N_PROX          "com.sapphire.sensor.prox"       /* sensord: notify state 1 = proximity near */
 
 static os_log_t olog;
 
@@ -743,7 +746,8 @@ struct client {
 static dispatch_queue_t q;
 static dispatch_source_t poll_timer;
 static int poll_ms;                     /* interval of poll_timer, 0 = stopped */
-static int tok_blank = -1, tok_display = -1, tok_state = -1, tok_fails = -1;
+static int tok_blank = -1, tok_display = -1, tok_state = -1, tok_fails = -1, tok_prox = -1;
+static unsigned st_pocket;
 static bool lockedout, have_ready, qsee_ok;
 static uint64_t last_ready;
 static int last_seq, ticks;
@@ -945,6 +949,14 @@ screen_off_press(int seq)
 	}
 }
 
+/* pocket mode: sensord's proximity says something covers the top of the phone */
+static bool
+prox_near(void)
+{
+	uint64_t v = 0;
+	return tok_prox >= 0 && notify_get_state(tok_prox, &v) == NOTIFY_STATUS_OK && v != 0;
+}
+
 static void
 poll_tick(void)
 {
@@ -954,6 +966,12 @@ poll_tick(void)
 	}
 	if (seq != last_seq) {
 		last_seq = seq;
+		if (prox_near()) {
+			if (st_pocket++ < 20 || (st_pocket % 100) == 0) {
+				LOG("press %d ignored: proximity near (pocket), %u so far", seq, st_pocket);
+			}
+			return;
+		}
 		if (poll_ms == POLL_OFF_MS && !screen_is_on()) {
 			screen_off_press(seq);
 		} else {
@@ -1685,6 +1703,9 @@ main(void)
 	}
 	if (notify_register_check(N_FAILS, &tok_fails) != NOTIFY_STATUS_OK) {
 		tok_fails = -1;
+	}
+	if (notify_register_check(N_PROX, &tok_prox) != NOTIFY_STATUS_OK) {
+		tok_prox = -1;
 	}
 	dispatch_sync(q, ^{
 		set_fails(0);

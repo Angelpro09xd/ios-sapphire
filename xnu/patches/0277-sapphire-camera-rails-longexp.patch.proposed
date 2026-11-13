@@ -1,0 +1,235 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0277: camera rails' drive, whole-frame stills, long exposures
+
+The front/ultra-wide/macro rails come from PM6125 GPIO2 (AVDD) and PM7250B
+GPIO3 (DVDD); their DT pinctrl states set no pull and a drive strength (2 and
+3), which 0270 never wrote (DIG_OUT_CTL 0x45 may have been 0, no drive): an
+unpowered sensor would hold CCI master 1's bus. Both are now written, and the
+log shows pull/drive before and after. Op 6 turns every camera rail on and
+logs both CCI buses' SDA/SCL levels.
+A still now clears the stale RDI/TFE/bus status before the resume and only
+takes an EOF that follows a SOF seen after it (a whole frame at the pool
+start), with a time limit of three frame times (at least 3 s); the log shows
+the SOF time and the WM7 end address expected.
+Long exposures: kern.sweet_cam_exp accepts a frame length up to 65535 lines
+and lengthens the frame on its own when the exposure needs it (about 1 s in
+mode 0); a mode change keeps the exposure time and the longer frame.
+---
+ bsd/dev/sweet_cam.c | 91 +++++++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 74 insertions(+), 17 deletions(-)
+
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index be71af8..11c6ba7 100755
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -15,6 +15,8 @@
+  *     the pool), 21 (TFE registers read), 22 (WM7 written, not enabled), 23 (enable + one frame);
+  *     0276: kern.sweet_cam_exp (exposure), op 30 preview ring (kern.sweet_cam_latest,
+  *     kern.sweet_cam_sel), 31 preview off, 32 108 MP still; op 9 also stops the stream/capture path.
++ *     0277: op 6 bus check (CCI levels with every rail on); PMIC rail GPIOs get the DT's pull/drive;
++ *     a still waits for a whole frame; long exposures lengthen the frame (up to 65535 lines).
+  *     kern.sweet_cam_seek + kern.sweet_cam_frame: the frame in
+  *     1 MB reads, kern.sweet_cam_frame_len its size.
+  *   kern.sweet_cam_log: the log of the last request (also in the kernel log, "SWEET CAM:").
+@@ -100,6 +102,7 @@ static bool camss_up;
+ static int cam_arg;
+ static int64_t cam_seek;
+ static uint32_t cam_frame_len, cam_frame_off;
++static uint64_t cam_frame_ns;                   /* 0277: the HM6 frame time in use (exposure, frame length) */
+ static uint8_t *cam_pool;
+ static vm_offset_t cam_phy, cam_ppi, cam_csid, cam_smmu;
+ static bool slot_up[4], cam_streaming, cam_csid_up;
+@@ -233,9 +236,9 @@ static bool pin_out(unsigned gpio, int high) { return pin_cfg(gpio, 0, 0, high);
+ 
+ /* a PM6125/PM7250B LV/MV GPIO as a plain output (pinctrl-spmi-gpio lv_mv layout) */
+ static bool
+-pmic_gpio(unsigned sid, unsigned base, int high, const char *name)
++pmic_gpio(unsigned sid, unsigned base, int high, unsigned strength, const char *name)
+ {
+-	uint8_t type = 0, sub = 0, mode = 0, src = 0, en = 0, vin = 0;
++	uint8_t type = 0, sub = 0, mode = 0, src = 0, en = 0, vin = 0, drv = 0, pull = 0;
+ 	if (sweet_spmi_init() != 0 || sweet_spmi_read_any(sid, base + 0x04, &type) != 0 ||
+ 	    sweet_spmi_read_any(sid, base + 0x05, &sub) != 0) {
+ 		camlog("%s (sid %u %#x): not readable: stop", name, sid, base);
+@@ -245,11 +248,15 @@ pmic_gpio(unsigned sid, unsigned base, int high, const char *name)
+ 	(void)sweet_spmi_read_any(sid, base + 0x41, &vin);
+ 	(void)sweet_spmi_read_any(sid, base + 0x44, &src);
+ 	(void)sweet_spmi_read_any(sid, base + 0x46, &en);
++	(void)sweet_spmi_read_any(sid, base + 0x45, &drv);
++	(void)sweet_spmi_read_any(sid, base + 0x42, &pull);
+ 	if (type != 0x10 || sub < 0x10 || sub > 0x13) {
+ 		camlog("%s (sid %u %#x): type %#x subtype %#x is not an LV/MV GPIO: stop", name, sid, base, type, sub);
+ 		return false;
+ 	}
+ 	int r = sweet_spmi_write(sid, base + 0x41, 0x00);                       /* DIG_VIN_CTL: VIN0 */
++	r = r ? r : sweet_spmi_write(sid, base + 0x42, 0x05);                   /* 0277 DIG_PULL_CTL: no pull (bias-disable) */
++	r = r ? r : sweet_spmi_write(sid, base + 0x45, strength & 3);           /* 0277 DIG_OUT_CTL: CMOS, the DT's drive strength */
+ 	r = r ? r : sweet_spmi_write(sid, base + 0x40, 0x01);                   /* MODE_CTL: output */
+ 	r = r ? r : sweet_spmi_write(sid, base + 0x44, high ? 0x80 : 0x00);     /* DIG_OUT_SOURCE_CTL: level, normal */
+ 	r = r ? r : sweet_spmi_write(sid, base + 0x46, 0x80);                   /* EN_CTL: enabled */
+@@ -258,8 +265,10 @@ pmic_gpio(unsigned sid, unsigned base, int high, const char *name)
+ 	(void)sweet_spmi_read_any(sid, base + 0x44, &src2);
+ 	(void)sweet_spmi_read_any(sid, base + 0x46, &en2);
+ 	(void)sweet_spmi_read_any(sid, base + 0x08, &st);
+-	camlog("%s (sid %u %#x, subtype %#x, vin %#x): mode %#x src %#x en %#x -> mode %#x src %#x en %#x status %#x: %s%s",
+-	    name, sid, base, sub, vin, mode, src, en, mode2, src2, en2, st, high ? "high" : "low", r ? " WRITE FAILED" : "");
++	uint8_t drv2 = 0;
++	(void)sweet_spmi_read_any(sid, base + 0x45, &drv2);
++	camlog("%s (sid %u %#x, subtype %#x, vin %#x, pull %#x): mode %#x src %#x en %#x drive %#x -> mode %#x src %#x en %#x drive %#x status %#x: %s%s",
++	    name, sid, base, sub, vin, pull, mode, src, en, drv, mode2, src2, en2, drv2, st, high ? "high" : "low", r ? " WRITE FAILED" : "");
+ 	return r == 0;
+ }
+ 
+@@ -528,9 +537,9 @@ mclk_on(unsigned slot)
+ }
+ 
+ static bool
+-avdd(int on) { return pmic_gpio(AVDD_SID, AVDD_BASE, on, "AVDD PM6125 GPIO2"); }
++avdd(int on) { return pmic_gpio(AVDD_SID, AVDD_BASE, on, 2, "AVDD PM6125 GPIO2"); }
+ static bool
+-dvdd(int on) { return pmic_gpio(DVDD_SID, DVDD_BASE, on, "DVDD PM7250B GPIO3"); }
++dvdd(int on) { return pmic_gpio(DVDD_SID, DVDD_BASE, on, 3, "DVDD PM7250B GPIO3"); }
+ 
+ /* the chip id (and its alternative for the front slot), then 16 bytes of the EEPROM */
+ static int
+@@ -1525,11 +1534,20 @@ cam_capture_staged(void)
+ 	step("WM7 enable (0x2300=0x10001) + reg update");
+ 	wr(t, 0x2300, 0x00010001);
+ 	wr(t, 0x102C, 0x2);
+-	step("CSID RDI0 resume: the TFE starts writing at the next frame");
++	/* 0277: stale RDI/TFE/bus status cleared, then only an EOF after a SOF seen from now on counts */
++	wr(t, 0x048, 0x3FFFF); wr(t, 0x080, 1);
++	wr(t, 0x1040, 0xFFFFFFFF); wr(t, 0x1044, 0xFFFFFFFF); wr(t, 0x1048, 0xFFFFFFFF); wr(t, 0x1030, 1);
++	wr(t, 0x1A20, 0xFFFFFFFF); wr(t, 0x1A24, 0xFFFFFFFF); wr(t, 0x1A30, 1);
++	uint64_t limit = 3000000000ull;
++	if (cs.slot == 0 && cam_frame_ns * 3 > limit) {
++		limit = cam_frame_ns * 3;
++	}
++	step("CSID RDI0 resume: the TFE starts writing at the next frame (WM7 at %#x, wait up to %llu ms)", rd(t, 0x2304),
++	    limit / 1000000);
+ 	wr(t, 0x308, 1);
+-	uint64_t t0 = mach_absolute_time(), ns = 0;
++	uint64_t t0 = mach_absolute_time(), ns = 0, sof_ns = 0;
+ 	uint32_t logs = 0, b0 = 0, b1 = 0;
+-	bool eof = false, done = false, fault = false;
++	bool eof = false, done = false, fault = false, sof = false;
+ 	while (!done) {
+ 		fault = smmu_fault("during the frame");
+ 		uint32_t s0 = rd(t, 0x104C), s1 = rd(t, 0x1050), rdi = rd(t, 0x040);
+@@ -1546,12 +1564,18 @@ cam_capture_staged(void)
+ 		if (b0 | b1) {
+ 			wr(t, 0x1A20, b0); wr(t, 0x1A24, b1); wr(t, 0x1A30, 1);
+ 		}
+-		eof |= (rdi & (1u << 9)) != 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		if ((rdi & (1u << 9)) && sof) {
++			eof = true;                             /* the end of the frame that started after the resume */
++		}
++		if ((rdi & (1u << 12)) && !sof) {
++			sof = true;
++			sof_ns = ns;
++		}
+ 		if (rdi) {
+ 			wr(t, 0x048, rdi); wr(t, 0x080, 1);
+ 		}
+-		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+-		done = fault || (eof && (b0 | b1) != 0) || ns > 3000000000ull;
++		done = fault || (eof && (b0 | b1) != 0) || ns > limit;
+ 		if (!done) {
+ 			IOSleep(2);
+ 		}
+@@ -1565,8 +1589,9 @@ cam_capture_staged(void)
+ 		changed += cam_pool[i] != 0xA5;
+ 		tail += cam_pool[bytes - 4096 + i] != 0xA5;
+ 	}
+-	camlog("frame: %s%s after %llu ms; WM7 addr status %#x; first 4 KB %u bytes written, last 4 KB %u", eof ? "EOF" : "NO EOF",
+-	    fault ? ", SMMU FAULT" : "", ns / 1000000, rd(t, 0x2368), changed, tail);
++	camlog("frame: %s%s after %llu ms (SOF at %llu ms); WM7 addr status %#x (end %#llx expected); first 4 KB %u bytes written, last 4 KB %u",
++	    eof ? "EOF" : "NO EOF", fault ? ", SMMU FAULT" : "", ns / 1000000, sof_ns / 1000000, rd(t, 0x2368), CAM_POOL_PA + bytes,
++	    changed, tail);
+ 	camlog("frame +0: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", cam_pool[0],
+ 	    cam_pool[1], cam_pool[2], cam_pool[3], cam_pool[4], cam_pool[5], cam_pool[6], cam_pool[7], cam_pool[8], cam_pool[9],
+ 	    cam_pool[10], cam_pool[11], cam_pool[12], cam_pool[13], cam_pool[14], cam_pool[15]);
+@@ -1642,6 +1667,7 @@ hm6_apply_exposure(void)
+ 	uint32_t code = ex.gain_x1000 * 32 / 1000;
+ 	code = code < 0x20 ? 0x20 : code > 0x800 ? 0x800 : code;
+ 	uint32_t lines = ex.coarse < 12 ? 12 : ex.coarse > exp_max_lines() ? exp_max_lines() : ex.coarse;
++	cam_frame_ns = (uint64_t)m_line_ns * (ex.fll ? ex.fll : m_fll);
+ 	bool ok = cci_write(0, 0x10, 0xFCFC, 0x4000, 2) && cci_write(0, 0x10, 0x0104, 0x0101, 2);
+ 	if (ok && ex.fll != 0) {
+ 		ok = cci_write(0, 0x10, 0x0340, ex.fll, 2);
+@@ -1689,11 +1715,12 @@ hm6_switch(unsigned mode)
+ 	m_fll = tbl_last(mt, mn, 0x0340, 1);
+ 	m_llp = tbl_last(mt, mn, 0x0342, 0);
+ 	m_line_ns = (uint32_t)(100000000000ull / ((uint64_t)hm6_fps_x100[mode] * m_fll));
++	cam_frame_ns = (uint64_t)m_line_ns * m_fll;
+ 	if (ex.set) {
+ 		if (old_line_ns != 0 && old_line_ns != m_line_ns) {
+-			/* the same exposure time in the new mode's lines; its own frame length */
++			/* the same exposure time in the new mode's lines; a longer frame only if the exposure needs it */
+ 			ex.coarse = (uint32_t)((uint64_t)ex.coarse * old_line_ns / m_line_ns);
+-			ex.fll = 0;
++			ex.fll = ex.coarse + 16 > m_fll ? (ex.coarse + 16 > 65535 ? 65535 : ex.coarse + 16) : 0;
+ 		}
+ 		(void)hm6_apply_exposure();
+ 	}
+@@ -1731,7 +1758,7 @@ sysctl_sweet_cam_exp SYSCTL_HANDLER_ARGS
+ 		}
+ 		k++;
+ 	}
+-	if (k < 2 || v[1] < 1000 || v[1] > 64000) {
++	if (k < 2 || v[1] < 1000 || v[1] > 64000 || (k > 2 && v[2] > 65535)) {
+ 		return EINVAL;
+ 	}
+ 	lck_mtx_lock(&sweet_cam_mtx);
+@@ -1741,6 +1768,9 @@ sysctl_sweet_cam_exp SYSCTL_HANDLER_ARGS
+ 	ex.coarse = v[0];
+ 	ex.gain_x1000 = v[1];
+ 	ex.fll = k > 2 ? v[2] : 0;
++	if (ex.fll == 0 && ex.coarse + 16 > m_fll && m_fll != 0) {
++		ex.fll = ex.coarse + 16 > 65535 ? 65535 : ex.coarse + 16;      /* 0277: a longer frame for a long exposure */
++	}
+ 	int r = 0;
+ 	if (cam_streaming && cs.slot == 0) {
+ 		r = hm6_apply_exposure();
+@@ -2005,6 +2035,30 @@ cam_stream_off_all(void)
+ 	/* the RPM votes for L4/L18 stay: they are APPS' only vote on rails the display and USB PHYs share, at the values UEFI set */
+ }
+ 
++/*
++ * 0277 op 6: both CCI buses' levels with every camera rail on (VIO, AVDD PM6125 GPIO2, DVDD PM7250B
++ * GPIO3) and no reset/MCLK change: an I2C bus at rest reads high on SDA and SCL; low means a
++ * device holds it (an unpowered sensor clamps it) or the pin is not on the bus.
++ */
++static int
++cam_bus_check(void)
++{
++	if (!camss_up) {
++		int r = camss_on();
++		if (r != 0) {
++			return r;
++		}
++	}
++	bool ok = pin_out(GPIO_VIO, 1) && avdd(1) && dvdd(1);
++	IOSleep(10);
++	for (unsigned i = 0; i < 4; i++) {
++		volatile uint32_t *g = tlmm_pin(cci_pins[i]);
++		camlog("CCI m%u %s gpio%u: ctl %#x level %u", i / 2, (i & 1) ? "SCL" : "SDA", cci_pins[i], g ? g[0] : 0, g ? (g[1] & 1) : 9);
++	}
++	camlog("op 6: rails %s", ok ? "on" : "NOT all on");
++	return ok ? 0 : EIO;
++}
++
+ static int
+ sysctl_sweet_cam SYSCTL_HANDLER_ARGS
+ {
+@@ -2026,6 +2080,9 @@ sysctl_sweet_cam SYSCTL_HANDLER_ARGS
+ 	case 2: case 3: case 4: case 5:
+ 		r = slot_on((unsigned)(v - 2));
+ 		break;
++	case 6:
++		r = cam_bus_check();
++		break;
+ 	case 9:
+ 		r = cam_off();
+ 		break;

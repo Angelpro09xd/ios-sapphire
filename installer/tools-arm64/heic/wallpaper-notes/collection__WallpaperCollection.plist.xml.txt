@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>identifier</key>
+	<string>23EC2CF1-0188-49FC-B214-EC1AB37FE5C4</string>
+	<key>isLegacyContent</key>
+	<false/>
+	<key>name</key>
+	<string>iOS 16</string>
+	<key>order</key>
+	<array>
+		<integer>7400</integer>
+	</array>
+	<key>source</key>
+	<string>Apple</string>
+</dict>
+</plist>

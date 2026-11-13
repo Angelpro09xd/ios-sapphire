@@ -1,0 +1,175 @@
+0317: SapphireGpu: a hung GPU is reset (RBBM software reset, hw_init, the CP and the zap shader again) and the
+service goes on; GET_PARAM FAULTS counts the resets. boot-arg gpu_norecover=1 keeps the old stop.
+
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -135,6 +135,7 @@
+ #define REG_RBBM_INT_0_MASK     0x0038
+ #define REG_RBBM_INT_0_STATUS   0x0201
+ #define REG_RBBM_STATUS         0x0210
++#define REG_RBBM_SW_RESET_CMD   0x0043
+ #define REG_CP_RB_BASE          0x0800
+ #define REG_CP_RB_CNTL          0x0802
+ #define REG_CP_RB_RPTR          0x0806
+@@ -295,6 +296,7 @@
+ static uint32_t draw_first = 1;                 /* boot-arg gpu_draw=0 skips the 2D fill */
+ static bool stopped_early;
+ static bool service_ok;                         /* stage 3 and the draw tests passed */
++static bool recover_zap;                        /* 0317: the zap shader is up (gpu=3): a reset resumes it */
+ static volatile bool service_ready;              /* gpu_service: the GPU takes work from the rest of the kernel */
+ 
+ static bool
+@@ -2595,7 +2597,7 @@
+ 	}
+ 	if (stage == 3 && stop_here(1, "the zap shader")) {
+ 		;
+-	} else if (cp_start(stage == 3)) {
++	} else if ((recover_zap = (stage == 3)), cp_start(stage == 3)) {
+ 		LOG("*** the GPU executes commands ***");
+ 		if (draw_first && blit_fill(0xFF8000FF)) {
+ 			LOG("*** the GPU drew: every pixel of the 2D fill is right ***");
+@@ -3360,16 +3362,95 @@
+ 	return (uint64_t)left / NSEC_PER_MSEC > 2000 ? 2000 : (uint64_t)left / NSEC_PER_MSEC;
+ }
+ 
+-/* A submission that never finishes: the service stops (no more work is given to a GPU that may still write). */
++/*
++ * 0317: a submission that never finishes. The GPU is reset and the service goes on (Linux
++ * a6xx_recover for a GPU without a GMU: drain the bus, RBBM software reset, hw_init, the CP
++ * started again on an empty ring, the zap shader resumed and secure mode left), keeping the page
++ * tables, the SQE microcode already in the pool and every client's buffers. What was in flight
++ * is given up: both fence words jump to the last number handed out, so every wait ends, and
++ * GET_PARAM FAULTS counts the resets (a client that sees it rise knows its work did not run, as
++ * Linux's msm says with the same parameter). boot-arg gpu_norecover=1: the old behaviour, the
++ * service stops for good. Called with service_lock held or not (`locked`).
++ */
++static uint32_t gpu_faults;
++
++static bool
++gpu_recover(void)
++{
++	uint64_t res = 0;
++	long long st;
++
++	bus_drain();
++	gwr(REG_RBBM_SW_RESET_CMD, 1);
++	(void)grd(REG_RBBM_SW_RESET_CMD);
++	IODelay(100);
++	gwr(REG_RBBM_SW_RESET_CMD, 0);
++	(void)grd(REG_RBBM_SW_RESET_CMD);
++	IODelay(100);
++	hw_init_regs();
++	gwr64(REG_CP_SQE_INSTR_BASE, POOL_PA + OFF_SQE);
++	gwr64(REG_CP_RB_BASE, POOL_PA + OFF_RING);
++	gwr(REG_CP_RB_CNTL, 12 | (2 << 8) | (1u << 27));
++	ring_wptr = 0;
++	gwr(REG_CP_RB_WPTR, 0);
++	gwr(REG_CP_SQE_CNTL, 1);
++	emit(pkt7(CP_ME_INIT, 8));
++	emit(0x2f);
++	emit(3);
++	emit(0x20000000);
++	emit(0);
++	emit(0);
++	emit(0);
++	emit(0);
++	emit(0);
++	if (!submit("recover: CP_ME_INIT", 100)) {
++		return false;
++	}
++	if (recover_zap) {
++		st = scm(SCM_FN(SCM_SVC_BOOT, SCM_BOOT_SET_REMOTE_STATE), 2, 0, GPU_PAS_ID, 0, &res);
++		LOG("msm: recover: zap resume: ret %llx res %llx", st, res);
++		emit(pkt7(CP_SET_SECURE_MODE, 1));
++		emit(0);
++		if (!submit("recover: CP_SET_SECURE_MODE 0", 100)) {
++			return false;
++		}
++	} else {
++		gwr(REG_RBBM_SECVID_TRUST_CNTL, 0);
++	}
++	*(volatile uint32_t *)(pool + OFF_MSM_FENCE) = msm_seq;
++	*(volatile uint32_t *)(pool + OFF_FENCE) = fence_seq;
++	gmb();
++	smmu_fault("msm: recover");
++	return true;
++}
++
+ static void
+-msm_hung(const char *who, uint32_t fence)
++msm_hung(const char *who, uint32_t fence, bool locked)
+ {
++	uint32_t norecover = 0;
++
++	if (!locked) {
++		IOLockLock(service_lock);
++	}
+ 	if (service_ready) {
+ 		service_ready = false;
+-		LOG("msm: %s: submission %u did not finish in 2 s (done: %u): the GPU service stops; RBBM_STATUS %08x CP_HW_FAULT %08x rptr %u wptr %u",
++		LOG("msm: %s: submission %u did not finish in 2 s (done: %u): RBBM_STATUS %08x CP_HW_FAULT %08x rptr %u wptr %u",
+ 		    who, fence, *(volatile uint32_t *)(pool + OFF_MSM_FENCE), grd(REG_RBBM_STATUS), grd(REG_CP_HW_FAULT),
+ 		    grd(REG_CP_RB_RPTR), ring_wptr % RING_DWORDS);
+ 		smmu_fault("msm");
++		PE_parse_boot_argn("gpu_norecover", &norecover, sizeof(norecover));
++		if (norecover) {
++			LOG("msm: gpu_norecover=1: the GPU service stops");
++		} else if (gpu_recover()) {
++			gpu_faults++;
++			service_ready = true;
++			LOG("*** msm: the GPU was reset (%u so far); work up to %u given up, the service goes on ***", gpu_faults, msm_seq);
++		} else {
++			LOG("msm: the GPU did not come back from its reset: the GPU service stops; RBBM_STATUS %08x", grd(REG_RBBM_STATUS));
++		}
++	}
++	if (!locked) {
++		IOLockUnlock(service_lock);
+ 	}
+ }
+ 
+@@ -3587,7 +3668,7 @@
+ 	}
+ 	IOLockUnlock(service_lock);                 /* no room to leave it: wait for it */
+ 	if (!msm_wait(b->fence, 2000)) {
+-		msm_hung(fName, b->fence);
++		msm_hung(fName, b->fence, false);
+ 	}
+ 	IOLockLock(service_lock);
+ 	freeBo(b);
+@@ -3597,7 +3678,7 @@
+ SapphireGPUClient::clientClose(void)
+ {
+ 	if (service_ready && !msm_wait(msm_seq, 2000)) {       /* nothing of ours may still be at work */
+-		msm_hung(fName, msm_seq);
++		msm_hung(fName, msm_seq, false);
+ 	}
+ 	IOLockLock(service_lock);
+ 	for (uint32_t i = 0; fBo != NULL && i < MSM_BUFFERS; i++) {
+@@ -3867,7 +3948,7 @@
+ 	}
+ 	reap();
+ 	if (!ring_room(4 * r->nr_cmds + 16, 2000)) {
+-		msm_hung(fName, msm_seq);
++		msm_hung(fName, msm_seq, true);
+ 		IOLockUnlock(service_lock);
+ 		ret = kIOReturnTimeout;
+ 		goto out;
+@@ -3966,7 +4047,8 @@
+ 	case 0x05: *value = mach_absolute_time(); return true;  /* TIMESTAMP */
+ 	case 0x06: *value = 0x100000; return true;              /* GMEM_BASE: UCHE_GMEM_RANGE_MIN of hw_init */
+ 	case 0x07: *value = 1; return true;                     /* PRIORITIES */
+-	case 0x08: case 0x09: case 0x0a: case 0x11: *value = 0; return true;  /* PP_PGTABLE FAULTS SUSPENDS RAYTRACING */
++	case 0x09: *value = gpu_faults; return true;           /* FAULTS: the resets of a hung GPU (0317) */
++	case 0x08: case 0x0a: case 0x11: *value = 0; return true;  /* PP_PGTABLE SUSPENDS RAYTRACING */
+ 	case 0x10: *value = 14; return true;                    /* HIGHEST_BANK_BIT */
+ 	case 0x1000: *value = gpool_enabled(); return true;     /* sapphire: buffers are write-combined (libdrm) */
+ 	default: return false;                                  /* VA_START/VA_SIZE among them */
+@@ -4047,7 +4129,7 @@
+ 		if (!msm_wait(r.waitFence.fence, ms)) {
+ 			ret = kIOReturnTimeout;
+ 			if (ms >= 2000) {
+-				msm_hung(fName, r.waitFence.fence);
++				msm_hung(fName, r.waitFence.fence, false);
+ 			}
+ 		}
+ 		break;

@@ -1,0 +1,30 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0307: kern.sweet_boot_android restarts into the system, not fastboot
+
+0221 makes every restart go to the bootloader by default (iOS was only ever started with fastboot boot,
+and a plain restart would have come up in Android). The switch to Android (0305/0306) restarted that
+way too: the slot and the boot LUN were right, the phone stopped in fastboot, `fastboot continue` booted
+Android. The switch now sets the restart mode to the system first. Dual-boot images (iOS in its own
+slot) are packed with boot-arg sweet_reboot=0, so iOS's own restarts come back to iOS.
+---
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 1d1825a..b4ded34 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1302,6 +1302,7 @@ out_free:
+ }
+ 
+ extern int reboot_kernel(int howto, char *message);
++extern void sweet_reboot_mode_set(int mode);
+ 
+ static int
+ sysctl_sweet_boot_android SYSCTL_HANDLER_ARGS
+@@ -1322,6 +1323,8 @@ sysctl_sweet_boot_android SYSCTL_HANDLER_ARGS
+ 	}
+ 	error = sweet_ufs_slot(active == 'a' ? 'b' : 'a', false, NULL);
+ 	if (!error && v == 1) {
++		/* 0307: a restart to the system (the slot just made active), not the default bootloader (0221) */
++		sweet_reboot_mode_set(0);
+ 		(void)reboot_kernel(0, (char *)"sweet: to Android");
+ 	}
+ 	return error;

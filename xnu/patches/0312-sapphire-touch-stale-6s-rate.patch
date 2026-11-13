@@ -1,0 +1,84 @@
+From: x <x@x>
+Subject: [PATCH] sapphire-0312: touch: a still finger kept 6 s before it counts as stuck (the fingerprint
+ sensor released it at 1 s); kern.sweet_touch_rate; FocalTech rate registers logged
+
+---
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -464,8 +464,35 @@
+  * kern.sweet_touch_stale: releases so far; kern.sweet_touch_same_ms: the longest identical run seen
+  * with a contact down (to tune the threshold against long presses).
+  */
+-static unsigned touch_stale_ms = 1000;
++/*
++ * 0312: 6 s. A finger held still on the in-display fingerprint sensor (or a long press) gives the
++ * FocalTech IC's very same frame for a second and more: at 1 s it was released mid-scan.
++ */
++static unsigned touch_stale_ms = 6000;
+ static int sweet_touch_stale, sweet_touch_same_ms;
++static uint64_t touch_rate_down_abs;
++static unsigned touch_rate_new, touch_rate_reads;
++
++/* kern.sweet_touch_rate: new frames per second of contact since the last write of 0 (0312) */
++static int
++sysctl_sweet_touch_rate SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char out[128];
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(touch_rate_down_abs, &ns);
++	unsigned ms = (unsigned)(ns / NSEC_PER_MSEC);
++	snprintf(out, sizeof(out), "%u new frames in %u ms of contact (%u per s)", touch_rate_new, ms,
++	    ms ? (unsigned)((uint64_t)touch_rate_new * 1000 / ms) : 0);
++	int error = SYSCTL_OUT(req, out, strlen(out) + 1);
++	if (!error && req->newptr != USER_ADDR_NULL) {
++		touch_rate_down_abs = 0;
++		touch_rate_new = touch_rate_reads = 0;
++	}
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_touch_rate, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_touch_rate, "A", "touch: new IC frames per second of contact (write anything: reset) (0312)");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_touch_stale, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_touch_stale, 0,
+     "contacts released because the touch IC repeated one frame (0300)");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_touch_same_ms, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_touch_same_ms, 0,
+@@ -561,6 +588,15 @@
+ 	if (err) {
+ 		return err;
+ 	}
++	/* 0312: how often the IC really has a new frame while a contact is down (kern.sweet_touch_rate) */
++	{
++		static uint64_t prev;
++		uint64_t t = mach_absolute_time();
++		if (st.active && prev != 0) {
++			touch_rate_down_abs += t - prev;
++		}
++		prev = t;
++	}
+ 	/* 0300: a frame repeated for too long with a contact down is a stuck one */
+ 	static uint8_t last[sizeof(buf)];
+ 	static uint64_t same_since;
+@@ -570,6 +606,10 @@
+ 		memcpy(last, buf, sizeof(buf));
+ 		same_since = now;
+ 		stale = false;
++		if (st.active) {
++			touch_rate_new++;
++		}
++		touch_rate_reads++;
+ 	} else if (stale) {
+ 		return 0;               /* the stuck frame again: nothing new */
+ 	} else if (st.active) {
+@@ -799,6 +839,12 @@
+ 		int e5 = touch_read(0x38, 0xa1, false, lib, 2);
+ 		printf("SWEET TOUCH: ft fw=%02x/%d vendor=%02x/%d devmode=%02x/%d pmode=%02x/%d lib=%02x%02x/%d\n",
+ 		    fw, e1, vendor, e2, mode, e3, pmode, e4, lib[0], lib[1], e5);
++		/* 0312: the active report period/rate registers (FocalTech: 0x88 ID_G_PERIODACTIVE, 0x89 monitor) */
++		uint8_t r88 = 0, r89 = 0, r8b = 0;
++		int e6 = touch_read(0x38, 0x88, false, &r88, 1);
++		int e7 = touch_read(0x38, 0x89, false, &r89, 1);
++		int e8 = touch_read(0x38, 0x8b, false, &r8b, 1);
++		printf("SWEET TOUCH: ft 0x88=%02x/%d 0x89=%02x/%d 0x8b=%02x/%d\n", r88, e6, r89, e7, r8b, e8);
+ 	}
+ 	st.probing = false;
+ 	st.d_ge = ge;

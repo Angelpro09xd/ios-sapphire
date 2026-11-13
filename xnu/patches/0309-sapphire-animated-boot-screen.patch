@@ -1,0 +1,212 @@
+From: x <x@x>
+Subject: [PATCH] sapphire-0309: the animated boot screen (SPL2): the gem pulses, a comet runs round the ring, sparkles,
+ a light sweeps the wordmark, ~25 fps until iOS's first frame
+
+The shim's picture may now be a full-screen "SPL2" blob (shim/splash/make_splash.py): the still frame plus
+the layers this thread animates; shim/splash/splash_anim.py is the same arithmetic (its GIF = the phone).
+The old "SPLH" picture still works as before.
+---
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -3437,6 +3437,127 @@
+ static uint32_t sweet_splash_w, sweet_splash_h;
+ 
+ #define SPLASH_PIC_Y    380
++static unsigned int sweet_splash_y = SPLASH_PIC_Y;
++
++/*
++ * sapphire 0309: the animated boot screen ("SPL2", shim/splash/make_splash.py): a full-screen frame, plus
++ * what this thread animates over it -- the gem's glow (pulsing), a comet round the ring, sparkles on the
++ * gem, a light sweeping the wordmark. shim/splash/splash_anim.py is the same arithmetic in Python (its
++ * GIF is what the phone shows).
++ */
++struct sweet_spl2 {
++	uint32_t magic, w, h, version;
++	uint32_t gx, gy, gw, gh;                /* the glow layer's box */
++	uint32_t wx, wy, ww, wh;                /* the wordmark's mask box */
++	uint32_t cx, cy, r, n;                  /* the ring; n points */
++	uint32_t spr, glint_n, pad[2];          /* the sparkle sprite (spr x spr), its points */
++};
++static const struct sweet_spl2 *sweet_spl2;
++static const uint32_t *spl2_base, *spl2_glow, *spl2_spr;
++static const uint8_t *spl2_mask;
++static const int16_t *spl2_ring, *spl2_glints;
++
++static const int8_t sweet_sin[256] = {0,3,6,9,12,16,19,22,25,28,31,34,37,40,43,46,49,51,54,57,60,63,65,68,71,73,76,78,81,83,85,88,90,92,94,96,98,100,102,104,106,107,109,111,112,113,115,116,117,118,120,121,122,122,123,124,125,125,126,126,126,127,127,127,127,127,127,127,126,126,126,125,125,124,123,122,122,121,120,118,117,116,115,113,112,111,109,107,106,104,102,100,98,96,94,92,90,88,85,83,81,78,76,73,71,68,65,63,60,57,54,51,49,46,43,40,37,34,31,28,25,22,19,16,12,9,6,3,0,-3,-6,-9,-12,-16,-19,-22,-25,-28,-31,-34,-37,-40,-43,-46,-49,-51,-54,-57,-60,-63,-65,-68,-71,-73,-76,-78,-81,-83,-85,-88,-90,-92,-94,-96,-98,-100,-102,-104,-106,-107,-109,-111,-112,-113,-115,-116,-117,-118,-120,-121,-122,-122,-123,-124,-125,-125,-126,-126,-126,-127,-127,-127,-127,-127,-127,-127,-126,-126,-126,-125,-125,-124,-123,-122,-122,-121,-120,-118,-117,-116,-115,-113,-112,-111,-109,-107,-106,-104,-102,-100,-98,-96,-94,-92,-90,-88,-85,-83,-81,-78,-76,-73,-71,-68,-65,-63,-60,-57,-54,-51,-49,-46,-43,-40,-37,-34,-31,-28,-25,-22,-19,-16,-12,-9,-6,-3};
++
++static uint64_t
++sweet_spl2_size(const struct sweet_spl2 *h)
++{
++	return sizeof(*h) + (uint64_t)h->w * h->h * 4 + (uint64_t)h->gw * h->gh * 4 + (uint64_t)h->ww * h->wh +
++	       (uint64_t)h->n * 4 + (uint64_t)h->spr * h->spr * 4 + (uint64_t)h->glint_n * 4;
++}
++
++static inline uint32_t
++spl2_add(uint32_t px, unsigned int r, unsigned int g, unsigned int b)
++{
++	r += (px >> 16) & 255;
++	g += (px >> 8) & 255;
++	b += px & 255;
++	return 0xff000000u | (r > 255 ? 255 : r) << 16 | (g > 255 ? 255 : g) << 8 | (b > 255 ? 255 : b);
++}
++
++static void
++spl2_dot(uint32_t *f, int x, int y, int rad, unsigned int r, unsigned int g, unsigned int b)
++{
++	const struct sweet_spl2 *h = sweet_spl2;
++	for (int yy = y - rad; yy <= y + rad; yy++) {
++		for (int xx = x - rad; xx <= x + rad; xx++) {
++			if (xx >= 0 && yy >= 0 && (uint32_t)xx < h->w && (uint32_t)yy < h->h) {
++				uint32_t *q = f + (size_t)yy * h->w + xx;
++				*q = spl2_add(*q, r, g, b);
++			}
++		}
++	}
++}
++
++/* frame T (ms) into F (the whole screen): only the gem box and the wordmark box change */
++static void
++sweet_splash2_frame(uint32_t *f, uint64_t t)
++{
++	const struct sweet_spl2 *h = sweet_spl2;
++	/* the gem pulses */
++	unsigned int p = (unsigned int)(150 + sweet_sin[(t * 256 / 2400) & 255] * 105 / 127);
++	for (uint32_t y = 0; y < h->gh; y++) {
++		const uint32_t *b = spl2_base + (size_t)(h->gy + y) * h->w + h->gx;
++		const uint32_t *g = spl2_glow + (size_t)y * h->gw;
++		uint32_t *o = f + (size_t)(h->gy + y) * h->w + h->gx;
++		for (uint32_t x = 0; x < h->gw; x++) {
++			uint32_t gl = g[x];
++			o[x] = spl2_add(b[x], (((gl >> 16) & 255) * p) >> 8, (((gl >> 8) & 255) * p) >> 8, ((gl & 255) * p) >> 8);
++		}
++	}
++	/* the comet round the ring, every 2.8 s */
++	const int tail = 110;
++	uint32_t head = (uint32_t)((t * h->n / 2800) % h->n);
++	for (int i = tail - 1; i >= 0; i--) {
++		uint32_t k = (head + h->n - (uint32_t)i) % h->n;
++		unsigned int b = 255 - (unsigned int)i * 255 / tail;
++		int x = (int)h->cx + spl2_ring[2 * k], y = (int)h->cy + spl2_ring[2 * k + 1];
++		if (i >= 4) {
++			spl2_dot(f, x, y, i < 6 ? 3 : 2, b * 90 >> 8, b * 200 >> 8, b);
++		} else {
++			spl2_dot(f, x, y, 3, b, b, b);
++		}
++	}
++	/* a sparkle at a time on the gem */
++	if (h->glint_n != 0) {
++		uint32_t slot = 2000 / h->glint_n, ph = (uint32_t)(t % 2000);
++		uint32_t j = ph * h->glint_n / 2000, q = ph - j * slot;
++		if (j < h->glint_n && q < slot) {
++			int a = sweet_sin[(q * 128 / slot) & 255] * 2;
++			int hs = (int)h->spr / 2;
++			int x0 = spl2_glints[2 * j] - hs, y0 = spl2_glints[2 * j + 1] - hs;
++			for (uint32_t y = 0; y < h->spr; y++) {
++				for (uint32_t x = 0; x < h->spr; x++) {
++					int xx = x0 + (int)x, yy = y0 + (int)y;
++					if (xx < 0 || yy < 0 || (uint32_t)xx >= h->w || (uint32_t)yy >= h->h) {
++						continue;
++					}
++					uint32_t sp = spl2_spr[y * h->spr + x];
++					uint32_t *o = f + (size_t)yy * h->w + xx;
++					*o = spl2_add(*o, (((sp >> 16) & 255) * a) >> 8, (((sp >> 8) & 255) * a) >> 8, ((sp & 255) * a) >> 8);
++				}
++			}
++		}
++	}
++	/* the wordmark: back to the still frame, then a light sweeping it (1.4 s every 3 s) */
++	uint32_t ts = (uint32_t)(t % 3000);
++	int span = (int)(h->ww + h->wh / 2 + 240), pos = -120 + (int)(ts * (uint32_t)span / 1400);
++	for (uint32_t y = 0; y < h->wh; y++) {
++		const uint32_t *b = spl2_base + (size_t)(h->wy + y) * h->w + h->wx;
++		uint32_t *o = f + (size_t)(h->wy + y) * h->w + h->wx;
++		const uint8_t *m = spl2_mask + (size_t)y * h->ww;
++		for (uint32_t x = 0; x < h->ww; x++) {
++			int dd = (int)x + (int)(h->wh - y) / 2 - pos;
++			dd = dd < 0 ? -dd : dd;
++			if (ts < 1400 && dd < 70 && m[x]) {
++				unsigned int a = (unsigned int)(70 - dd) * m[x] / 70;
++				o[x] = spl2_add(b[x], a, a, a);
++			} else {
++				o[x] = b[x];
++			}
++		}
++	}
++}
+ #define SPLASH_GREY     0xff8a8a8au
+ #define SPLASH_HEART    0xffff3b5cu
+ 
+@@ -3451,8 +3572,8 @@
+ 	unsigned int x0 = (w - sweet_splash_w) / 2;
+ 	for (unsigned int y = 0; y < h; y++) {
+ 		uint32_t *row = (uint32_t *)((uintptr_t)dst + (uintptr_t)y * pitch);
+-		unsigned int py = y - SPLASH_PIC_Y;
+-		if (y < SPLASH_PIC_Y || py >= sweet_splash_h) {
++		unsigned int py = y - sweet_splash_y;
++		if (y < sweet_splash_y || py >= sweet_splash_h) {
+ 			for (unsigned int x = 0; x < w; x++) {
+ 				row[x] = 0xff000000u;
+ 			}
+@@ -3488,6 +3609,40 @@
+ 		return;
+ 	}
+ 	const uint32_t *hdr = (const uint32_t *)(m + (sweet_splash_pa & PAGE_MASK));
++	if (hdr[0] == 0x324c5053u) {    /* "SPL2" (0309): the whole blob mapped, its parts found */
++		const struct sweet_spl2 *h2 = (const struct sweet_spl2 *)hdr;
++		if (h2->w != vinfo.v_width || h2->h != vinfo.v_height || h2->n == 0 || h2->gw == 0 ||
++		    h2->gx + h2->gw > h2->w || h2->gy + h2->gh > h2->h || h2->wx + h2->ww > h2->w ||
++		    h2->wy + h2->wh > h2->h || h2->spr > 512 || h2->glint_n > 64) {
++			return;
++		}
++		vm_offset_t m2 = ml_io_map_unmappable((vm_map_offset_t)(sweet_splash_pa & ~(uint64_t)PAGE_MASK),
++		    round_page(sweet_spl2_size(h2) + PAGE_SIZE), VM_WIMG_WCOMB);
++		if (m2 == 0) {
++			return;
++		}
++		h2 = (const struct sweet_spl2 *)(m2 + (sweet_splash_pa & PAGE_MASK));
++		const uint8_t *d = (const uint8_t *)(h2 + 1);
++		spl2_base = (const uint32_t *)d;
++		d += (size_t)h2->w * h2->h * 4;
++		spl2_glow = (const uint32_t *)d;
++		d += (size_t)h2->gw * h2->gh * 4;
++		spl2_mask = d;
++		d += (size_t)h2->ww * h2->wh;
++		spl2_ring = (const int16_t *)d;
++		d += (size_t)h2->n * 4;
++		spl2_spr = (const uint32_t *)d;
++		d += (size_t)h2->spr * h2->spr * 4;
++		spl2_glints = (const int16_t *)d;
++		sweet_spl2 = h2;
++		sweet_splash_w = h2->w;
++		sweet_splash_h = h2->h;
++		sweet_splash_y = 0;
++		sweet_splash_pic = spl2_base;
++		sweet_splash_active = 1;
++		sweet_splash_base((uint32_t *)vinfo.v_baseaddr, vinfo.v_rowbytes, vinfo.v_width, vinfo.v_height);
++		return;
++	}
+ 	if (hdr[0] != 0x484c5053u || hdr[1] == 0 || hdr[1] > vinfo.v_width || hdr[2] == 0 ||
+ 	    SPLASH_PIC_Y + hdr[2] > vinfo.v_height) {
+ 		return;
+@@ -3579,6 +3734,21 @@
+ 		return;
+ 	}
+ 	sweet_splash_base(f, w * 4, w, h);
++	if (sweet_spl2 != NULL) {
++		/* 0309: animated, ~25 frames a second, until iOS's first frame (or 5 minutes) */
++		const struct sweet_spl2 *s2 = sweet_spl2;
++		uint64_t t0 = mach_absolute_time(), ns = 0;
++		sweet_splash_show(f, 0, h);
++		while (sweet_splash_active && ns < 300ull * NSEC_PER_SEC) {
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			sweet_splash2_frame(f, ns / NSEC_PER_MSEC);
++			sweet_splash_show(f, s2->gy, s2->gy + s2->gh);
++			sweet_splash_show(f, s2->wy, s2->wy + s2->wh);
++			sweet_splash_sleep(40);
++		}
++		kfree_data(f, size);
++		return;
++	}
+ 	sweet_splash_line(f, w, h, (int)h - 150, "Hold VOL+ for Recovery", 2, SPLASH_GREY, 0);
+ 	sweet_splash_show(f, 0, h);
+ 

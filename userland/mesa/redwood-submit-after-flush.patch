@@ -1,0 +1,64 @@
+redwood_after_flush(): fn() only once what the asynchronous glFlush sent is in the kernel (freedreno held small submissions back:
+the display showed surfaces the GPU had not drawn yet with /redwood/glasync)
+
+--- a/src/gallium/frontends/osmesa/osmesa.c
++++ b/src/gallium/frontends/osmesa/osmesa.c
+@@ -867,6 +867,39 @@
+  */
+ GLAPI void GLAPIENTRY redwood_after_flush(void (*fn)(void *), void *data);
+ 
++/*
++ * On the driver's thread. freedreno merges a small submission that touches no shared buffer with
++ * the next one (submit merging, fd_submit_sp_flush) unless a fence is asked for: the asynchronous
++ * glFlush's submission could still be held in this process when fn() told the display the frame
++ * had been sent, and the display showed a surface the GPU had not drawn yet (the "leftovers" of
++ * /redwood/glasync). A flush with a fence, and a look at it that waits for nothing, sends what is
++ * held back to the kernel first (as glClientWaitSync(GL_SYNC_FLUSH_COMMANDS_BIT, 0) does).
++ */
++#include "util/u_threaded_context.h"
++
++struct redwood_after {
++   void (*fn)(void *);
++   void *data;
++   struct pipe_context *driver;
++};
++
++static void
++redwood_after_run(void *p)
++{
++   struct redwood_after *after = p;
++   struct pipe_context *driver = after->driver;
++   struct pipe_screen *screen = driver->screen;
++   struct pipe_fence_handle *fence = NULL;
++
++   driver->flush(driver, &fence, 0);
++   if (fence != NULL) {
++      (void)screen->fence_finish(screen, NULL, fence, 0);
++      screen->fence_reference(screen, &fence, NULL);
++   }
++   after->fn(after->data);
++   free(after);
++}
++
+ GLAPI void GLAPIENTRY
+ redwood_after_flush(void (*fn)(void *), void *data)
+ {
+@@ -877,8 +910,17 @@
+       fn(data);
+       return;
+    }
++   struct redwood_after *after = malloc(sizeof(*after));
++
++   if (after == NULL) {
++      fn(data);
++      return;
++   }
++   after->fn = fn;
++   after->data = data;
++   after->driver = threaded_context(pipe)->pipe;
+    _mesa_glthread_finish(osmesa->st->ctx);     /* (the pipe is glthread's while it runs) */
+-   pipe->callback(pipe, fn, data, false);
++   pipe->callback(pipe, redwood_after_run, after, false);
+    pipe->flush(pipe, NULL, PIPE_FLUSH_ASYNC);      /* (sends the batch that holds it on) */
+ }
+ 

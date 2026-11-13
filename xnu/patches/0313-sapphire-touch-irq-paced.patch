@@ -1,0 +1,99 @@
+From: x <x@x>
+Subject: [PATCH] sapphire-0313: touch: with a finger down, the FocalTech frame read as soon as its IRQ says
+ it is there (0.5 ms checks; 240 Hz IC vs a 250 Hz fixed poll gave uneven drags)
+
+---
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -471,7 +471,17 @@
+ static unsigned touch_stale_ms = 6000;
+ static int sweet_touch_stale, sweet_touch_same_ms;
+ static uint64_t touch_rate_down_abs;
+-static unsigned touch_rate_new, touch_rate_reads;
++static unsigned touch_rate_new, touch_rate_reads, touch_irq_reads, touch_late_reads;
++/*
++ * 0313: with a finger down the FocalTech IC has a new frame every 4.17 ms (240 Hz, register 0x88 = 24) and
++ * the IC was read every 4.00 ms on a fixed grid: the two drift past each other ~10 times a second, a read
++ * finds nothing new and the next one a frame up to 4 ms old, so iOS got positions in uneven steps (a
++ * finger's drag stuttered where the injected, perfectly even, touches did not). Now, with a finger down,
++ * the IRQ line (GPIO80, low when the IC has a frame) is looked at every 0.5 ms and the frame read as soon
++ * as it is there (time-stamped within 0.5 ms of the IC's), or after 6 ms anyway. Boot-arg
++ * sweettouchfast=0: the fixed 4 ms grid as before.
++ */
++static unsigned touch_fast = 1;
+ 
+ /* kern.sweet_touch_rate: new frames per second of contact since the last write of 0 (0312) */
+ static int
+@@ -482,12 +492,13 @@
+ 	uint64_t ns = 0;
+ 	absolutetime_to_nanoseconds(touch_rate_down_abs, &ns);
+ 	unsigned ms = (unsigned)(ns / NSEC_PER_MSEC);
+-	snprintf(out, sizeof(out), "%u new frames in %u ms of contact (%u per s)", touch_rate_new, ms,
+-	    ms ? (unsigned)((uint64_t)touch_rate_new * 1000 / ms) : 0);
++	snprintf(out, sizeof(out), "%u new frames in %u ms of contact (%u per s); reads on IRQ %u, late %u; fast %u",
++	    touch_rate_new, ms, ms ? (unsigned)((uint64_t)touch_rate_new * 1000 / ms) : 0, touch_irq_reads,
++	    touch_late_reads, touch_fast);
+ 	int error = SYSCTL_OUT(req, out, strlen(out) + 1);
+ 	if (!error && req->newptr != USER_ADDR_NULL) {
+ 		touch_rate_down_abs = 0;
+-		touch_rate_new = touch_rate_reads = 0;
++		touch_rate_new = touch_rate_reads = touch_irq_reads = touch_late_reads = 0;
+ 	}
+ 	return error;
+ }
+@@ -873,6 +884,9 @@
+ 	 */
+ 	nanoseconds_to_absolutetime(4 * NSEC_PER_MSEC, &period_down);
+ 	nanoseconds_to_absolutetime(10 * NSEC_PER_MSEC, &period_up);
++	uint64_t period_fast, late_after, last_read = 0;
++	nanoseconds_to_absolutetime(500 * NSEC_PER_USEC, &period_fast);
++	nanoseconds_to_absolutetime(6 * NSEC_PER_MSEC, &late_after);
+ 	while (!st.dead) {
+ 		if (st.diag == 2 && ++polls == 3000) {  /* ~30 s at 10 ms */
+ 			panic("SWEET TOUCH stats: frames=%u errs=%u lasterr=%d maxn=%u hid down=%u up=%u last=%d,%d | "
+@@ -883,9 +897,25 @@
+ 			    st.s_raw[8], st.s_raw[9], st.s_raw[10], st.s_raw[11]);
+ 		}
+ 		/* Optional IRQ hint still reads every 100ms, and always while down. */
+-		if (!st.irq_hint || st.active ||
+-		    !(touch_rd(st.west, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)) & 1u) ||
+-		    (++ticks % 10u) == 0) {
++		bool fast = touch_fast && st.irq_hint && st.kind == TOUCH_FTS && st.active;
++		bool irq_low = st.irq_hint && !(touch_rd(st.west, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)) & 1u);
++		bool want;
++		if (fast) {
++			/* 0313: as soon as the IC has a frame, or 6 ms after the last read anyway */
++			uint64_t t = mach_absolute_time();
++			want = irq_low || t - last_read >= late_after;
++			if (want) {
++				if (irq_low) {
++					touch_irq_reads++;
++				} else {
++					touch_late_reads++;
++				}
++			}
++		} else {
++			want = !st.irq_hint || st.active || irq_low || (++ticks % 10u) == 0;
++		}
++		if (want) {
++			last_read = mach_absolute_time();
+ 			int err = st.kind == TOUCH_GOODIX ? touch_goodix() : touch_focaltech();
+ 			if (err) {
+ 				st.s_errs++;
+@@ -900,7 +930,7 @@
+ 				errors = 0;
+ 			}
+ 		}
+-		uint64_t period = st.active ? period_down : period_up, now = mach_absolute_time();
++		uint64_t period = st.active ? (fast ? period_fast : period_down) : period_up, now = mach_absolute_time();
+ 		next = (next == 0 || now > next + period) ? now + period : next + period;
+ 		touch_wait_until(next);
+ 	}
+@@ -929,6 +959,7 @@
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	st.irq_hint = 1; /* topaz: read on IRQ GPIO80 low, while touching, else every 100 ms */
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
++	(void)PE_parse_boot_argn("sweettouchfast", &touch_fast, sizeof(touch_fast));
+ 	(void)PE_parse_boot_argn("sweettouchdiag", &st.diag, sizeof(st.diag));
+ 	/* topaz defaults; sapphire's FT3519T is set from its boot image */
+ 	st.fbits = 2;

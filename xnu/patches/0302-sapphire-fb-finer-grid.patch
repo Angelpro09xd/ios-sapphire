@@ -1,0 +1,43 @@
+From: Angelpro09xd <167892325+Angelpro09xd@users.noreply.github.com>
+Subject: [PATCH] sapphire-0302: sweetfb_hz=180/240: a finer vsync grid for CoreAnimation than the panel's
+
+CoreAnimation's render server starts a frame on a vsync tick. At 120, a frame of 8.4-16.7 ms (most
+of backboardd's on the Adreno 610 during a home screen swipe) waited for the second tick: 60 a
+second (measured: frames of 8.3-12 ms were followed 2 ticks later 90% of the time). With
+sweetfb_hz=180 or 240 the vsync timer, the published modes and IOMFBDisplayRefresh say that rate,
+so such a frame takes three ticks of 4.2 ms (12.5 ms) or two (8.3 ms). The panel still refreshes at
+120. Without the boot-arg nothing changes.
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b7e5b6f..1c52108 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -229,7 +229,7 @@ public:
+ 	bool          directPresent(const uint8_t *rec);
+ 	void          scanFrom(uint64_t pa, uint32_t stride);
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+-	uint32_t      fRateHz;        /* vsync and published refresh rate: 60, 90 or 120 (sweetfb_hz) */
++	uint32_t      fRateHz;        /* vsync and published refresh rate: 60, 90, 120, 180 or 240 (sweetfb_hz) */
+ 	/* 0286: a frame still being sent to the GPU (kern.sweet_fb_frame_await/_sent, backboardd's GL bridge) */
+ 	uint32_t      fAwaitSid;      /* its number, the bridge's (0: none) */
+ 	bool          fAwaitSent;     /* ... reported sent before its swap came */
+@@ -559,8 +559,15 @@ AppleCLCD::start(IOService *provider)
+ 	 * The panel's only timing is 120 Hz (dfps by the vertical front porch, the INTF counts 120
+ 	 * frames a second): with sweetfb_hz=90/120 CoreAnimation is told that rate and the vsync ticks
+ 	 * at it, so frames that are ready sooner are shown sooner. Below 60, ticks stay at 60.
++	 *
++	 * 0302: 180 and 240 too, a finer grid for CoreAnimation than the panel's. Its render server
++	 * starts a frame on a vsync tick, so a frame that takes a little longer than a tick waits for
++	 * the next: at 120, every frame of 8.4-16.7 ms (most of backboardd's on the Adreno 610) came
++	 * 16.7 ms after the last, 60 a second. Told 240, such a frame takes three ticks of 4.2 ms
++	 * (12.5 ms, 80 a second) or two (8.3 ms). The panel still refreshes at 120 and shows the latest
++	 * frame at each of its refreshes.
+ 	 */
+-	fRateHz = hz >= 120 ? 120 : hz >= 90 ? 90 : 60;
++	fRateHz = hz >= 240 ? 240 : hz >= 180 ? 180 : hz >= 120 ? 120 : hz >= 90 ? 90 : 60;
+ 	fVsync->setTimeoutUS(1000000 / fRateHz);
+ 
+ 	publishModes();

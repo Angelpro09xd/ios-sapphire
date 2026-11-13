@@ -1,0 +1,69 @@
+--- ./7400.WWDC_2022_Background-375w-812h@3x~iphone.ca/assets/Head Mask.HEIC
+650x683 alpha
+images: 1  luma_bits: 8  chroma_bits: 8  premultiplied: 0  depth: 0
+color: nclx nclx: primaries=2 transfer=2 matrix=6 full_range=1
+650x683 alpha
+--- ./7400.WWDC_2022_Background-375w-812h@3x~iphone.ca/assets/Head.HEIC
+1105x1160 noalpha
+images: 1  luma_bits: 8  chroma_bits: 8  premultiplied: 0  depth: 0
+color: nclx nclx: primaries=2 transfer=2 matrix=6 full_range=1
+1105x1160 noalpha
+--- ./7400.WWDC_2022_Background-375w-812h@3x~iphone.ca/assets/Leg.HEIC
+1326x1160 alpha
+images: 1  luma_bits: 8  chroma_bits: 8  premultiplied: 0  depth: 0
+color: nclx nclx: primaries=2 transfer=2 matrix=6 full_range=1
+1326x1160 alpha
+--- ./7400.WWDC_2022_Floating-375w-812h@3x~iphone.ca/assets/Arm.HEIC
+1326x1326 alpha
+images: 1  luma_bits: 8  chroma_bits: 8  premultiplied: 0  depth: 0
+color: nclx nclx: primaries=2 transfer=2 matrix=6 full_range=1
+1326x1326 alpha
+--- ./7400.WWDC_2022_Foreground-375w-812h@3x~iphone.ca/assets/Body.HEIC
+1271x1823 alpha
+images: 1  luma_bits: 8  chroma_bits: 8  premultiplied: 0  depth: 0
+color: nclx nclx: primaries=2 transfer=2 matrix=6 full_range=1
+1271x1823 alpha
+--- qemu-aarch64: ./7400.WWDC_2022_Background-375w-812h@3x~iphone.ca/assets/Head Mask.HEIC
+650x683 alpha
+images: 1  luma_bits: 8  chroma_bits: 8  premultiplied: 0  depth: 0
+color: nclx nclx: primaries=2 transfer=2 matrix=6 full_range=1
+650x683 alpha
+arm64 output identical to x86 output
+7400.WWDC_2022_Background-375w-812h@3x~iphone.ca/assets/Head Mask.HEIC
+    heic=65125 B  png=106986 B  RGBA  650x683  OK  chunks=IHDR,IDAT,IEND
+    alpha min=0 max=255 transparent=23.6% opaque=44.4% rgb_extrema=((0, 254), (0, 76), (0, 76))
+    info: images: 1  luma_bits: 8  chroma_bits: 8  premultiplied: 0  depth: 0
+    info: color: nclx nclx: primaries=2 transfer=2 matrix=6 full_range=1
+7400.WWDC_2022_Background-375w-812h@3x~iphone.ca/assets/Head.HEIC
+    heic=608897 B  png=1330947 B  RGB  1105x1160  OK  chunks=IHDR,IDAT,IEND
+     rgb_extrema=((0, 250), (99, 208), (50, 209))
+    info: images: 1  luma_bits: 8  chroma_bits: 8  premultiplied: 0  depth: 0
+    info: color: nclx nclx: primaries=2 transfer=2 matrix=6 full_range=1
+7400.WWDC_2022_Background-375w-812h@3x~iphone.ca/assets/Leg.HEIC
+    heic=310057 B  png=742033 B  RGBA  1326x1160  OK  chunks=IHDR,IDAT,IEND
+    alpha min=0 max=255 transparent=50.7% opaque=49.1% rgb_extrema=((0, 224), (0, 250), (0, 255))
+    info: images: 1  luma_bits: 8  chroma_bits: 8  premultiplied: 0  depth: 0
+    info: color: nclx nclx: primaries=2 transfer=2 matrix=6 full_range=1
+7400.WWDC_2022_Floating-375w-812h@3x~iphone.ca/assets/Arm.HEIC
+    heic=677535 B  png=1376824 B  RGBA  1326x1326  OK  chunks=IHDR,IDAT,IEND
+    alpha min=0 max=255 transparent=32.4% opaque=34.0% rgb_extrema=((0, 255), (0, 255), (0, 255))
+    info: images: 1  luma_bits: 8  chroma_bits: 8  premultiplied: 0  depth: 0
+    info: color: nclx nclx: primaries=2 transfer=2 matrix=6 full_range=1
+7400.WWDC_2022_Foreground-375w-812h@3x~iphone.ca/assets/Body.HEIC
+    heic=808440 B  png=1656113 B  RGBA  1271x1823  OK  chunks=IHDR,IDAT,IEND
+    alpha min=0 max=255 transparent=43.4% opaque=31.7% rgb_extrema=((0, 255), (0, 251), (0, 246))
+    info: images: 1  luma_bits: 8  chroma_bits: 8  premultiplied: 0  depth: 0
+    info: color: nclx nclx: primaries=2 transfer=2 matrix=6 full_range=1
+RESULT: ALL OK
+rc=2
+rc=1
+rc=1
+rc=1
+rc=1
+total 4308
+-rwxr-xr-x 1 angel angel 2105856 Nov  9 11:00 sapphire-heic2png
+-rwxr-xr-x 1 angel angel 2297880 Nov  9 11:00 sapphire-heic2png.x86
+e48d7197951c8eecacb965b10955a51ae9d6c32028f042307027b403c7fd2a20  /home/angel/ios-sapphire/installer/tools-arm64/heic/out/sapphire-heic2png
+bca86ed2bc470ee5a6e89d1eb18d8fe5d68a3c2f6484f66c9069599165b52558  /home/angel/ios-sapphire/installer/tools-arm64/heic/out/sapphire-heic2png.x86
+: Unspecified: Error opening file: No such file or directory (2)
+
