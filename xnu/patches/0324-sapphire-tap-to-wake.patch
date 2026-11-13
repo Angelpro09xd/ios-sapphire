@@ -1,0 +1,166 @@
+0324: tap to wake (tester bug 5). SweetFramebuffer exports the panel state (sweet_fb_panel_off, set where RequestPowerChange
+turns the panel off/on); sweet_touch turns two quick still taps while the panel is off (second down within 400 ms of the first
+lift, within 120 px; each under 250 ms, moved < 40 px, not within 60 px of an edge nor on the fingerprint circle; one finger)
+into a side-button press, sweet_hid_key(0, 1/0) 50 ms apart. Not before the panel has been off 1 s; 1.5 s cooldown.
+kern.sweet_tap_wake / boot-arg sweettapwake: 0 off, 1 single tap, 2 double tap (default); kern.sweet_tap_wakes counts.
+Tap filter after telegdyd hakios inject.c dd78da76 (MIT); code ours.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -76,6 +76,11 @@
+ static AppleCLCD *sweet_cons_fb;
+ static AppleCLCD *sweet_dsi_fb;                 /* 0260: sweet_fb_dsi_seq() */
+ static AppleCLCD *sweet_frame_fb;               /* 0286: kern.sweet_fb_frame_await/_sent */
++/* 0324: the panel's state for tap to wake (bsd/dev/sweet_touch.c): 1 after RequestPowerChange(0), and since when */
++extern "C" volatile int sweet_fb_panel_off;
++extern "C" volatile uint64_t sweet_fb_panel_off_abs;
++volatile int sweet_fb_panel_off;
++volatile uint64_t sweet_fb_panel_off_abs;
+ static void sweet_cons_show(void);
+ class OSDictionary;
+ static void sweet_bl_log(const char *who, OSDictionary *d);
+@@ -2009,6 +2014,8 @@
+ 			bool changed = off != fFB->fPowerOff;
+ 			if (changed) {
+ 				fFB->fPowerOff = off;
++				sweet_fb_panel_off_abs = mach_absolute_time();  /* 0324: tap to wake */
++				sweet_fb_panel_off = off ? 1 : 0;
+ 				fFB->fFadeStep = 0;
+ 				if (off) {
+ 					fFB->fDirty = true;
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -530,10 +530,125 @@
+ SYSCTL_INT(_kern, OID_AUTO, sweet_touch_same_ms, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_touch_same_ms, 0,
+     "longest run of identical touch frames with a contact down, ms (0300)");
+ 
++/*
++ * 0324: tap to wake (tester bug 5). The IC keeps scanning while backboardd has the panel off and
++ * those touches reach iOS, which ignores them. Here taps while the panel is off become a press of
++ * the side button (sweet_hid_key(0, ...), what sweet_keys.c sends for the real one: iOS lights the
++ * lock screen). A tap: one finger, lifted within 250 ms, moved under 40 px, not within 60 px of an
++ * edge (grip) nor in the fingerprint circle (touch_fod's). There is no proximity sensor yet, so the
++ * default asks for two: the second down within 400 ms of the first one's lift, within 120 px of it.
++ * Not before the panel has been off 1 s (a press racing backboardd's off would turn it on again),
++ * and 1.5 s of nothing after a wake. Filter after telegdyd's hakios inject.c (dd78da76, MIT).
++ * kern.sweet_tap_wake (boot-arg sweettapwake): 0 off, 1 single tap, 2 double tap (default);
++ * kern.sweet_tap_wakes: wakes so far.
++ */
++extern volatile int sweet_fb_panel_off;           /* iokit/Kernel/arm/SweetFramebuffer.cpp (0324) */
++extern volatile uint64_t sweet_fb_panel_off_abs;
++extern void sweet_hid_key(int key, int down);     /* iokit/Kernel/arm/hid/SweetHID.cpp: 0 = side button */
++#define TAPW_MAX_MS     250
++#define TAPW_MOVE_PX    40
++#define TAPW_EDGE_PX    60
++#define TAPW_GAP_MS     400
++#define TAPW_NEAR_PX    120
++#define TAPW_OFF_MS     1000
++#define TAPW_COOL_MS    1500
++static unsigned touch_tap_wake = 2;
++static int sweet_tap_wakes;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_tap_wake, CTLFLAG_RW | CTLFLAG_LOCKED, &touch_tap_wake, 0,
++    "touch: tapping the panel while off wakes it: 0 off, 1 single tap, 2 double tap (0324)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_tap_wakes, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_tap_wakes, 0,
++    "touch: wakes by tapping so far (0324)");
++static struct {
++	bool tracking, bad, have_first;
++	unsigned id;
++	int x0, y0, fx, fy;
++	uint64_t down_abs, first_up_abs, cool_until;
++} tapw;
++
++static uint64_t
++tapw_abs(unsigned ms)
++{
++	uint64_t abs = 0;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &abs);
++	return abs;
++}
++
++static bool
++tapw_bad_spot(int x, int y)
++{
++	int dx = x - FOD_X, dy = y - FOD_Y;
++	return x < TAPW_EDGE_PX || x > 1080 - TAPW_EDGE_PX || y < TAPW_EDGE_PX || y > 2400 - TAPW_EDGE_PX ||
++	       dx * dx + dy * dy <= FOD_R * FOD_R;
++}
++
++/* From touch_report() before it updates st.active: st.active is still the previous frame's contacts. */
++static void
++touch_tap_wake_check(uint32_t mask, const int *x, const int *y)
++{
++	uint64_t now = mach_absolute_time();
++	if (touch_tap_wake == 0 || !sweet_fb_panel_off || now < tapw.cool_until ||
++	    now - sweet_fb_panel_off_abs < tapw_abs(TAPW_OFF_MS)) {
++		tapw.tracking = false;
++		tapw.have_first = false;
++		return;
++	}
++	if (!tapw.tracking) {
++		if (mask == 0 || st.active != 0) {
++			return;         /* nothing down, or a touch that began before taps counted: wait for its lift */
++		}
++		tapw.tracking = true;
++		tapw.id = (unsigned)__builtin_ctz(mask);
++		tapw.x0 = x[tapw.id];
++		tapw.y0 = y[tapw.id];
++		tapw.bad = (mask & (mask - 1u)) != 0 || tapw_bad_spot(tapw.x0, tapw.y0);
++		tapw.down_abs = now;
++		if (tapw.have_first && now - tapw.first_up_abs > tapw_abs(TAPW_GAP_MS)) {
++			tapw.have_first = false;        /* too late for a second tap: this may be a new first one */
++		}
++		return;
++	}
++	if (mask != 0) {
++		if (mask != (1u << tapw.id)) {
++			tapw.bad = true;                /* a second finger or another contact: grip, palm */
++		} else {
++			int dx = x[tapw.id] - tapw.x0, dy = y[tapw.id] - tapw.y0;
++			if (dx * dx + dy * dy > TAPW_MOVE_PX * TAPW_MOVE_PX) {
++				tapw.bad = true;        /* a swipe or a brush, not a tap */
++			}
++		}
++		return;
++	}
++	/* every contact lifted */
++	tapw.tracking = false;
++	if (tapw.bad || now - tapw.down_abs > tapw_abs(TAPW_MAX_MS)) {
++		tapw.have_first = false;
++		return;
++	}
++	if (touch_tap_wake >= 2) {
++		int dx = tapw.x0 - tapw.fx, dy = tapw.y0 - tapw.fy;
++		if (!tapw.have_first || dx * dx + dy * dy > TAPW_NEAR_PX * TAPW_NEAR_PX) {
++			tapw.have_first = true;         /* the first tap: wait for the second */
++			tapw.first_up_abs = now;
++			tapw.fx = tapw.x0;
++			tapw.fy = tapw.y0;
++			return;
++		}
++	}
++	tapw.have_first = false;
++	tapw.cool_until = now + tapw_abs(TAPW_COOL_MS);
++	sweet_tap_wakes++;
++	printf("SWEET TOUCH: tap to wake (%s at %d,%d): side button press\n",
++	    touch_tap_wake >= 2 ? "double tap" : "tap", tapw.x0, tapw.y0);
++	sweet_hid_key(0, 1);
++	delay(50 * 1000);       /* 50 ms down, like a short real press (sweet_keys.c debounces 40 ms) */
++	sweet_hid_key(0, 0);
++}
++
+ static void
+ touch_report(uint32_t mask, const int *x, const int *y)
+ {
+ 	touch_fod(mask, x, y);
++	touch_tap_wake_check(mask, x, y);
+ 	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
+ 		uint32_t bit = 1u << id;
+ 		if (mask & bit) {
+@@ -1024,6 +1139,7 @@
+ 	(void)PE_parse_boot_argn("sweettouch_ry", &st.ry, sizeof(st.ry));
+ 	(void)PE_parse_boot_argn("sweettouch_rawlog", &st.rawlog, sizeof(st.rawlog));
+ 	(void)PE_parse_boot_argn("sweettouch_stale_ms", &touch_stale_ms, sizeof(touch_stale_ms));
++	(void)PE_parse_boot_argn("sweettapwake", &touch_tap_wake, sizeof(touch_tap_wake));      /* 0324 */
+ 	if (st.fbits != 4u) {
+ 		st.fbits = 2;
+ 	}

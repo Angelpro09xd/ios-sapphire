@@ -439,8 +439,38 @@ trace_cmd(uint16_t op, const uint8_t *par, size_t plen)
 	case 0x0c1a: say("BR: write scan enable %#x (1 inquiry scan = discoverable, 2 page scan = connectable)",
 	    plen ? par[0] : 0); break;
 	case 0x0c13: say("BR: local name set"); break;
+	case 0x0419: say("BR: remote name request"); break;
+	case 0x0c45: say("BR: write inquiry mode %u", plen ? par[0] : 0); break;
 	default: break;
 	}
+}
+
+/*
+ * one inquiry result: [num=1][addr 6][psrm][reserved 1 or 2][class 3][clock 2]([rssi])...; *cod, *rssi filled.
+ * 0x02 has 2 reserved bytes and no RSSI, 0x22 / 0x2F one reserved byte and an RSSI. Only num == 1 is decoded.
+ */
+static int
+inq_decode(const uint8_t *p, size_t n, const uint8_t **addr, uint32_t *cod, int *rssi)
+{
+	if (n < 4 || p[3] < 1)
+		return -1;
+	size_t cl = p[1] == 0x02 ? 4 + 6 + 1 + 2 : 4 + 6 + 1 + 1;   /* offset of the class */
+	if (p[3] != 1 || n < cl + 3 + 2 + (p[1] == 0x02 ? 0 : 1))
+		return -1;
+	*addr = p + 4;
+	*cod = (uint32_t)(p[cl] | (p[cl + 1] << 8) | (p[cl + 2] << 16));
+	*rssi = p[1] == 0x02 ? 0 : (int8_t)p[cl + 5];
+	return 0;
+}
+
+/* the Major Device Class, as iOS Settings uses it (1 computer, 2 phone, 4 audio/video, 5 peripheral, ...) */
+static const char *
+cod_major(uint32_t cod)
+{
+	static const char *m[] = { "misc", "computer", "phone", "network", "audio/video", "peripheral", "imaging",
+		"wearable", "toy", "health" };
+	unsigned k = (cod >> 8) & 0x1f;
+	return k < sizeof(m) / sizeof(m[0]) ? m[k] : "uncategorized";
 }
 
 static void
@@ -449,10 +479,23 @@ trace_event(const uint8_t *p, size_t n)
 	if (p[0] != 4 || n < 3)
 		return;
 	switch (p[1]) {
-	case 0x01: say("BR: inquiry complete, %u results", inq_results); break;
+	case 0x01: say("BR: inquiry complete status %#x, %u results", n >= 4 ? p[3] : 0, inq_results); break;
 	case 0x02: case 0x22: case 0x2f:
-		if (inq_results++ < 20)
-			say("BR: inquiry result (event %#x, %u so far)", p[1], inq_results);
+		if (inq_results++ < 20) {
+			const uint8_t *a;
+			uint32_t cod;
+			int rssi;
+			if (inq_decode(p, n, &a, &cod, &rssi) == 0)
+				say("BR: inquiry result (event %#x, %u so far): ..:%02x:%02x class %06x (%s) rssi %d", p[1],
+				    inq_results, a[1], a[0], cod, cod_major(cod), rssi);
+			else
+				say("BR: inquiry result (event %#x, %u so far)", p[1], inq_results);
+		}
+		break;
+	case 0x07: say("BR: remote name complete status %#x", p[3]); break;
+	case 0x0f:
+		if (n >= 7 && (p[5] | (p[6] << 8)) == 0x0401)
+			say("BR: inquiry Command Status %#x", p[3]);
 		break;
 	case 0x03: say("BR: connection complete status %#x handle %#x", p[3], n >= 6 ? p[4] | (p[5] << 8) : 0); break;
 	case 0x04: say("BR: connection request (class %02x%02x%02x)", n >= 12 ? p[11] : 0, n >= 11 ? p[10] : 0,
@@ -542,9 +585,40 @@ scan_seen_add(const uint8_t *addr, unsigned type, int rssi)
 	}
 }
 
+/* "inquiry N" on the control socket: btshim's own classic inquiry (GIAC) of about N s, straight to the WCN, results
+ * kept from bluetoothd and logged: tells "the radio hears nothing" from "bluetoothd/Settings drop what it hears".
+ * Run it with Settings > Bluetooth closed (bluetoothd must not be inquiring at the same time). */
+static int inq_test;
+static time_t inq_end;
+static unsigned inq_test_results;
+
 static void
 from_controller(const uint8_t *p, size_t n)
 {
+	if (inq_test && p[0] == 4 && n >= 3) {
+		if (p[1] == 0x0f && n >= 7 && (p[5] | (p[6] << 8)) == 0x0401) {
+			say("inquiry test: Command Status %#x%s", p[3], p[3] ? " (refused)" : "");
+			if (p[3])
+				inq_test = 0;
+			return;
+		}
+		if (p[1] == 0x02 || p[1] == 0x22 || p[1] == 0x2f) {
+			const uint8_t *a;
+			uint32_t cod;
+			int rssi;
+			inq_test_results++;
+			if (inq_decode(p, n, &a, &cod, &rssi) == 0)
+				say("inquiry test: answer %u (event %#x): ..:%02x:%02x class %06x (%s) rssi %d", inq_test_results,
+				    p[1], a[1], a[0], cod, cod_major(cod), rssi);
+			return;
+		}
+		if (p[1] == 0x01) {
+			say("inquiry test: complete, status %#x, %u answers%s", n >= 4 ? p[3] : 0, inq_test_results,
+			    inq_test_results ? "" : " (nothing discoverable in range, or the radio does not hear)");
+			inq_test = 0;
+			return;
+		}
+	}
 	if (scan_test) {
 		uint16_t cop = (uint16_t)(p[4] | (p[5] << 8));
 		if (p[0] == 4 && p[1] == 0x0e && n >= 7 && (cop == 0x200b || cop == 0x200c || cop == 0x2041 || cop == 0x2042)) {
@@ -669,6 +743,7 @@ from_host(const uint8_t *p, size_t n)
 		if (op == 0x0c03) {     /* HCI_Reset: bluetoothd (re)starts; its advertising instances are gone */
 			memset(adv, 0, sizeof(adv));
 			le_scanning = 0;
+			le_random_set = 0;      /* the reset clears the controller's random address too */
 		}
 		if ((op >> 10) == 0x08 && le_legacy(op, par, plen))
 			return;
@@ -774,6 +849,26 @@ ctl_serve(int s)
 		ctl_reply(c, 0, line);
 		return;
 	}
+	if (!strncmp(line, "inquiry", 7)) {
+		int secs = atoi(line + 7);
+		if (!controller_up || opt_fake || inq_test) {
+			ctl_reply(c, 1, line);
+			return;
+		}
+		if (secs <= 0)
+			secs = 10;
+		if (secs > 60)
+			secs = 60;
+		/* HCI_Inquiry: GIAC 0x9E8B33, length in 1.28 s units, unlimited responses */
+		uint8_t q[5] = { 0x33, 0x8b, 0x9e, (uint8_t)((secs * 100 + 127) / 128), 0x00 };
+		inq_test = 1;
+		inq_test_results = 0;
+		inq_end = time(NULL) + secs + 5;
+		qca_cmd(0x0401, q, 5);
+		say("inquiry test: started for %d x 1.28 s", q[3]);
+		ctl_reply(c, 0, line);
+		return;
+	}
 	/* deepsleep, reset and RunCommand text: nothing to do yet (the WCN stays up) */
 	ctl_reply(c, 0, line);
 }
@@ -867,6 +962,10 @@ daemon_main(void)
 			say("scan test: done, %u advertising reports from %u devices", scan_reports, scan_devs);
 		} else if (scan_test == 2 && time(NULL) >= scan_end) {
 			scan_test = 0;
+		}
+		if (inq_test && time(NULL) >= inq_end) {
+			say("inquiry test: no Inquiry Complete in time (%u answers)", inq_test_results);
+			inq_test = 0;
 		}
 		struct timeval tv = { 1, 0 };
 		int k = select(mx + 1, &r, NULL, NULL, opt_fake ? NULL : &tv);
@@ -1032,6 +1131,13 @@ main(int argc, char **argv)
 		snprintf(req, sizeof(req), "scan %s", argc > 2 ? argv[2] : "10");
 		int r = ask_daemon(req);
 		printf("scan test %s (see /var/tmp/btshim.log)\n", r == 0 ? "started" : "refused");
+		return r;
+	}
+	if (!strcmp(mode, "inquiry")) {  /* btshim inquiry [seconds]: the daemon's classic inquiry test */
+		char req[32];
+		snprintf(req, sizeof(req), "inquiry %s", argc > 2 ? argv[2] : "10");
+		int r = ask_daemon(req);
+		printf("inquiry test %s (see /var/tmp/btshim.log)\n", r == 0 ? "started" : "refused");
 		return r;
 	}
 	if (!strcmp(mode, "bluetool"))

@@ -21,6 +21,25 @@
  * relabelled), LE Enhanced Connection Complete (0x0A) -> LE Connection Complete (0x01).
  * Our own commands go one at a time (the WCN's command credit is 1): a queue, the next one sent when the
  * previous one's Command Complete/Status arrives; those events never reach bluetoothd (non-zero status logged).
+ *
+ * 2026-11-13 draft (testers bug 29b, "Bluetooth on, finds no devices"): the scan bluetoothd asks for was
+ * translated faithfully, and the WCN refused it, but the refusal was only logged (bluetoothd had already been told
+ * "success"), so iOS believed it was scanning while the radio was not:
+ *   - Filter_Duplicates 2 ("reset each period") in LE Set Extended Scan Enable with Duration = Period = 0 is
+ *     Invalid HCI Command Parameters (0x12) by Core 5.x Vol 4 Part E 7.8.65. Apple's stack sends 2 (seen by the
+ *     xreactx OnePlus 6T port, WCN3990, on 0x200C). Now 2 -> 1.
+ *   - Own_Address_Type random (1) or "RPA else random" (3) without a random address ever set is also 0x12 at scan
+ *     enable (7.8.64/7.8.65). Apple's controllers generate their private addresses themselves (Broadcom LE_META IRK
+ *     VSCs, which btshim only acknowledges), so bluetoothd never sends LE Set Random Address. Now: public (0)
+ *     unless bluetoothd did send 0x2005 since the last reset. Same for 0x200D -> 0x2043.
+ *   - Window > interval, or 100 % duty-cycle defaults (0x30/0x30) for Apple's 0xFE29: clamped, default 0x60/0x30 so
+ *     classic inquiry/page get air time.
+ *   - A refused scan enable is retried once with the safest parameters (public, dup 1, 0x60/0x30), loudly logged.
+ *   - own_event() only swallows the answer to the command btshim itself has in flight: an extended LE command that
+ *     bluetoothd sends on its own (the WCN's supported-commands mask, passed through, advertises them) gets its
+ *     Command Complete instead of a "timedout waiting for controller".
+ *   - Counters: "le: N advertising reports from M devices passed to bluetoothd".
+ * The idea of the first two items comes from xreactx's hakios.bt6t.c (APSL/MIT, OnePlus 6T); no code was copied.
  */
 
 /* ---------------------------------------------------------------- our own command queue */
@@ -30,7 +49,13 @@ static struct own_cmd own_q[48];
 static unsigned own_head, own_tail;     /* tail: next to send */
 static int own_busy;
 static uint16_t own_inflight;
+static uint8_t own_inflight_arg;        /* its first parameter byte (0x2042: enable or disable) */
 static time_t own_sent_at;
+
+static int le_random_set;               /* bluetoothd sent LE Set Random Address since the last HCI_Reset */
+static int le_scan_retried;             /* the current scan request has been retried once already */
+static int le_scanning;                 /* bluetoothd asked for a scan and has not stopped it */
+static void scan_retry_safe(void);
 
 static int
 is_own_op(uint16_t op)
@@ -51,6 +76,7 @@ own_pump(void)
 	own_tail++;
 	own_busy = 1;
 	own_inflight = c->op;
+	own_inflight_arg = c->len ? c->par[0] : 0;
 	own_sent_at = time(NULL);
 	if (opt_verbose)
 		say("le: -> %#06x (%u bytes)", c->op, c->len);
@@ -89,18 +115,28 @@ own_event(const uint8_t *p, size_t n)
 	}
 	if (!is_own_op(op))
 		return 0;
+	if (!own_busy || op != own_inflight)
+		return 0;       /* bluetoothd's own extended command (or a late answer): its event, pass it on */
 	if (op == 0x2043 && p[1] == 0x0f) {     /* relabel for bluetoothd, who sent 0x200D */
 		uint8_t q[7];
 		memcpy(q, p, 7);
 		q[5] = 0x0d, q[6] = 0x20;
 		to_host(q, 7);
 	}
+	uint8_t arg = own_inflight_arg;
 	if (st)
-		say("le: WCN answered %#06x with status %#x", op, st);
-	if (op == own_inflight) {
-		own_busy = 0;
-		own_pump();
+		say("le: WCN answered %#06x%s with status %#x", op,
+		    op == 0x2042 ? (arg ? " (scan ENABLE)" : " (scan disable)") : "", st);
+	own_busy = 0;
+	if (op == 0x2042 && arg == 1 && st == 0)
+		say("le: scan running on the WCN");
+	if ((op == 0x2041 || (op == 0x2042 && arg == 1)) && st && le_scanning && !le_scan_retried) {
+		/* the scan bluetoothd believes is running is not: once, the safest parameters */
+		le_scan_retried = 1;
+		say("le: SCAN REFUSED by the WCN (%#06x status %#x): retrying public address, dup 1, 0x60/0x30", op, st);
+		scan_retry_safe();
 	}
+	own_pump();
 	return 1;
 }
 
@@ -186,26 +222,88 @@ adv_enable(int h, int on)
 /* ---------------------------------------------------------------- scanning */
 
 static uint8_t scan_type = 1;           /* active */
-static uint16_t scan_int = 0x0030, scan_win = 0x0030;
+static uint16_t scan_int = 0x0060, scan_win = 0x0030;  /* 60 ms / 30 ms: half the air time left to BR/EDR */
 static uint8_t scan_own = 0, scan_filter = 0;
-static int le_scanning;
+
+/* an own address type the WCN will take for scanning/initiating: random needs a random address set first */
+static uint8_t
+own_addr_ok(uint8_t own, const char *what)
+{
+	if ((own == 1 || own == 3) && !le_random_set) {
+		static unsigned told;
+		if (told++ < 4)
+			say("le: %s with own address type %u but no random address set: public instead", what, own);
+		return 0;
+	}
+	return own > 3 ? 0 : own;
+}
 
 static void
 scan_apply(int on, uint8_t dup)
 {
 	if (on) {
-		uint8_t p[8] = { scan_own, scan_filter, 0x01, scan_type,
-			(uint8_t)(scan_int & 0xff), (uint8_t)(scan_int >> 8), (uint8_t)(scan_win & 0xff), (uint8_t)(scan_win >> 8) };
-		if (le_scanning) {
-			uint8_t off[6] = { 0 };
-			own_cmd(0x2042, off, 6);
-		}
+		uint16_t iv = scan_int, wn = scan_win;
+		if (iv < 0x0004)
+			iv = 0x0004;
+		if (wn < 0x0004)
+			wn = 0x0004;
+		if (wn > iv)
+			wn = iv;
+		uint8_t own = own_addr_ok(scan_own, "scan");
+		uint8_t filt = scan_filter > 3 ? 0 : scan_filter;
+		uint8_t type = scan_type > 1 ? 1 : scan_type;
+		uint8_t p[8] = { own, filt, 0x01, type, (uint8_t)(iv & 0xff), (uint8_t)(iv >> 8), (uint8_t)(wn & 0xff),
+			(uint8_t)(wn >> 8) };
+		/* always a disable first: Set Extended Scan Parameters is Command Disallowed while scanning, and our idea of
+		 * le_scanning may be stale (a refused enable); disabling an idle scan is not an error */
+		uint8_t off[6] = { 0 };
+		own_cmd(0x2042, off, 6);
 		own_cmd(0x2041, p, 8);
+		if (dup > 1) {
+			/* 2 = "reset each period" needs a non-zero Period/Duration in the extended command: 0x12 otherwise */
+			static unsigned told;
+			if (told++ < 4)
+				say("le: Filter_Duplicates %u -> 1 (2 is invalid with Period 0)", dup);
+			dup = 1;
+		}
+		say("le: scanning on (type %u, own %u, filter %u, interval %#x, window %#x, dup %u)", type, own, filt, iv, wn,
+		    dup);
+	} else {
+		say("le: scanning off");
 	}
-	uint8_t e[6] = { (uint8_t)(on ? 1 : 0), dup, 0, 0, 0, 0 };
+	uint8_t e[6] = { (uint8_t)(on ? 1 : 0), dup > 1 ? 1 : dup, 0, 0, 0, 0 };
 	own_cmd(0x2042, e, 6);
 	le_scanning = on;
-	say("le: scanning %s (type %u, interval %#x, window %#x)", on ? "on" : "off", scan_type, scan_int, scan_win);
+}
+
+/* one retry after the WCN refused a scan bluetoothd believes runs: public, accept all, 1M, current type */
+static void
+scan_retry_safe(void)
+{
+	scan_own = 0;
+	scan_filter = 0;
+	scan_int = 0x0060;
+	scan_win = 0x0030;
+	scan_apply(1, 1);
+}
+
+/* reports passed to bluetoothd: a count and a rough number of distinct devices, for the log */
+static unsigned le_reports;
+static unsigned le_devs;
+static uint8_t le_seen[128][6];
+
+static void
+le_count(const uint8_t *addr)
+{
+	le_reports++;
+	unsigned k;
+	for (k = 0; k < le_devs; k++)
+		if (!memcmp(le_seen[k], addr, 6))
+			break;
+	if (k == le_devs && le_devs < 128)
+		memcpy(le_seen[le_devs++], addr, 6);
+	if (le_reports == 1 || le_reports == 10 || le_reports == 100 || le_reports % 1000 == 0)
+		say("le: %u advertising reports from %u devices passed to bluetoothd", le_reports, le_devs);
 }
 
 /* ---------------------------------------------------------------- bluetoothd's commands */
@@ -302,8 +400,10 @@ le_vsc(uint16_t op, const uint8_t *par, size_t plen)
 		for (size_t i = 0; i < plen && i < 16; i++)
 			k += snprintf(hex + k, sizeof(hex) - (size_t)k, "%02x ", par[i]);
 		say("le: Olympic scan enable: %s", hex);
-		if (plen >= 1)
+		if (plen >= 1) {
+			le_scan_retried = 0;
 			scan_apply(par[0] != 0, plen >= 2 ? par[1] : 0);
+		}
 		ok_reply(op);
 		return 1;
 	}
@@ -330,6 +430,7 @@ le_legacy(uint16_t op, const uint8_t *par, size_t plen)
 		if (plen >= 6) {
 			adv[0].addr_type = 1;
 			memcpy(adv[0].addr, par, 6);
+			le_random_set = 1;
 		}
 		return 0;       /* forwarded as it is */
 	case 0x2006:            /* LE Set Advertising Parameters [min2][max2][type][own][peer type][peer6][map][filter] */
@@ -366,19 +467,23 @@ le_legacy(uint16_t op, const uint8_t *par, size_t plen)
 			scan_win = (uint16_t)(par[3] | (par[4] << 8));
 			scan_own = par[5];
 			scan_filter = par[6];
+			say("le: scan parameters from bluetoothd: type %u interval %#x window %#x own %u filter %u", scan_type,
+			    scan_int, scan_win, scan_own, scan_filter);
 		}
 		ok_reply(op);
 		return 1;
 	case 0x200c:            /* LE Set Scan Enable [enable][dup] */
-		if (plen >= 2)
+		if (plen >= 2) {
+			le_scan_retried = 0;
 			scan_apply(par[0] != 0, par[1]);
+		}
 		ok_reply(op);
 		return 1;
 	case 0x200d:            /* LE Create Connection -> LE Extended Create Connection (1M) */
 		if (plen >= 25) {
 			uint8_t p[26];
 			p[0] = par[4];                  /* initiator filter policy */
-			p[1] = par[12];                 /* own address type */
+			p[1] = own_addr_ok(par[12], "LE create connection");    /* own address type */
 			p[2] = par[5];                  /* peer address type */
 			memcpy(p + 3, par + 6, 6);      /* peer address */
 			p[9] = 0x01;                    /* 1M */
@@ -441,6 +546,7 @@ le_event(const uint8_t *p, size_t n)
 			q[k++] = r[13];                 /* RSSI */
 			q[2] = (uint8_t)(k - 3);
 			to_host(q, k);
+			le_count(r + 3);
 			r += 24 + dl;
 		}
 		return 1;

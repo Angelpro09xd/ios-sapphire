@@ -1,0 +1,252 @@
+0325: battery percent (tester bug 9). Start from Android's QG SoC in PM7250B SDAM (sid 2 0xb100 +0x46 valid, +0x47 soc,
++0x54 RTC time, +0x80 magic 0x12345678) when stamped by the PM6125 RTC (sid 0 0x6048) no more than sweetbat_sdam_age (600) s
+ago; otherwise the cell's own OCV curve (25 C column of the guanyu-5000mAh profile in sapphire's dtbo) replaces the generic one.
+Then integrate the QG current every poll over 5020 mAh; the OCV pulls slowly at light load and fully when the gauge is not
+sampling. Shown: only the way the current goes, 99 until full. Read only; logs charger APSD/ICL/FCC/JEITA for the charge study.
+
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -12,9 +12,11 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
++#include <kern/clock.h>
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" int sweet_spmi_read_any(unsigned sid, unsigned addr, uint8_t *out);     /* any PMIC register, read only */
+ extern "C" int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
+ /* bsd/dev/sweet_i2c1.c: topaz battery bus (QUP0 SE1) */
+ extern "C" int sweet_i2c1_init(void);
+@@ -194,11 +196,19 @@
+ unsigned
+ SweetBattery::estimatePercent(unsigned mv)
+ {
+-	/* Generic single-cell curve, intentionally NOT advertised as QG SOC.
+-	 * Load sag, temperature, aging and charging introduce large errors. */
+-	static const unsigned volts[] = {3400, 3500, 3600, 3700, 3800, 3900,
+-	    4000, 4100, 4200, 4350};
+-	static const unsigned soc[] = {1, 5, 10, 20, 40, 60, 75, 85, 93, 100};
++	/*
++	 * 0325: this cell's own open-circuit curve, 25 C column of qcom,pc-temp-v1-lut (0.1 mV units) in
++	 * sapphire's dtbo, qcom,qbg-battery-profile-guanyu-5000mAh (the nvt-5000mAh profile is within 20 mV).
++	 * At 3.93 V under +0.8 A (open circuit ~3.81 V) the generic 3.4-4.35 V curve gave 42 %, this one 29 %.
++	 * Still an estimate: load (taken out with 0.15 ohm by the caller), temperature and aging.
++	 */
++	static const unsigned volts[] = {3000, 3325, 3474, 3563, 3625, 3671, 3696, 3704, 3709, 3720,
++	    3736, 3753, 3766, 3778, 3789, 3797, 3806, 3816, 3829, 3844, 3860, 3879, 3892, 3909, 3932,
++	    3962, 3985, 4004, 4041, 4083, 4129, 4178, 4230, 4282, 4331, 4377, 4422, 4452, 4495};
++	static const unsigned soc[] = {0, 1, 2, 3, 4, 5, 6, 8, 10, 12,
++	    14, 16, 18, 20, 22, 24, 28, 32, 36, 40, 44, 48, 50, 52, 54,
++	    56, 58, 60, 64, 68, 72, 76, 80, 84, 88, 92, 96, 98, 100};
++	static_assert(sizeof(volts) == sizeof(soc), "OCV table");
+ 	if (mv <= volts[0]) {
+ 		return soc[0];
+ 	}
+@@ -212,6 +222,57 @@
+ }
+ 
+ /*
++ * 0325: Android's QG keeps its state in the PM7250B's SDAM (sid 2, 0xb100: qcom,qg-sdam@b100 under
++ * qpnp,qg / "qcom,pm7250b-qg" in sapphire's dtbo) and rewrites it at every SoC update. Offsets from
++ * Linux qg-reg.h / qg-sdam.c (msm-4.19 drivers/power/supply/qcom): VALID 0x46 (1), SOC 0x47 (1, the
++ * shown %), TEMP 0x48 (2, 0.1 C), OCV_UV 0x4c (4), TIME_SEC 0x54 (4, PMIC RTC seconds), MAGIC 0x80 (4,
++ * 0x12345678 once qpnp-qg has initialised it). Little endian. Read only, through the observer.
++ */
++static bool
++qgSdam(unsigned offset, unsigned length, uint32_t *value)
++{
++	uint32_t v = 0;
++	for (unsigned i = 0; i < length && i < 4; i++) {
++		uint8_t b = 0;
++		if (sweet_spmi_read_any(2, 0xb100u + offset + i, &b) != 0) {
++			return false;
++		}
++		v |= (uint32_t)b << (8 * i);
++	}
++	*value = v;
++	return true;
++}
++
++/*
++ * 0325: PM6125's RTC (sid 0, "qcom,pm8941-rtc" at 0x6000; Linux rtc-pm8xxx pm8941 layout: RDATA0-3 at
++ * 0x6048, CTRL 0x6046 bit 7 enable), the clock QG stamps TIME_SEC with. Raw seconds, as Linux 4.19
++ * reads them (no offset). Byte 0 read again: if it moved during the read, read again.
++ */
++static bool
++pmicRtc(uint32_t *seconds)
++{
++	uint8_t ctrl = 0;
++	if (sweet_spmi_read_any(0, 0x6046, &ctrl) != 0 || !(ctrl & 0x80u)) {
++		return false;
++	}
++	for (unsigned attempt = 0; attempt < 3; attempt++) {
++		uint32_t v = 0;
++		bool ok = true;
++		for (unsigned i = 0; i < 4 && ok; i++) {
++			uint8_t b = 0;
++			ok = sweet_spmi_read_any(0, 0x6048u + i, &b) == 0;
++			v |= (uint32_t)b << (8 * i);
++		}
++		uint8_t again = 0;
++		if (ok && sweet_spmi_read_any(0, 0x6048, &again) == 0 && again == (uint8_t)v) {
++			*seconds = v;
++			return true;
++		}
++	}
++	return false;
++}
++
++/*
+  * topaz (MakrSas/topaz-woa TopazBattery gauge.c): SM5602 fuel gauge at 0x71
+  * (16-bit little-endian words) and the bq25890-map charger at 0x6a, REG0B.
+  * Read-only: nothing is written to either chip; charging runs in hardware.
+@@ -361,32 +422,109 @@
+ 	 * (1/8 of each new reading), its percent shown at most 1 point every 30 s, never down while
+ 	 * charging nor up while discharging; "full" only after 3 polls in a row.
+ 	 */
+-	static int64_t avgMv16;                 /* the averaged estimate, mV * 16 */
+-	static unsigned shown, sinceChange, fullPolls;
++	/*
++	 * 0325 (tester bug 9): the voltage alone read 20 points low on this 4.45 V cell. Now:
++	 * - start: Android's own percent, from the QG's SDAM (qgSdam), if it is valid, stamped by the
++	 *   PMIC RTC no more than sweetbat_sdam_age (600) s ago (Linux's own rule, 360 s by default: the
++	 *   phone was just restarted from Android). Otherwise (iOS after iOS, a cold boot) the cell's real
++	 *   open-circuit curve (estimatePercent) at the voltage with the current's drop taken out.
++	 * - then: the charge counted, the measured current integrated over 5020 mAh every poll.
++	 * - the curve still pulls, slowly (~30 min), when the load is light (|I| < 150 mA: the drop is
++	 *   small), and at once when there is no live current (the gauge's samples are not moving: no
++	 *   Linux ran the QG this power-up): the 0213 behaviour.
++	 * - shown: never up while discharging nor down while charging, 99 until the charger says full.
++	 * ioreg: SweetBatterySOCSource 1 SDAM, 2 voltage; SweetBatteryChargeUAh; SweetBatteryOCVPercent.
++	 */
++	static const int64_t kCapUAh = 5020ll * 1000ll;
++	static bool seeded;
++	static int64_t chargeUAh;               /* charge left, uAh, 0..kCapUAh */
++	static uint64_t lastAbs;
++	static unsigned shown, fullPolls, source, stillPolls, gaps;
++	static uint16_t lastRawV, lastRawI;
+ 	unsigned percent = shown != 0 ? shown : 50;
++	unsigned ocvPct = 0;
++	int ocvMv = 0;
++	fullPolls = (external && state == 5 && !(error & 2u)) ? fullPolls + 1 : 0;
++	full = fullPolls >= 3;
+ 	if (haveV) {
+-		int ocv = (int)mv - (int)((int64_t)ma * 15 / 100);     /* ma > 0 charging: the voltage stands above the OCV */
+-		if (ocv < 3000) {
+-			ocv = 3000;
+-		}
+-		avgMv16 = avgMv16 == 0 ? (int64_t)ocv * 16 : avgMv16 + ((int64_t)ocv * 16 - avgMv16) / 8;
+-		unsigned target = estimatePercent((unsigned)(avgMv16 / 16));
+-		if (shown == 0) {
++		ocvMv = (int)mv - (int)((int64_t)ma * 15 / 100);       /* ma > 0 charging: the voltage stands above the OCV */
++		if (ocvMv < 3000) {
++			ocvMv = 3000;
++		}
++		ocvPct = estimatePercent((unsigned)ocvMv);
++	}
++	if (!seeded && regs && haveV) {
++		seeded = true;
++		uint32_t valid = 0, soc = 0, when = 0, magic = 0, temp = 0, now = 0;
++		bool sdam = qgSdam(0x46, 1, &valid) && qgSdam(0x47, 1, &soc) && qgSdam(0x48, 2, &temp) &&
++		    qgSdam(0x54, 4, &when) && qgSdam(0x80, 4, &magic);
++		bool rtc = pmicRtc(&now);
++		long long age = (sdam && rtc) ? (long long)now - (long long)when : -1;
++		unsigned maxAge = 600;
++		(void)PE_parse_boot_argn("sweetbat_sdam_age", &maxAge, sizeof(maxAge));
++		bool useSdam = sdam && valid == 1 && magic == 0x12345678u && soc <= 100 && age >= 0 &&
++		    age <= (long long)maxAge;
++		unsigned start = useSdam ? soc : ocvPct;
++		source = useSdam ? 1 : 2;
++		chargeUAh = kCapUAh * start / 100;
++		lastAbs = mach_absolute_time();
++		IOLog("SWEET BATTERY: start at %u%% from %s; SDAM %s valid %u soc %u temp %d (0.1 C) magic %#x, age %lld s "
++		    "(max %u, rtc %s %u); now %u mV %d mA, open circuit ~%d mV = %u%%\n", start,
++		    useSdam ? "Android's QG (SDAM)" : "the voltage", sdam ? "read" : "unreadable", valid, soc,
++		    (int)(int16_t)temp, magic, age, maxAge, rtc ? "at" : "unreadable", now, mv, ma, ocvMv, ocvPct);
++	}
++	if (seeded) {
++		uint64_t nowAbs = mach_absolute_time(), ns = 0;
++		absolutetime_to_nanoseconds(nowAbs - lastAbs, &ns);
++		lastAbs = nowAbs;
++		uint64_t ms = ns / NSEC_PER_MSEC;
++		/* the same raw V and I for a minute is a gauge that is not sampling, not a measurement */
++		stillPolls = (rawVoltage == lastRawV && rawCurrent == lastRawI) ? stillPolls + 1 : 0;
++		lastRawV = rawVoltage;
++		lastRawI = rawCurrent;
++		bool live = currentValid && which < 3 && stillPolls < 30;     /* 3: the power-on OCV sample, fixed */
++		if (live && ms <= 30000) {
++			chargeUAh += (int64_t)ma * (int64_t)ms / 3600;          /* mA * ms / 3600 = uAh */
++		} else if (ms > 30000) {
++			gaps++;
++		}
++		if (haveV && (!live || (ma > -150 && ma < 150))) {
++			int64_t target = kCapUAh * ocvPct / 100;
++			chargeUAh += (target - chargeUAh) / (live ? 900 : 30);
++		}
++		if (haveV && !external && mv < 3450 && chargeUAh > kCapUAh * 3 / 100) {
++			chargeUAh -= (chargeUAh - kCapUAh * 3 / 100) / 10;      /* sagging near the 3.4 V cutoff: head for 3 % */
++		}
++		if (full) {
++			chargeUAh = kCapUAh;
++		}
++		if (chargeUAh < 0) {
++			chargeUAh = 0;
++		} else if (chargeUAh > kCapUAh) {
++			chargeUAh = kCapUAh;
++		}
++		unsigned target = (unsigned)((chargeUAh * 100 + kCapUAh / 2) / kCapUAh);
++		if (target >= 100 && !full) {
++			target = 99;
++		}
++		if (target == 0 && haveV && mv > 3500) {
++			target = 1;
++		}
++		if (full) {
++			shown = 100;
++		} else if (shown == 0) {
+ 			shown = target;
+-			sinceChange = 0;
+-		} else if (++sinceChange >= 15 && target != shown) {
++		} else if (target != shown) {
+ 			bool up = target > shown;
+-			if ((up && !(charging && (ma >= 0))) || (!up && charging)) {
+-				/* not the way the current goes: stay */
+-			} else {
+-				shown += up ? 1 : -1;
+-				sinceChange = 0;
++			if (!live || (up && ma > 0) || (!up && ma < 0)) {
++				shown += up ? 1 : -1;   /* at most a point a poll, and only the way the current goes */
+ 			}
+ 		}
+ 		percent = shown;
++		putNumber("SweetBatterySOCSource", source);
++		putNumber("SweetBatteryChargeUAh", (UInt32)chargeUAh);
++		putNumber("SweetBatteryOCVPercent", ocvPct);
+ 	}
+-	fullPolls = (external && state == 5 && !(error & 2u)) ? fullPolls + 1 : 0;
+-	full = fullPolls >= 3;
+ 	if (!regs) {
+ 		static unsigned bad;
+ 		if (bad++ % 30 == 0) {
+@@ -402,6 +540,20 @@
+ 		IOLog("SWEET BATTERY: sid %u: %umV from %#x (~%u%%, monotonic soc %u) %dmA usb %#x path %#x chgr %#x err %#x present %#x "
+ 		    "-> external=%d charging=%d full=%d\n", sid, mv, haveV ? vregs[which] : 0, percent, msoc, ma, usb, path, charger,
+ 		    error, present, external, charging, full);
++		/*
++		 * 0325: the gauge, and what limits the charge (read only; Linux smb5-reg.h, 50 mA steps):
++		 * APSD_RESULT 0x1308 (bit 0 SDP, 2 CDP, 3 DCP, 5 QC2, 6 QC3), USBIN_CURRENT_LIMIT_CFG 0x1370,
++		 * ICL_STATUS 0x1107 (the limit in use after AICL), FAST_CHARGE_CURRENT_CFG 0x1061, and the
++		 * charger's JEITA band from BATTERY_CHARGER_STATUS_7 0x100d (bits 5/4 warm/cool, 3/2 hot/cold).
++		 */
++		uint8_t apsd = 0, iclCfg = 0, iclNow = 0, fcc = 0;
++		(void)sweet_spmi_read(sid, 0x1308, &apsd);
++		(void)sweet_spmi_read(sid, 0x1370, &iclCfg);
++		(void)sweet_spmi_read(sid, 0x1107, &iclNow);
++		(void)sweet_spmi_read(sid, 0x1061, &fcc);
++		IOLog("SWEET BATTERY: gauge %u%% (source %u, %lld uAh, ocv %d mV = %u%%, still %u, gaps %u); charger apsd %#x "
++		    "icl cfg %u mA in use %u mA, fcc %u mA, jeita %#x\n", percent, source, chargeUAh, ocvMv, ocvPct,
++		    stillPolls, gaps, apsd, iclCfg * 50u, iclNow * 50u, fcc * 50u, temperature);
+ 	}
+ }
+ 
