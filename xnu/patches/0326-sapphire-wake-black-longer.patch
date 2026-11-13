@@ -1,0 +1,14 @@
+0326: at display on, the panel stays black up to 2 s (was 0.3 s) for the first new frame: with Metal, backboardd took longer
+and the frame from before display off flashed before the lock screen.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2029,7 +2029,7 @@
+ 					 * is presented; only if none comes in 0.3 s is the old one shown.
+ 					 */
+ 					fFB->fDirty = false;
+-					fFB->fWakeTicks = fFB->fRateHz * 3 / 10 + 1;
++					fFB->fWakeTicks = fFB->fRateHz * 2 + 1;   /* 0326: 2 s (0.3 s ran out before Metal backboardd sent its first frame after wake: the old frame flashed, then the lock screen) */
+ 				}
+ 			}
+ 			uint32_t level = fFB->fBlLevel;
