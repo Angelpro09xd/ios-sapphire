@@ -1241,8 +1241,19 @@ cmd_autodata(const char *apn)
 			fclose(f);
 		}
 	}
-	if (apn == NULL) {
-		apn = "internet";
+	/*
+	 * bug 23: "internet" fits the developer's carrier only. Without an APN from the command
+	 * line or /var/root/apn, try in turn: no APN at all (WDS Start Network then uses the modem's default
+	 * profile, the one Android's carrier config last wrote into the modem: right for the SIM the phone
+	 * had in Android), then "internet". A choice that fails at once moves to the next one.
+	 */
+	const char *choices[3];
+	int nchoices = 0, which = 0;
+	if (apn != NULL) {
+		choices[nchoices++] = apn;
+	} else {
+		choices[nchoices++] = NULL;     /* the modem's default profile */
+		choices[nchoices++] = "internet";
 	}
 	time_t last_online = 0;
 	for (;;) {
@@ -1258,8 +1269,10 @@ cmd_autodata(const char *apn)
 			sleep(3);
 			continue;
 		}
-		printf("autodata: attached, data call on APN %s\n", apn);
+		apn = choices[which];
+		printf("autodata: attached, data call on %s%s\n", apn ? "APN " : "the modem's default profile", apn ? apn : "");
 		fflush(stdout);
+		time_t started = time(NULL);
 		pid_t pid = fork();
 		if (pid == 0) {
 			_exit(cmd_datacall(apn));
@@ -1267,6 +1280,9 @@ cmd_autodata(const char *apn)
 		int st = 0;
 		if (pid > 0) {
 			(void)waitpid(pid, &st, 0);
+		}
+		if (st != 0 && time(NULL) - started < 20 && nchoices > 1) {
+			which = (which + 1) % nchoices;         /* refused at once: the next APN choice */
 		}
 		printf("autodata: data call ended (status %d), again in 10 s\n", st);
 		fflush(stdout);

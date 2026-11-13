@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Tester bug 6 (kernel 0322).
+  The kick killed wifid 20 s after EVERY boot. kcon logs (2026-11-10..13, 8 boots): the first wifid
+  usually had the radio up 1-3 s after it asked (apple80211 get 106 RSSI_BOUNDS), but the wifid that
+  launchd relaunches after the kill always sat ~4 min 35-45 s before touching en0 again
+  (17:30:00->17:34:35, 18:48:01->18:52:40, 22:58:41->23:03:23, 12:11:06->12:15:51 ...). That is the
+  "Wi-Fi frozen / won't turn on for a few minutes after boot".
+  Now: kill only if the first wifid has not read RSSI_BOUNDS by 25 s (kern.sweet_wifid_opened, from
+  drafts/wifid-opened-sysctl.patch; dmesg is no good: its buffer rolls over within seconds at boot).
+  Without the sysctl (older kernel) it behaves as before.
+  Better long-term: find what the relaunched wifid waits on (spindump wifid during the stall).
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.sapphire.wifidkick</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/var/jb/bin/bash</string>
+		<string>-c</string>
+		<string>sleep 25; if [ "$(/var/jb/usr/sbin/sysctl -n kern.sweet_wifid_opened 2>/dev/null || echo 0)" -gt 0 ]; then echo "wifidkick: wifid is up, left alone" > /dev/console; else /var/jb/usr/bin/killall -9 wifid; echo "wifidkick: wifid had not brought en0 up in 25 s: restarted" > /dev/console; fi</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>LaunchOnlyOnce</key>
+	<true/>
+	<key>UserName</key>
+	<string>root</string>
+</dict>
+</plist>

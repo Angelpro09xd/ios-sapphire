@@ -1,0 +1,24 @@
+0320: SweetFramebuffer: sweetfb_scale=1 -- iOS draws its points at 1x (375 x 812 or 414 x 896), scaled onto the panel
+by the GPU as for 2x; four times fewer pixels for a GPU bound by memory bandwidth.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -456,11 +456,17 @@
+ 	int scale = 3, width2x = 828;
+ 	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
+ 	PE_parse_boot_argn("sweetfb_w", &width2x, sizeof(width2x));
+-	fScale2 = scale == 2 && fLogicalW == SWEET_FB_LOGICAL_W && fLogicalH == SWEET_FB_LOGICAL_H &&
++	/* 0320: sweetfb_scale=1 too -- iOS draws its points at 1x (375 x 812, 414 x 896), four times fewer pixels
++	 * than 2x for a GPU bound by memory bandwidth; fScale2 means scaled onto the panel, whatever the factor */
++	fScale2 = (scale == 2 || scale == 1) && fLogicalW == SWEET_FB_LOGICAL_W && fLogicalH == SWEET_FB_LOGICAL_H &&
+ 	    (width2x == 750 || width2x == 828);
+ 	if (fScale2) {
+ 		fLogicalW = (uint32_t)width2x;
+ 		fLogicalH = width2x == 828 ? 1792 : SWEET_FB_LOGICAL_H * 2 / 3;
++		if (scale == 1) {
++			fLogicalW /= 2;
++			fLogicalH /= 2;
++		}
+ 		IOLog("SWEET FB: iOS draws at 2x, %ux%u, scaled onto the panel by the GPU\n", fLogicalW, fLogicalH);
+ 	}
+ 	fLock = IOLockAlloc();

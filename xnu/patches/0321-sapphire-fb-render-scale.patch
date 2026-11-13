@@ -1,0 +1,72 @@
+0321: SweetFramebuffer: kern.sweet_fb_rscale (boot-arg sweetrscale, permille) -- the GPU driver draws the 2x frame
+into that part of the surface and the panel copy scales that part; kern.sweet_fb_ids lists the panel surfaces.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -157,6 +157,17 @@
+  * cost ~162k dc civac, 10.4 MB, on every frame for nothing. kern.sweet_fb_flipflush=1 puts it back.
+  */
+ static int sweet_fb_flipflush = 0;
++/*
++ * 0321: a render scale under the 2x one. kern.sweet_fb_rscale (permille, 400 to 1000; boot-arg sweetrscale, default
++ * 1000) says how much of the 2x surface the window server's GPU driver drew: HakiosMetal draws the frame into the
++ * top-left rscale x rscale part of it (viewport and scissor scaled; the surface sampled back for blurs is that part,
++ * as a smaller texture), and the panel copy scales that part instead of the whole surface. iOS keeps its 2x geometry,
++ * assets and caches (at 1x Settings, the wallpaper and widgets broke). kern.sweet_fb_ids: the IOSurface ids swapped
++ * onto the panel lately, so that the driver scales those passes only.
++ */
++static int sweet_fb_rscale = 1000;
++static uint32_t sweet_fb_ids[4];
++static unsigned sweet_fb_ids_next;
+ #define SWEET_FB_LOW_SIZE       0x03000000ull
+ static uint64_t sweet_fb_low_used;
+ 
+@@ -456,6 +467,7 @@
+ 	int scale = 3, width2x = 828;
+ 	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
+ 	PE_parse_boot_argn("sweetfb_w", &width2x, sizeof(width2x));
++	PE_parse_boot_argn("sweetrscale", &sweet_fb_rscale, sizeof(sweet_fb_rscale));
+ 	/* 0320: sweetfb_scale=1 too -- iOS draws its points at 1x (375 x 812, 414 x 896), four times fewer pixels
+ 	 * than 2x for a GPU bound by memory bandwidth; fScale2 means scaled onto the panel, whatever the factor */
+ 	fScale2 = (scale == 2 || scale == 1) && fLogicalW == SWEET_FB_LOGICAL_W && fLogicalH == SWEET_FB_LOGICAL_H &&
+@@ -1673,8 +1685,19 @@
+ 				if (!(s->gpuDrawn && seed_now == s->gpuSeed)) {
+ 					sweet_dcache_clean((vm_offset_t)(src + s->offset), (unsigned)((uint64_t)s->height * s->bytesPerRow));
+ 				}
+-				/* the panel's window of the 3x picture, in the 2x one's pixels << 8 */
+-				uint64_t kx = ((uint64_t)fLogicalW << 8), ky = ((uint64_t)fLogicalH << 8);
++				/* the panel's window of the 3x picture, in the 2x one's pixels << 8 (0321: of the part drawn) */
++				int rs = sweet_fb_rscale >= 400 && sweet_fb_rscale <= 1000 ? sweet_fb_rscale : 1000;
++				uint64_t kx = ((uint64_t)fLogicalW << 8) * (uint64_t)rs / 1000, ky = ((uint64_t)fLogicalH << 8) * (uint64_t)rs / 1000;
++				{
++					uint32_t sid = s->id;
++					bool known = false;
++					for (unsigned i = 0; i < 4; i++) {
++						known |= sweet_fb_ids[i] == sid;
++					}
++					if (!known) {
++						sweet_fb_ids[sweet_fb_ids_next++ & 3] = sid;
++					}
++				}
+ 				shown = sapphire_gpu_copy_scaled(s->memory, s->offset, s->bytesPerRow,
+ 				    (uint32_t)((uint64_t)fOffX * kx / SWEET_FB_LOGICAL_W), (uint32_t)((uint64_t)fOffY * ky / SWEET_FB_LOGICAL_H),
+ 				    (uint32_t)((uint64_t)fWidth * kx / SWEET_FB_LOGICAL_W), (uint32_t)((uint64_t)fHeight * ky / SWEET_FB_LOGICAL_H),
+@@ -2320,6 +2343,18 @@
+ 	}
+ 	return error;
+ }
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_rscale, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_rscale, 0,
++    "sapphire 0321: permille of the 2x surface the GPU driver draws (400-1000)");
++static int
++sweet_fb_ids_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint32_t ids[4];
++	memcpy(ids, sweet_fb_ids, sizeof(ids));
++	return SYSCTL_OUT(req, ids, sizeof(ids));
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_ids, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    NULL, 0, sweet_fb_ids_sysctl, "S", "0321: the IOSurface ids swapped onto the panel lately");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_flipflush, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_flipflush, 0,
+     "sapphire 0304: 1 = flush the whole flip buffer after each 2x GPU copy (as before)");
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_frame_await, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,

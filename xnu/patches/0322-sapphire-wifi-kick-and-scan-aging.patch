@@ -1,0 +1,115 @@
+0322: Wi-Fi: kern.sweet_wifid_opened (wifid read RSSI_BOUNDS: com.sapphire.wifidkick restarts wifid only if it is 0 at 25 s;
+a wifid restarted when it was fine sat ~4.5 min before using en0); the scan table drops APs not heard for 120 s and
+recycles the oldest when full (with 64 BSSIDs heard no new network was listed or joinable). Tester bugs 6 and 7.
+
+--- a/bsd/dev/sapphire_apple80211.c
++++ b/bsd/dev/sapphire_apple80211.c
+@@ -47,6 +47,16 @@
+ #include <sys/sapphire_sta.h>
+ #include <sys/sockio.h>
+ #include <sys/systm.h>
++#include <sys/sysctl.h>
++
++/*
++ * 0322: how many times wifid has read the RSSI bounds, i.e. opened the device and gone on to power and
++ * scan. com.sapphire.wifidkick reads it 25 s into the boot and restarts wifid only if it is still 0
++ * (a wifid restarted when it was fine sat ~4.5 min before touching en0 again).
++ */
++static int sweet_wifid_opened;
++SYSCTL_INT(_kern, OID_AUTO, sweet_wifid_opened, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_wifid_opened, 0,
++    "sapphire: times wifid read RSSI_BOUNDS (the device opened)");
+ 
+ #define SIOCSA80211             0x802869c8u     /* _IOW('i', 200, struct apple80211req) */
+ #define SIOCGA80211             0xc02869c9u     /* _IOWR('i', 201, struct apple80211req) */
+@@ -398,6 +408,7 @@
+ 			int32_t min, max, threshold;
+ 		} answer = { .version = 1, .min = NOISE_FLOOR_DBM, .max = -20, .threshold = -85 };
+ 
++		sweet_wifid_opened++;           /* (0322: wifid got as far as opening the device) */
+ 		return give(request, &answer, sizeof(answer));
+ 	}
+ 	case 21:                                /* how the last join went (0: not over yet) */
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -6081,9 +6081,37 @@
+ static bool scan_started, scanning;
+ static unsigned next_scan_ms;
+ 
++/*
++ * 0322: access points not heard for BSS_MAX_AGE_MS leave the table when the next scan starts (the scan
++ * fills it again with what is still there). Before, the table only ever grew: networks that had gone
++ * stayed listed and, with 64 entries, new ones were dropped. The network joined is always kept.
++ */
++#define BSS_MAX_AGE_MS 120000u
++static bool bss_is_ours(const uint8_t *bssid);  /* (below, next to the join's state) */
++static void
++bss_age(void)
++{
++	uint32_t keep = 0, gone = 0;
++	for (uint32_t i = 0; i < nbss; i++) {
++		if (g_ms - bss[i].last_ms <= BSS_MAX_AGE_MS || bss_is_ours(bss[i].bssid)) {
++			if (keep != i) {
++				bss[keep] = bss[i];
++			}
++			keep++;
++		} else {
++			gone++;
++		}
++	}
++	nbss = keep;
++	if (gone != 0) {
++		LOG("t=%u ms: scan: %u networks not heard for %u s forgotten, %u kept", g_ms, gone, BSS_MAX_AGE_MS / 1000, keep);
++	}
++}
++
+ static bool
+ scan_send_start(void)
+ {
++	bss_age();
+ 	static uint8_t m[512];
+ 	uint8_t *p = m, *c;
+ 	bzero(m, sizeof(m));
+@@ -6438,10 +6466,25 @@
+ 		}
+ 	}
+ 	if (b == NULL) {
+-		if (nbss >= 64) {
+-			return;
++		if (nbss < 64) {
++			b = &bss[nbss++];
++		} else {
++			/*
++			 * 0322: the table is full: the access point heard longest ago makes room. Before, once 64
++			 * BSSIDs had been heard (a campus or a block of flats: every AP has one per band and per
++			 * name) no new network was ever listed again, nor could it be joined ("no such network heard").
++			 */
++			uint32_t old = 0;
++			for (uint32_t i = 1; i < nbss; i++) {
++				if (bss[i].last_ms < bss[old].last_ms) {
++					old = i;
++				}
++			}
++			if (g_ms - bss[old].last_ms < 5000 || bss_is_ours(bss[old].bssid)) {
++				return;                 /* all heard in the last 5 s (or it is ours): wait for the next scan */
++			}
++			b = &bss[old];
+ 		}
+-		b = &bss[nbss++];
+ 		bzero(b, sizeof(*b));
+ 		memcpy(b->bssid, f + 16, 6);
+ 		fresh = true;
+@@ -6865,6 +6908,14 @@
+ static volatile bool s_join_asked, s_leave_asked;
+ static volatile uint32_t s_join_done;           /* bumped when a join ends either way */
+ static uint8_t s_ssid[32], s_ssid_len, s_bssid[6], s_pmk[32];
++
++/* 0322: the access point being joined or joined (never aged out of the scan table) */
++static bool
++bss_is_ours(const uint8_t *bssid)
++{
++	static const uint8_t none[6] = {};
++	return memcmp(s_bssid, none, 6) != 0 && memcmp(bssid, s_bssid, 6) == 0;
++}
+ static uint8_t s_body[768];                     /* the AP's beacon IEs */
+ static uint32_t s_body_len, s_freq, s_aid, s_tries, s_deadline, s_desc, s_msg1s;
+ static bool s_rsn, s_start_resp, s_ptk_set;
