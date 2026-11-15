@@ -28,16 +28,19 @@ env:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
-      # Xcode 16.0 as on Codemagic (patch 0128 gives iig's IORPC.kernelContent)
-      - name: Xcode 16.0
+      # Xcode 16.0 as on Codemagic (patch 0141 gives iig's IORPC.kernelContent)
+      - name: Xcode 16.x
         run: |
           ls -d /Applications/Xcode*.app
-          sudo xcode-select -s /Applications/Xcode_16.0.app
+          # macos-14 images were retired; take the oldest Xcode 16.x on macos-15 (the port was built with 16.0)
+          X=$(ls -d /Applications/Xcode_16*.app | sort -V | head -1)
+          echo "using $X"
+          sudo xcode-select -s "$X"
           xcodebuild -version
 
       - uses: actions/cache@v4
@@ -89,7 +92,7 @@ jobs:
         run: |
           mkdir -p out
           cp -R dxb/fakeroot/System/Library/Kernels/. out/
-          (cd out && shasum -a 256 kernel.* > SHA256SUMS)
+          (cd out && find . -maxdepth 1 -type f -name "kernel.*" -exec shasum -a 256 {} + > SHA256SUMS && cat SHA256SUMS)
           ls -la out
 
       - uses: actions/upload-artifact@v4

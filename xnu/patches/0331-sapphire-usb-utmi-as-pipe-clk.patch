@@ -1,0 +1,53 @@
+0331: sweet_usb: UTMI as the PIPE clock (Linux dwc3_qcom_select_utmi_clk), boot-arg sweetusb_utmipipe=1
+
+For this HS-only controller, gadget_start runs the sequence Linux's dwc3-qcom runs for
+qcom,select-utmi-as-pipe-clk: QSCRATCH GENERAL_CFG PIPE_UTMI_CLK_DIS set, PIPE_UTMI_CLK_SEL and
+PIPE3_PHYSTATUS_SW set, PIPE_UTMI_CLK_DIS cleared, 1 ms apart. The log line "SWEET USBDIAG utmipipe=1
+GENERAL_CFG 0x... -> 0x..." gives the register before and after.
+
+boot-arg sweetusb_utmipipe, default 0 in this patch (0332 makes it 1).
+
+Why: on a normal boot the USB3 PHY pipe clock is off (0329's snapshot), and ep0 SETEPCONFIG times out.
+Measured on normal boots: with sweetusb_utmipipe=1 the phone enumerated in 5 of 5 boots (GENERAL_CFG
+0x4 -> 0xd), without it in 0 of 3.
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -2111,6 +2111,37 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	}
+ 	ud_if_create();
+ 
++	/*
++	 * 0331 (boot-arg sweetusb_utmipipe; the default is set below): use the UTMI clock as the
++	 * PIPE clock, as Linux dwc3-qcom does for an HS-only controller (dwc3_qcom_select_utmi_clk,
++	 * binding qcom,select-utmi-as-pipe-clk: "disable USB3 pipe_clk requirement"). 0329 showed that
++	 * on a normal boot GCC gcc_usb3_prim_phy_pipe_clk (CBCR 0x1a058) reads 0x80000001 (enabled but
++	 * off: no USB3 PHY running) while it runs after `fastboot continue` (0x00000001), the femto HS
++	 * PHY being identical on both paths, and QSCRATCH GENERAL_CFG 0x4 on both (never selected).
++	 */
++	{
++		int utmipipe = 0;
++		PE_parse_boot_argn("sweetusb_utmipipe", &utmipipe, sizeof(utmipipe));
++		if (utmipipe) {
++			vm_offset_t qsg = ml_io_map(QSCRATCH_PA, 0x100);
++			if (qsg != 0) {
++				volatile uint32_t *gcfg = (volatile uint32_t *)(qsg + 0x08);    /* QSCRATCH_GENERAL_CFG */
++				uint32_t before = *gcfg;
++				*gcfg = *gcfg | (1u << 8);                      /* PIPE_UTMI_CLK_DIS */
++				__asm__ volatile ("dsb sy" ::: "memory");
++				delay(1000);
++				*gcfg = *gcfg | (1u << 0) | (1u << 3);          /* PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW */
++				__asm__ volatile ("dsb sy" ::: "memory");
++				delay(1000);
++				*gcfg = *gcfg & ~(1u << 8);                     /* clear PIPE_UTMI_CLK_DIS */
++				__asm__ volatile ("dsb sy" ::: "memory");
++				delay(1000);
++				printf("SWEET USBDIAG utmipipe=%d GENERAL_CFG 0x%08x -> 0x%08x\n", utmipipe, before, *gcfg);
++			} else {
++				printf("SWEET USBDIAG utmipipe: QSCRATCH map failed\n");
++			}
++		}
++	}
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;

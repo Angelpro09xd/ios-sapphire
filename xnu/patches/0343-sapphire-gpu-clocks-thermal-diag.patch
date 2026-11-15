@@ -1,0 +1,388 @@
+0343: SapphireGpu: clocks, DDR and temperatures, measured (read only): kern.sweet_gpu_clocks, kern.sweet_ddr_khz, kern.sweet_thermal, kern.sweet_gpu_temp
+
+Read only: nothing changes what a block does, and nothing runs unless a sysctl is read (or boot-arg
+gpu_clkdiag=1 prints both lines after the GPU powers up).
+
+- kern.sweet_gpu_clocks (string, ~0.2 s): gx_gfx3d and cx_gmu through the GPU CC debug mux,
+  gcc_gpu_memnoc_gfx and gcc_bimc_gpu_axi through the GCC's, both CPU clusters through the APSS mux, and the
+  DDR from the memory controller's period register, with Qualcomm's clock measurement as the stock
+  debugcc-khaje.c / clk-debug.c do it (muxes and inputs from debugcc-khaje.c). Debug branches and the XO/4
+  branch are left as found. Before the GPU is powered it gives only the DDR.
+- kern.sweet_ddr_khz (int): 10^12 / the period in ps at 0x447d220 (mccc_debug of the stock device tree).
+- kern.sweet_thermal (string): the 16 TSENS sensors (SROT 0x4410000, TM 0x4411000; tsens2xxx.c / Linux
+  tsens-v2.c), each by the name of the stock thermal zone that uses it, in milli-degrees C, with SROT_CTRL
+  and TM_TRDY; values outside -40..150 C are not valid. kern.sweet_gpu_temp (int): sensor 15, the stock
+  "gpu" zone; ENODEV, EAGAIN (first round not complete) or EIO (no valid value).
+
+Locking: the clock measurement runs under its own lock (clk_lock); its pages are mapped once on first use.
+TSENS and the DDR period are plain reads.
+
+Measured on the phone at boot: gx_gfx3d 819998 kHz (gpu_mhz=820), DDR 1555210 kHz, CPU clusters 2803196
+and 1900802 kHz; one minute after boot the 16 sensors read 65.6-70.2 C. No hang reading any of them.
+
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -347,6 +347,22 @@ static uint32_t vco2;
+ static uint32_t cx_arg = ~0u, mx_arg = ~0u;
+ static uint32_t cx_voted, mx_voted;             /* the levels this driver asked the RPM for (0: none) */
+ static uint32_t bin_fuse = ~0u;                 /* the speed bin (~0: not read) */
++/*
++ * sapphire 0343: what the clocks and the temperatures really are, read only.
++ *   kern.sweet_gpu_clocks  measures, when it is read (about 0.2 s), the GPU's core clock, the GMU clock, the two bus
++ *                          branches the GPU's memory traffic crosses, the DDR's clock and both CPU clusters' clocks;
++ *   kern.sweet_ddr_khz     the DDR's clock in kHz, from the memory controller's period register (no GPU needed);
++ *   kern.sweet_thermal     every TSENS sensor of the SoC, by the name of its thermal zone in the stock device tree, in
++ *                          milli-degrees C, with the state of the controller;
++ *   kern.sweet_gpu_temp    the GPU's sensor (TSENS 15, thermal zone "gpu"), in milli-degrees C;
++ *   gpu_clkdiag=1          puts the clocks and the temperatures in the boot log after the power-up.
++ * Nothing here changes what a block does: the clock measurement picks a clock on the debug muxes and runs their
++ * counter, as the stock clk_measure does from debugfs, and leaves the debug branches as it found them; the rest are
++ * register reads.
++ */
++static uint32_t clkdiag;
++static bool clocks_up;                          /* power_up() succeeded: the GPU CC's clocks may be measured */
++static IOLock *clk_lock;
+ /*
+  * boot-arg gpu_smmu_early: program the identity context bank as soon as its clock is voted,
+  * before the GX domain comes up, instead of in cp_start(). The GPU's SMMU comes out of the
+@@ -1130,10 +1146,316 @@ power_up(void)
+ 	return ok;
+ }
+ 
++/*
++ * 0343: Qualcomm's clock measurement, as the stock debugcc-khaje.c and clk-debug.c do it (MiCode topaz-t-oss
++ * 345999da: clk-debug.c run_measurement() and clk_debug_mux_measure_rate(); debugcc-khaje.c for the muxes and their
++ * inputs). The GCC debug mux (GCC + 0x62000, its divider + 0x30000, its branch + 0x30004) picks a clock; a counter runs
++ * on it while XO/4 (4.8 MHz) counts a number of ticks (control GCC + 0x62038, status + 0x6203c); a short run first
++ * tells a clock that is off, whose counter does not move. The GPU CC has its own mux (GPU CC + 0x1568, a divider by 2
++ * at + 0x10fc, its branch + 0x1100) on input 0xed of the GCC's; the CPU clusters' clocks come through the APSS mux
++ * (0xf11101c, a divider by 8) on input 0xb6; the DDR's clock is read as a period in ps from the memory controller's
++ * clock block (mccc_debug, 0x447d200 + 0x20).
++ */
++#define GCC_DBG_MUX         0x62000u
++#define GCC_DBG_DIV         0x30000u
++#define GCC_DBG_CBCR        0x30004u
++#define GCC_XO_DIV4_CBCR    0x28008u
++#define GCC_MEAS_CTL        0x62038u
++#define GCC_MEAS_STATUS     0x6203cu
++#define GPUCC_DBG_MUX       0x1568u
++#define GPUCC_DBG_DIV       0x10fcu
++#define GPUCC_DBG_CBCR      0x1100u
++#define MEAS_TERM_MASK      0x000fffffu         /* XO_DIV4_TERM_CNT_MASK */
++#define MEAS_CNT_EN         (1u << 20)
++#define MEAS_CLR_CNT        (1u << 21)
++#define MEAS_DONE           (1u << 25)          /* XO_DIV4_CNT_DONE */
++#define MEAS_CNT_MASK       0x01ffffffu         /* MEASURE_CNT */
++#define MEAS_TICKS_SHORT    0x1000u             /* SAMPLE_TICKS_1_MS */
++#define MEAS_TICKS_FULL     0x20000u            /* SAMPLE_TICKS_27_MS */
++#define APSS_DBG_PA         0x0f111000ull       /* the mux register is at + 0x1c */
++#define MCCC_PA             0x0447d000ull       /* the period register is at + 0x220 */
++
++static volatile uint8_t *apss_dbg, *mccc;
++
++/* A device page mapped once and kept; two callers racing both map it and one mapping is given back. */
++static volatile uint8_t *
++map_reg_page(volatile uint8_t *volatile *where, uint64_t pa)
++{
++	if (*where == NULL) {
++		IOMemoryMap *m = map_phys(pa, 0x1000, false);
++		if (m == NULL) {
++			return NULL;
++		}
++		if (!OSCompareAndSwapPtr(NULL, (void *)m->getVirtualAddress(), (void * volatile *)where)) {
++			m->release();
++		}
++	}
++	return *where;
++}
++
++static uint32_t
++meas_run(uint32_t ticks)
++{
++	rmw(gcc, GCC_MEAS_CTL, MEAS_CNT_EN, 0);
++	rmw(gcc, GCC_MEAS_CTL, 0, MEAS_CLR_CNT);
++	IODelay(1);
++	rmw(gcc, GCC_MEAS_CTL, MEAS_CLR_CNT, 0);
++	rmw(gcc, GCC_MEAS_CTL, MEAS_TERM_MASK, ticks & MEAS_TERM_MASK);
++	rmw(gcc, GCC_MEAS_CTL, 0, MEAS_CNT_EN);
++	for (unsigned i = 0; i < 100 && (rd(gcc, GCC_MEAS_STATUS) & MEAS_DONE) == 0; i++) {
++		IOSleep(1);
++	}
++	rmw(gcc, GCC_MEAS_CTL, MEAS_CNT_EN, 0);
++	return rd(gcc, GCC_MEAS_STATUS) & MEAS_CNT_MASK;
++}
++
++/* kHz of input sel of the GCC debug mux, times the dividers on the way to it; 0: the clock is off. */
++static uint32_t
++meas_khz(uint32_t sel, uint32_t dividers)
++{
++	uint32_t xo4 = rd(gcc, GCC_XO_DIV4_CBCR), brief, full;
++
++	rmw(gcc, GCC_DBG_MUX, 0x3ff, sel);
++	rmw(gcc, GCC_DBG_DIV, 0xf, 0);              /* post_div_val 1 */
++	rmw(gcc, GCC_DBG_CBCR, 0, CBCR_EN);
++	wr(gcc, GCC_XO_DIV4_CBCR, xo4 | CBCR_EN);
++	brief = meas_run(MEAS_TICKS_SHORT);
++	full = meas_run(MEAS_TICKS_FULL);
++	wr(gcc, GCC_XO_DIV4_CBCR, xo4);
++	rmw(gcc, GCC_DBG_CBCR, CBCR_EN, 0);
++	if (full == brief) {
++		return 0;
++	}
++	/* clk_debug_mux_measure_rate(): ((count * 10 + 15) * 4.8 MHz) / (ticks * 10 + 35) */
++	uint64_t hz = ((uint64_t)full * 10 + 15) * 4800000ull / ((uint64_t)MEAS_TICKS_FULL * 10 + 35);
++	return (uint32_t)(hz * dividers / 1000);
++}
++
++static uint32_t
++meas_gpucc_khz(uint32_t sel)
++{
++	uint32_t khz;
++
++	rmw(gpucc, GPUCC_DBG_MUX, 0xff, sel);
++	rmw(gpucc, GPUCC_DBG_DIV, 0xf, 1);          /* post_div_val 2 */
++	rmw(gpucc, GPUCC_DBG_CBCR, 0, CBCR_EN);
++	khz = meas_khz(0xed, 2);
++	rmw(gpucc, GPUCC_DBG_CBCR, CBCR_EN, 0);
++	return khz;
++}
++
++static uint32_t
++meas_cpu_khz(uint32_t perf)
++{
++	if (map_reg_page(&apss_dbg, APSS_DBG_PA) == NULL) {
++		return 0;
++	}
++	rmw(apss_dbg, 0x1c, 0x3ff00, perf << 8);    /* 1 measure_only_perf_clk (gold), 0 measure_only_pwclk_clk (silver) */
++	rmw(apss_dbg, 0x1c, 0xf0000000u, 0);        /* post_div_val 1; the fixed pre-divider is 8 */
++	return meas_khz(0xb6, 8);
++}
++
++/* The DDR's clock from the memory controller's period register (stock clk-debug.c: 10^12 / period); 0: unknown. */
++static uint32_t
++ddr_period_ps(void)
++{
++	return map_reg_page(&mccc, MCCC_PA) != NULL ? rd(mccc, 0x220) : 0;
++}
++
++static uint32_t
++ddr_khz(void)
++{
++	uint32_t ps = ddr_period_ps();
++	return ps != 0 ? (uint32_t)((1000000000ull + ps / 2) / ps) : 0;
++}
++
++/* The nearest row of the DDR plan of this phone (stock device tree, and xbl_a's table) to a measured kHz. */
++static uint32_t
++ddr_plan_khz(uint32_t khz)
++{
++	static const uint32_t plan[] = { 200000, 547200, 768000, 1017600, 1555200, 1804800, 2092800 };
++	uint32_t best = 0;
++
++	for (unsigned i = 0; i < sizeof(plan) / sizeof(plan[0]); i++) {
++		uint32_t d = plan[i] > khz ? plan[i] - khz : khz - plan[i];
++		uint32_t bd = best > khz ? best - khz : khz - best;
++		if (best == 0 || d < bd) {
++			best = plan[i];
++		}
++	}
++	return khz != 0 ? best : 0;
++}
++
++/* One line with the clocks that matter to the GPU, measured now. It sleeps: not for interrupt context. */
++static void
++clock_report(char *line, size_t size)
++{
++	uint32_t ddr = ddr_khz(), ps = ddr_period_ps();
++
++	if (!clocks_up || clk_lock == NULL || gcc == NULL || gpucc == NULL) {
++		snprintf(line, size, "the GPU's clocks are not up; ddr %u kHz (period %u ps, plan row %u kHz)", ddr, ps,
++		    ddr_plan_khz(ddr));
++		return;
++	}
++	IOLockLock(clk_lock);
++	uint32_t gx = meas_gpucc_khz(0x0b), gmu = meas_gpucc_khz(0x18), memnoc = meas_khz(0xee, 1);
++	uint32_t bimc = meas_khz(0x97, 1), gold = meas_cpu_khz(1), silver = meas_cpu_khz(0);
++	IOLockUnlock(clk_lock);
++	snprintf(line, size, "measured, kHz: gx_gfx3d %u, cx_gmu %u, gcc_gpu_memnoc_gfx %u, gcc_bimc_gpu_axi %u, "
++	    "ddr %u (period %u ps, plan row %u), cpu gold %u, cpu silver %u", gx, gmu, memnoc, bimc, ddr, ps,
++	    ddr_plan_khz(ddr), gold, silver);
++}
++
++static int
++sweet_gpu_clocks_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char line[360];
++
++	clock_report(line, sizeof(line));
++	return SYSCTL_OUT(req, line, strlen(line) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_clocks, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_clocks_sysctl, "A", "sapphire 0343: the GPU, bus, DDR and CPU clocks, measured at the read");
++
++static int
++sweet_ddr_khz_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int khz = (int)ddr_khz();
++
++	return SYSCTL_OUT(req, &khz, sizeof(khz));
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ddr_khz, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_ddr_khz_sysctl, "I", "sapphire 0343: the DDR's clock in kHz, from the memory controller's period register");
++
++/*
++ * 0343: the temperature sensors (TSENS v2, tsens0 of the stock device tree: compatible qcom,tsens24xx, SROT at 0x4410000,
++ * TM at 0x4411000; the stock driver for it is msm-tsens-driver.ko, CodeLinaro msm-5.15 drivers/thermal/qcom/tsens2xxx.c,
++ * and Linux's tsens-v2.c drives the same block on sm6115). The controller converts in hardware from its fused
++ * calibration and the boot firmware starts it; the OS only reads:
++ *   SROT_CTRL (SROT + 4)        bit 0 the controller is on, bit 3 + n sensor n is converted;
++ *   TM_TRDY (TM + 0xe4)         bit 3 the first round of conversions is complete; 0 after a reset of the controller,
++ *                               when the values are stale (stock checks it before every read, tsens2xxx.c);
++ *   TM_Sn_STATUS (TM + 0xa0 + 4 n)  bits 11:0 the last temperature in tenths of a degree, signed; bit 21 VALID, 0 for a
++ *                               few AHB cycles while a new value lands (polled here up to 20 times, 1 us apart).
++ * A value outside -40..150 C is taken as not valid. Reads have no side effect (the interrupts are cleared by writes to
++ * other registers). The names are those of the thermal zones that use each sensor.
++ */
++#define TSENS_SROT_PA       0x04410000ull
++#define TSENS_TM_PA         0x04411000ull
++#define TSENS_SENSORS       16u
++#define TSENS_GPU           15u
++#define TSENS_SROT_CTRL     0x04u
++#define TSENS_TM_TRDY       0xe4u
++#define TSENS_FIRST_ROUND   (1u << 3)
++#define TSENS_TM_SN_STATUS  0xa0u
++#define TSENS_VALID         (1u << 21)
++
++static const char *const tsens_name[TSENS_SENSORS] = {
++	"mapss", "cdsp-hvx", "wlan", "camera", "video", "mdm-1", "cpu-1-0", "cpu-1-1", "cpu-1-2", "cpu-1-3",
++	"cpuss-0", "cpuss-1", "cpuss-2", "mdm-0", "display", "gpu",
++};
++static volatile uint8_t *tsens_srot, *tsens_tm;
++
++/* tenths of a degree, 12 bits two's complement, to milli-degrees */
++static int32_t
++tsens_dc_to_mc(uint32_t status)
++{
++	int32_t dc = (int32_t)((status & 0xfffu) ^ 0x800u) - 0x800;
++	return dc * 100;
++}
++
++/*
++ * Sensor n in milli-degrees C. 0, or: ENXIO not mapped, ENODEV the controller or the sensor is off, EAGAIN the first
++ * round is not complete (a controller reset: stale values), EIO no VALID within 20 us or a value out of range.
++ */
++static int
++tsens_read(unsigned n, int32_t *mc)
++{
++	if (n >= TSENS_SENSORS || map_reg_page(&tsens_tm, TSENS_TM_PA) == NULL ||
++	    map_reg_page(&tsens_srot, TSENS_SROT_PA) == NULL) {
++		return ENXIO;
++	}
++	uint32_t ctrl = rd(tsens_srot, TSENS_SROT_CTRL);
++	if ((ctrl & 1) == 0 || (ctrl & (1u << (3 + n))) == 0) {
++		return ENODEV;
++	}
++	if ((rd(tsens_tm, TSENS_TM_TRDY) & TSENS_FIRST_ROUND) == 0) {
++		return EAGAIN;
++	}
++	for (unsigned i = 0; i < 20; i++) {
++		uint32_t st = rd(tsens_tm, TSENS_TM_SN_STATUS + 4 * n);
++		if ((st & TSENS_VALID) != 0) {
++			int32_t v = tsens_dc_to_mc(st);
++			if (v < -40000 || v > 150000) {
++				return EIO;
++			}
++			*mc = v;
++			return 0;
++		}
++		IODelay(1);
++	}
++	return EIO;
++}
++
++static void
++thermal_report(char *line, size_t size)
++{
++	uint32_t ctrl = map_reg_page(&tsens_srot, TSENS_SROT_PA) != NULL ? rd(tsens_srot, TSENS_SROT_CTRL) : 0;
++	uint32_t trdy = map_reg_page(&tsens_tm, TSENS_TM_PA) != NULL ? rd(tsens_tm, TSENS_TM_TRDY) : 0;
++	size_t off = 0;
++	int n;
++
++	n = snprintf(line, size, "tsens ctrl %08x (%s, sensors on %04x), trdy %08x (%s), milli-degrees C:", ctrl,
++	    (ctrl & 1) != 0 ? "on" : "OFF", (ctrl >> 3) & 0xffff, trdy, (trdy & TSENS_FIRST_ROUND) != 0 ? "ready" : "NOT READY");
++	off = n > 0 && (size_t)n < size ? (size_t)n : size - 1;
++	for (unsigned i = 0; i < TSENS_SENSORS && off + 1 < size; i++) {
++		int32_t mc = 0;
++		int e = tsens_read(i, &mc);
++		if (e == 0) {
++			n = snprintf(line + off, size - off, " %s %d", tsens_name[i], mc);
++		} else {
++			n = snprintf(line + off, size - off, " %s %s", tsens_name[i], e == ENODEV ? "off" : e == EAGAIN ?
++			    "not-ready" : e == ENXIO ? "unmapped" : "invalid");
++		}
++		off = n > 0 && off + (size_t)n < size ? off + (size_t)n : size - 1;
++	}
++}
++
++static int
++sweet_thermal_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char line[480];
++
++	thermal_report(line, sizeof(line));
++	return SYSCTL_OUT(req, line, strlen(line) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_thermal, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_thermal_sysctl, "A", "sapphire 0343: every TSENS sensor by its thermal zone's name, milli-degrees C");
++
++static int
++sweet_gpu_temp_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int32_t mc = 0;
++	int e = tsens_read(TSENS_GPU, &mc);
++
++	if (e != 0) {
++		return e;
++	}
++	int v = (int)mc;
++	return SYSCTL_OUT(req, &v, sizeof(v));
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_temp, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_temp_sysctl, "I", "sapphire 0343: the GPU's temperature sensor (TSENS 15), milli-degrees C");
++
+ static void
+ power_down(void)
+ {
+ 	LOG("--- power down");
++	clocks_up = false;                          /* 0343 */
+ 	rmw(gpucc, 0x1054, CBCR_EN, 0);
+ 	rmw(gpucc, 0x100c, 0, GDSC_COLLAPSE);
+ 	rmw(gpucc, 0x1508, 0, 1);
+@@ -3124,6 +3446,8 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+ 	if (PE_parse_boot_argn("gpu_div", &core_div, sizeof(core_div)) && (core_div < 1 || core_div > 16)) {
+ 		core_div = 2;
+ 	}
++	(void)PE_parse_boot_argn("gpu_clkdiag", &clkdiag, sizeof(clkdiag));         /* 0343 */
++	clk_lock = IOLockAlloc();
+ 	(void)PE_parse_boot_argn("gpu_copy_async", &copy_async, sizeof(copy_async));
+ 	(void)PE_parse_boot_argn("gpu_smmu_early", &smmu_early, sizeof(smmu_early));
+ 	(void)PE_parse_boot_argn("gpu_irq", &gpu_irq, sizeof(gpu_irq));
+@@ -3186,6 +3510,14 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+ 		return;
+ 	}
+ 	dump_clocks("powered");
++	clocks_up = true;                           /* 0343 */
++	if (clkdiag != 0) {
++		char line[480];
++		clock_report(line, sizeof(line));
++		LOG("clocks: %s", line);
++		thermal_report(line, sizeof(line));
++		LOG("temperatures: %s", line);
++	}
+ 	gpu_map = map_phys(GPU_PA, GPU_SIZE, false);
+ 	if (gpu_map == NULL) {
+ 		LOG("the GPU registers could not be mapped");

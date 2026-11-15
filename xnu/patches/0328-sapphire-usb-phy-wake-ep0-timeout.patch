@@ -1,0 +1,33 @@
+0328: sweet_usb: GUSB2PHYCFG SUSPHY/ENBLSLPM cleared before the first endpoint command; ep command poll bound 5000
+
+After the device controller's soft reset, GUSB2PHYCFG SUSPHY (bit 6) and ENBLSLPM (bit 8) are cleared before
+the first endpoint command, as Linux dwc3 clears them around every endpoint command, and the endpoint command
+poll loop runs up to 5000 iterations instead of 1000.
+
+Measured: a normal boot (not through fastboot) leaves GUSB2PHYCFG at 0x2500 (ENBLSLPM set). Clearing the bits
+alone does not make a normal boot enumerate: the ep0 SETEPCONFIG timeout on that path goes away with 0331
+(UTMI as the PIPE clock).
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -270,7 +270,7 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ 	dwc_wr(DEPCMDPAR1(ep), p1);
+ 	dwc_wr(DEPCMDPAR2(ep), p2);
+ 	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
+-	for (int i = 0; i < 1000; i++) {
++	for (int i = 0; i < 5000; i++) {   /* 0328: 5000 polls */
+ 		uint32_t v = dwc_rd(DEPCMD(ep));
+ 		if (!(v & DEPCMD_CMDACT)) {
+ 			uint32_t status = (v >> 12) & 0xf;
+@@ -1180,6 +1180,11 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		return;
+ 	}
+ 
++	/* 0328: clear GUSB2PHYCFG SUSPHY (bit 6) and ENBLSLPM (bit 8) before the first endpoint
++	 * command; Linux dwc3 clears them around every endpoint command. A normal boot leaves
++	 * GUSB2PHYCFG at 0x2500 (ENBLSLPM set). */
++	dwc_wr(0xc200, dwc_rd(0xc200) & ~((1u << 6) | (1u << 8)));
++
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+ 	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
