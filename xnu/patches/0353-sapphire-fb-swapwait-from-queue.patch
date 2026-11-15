@@ -1,0 +1,500 @@
+0353: SweetFramebuffer: SwapWait answered from the frame queue (kern.sweet_fb_swapwait, default 1)
+
+Needs 0340, 0350 and 0352. With the frame queue off (kern.sweet_fb_queue=0) nothing changes.
+
+CoreAnimation (QuartzCore 20H392, CA::WindowServer::IOMFBDisplay, read in its disassembly) draws into a ring
+of three pages; before each frame it takes a page back once SwapWait(the page's swap id, 0x80000000)
+answers 0, and with no page taken back that tick draws nothing. Flags: 0x80000000 answer now (compared
+with kIOReturnBusy); 1 the swap's frame is on the panel; 2 every swap so far (id 0), used by idle(). This
+port answered SwapWait 0 at once: CoreAnimation kept two surfaces, and with the scanout (0350) the next
+frame was drawn into the surface the panel was still scanning.
+
+1. Swap ids follow the frames: queued frames keep their swap's, a flip notes the swap it shows, surfaces
+   kept for the scanout keep theirs.
+2. AppleCLCD::swapWait() (selector 6), with the frame queue on and kern.sweet_fb_swapwait=1 (default):
+   flags 1 or 2: the frame is on the panel once the MDP has taken its flip or a later one and nothing of
+   that swap or before it waits; neither: the swap's surfaces are free unless a frame of it to be scanned
+   out waits, is on the panel or is being left (a GPU-copied frame does not hold them: the copy runs on the
+   one ring ahead of anything drawn after its SwapEnd). 0x80000000: answered now, kIOReturnBusy if not yet;
+   without it SwapWait waits up to 100 ms (kIOReturnTimeout). The same swap still busy after 1 s is
+   answered 0 (counted).
+   kern.sweet_fb_swapwait=2: also a copied frame's surfaces until the MDP has taken a later flip; 0:
+   SwapWait answers 0 at once.
+3. scanoutBusy() no longer counts a waiting copy of the surface, so it and SwapWait agree.
+4. After a wait for every swap (flags 2 without 0x80000000) the next SwapEnd returns once its frame is on
+   the panel, 50 ms at most; otherwise the frame after next can be drawn into the surface still shown.
+5. kern.sweet_fb_swapwait (read-write, boot-arg sweetfb_swapwait) and kern.sweet_fb_swapwait_diag.
+
+Checked on the host: CoreAnimation's page logic against the kernel code extracted as is, 30 seeds x 30 s,
+with the phone's CPU and GPU times: with the scanout, 54.2 frames/s, three surfaces, nothing drawn into a
+scanned surface (55.4 frames/s, but 277 draws into the scanned surface per run, without this patch).
+Measured on the phone (home-screen swipes, kern.sweet_fb_scanout=1, n=2): 60.1 and 48.1 command buffers/s,
+commit-to-completion 14.2 and 15.7 ms, against 45.4/s and 29.3 ms with copies (n=1); 179 frames, 179
+flips, "swapped again while on the panel or waiting" 0; the plane changed mode once. With CoreAnimation's
+partial updates enabled, a home-screen frame took 7.6 ms from commit to completion (n=2).
+Off: kern.sweet_fb_swapwait=0, at once.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -463,7 +463,9 @@ sweet_fbl_sample(volatile uint32_t *ctl, volatile uint32_t *intf)
+  *     from 0xe5000000, RAM the kernel does not manage, after the flip buffers' pool (0xe2000000-0xe5000000) and below
+  *     the QSEE pool (0xe8000000);
+  *   - the surface left alone while the panel may read it: in use (sweet_hold) from its SwapEnd until the MDP has taken
+- *     the flip of a later frame. The window server then draws into another one, or makes one more;
++ *     the flip of a later frame. CoreAnimation does not look at the use count of its screen surfaces: it learns this
++ *     from SwapWait, answered from the same state (0353, sweet_fb_swapwait below), and then draws into another
++ *     surface or makes one more; a surface swapped again while still in use goes the copy's way;
+  *   - the frame drawn before it is shown: the flip waits for the msm fence of the last submission made before the
+  *     SwapEnd (HakiosMetal's commit submits before it returns, and the CP runs one ring in order), and for any later
+  *     one that named the surface (its gpuFence); a hung GPU is reset after 2 s and its fences jump ahead (0317);
+@@ -506,6 +508,56 @@ static struct {
+ extern uint32_t sapphire_gpu_msm_fence(void);           /* SapphireGpu.cpp: the last msm submission's fence */
+ extern bool sapphire_gpu_msm_fence_done(uint32_t fence); /* ... and whether a given one is done */
+ 
++/*
++ * sapphire 0353: SwapWait (selector 6, scalars {id, flags, timeout}) answered from the frame queue's state.
++ *
++ * What CoreAnimation does with it (QuartzCore 20H392, CA::WindowServer::IOMFBDisplay, read in its
++ * disassembly):
++ *   - it draws its frames into a ring of three pages (AppleDisplay's constructor: 3, or 1 with page flipping
++ *     disabled). A page holds the buffer (an IOSurface) its frame was drawn into and the id of the swap that showed it;
++ *   - before each frame (can_update_) it looks at the two pages that are not the latest swap's, oldest first. A page is
++ *     taken back once SwapWait(its id, 0x80000000) answers 0; then its buffer is free. The first one is asked through
++ *     swap_wait_timeout(): every 100 us for up to 1 ms while the answer is not 0. If the oldest is still busy after
++ *     that, the frame is not drawn on this tick of CoreAnimation's own 120 Hz timer (the A11 path does not use the
++ *     vsync notifications, selector 72);
++ *   - the frame is drawn into the free buffer least out of date, or into a new one made then if none is free
++ *     (allocate_buffer). Answered 0 at once, every page but the latest is free at every frame: two buffers are enough,
++ *     and the one drawn into next is the one the panel may still be showing;
++ *   - flags: 0x80000000 answer now, kIOReturnBusy if not yet (can_update_ compares with it); 1 the swap's frame is on
++ *     the panel (the latest page, swapped_frame_displayed_p()); 2 every swap so far is on the panel, id 0 (idle(),
++ *     set_all_layers_to_null(), a synchronous finish_update(), is_ready()); neither of 1 and 2: the swap's surfaces are
++ *     no longer used (a page taken back, its buffer drawn into next). IOMobileFramebuffer's kern_SwapWait passes
++ *     {id, flags, 0}.
++ * Here, with the frame queue on:
++ *   - a swap's frame is on the panel once the MDP has taken its flip (flipTaken()) or a later one, and nothing of that
++ *     swap or before it waits in the queue;
++ *   - the surfaces of a swap whose frame is scanned out as it is (0350) are in use while the frame waits in the queue,
++ *     while it is on the panel and until the MDP has taken a later flip: what scanoutBusy() says. Those of a frame the
++ *     GPU copies are free from its SwapEnd, as before (the copy runs on the GPU's one ring ahead of anything drawn into
++ *     them later, 0201); those of one the CPU composes in present() too;
++ *   - without 0x80000000 SwapWait waits for it, 100 ms at most (then kIOReturnTimeout); the timeout scalar is not used;
++ *   - after a wait for every swap (flags 2 without 0x80000000) CoreAnimation clears the swap ids of all its pages, the
++ *     current one's too (idle()): the page of the frame on the panel is then taken back without asking once the next
++ *     frame is current. The first SwapEnd after such a wait is held until its frame is on the panel (swapEndHold()).
++ * kern.sweet_fb_swapwait (boot-arg sweetfb_swapwait):
++ *   1 (default)  as above: CoreAnimation leaves the surface on the panel alone and makes a third one when it needs it;
++ *                with the scanout the pool (four slots) holds the three;
++ *   2            the surfaces of every swap stay in use until the MDP has taken the flip of a later one, copied frames'
++ *                too (as an IOMobileFramebuffer that retains them): CoreAnimation keeps at most two frames ahead of the
++ *                panel either way, with a third surface also when copying;
++ *   0            SwapWait answers 0 at once.
++ * With the queue off it answers 0 at once. A swap still busy after 1 s of asking is answered 0 (counted): a wait that long
++ * is not a frame's (a hung GPU is reset after 2 s, 0317).
++ */
++static int sweet_fb_swapwait = 1;
++#define SWEET_FBW_FREE          0       /* SwapWait(id, 0 or 0x80000000): the swap's surfaces no longer used */
++#define SWEET_FBW_SHOWN         1       /* SwapWait(id, 1 or 0x80000001): the swap's frame on the panel */
++#define SWEET_FBW_ALL           2       /* SwapWait(0, 2, 3 or 0x80000003): every swap so far on the panel */
++static struct {
++	uint64_t asked[3], busy[3], waits, wait_us, wait_max_us, timeouts, forced, busy_max_us;
++	uint64_t holds, hold_us, hold_max_us, hold_timeouts;    /* swapEndHold() */
++} sweet_fbw;
++
+ /* The plane's registers the scaled scanout writes (VIG0's offsets; the scaler's at +0xa00), in the order Linux writes them. */
+ #define SWEET_PLANE_REGS        27
+ static const uint16_t sweet_plane_off[SWEET_PLANE_REGS] = {
+@@ -728,6 +780,7 @@ public:
+ 		SweetSurface *surf;
+ 		uint32_t      stride;
+ 		struct SweetGeo geo;
++		uint32_t      swap;           /* 0353: the id of the swap it shows (0: none, the timer's or an adopted copy) */
+ 	};
+ 	struct SweetQFrame fQ[SWEET_FB_BUFS];     /* the frames waiting for the panel, oldest first */
+ 	uint32_t      fQCount;
+@@ -775,6 +828,19 @@ public:
+ 	bool          frameDone(const struct SweetQFrame *f, uint64_t now);
+ 	void          frameShow(struct SweetQFrame *f);
+ 	bool          presentScanout(const uint8_t *rec, SweetSurface **held, bool *queued);
++	/* 0353: SwapWait (sweet_fb_swapwait). Swap ids, all with fPresentLock (0: none). */
++	uint32_t      fSwapShow;      /* the swap of the flip about to be written (frameShow(), present()'s own flips) */
++	uint32_t      fFlipSwap;      /* the swap of the last flip written */
++	uint32_t      fPanelSwap;     /* the swap of the last flip seen taken: the newest one on the panel */
++	uint32_t      fScanShowSwap;  /* the swap whose surfaces are fScanShow[] */
++	uint32_t      fScanLeaveSwap[4]; /* ... fScanLeave[f][] */
++	uint32_t      fSwapBusyId[3]; /* by how it is asked (SWEET_FBW_*): the last swap answered busy */
++	uint64_t      fSwapBusySince[3]; /* ... since when */
++	bool          fSwapHoldNext;  /* a wait for every swap was answered: the next SwapEnd waits for its frame */
++	IOReturn      swapWait(uint32_t id, uint32_t flags, uint32_t held);
++	void          swapEndHold(uint32_t id);
++	bool          swapShown(uint32_t id, uint32_t held);
++	bool          swapFree(uint32_t id, uint32_t held);
+ };
+ 
+ /*
+@@ -1144,6 +1210,7 @@ AppleCLCD::scanoutInit(void)
+ {
+ 	PE_parse_boot_argn("sweetfb_scanout", &sweet_fb_scanout, sizeof(sweet_fb_scanout));
+ 	PE_parse_boot_argn("sweetfb_flush_taken", &sweet_fb_flush_taken, sizeof(sweet_fb_flush_taken));     /* 0352 */
++	PE_parse_boot_argn("sweetfb_swapwait", &sweet_fb_swapwait, sizeof(sweet_fb_swapwait));             /* 0353 */
+ 	if (fVig0 == NULL || fCtl0 == NULL) {
+ 		fScanWhy = "the plane is not mapped";
+ 		return;
+@@ -1602,6 +1669,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 			sweet_fbd.hold_us += sweet_fbd_us(hold_t0, mach_absolute_time());
+ 		}
+ 		presentNow(rec, held);
++		swapEndHold(get32(rec, 0x50));  /* 0353: (SwapEnd's own thread, never the timer's) */
+ 		return;
+ 	}
+ 	IOLockLock(fLock);
+@@ -1778,7 +1846,9 @@ AppleCLCD::flipNote(uint64_t pa, bool force)
+ 		}
+ 		fQFlipAbs = now;
+ 		fQLatchWait = true;
++		fFlipSwap = fSwapShow;          /* 0353: the swap this flip shows (0: none of a swap) */
+ 	}
++	fSwapShow = 0;
+ }
+ 
+ /*
+@@ -2612,6 +2682,9 @@ AppleCLCD::flipTaken(uint64_t now)
+ 	}
+ 	fQLatchWait = false;
+ 	fQRetirePa[0] = fQRetirePa[1] = 0;
++	if (fFlipSwap != 0) {
++		fPanelSwap = fFlipSwap;         /* 0353 */
++	}
+ 	return true;
+ }
+ 
+@@ -2840,7 +2913,9 @@ AppleCLCD::presentQueued(const uint8_t *rec, SweetSurface **held, bool *queued)
+ 	}
+ 	uint64_t pa = fFlipPhys[back];
+ 
++	fSwapShow = get32(rec, 0x50);           /* 0353: (a frame the CPU writes is flipped in present()) */
+ 	bool copied = present(rec);
++	fSwapShow = 0;
+ 
+ 	if (fFlipWait) {
+ 		/* the GPU's copy into that buffer is queued: the frame waits its turn, and keeps its surfaces until then */
+@@ -2852,6 +2927,7 @@ AppleCLCD::presentQueued(const uint8_t *rec, SweetSurface **held, bool *queued)
+ 			f->fence = sapphire_gpu_copy_fence();
+ 			f->queued = sweet_fbd.pend_swap;
+ 			f->arrived = fQArrived;
++			f->swap = get32(rec, 0x50);     /* 0353 */
+ 			memcpy(f->held, held, sizeof(f->held));
+ 			*queued = true;
+ 			sweet_fbq.frames++;
+@@ -2905,7 +2981,7 @@ AppleCLCD::scanoutOn(void)
+ 	return sweet_fb_scanout == 1 && sweet_fb_scan_ready && !fScanStuck && fQThread && queueOn();
+ }
+ 
+-/* Whether the panel may still read surface s, or a frame of it waits: then it is not scanned out again. */
++/* Whether the panel may still read surface s, or a frame of it to be scanned out waits: then it is not scanned out again. */
+ bool
+ AppleCLCD::scanoutBusy(SweetSurface *s)
+ {
+@@ -2919,8 +2995,8 @@ AppleCLCD::scanoutBusy(SweetSurface *s)
+ 			}
+ 		}
+ 		for (uint32_t q = 0; q < fQCount; q++) {
+-			if (fQ[q].held[k] == s) {
+-				return true;
++			if (fQ[q].scan && fQ[q].held[k] == s) {
++				return true;   /* 0353: (a waiting copy reads it on the GPU's ring before whatever is drawn into it next) */
+ 			}
+ 		}
+ 	}
+@@ -2940,6 +3016,7 @@ AppleCLCD::scanoutLeave(void)
+ 		any |= fScanShow[k] != NULL;
+ 	}
+ 	if (!any) {
++		fScanShowSwap = 0;
+ 		return;
+ 	}
+ 	uint32_t f = 0;
+@@ -2957,12 +3034,15 @@ AppleCLCD::scanoutLeave(void)
+ 		sweet_fbs.released++;
+ 		for (uint32_t k = 0; k < 3; k++) {
+ 			memcpy(fScanLeave[k], fScanLeave[k + 1], sizeof(fScanLeave[k]));
++			fScanLeaveSwap[k] = fScanLeaveSwap[k + 1];      /* 0353 */
+ 		}
+ 		bzero(fScanLeave[3], sizeof(fScanLeave[3]));
+ 		f = 3;
+ 	}
+ 	memcpy(fScanLeave[f], fScanShow, sizeof(fScanShow));
++	fScanLeaveSwap[f] = fScanShowSwap;      /* 0353 */
+ 	bzero(fScanShow, sizeof(fScanShow));
++	fScanShowSwap = 0;
+ }
+ 
+ /* The MDP has taken the last flip written: it reads that frame alone, and the surfaces it left are free. */
+@@ -2978,6 +3058,7 @@ AppleCLCD::scanoutRetire(void)
+ 			sweet_hold_set(fScanLeave[f], false);
+ 			sweet_fbs.released++;
+ 		}
++		fScanLeaveSwap[f] = 0;                  /* 0353 */
+ 	}
+ }
+ 
+@@ -3106,6 +3187,7 @@ AppleCLCD::frameDone(const struct SweetQFrame *f, __unused uint64_t now)
+ void
+ AppleCLCD::frameShow(struct SweetQFrame *f)
+ {
++	fSwapShow = f->swap;                    /* 0353: (flipNote() notes it with the flip) */
+ 	if (f->scan) {
+ 		uint32_t last = f->surf != NULL ? f->surf->gpuFence : 0;
+ 		if (last != 0 && (int32_t)(last - f->fence) > 0) {
+@@ -3113,6 +3195,7 @@ AppleCLCD::frameShow(struct SweetQFrame *f)
+ 		}
+ 		planeScaled(f->pa, f->stride, &f->geo);
+ 		memcpy(fScanShow, f->held, sizeof(fScanShow));
++		fScanShowSwap = f->swap;        /* 0353 */
+ 		bzero(f->held, sizeof(f->held));
+ 		sweet_fbs.flips++;
+ 	} else {
+@@ -3253,6 +3336,7 @@ AppleCLCD::presentScanout(const uint8_t *rec, SweetSurface **held, bool *queued)
+ 	f->fence = sapphire_gpu_msm_fence();
+ 	f->queued = mach_absolute_time();
+ 	f->arrived = fQArrived;
++	f->swap = get32(rec, 0x50);             /* 0353 */
+ 	memcpy(f->held, own[layer] != NULL ? own : held, sizeof(f->held));
+ 	*queued = true;
+ 	sweet_fbs.frames++;
+@@ -3304,6 +3388,163 @@ AppleCLCD::scanoutStop(void)
+ 	IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ }
+ 
++/*
++ * 0353: whether the frame of swap id has reached the panel (id 0: the frame of every swap so far): no frame of it or of an
++ * earlier swap waits in the queue, the MDP has taken the flip written for the last of them, and the swap held back for
++ * backboardd's GL bridge (0286, held: its id, 0 if none) is not one of them. A swap whose frame was given up counts once
++ * a later one is on the panel. fPresentLock held.
++ */
++bool
++AppleCLCD::swapShown(uint32_t id, uint32_t held)
++{
++	if (fQLatchWait && fFlipSwap != 0 && (id == 0 || (int32_t)(fFlipSwap - id) <= 0)) {
++		return false;
++	}
++	for (uint32_t k = 0; k < fQCount; k++) {
++		if (id == 0 || (fQ[k].swap != 0 && (int32_t)(fQ[k].swap - id) <= 0)) {
++			return false;
++		}
++	}
++	return held == 0 || (id != 0 && (int32_t)(held - id) > 0);
++}
++
++/*
++ * 0353: whether the surfaces of swap id are no longer used, as scanoutBusy() says it of a surface: no frame of it to be
++ * scanned out waits in the queue, is on the panel or is being left (fScanShow, fScanLeave), and it is not the held swap.
++ * A frame the GPU copies does not count: the copy runs on the GPU's one ring before anything drawn into the surface after
++ * its SwapEnd (0201). With kern.sweet_fb_swapwait=2, also the MDP has taken the flip of a later swap. fPresentLock held.
++ */
++bool
++AppleCLCD::swapFree(uint32_t id, uint32_t held)
++{
++	for (uint32_t k = 0; k < fQCount; k++) {
++		if (fQ[k].swap == id && fQ[k].scan) {
++			return false;
++		}
++	}
++	if (fScanShowSwap == id || held == id) {
++		return false;
++	}
++	for (uint32_t f = 0; f < 4; f++) {
++		if (fScanLeaveSwap[f] == id) {
++			return false;
++		}
++	}
++	return sweet_fb_swapwait != 2 || (int32_t)(fPanelSwap - id) > 0;
++}
++
++/*
++ * 0353: SwapWait(id, flags) from the user client (no lock held; held: the GL bridge's held swap, read under fLock). See
++ * sweet_fb_swapwait at the top. The queue's state is brought up to date first (queueFlip(): a flip the MDP has taken
++ * since the queue's thread last looked, the frames that may go now), so that the answer is the panel's as of now.
++ */
++IOReturn
++AppleCLCD::swapWait(uint32_t id, uint32_t flags, uint32_t held)
++{
++	uint32_t kind = (flags & 2) != 0 ? SWEET_FBW_ALL : (flags & 1) != 0 ? SWEET_FBW_SHOWN : SWEET_FBW_FREE;
++	bool now = (flags & 0x80000000u) != 0, done = true;
++
++	sweet_fbw.asked[kind]++;
++	if (sweet_fb_swapwait == 0 || fPresentLock == NULL || (kind != SWEET_FBW_ALL && id == 0)) {
++		return kIOReturnSuccess;
++	}
++	IOLockLock(fPresentLock);
++	if (!queueOn()) {
++		IOLockUnlock(fPresentLock);
++		return kIOReturnSuccess;
++	}
++	uint64_t t0 = mach_absolute_time(), t = t0, deadline = 0, step;
++	for (;;) {
++		queueFlip();
++		done = kind == SWEET_FBW_FREE ? swapFree(id, held) : swapShown(kind == SWEET_FBW_ALL ? 0 : id, held);
++		t = mach_absolute_time();
++		if (done || now) {
++			break;
++		}
++		if (deadline == 0) {
++			clock_interval_to_deadline(100, kMillisecondScale, &deadline);
++		}
++		if (t >= deadline) {
++			sweet_fbw.timeouts++;
++			break;
++		}
++		clock_interval_to_deadline(1, kMillisecondScale, &step);
++		IOLockWakeup(fPresentLock, &fQThread, true);    /* (the thread looks again, and wakes this up when it flips) */
++		(void)IOLockSleepDeadline(fPresentLock, &fQCount, step < deadline ? step : deadline, THREAD_UNINT);
++	}
++	if (!now) {
++		uint64_t us = sweet_fbd_us(t0, t);
++		fSwapHoldNext |= kind == SWEET_FBW_ALL;
++		sweet_fbw.waits++;
++		sweet_fbw.wait_us += us;
++		if (us > sweet_fbw.wait_max_us) {
++			sweet_fbw.wait_max_us = us;
++		}
++	} else if (done) {
++		fSwapBusyId[kind] = 0;
++	} else if (fSwapBusyId[kind] != (id != 0 ? id : ~0u)) {
++		fSwapBusyId[kind] = id != 0 ? id : ~0u;   /* (~0: every swap, id 0) */
++		fSwapBusySince[kind] = t;
++		sweet_fbw.busy[kind]++;
++	} else {
++		uint64_t us = sweet_fbd_us(fSwapBusySince[kind], t);
++		sweet_fbw.busy[kind]++;
++		if (us > sweet_fbw.busy_max_us) {
++			sweet_fbw.busy_max_us = us;
++		}
++		if (us >= 1000000) {
++			done = true;                    /* (not a frame's wait: answered 0, and counted) */
++			fSwapBusyId[kind] = 0;
++			sweet_fbw.forced++;
++		}
++	}
++	IOLockUnlock(fPresentLock);
++	return done ? kIOReturnSuccess : now ? kIOReturnBusy : kIOReturnTimeout;
++}
++
++/*
++ * 0353: the first SwapEnd after a wait for every swap (fSwapHoldNext; see sweet_fb_swapwait at the top) returns once its
++ * frame is on the panel, 50 ms at most: the frame on the panel before it, whose page CoreAnimation no longer asks about,
++ * has left the panel when the frame after it is drawn. From swap(), after presentNow(): SwapEnd's thread, no lock held.
++ */
++void
++AppleCLCD::swapEndHold(uint32_t id)
++{
++	if (fPresentLock == NULL) {
++		return;
++	}
++	IOLockLock(fPresentLock);
++	bool hold = fSwapHoldNext && sweet_fb_swapwait != 0 && id != 0 && queueOn();
++	fSwapHoldNext = false;
++	if (!hold) {
++		IOLockUnlock(fPresentLock);
++		return;
++	}
++	uint64_t t0 = mach_absolute_time(), t = t0, deadline, step;
++	clock_interval_to_deadline(50, kMillisecondScale, &deadline);
++	for (;;) {
++		queueFlip();
++		t = mach_absolute_time();
++		if (swapShown(id, 0)) {
++			break;
++		}
++		if (t >= deadline) {
++			sweet_fbw.hold_timeouts++;
++			break;
++		}
++		clock_interval_to_deadline(1, kMillisecondScale, &step);
++		IOLockWakeup(fPresentLock, &fQThread, true);
++		(void)IOLockSleepDeadline(fPresentLock, &fQCount, step < deadline ? step : deadline, THREAD_UNINT);
++	}
++	uint64_t us = sweet_fbd_us(t0, t);
++	sweet_fbw.holds++;
++	sweet_fbw.hold_us += us;
++	if (us > sweet_fbw.hold_max_us) {
++		sweet_fbw.hold_max_us = us;
++	}
++	IOLockUnlock(fPresentLock);
++}
++
+ bool
+ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
+@@ -3530,7 +3771,17 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
+-		sweet_fbd.swap_waits++;         /* 0336: how often the window server asks to wait for a swap (answered at once) */
++		sweet_fbd.swap_waits++;         /* 0336: how often the window server asks to wait for a swap */
++		if (args->scalarInputCount >= 2) {
++			/* 0353: {id, flags, timeout}: answered from the frame queue (sweet_fb_swapwait) */
++			uint32_t held = 0;
++			IOLockLock(fFB->fLock);
++			if (fFB->fHeldRec != NULL) {
++				held = get32(fFB->fHeldRec, 0x50);
++			}
++			IOLockUnlock(fFB->fLock);
++			ret = fFB->swapWait((uint32_t)args->scalarInput[0], (uint32_t)args->scalarInput[1], held);
++		}
+ 		break;
+ 	default:
+ 		break;
+@@ -4100,3 +4351,52 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_scanout_diag, CTLTYPE_STRING | CTLFLAG_RD
+     NULL, 0, sweet_fb_scanout_diag_sysctl, "A", "sapphire 0350: the scanout's state and counters");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_flush_taken, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_flush_taken, 0,
+     "sapphire 0352: 1 = a flip is taken when CTL_FLUSH's bits read clear (once they are seen to read back), for every flip; 0 = by the frame counter, as 0340");
++
++/* sapphire 0353: kern.sweet_fb_swapwait (0, 1 or 2; boot-arg sweetfb_swapwait) and its counters (sweet_fbw, at the top). */
++static int
++sweet_fb_swapwait_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = sweet_fb_swapwait;
++	int error = sysctl_handle_int(oidp, &v, 0, req);
++
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (v < 0 || v > 2) {
++		return EINVAL;
++	}
++	sweet_fb_swapwait = v;
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_swapwait, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sweet_fb_swapwait_sysctl, "I",
++    "sapphire 0353: 1 = SwapWait answers from the frame queue (a swap's surfaces in use, its frame on the panel), 2 = and a copied frame's surfaces until a later flip, 0 = at once");
++
++static int
++sweet_fb_swapwait_diag_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[1024];
++	size_t off = 0;
++	AppleCLCD *fb = sweet_frame_fb;
++
++	buf[0] = 0;
++	SWEET_FBD_CAT("swapwait (kern.sweet_fb_swapwait %d): asked if the surfaces are free %llu (busy %llu), if the frame is "
++	    "on the panel %llu (busy %llu), if every frame is %llu (busy %llu)\n", sweet_fb_swapwait,
++	    sweet_fbw.asked[SWEET_FBW_FREE], sweet_fbw.busy[SWEET_FBW_FREE], sweet_fbw.asked[SWEET_FBW_SHOWN],
++	    sweet_fbw.busy[SWEET_FBW_SHOWN], sweet_fbw.asked[SWEET_FBW_ALL], sweet_fbw.busy[SWEET_FBW_ALL]);
++	SWEET_FBD_CAT("waited %llu times, %llu us in all, max %llu, timed out %llu; longest busy %llu us, answered 0 after "
++	    "1 s busy %llu\n", sweet_fbw.waits, sweet_fbw.wait_us, sweet_fbw.wait_max_us, sweet_fbw.timeouts,
++	    sweet_fbw.busy_max_us, sweet_fbw.forced);
++	SWEET_FBD_CAT("SwapEnds held after a wait for every swap %llu, %llu us in all, max %llu, timed out %llu\n",
++	    sweet_fbw.holds, sweet_fbw.hold_us, sweet_fbw.hold_max_us, sweet_fbw.hold_timeouts);
++	if (fb != NULL) {
++		SWEET_FBD_CAT("swaps: last flip %u (%s), on the panel %u, of a surface %u, left %u %u %u %u\n", fb->fFlipSwap,
++		    fb->fQLatchWait ? "not taken yet" : "taken", fb->fPanelSwap, fb->fScanShowSwap, fb->fScanLeaveSwap[0],
++		    fb->fScanLeaveSwap[1], fb->fScanLeaveSwap[2], fb->fScanLeaveSwap[3]);
++	}
++	return SYSCTL_OUT(req, buf, off + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_swapwait_diag, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_fb_swapwait_diag_sysctl, "A", "sapphire 0353: what SwapWait was asked and answered");

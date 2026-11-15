@@ -1,0 +1,241 @@
+0344: cpu: cache maintenance before WFI as a switch (kern.sweet_idle_cache, default 1: unchanged); per-CPU cost (kern.sweet_idle_stats); cache registers (kern.sweet_cpuregs)
+
+Before every WFI on a non-Apple core, cpu_idle() calls platform_cache_idle_enter() -> FlushPoU_Dcache(),
+which passes CLIDR_EL1.LoUIS (a count of levels, 1 here) to DCACHE_SET_WAY, whose bound is a 0-based
+inclusive level (caches_asm.s, cmp x1, x0 / b.ls). It cleans and invalidates by set/way the core's L1 and
+also the L2 shared by the four cores of the cluster.
+
+- kern.sweet_idle_cache (boot-arg sweet_idle_cache, read-write at any time): 1 (default) L1 + the
+  cluster's L2, as now; 2 the core's L1 only (sweet_FlushL1_Dcache); 0 nothing before WFI.
+- kern.sweet_idle_stats: per CPU, idle entries and the time spent in that maintenance.
+- kern.sweet_cpuregs: MIDR, MPIDR, CLIDR, CCSIDR (L1D, L1I, L2), CTR, SCTLR, TCR and MAIR of every CPU, read
+  by a cross call.
+
+Measured on the phone with the default: each idle entry of an A73 (CPUs 0-3 here) spends 439-518 us in this
+maintenance (10409 entries and 4.75 s on cpu0 since boot), 24-28 us on an A53. A pointer chase of
+128 KB-2 MB on an idle A73 cluster costs ~130-145 ns a load (DRAM); with the other three A73s kept busy the
+2 MB L2 shows at 7-11 ns. Interleaved runs of the same home-screen workload (n=2 each): with 1, 62-68 us of
+render-thread CPU per Metal draw and 29.6-31.6 command buffers/s; with 0, 25-26 us and 44.0-46.9/s.
+
+--- a/bsd/kern/kern_sysctl.c
++++ b/bsd/kern/kern_sysctl.c
+@@ -2541,6 +2541,81 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_sched,
+ #endif /* __AMP__ */
+ #endif /* __arm64__ */
+ 
++#if __arm64__ && defined(ARM64_BOARD_CONFIG_SWEET)
++/* sapphire: cache maintenance before WFI and per-CPU cache registers (osfmk/arm64/cpu.c, sweet_idle_cache_enter) */
++extern uint32_t sweet_idle_cache;
++extern uint64_t sweet_idle_entries[];
++extern uint64_t sweet_idle_cache_abs[];
++struct sweet_cpuregs {
++	uint64_t midr, mpidr, clidr, ccsidr_l1d, ccsidr_l1i, ccsidr_l2, ctr, sctlr, tcr, mair, valid;
++};
++extern struct sweet_cpuregs sweet_cpuregs[];
++extern void sweet_cpuregs_collect(void);
++
++static int
++sysctl_sweet_idle_cache SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int mode = (int)sweet_idle_cache, changed = 0;
++	int error = sysctl_io_number(req, mode, sizeof(mode), &mode, &changed);
++	if (error == 0 && changed) {
++		if (mode < 0 || mode > 2) {
++			return EINVAL;
++		}
++		os_atomic_store(&sweet_idle_cache, (uint32_t)mode, relaxed);
++	}
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_idle_cache,
++    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_idle_cache, "I",
++    "sapphire: before WFI 1 = upstream FlushPoU (L1 + cluster L2), 2 = the core's L1 only, 0 = nothing");
++
++static int
++sysctl_sweet_idle_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[1024];
++	int len = snprintf(buf, sizeof(buf), "idle cache (kern.sweet_idle_cache %u): per cpu idle entries, time in the cache "
++	    "maintenance before WFI (us), mean per entry (ns):", sweet_idle_cache);
++	for (unsigned int cpu = 0; cpu < (unsigned int)ml_get_max_cpu_number() + 1 && len < (int)sizeof(buf) - 80; cpu++) {
++		uint64_t n = sweet_idle_entries[cpu], ns = 0;
++		absolutetime_to_nanoseconds(sweet_idle_cache_abs[cpu], &ns);
++		len += snprintf(buf + len, sizeof(buf) - len, " cpu%u %llu %llu %llu;", cpu, n, ns / 1000, n ? ns / n : 0);
++	}
++	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_idle_stats,
++    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_idle_stats, "A",
++    "sapphire: idle entries and cache maintenance time before WFI, per CPU");
++
++static int
++sysctl_sweet_cpuregs SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char *buf = kalloc_data(4096, Z_WAITOK | Z_ZERO);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	sweet_cpuregs_collect();
++	int len = 0;
++	for (unsigned int cpu = 0; cpu < (unsigned int)ml_get_max_cpu_number() + 1 && len < 4096 - 300; cpu++) {
++		struct sweet_cpuregs *r = &sweet_cpuregs[cpu];
++		if (!r->valid) {
++			continue;
++		}
++		len += snprintf(buf + len, 4096 - len, "cpu%u midr %08llx mpidr %llx clidr %08llx ccsidr l1d %08llx l1i %08llx "
++		    "l2 %08llx ctr %08llx sctlr %08llx tcr %016llx mair %016llx\n", cpu, r->midr, r->mpidr, r->clidr,
++		    r->ccsidr_l1d, r->ccsidr_l1i, r->ccsidr_l2, r->ctr, r->sctlr, r->tcr, r->mair);
++	}
++	int error = SYSCTL_OUT(req, buf, strlen(buf) + 1);
++	kfree_data(buf, 4096);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cpuregs,
++    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_cpuregs, "A",
++    "sapphire: cache identification and control registers read on every CPU (architectural registers only)");
++#endif /* __arm64__ && ARM64_BOARD_CONFIG_SWEET */
++
+ #if __arm64__
+ extern int legacy_footprint_entitlement_mode;
+ SYSCTL_INT(_kern, OID_AUTO, legacy_footprint_entitlement_mode,
+--- a/osfmk/arm64/caches_asm.s
++++ b/osfmk/arm64/caches_asm.s
+@@ -391,6 +391,19 @@ LEXT(Flush_Dcache)
+ 	mov x0, #6 // Maximum allowable caching level (0-based)
+ 	DCACHE_SET_WAY cisw 
+ 
++/*
++ * void sweet_FlushL1_Dcache(void)
++ *
++ *		sapphire: clean and invalidate the calling core's L1 D-cache by set/way, level 0 only
++ *		(DCACHE_SET_WAY's bound is 0-based and inclusive). Used before WFI with kern.sweet_idle_cache=2.
++ */
++	.text
++	.align 2
++	.globl EXT(sweet_FlushL1_Dcache)
++LEXT(sweet_FlushL1_Dcache)
++	mov		x0, #0
++	DCACHE_SET_WAY cisw
++
+ /*
+  * void FlushPoU_Dcache(void)
+  *
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -477,6 +477,88 @@ wfe_to_deadline_or_interrupt(uint32_t cid, uint64_t wfe_deadline, cpu_data_t *cd
+ 	return ipending || (nirqc != irqc);
+ }
+ 
++#if defined(SWEET)
++/*
++ * sapphire: what is done to the caches before WFI (kern.sweet_idle_cache, boot-arg sweet_idle_cache), and what it
++ * costs (kern.sweet_idle_stats); the cache identification and control registers of every CPU (kern.sweet_cpuregs).
++ *
++ * Upstream calls platform_cache_idle_enter() -> FlushPoU_Dcache() before every WFI on non-Apple cores (below).
++ * FlushPoU_Dcache passes CLIDR_EL1.LoUIS -- a count of levels, 1 on these cores -- to DCACHE_SET_WAY, whose bound
++ * is a 0-based, inclusive level ("x0: maximum cache level, 0-based, inclusive"; the loop ends on cmp/b.ls,
++ * caches_asm.s), so it cleans and invalidates by set/way level 0, the core's L1, *and* level 1, the L2 that the
++ * four cores of the cluster share: every idle entry of any core empties its cluster's L2 (2 MB on the A73s).
++ *   1  upstream: L1 + the cluster's L2 (the default; nothing changes unless asked)
++ *   2  the core's L1 only, what a clean and invalidate to the PoU means on Cortex-A53/A73
++ *   0  nothing, as Linux's WFI idle state; here WFI is entered directly (no PSCI CPU_SUSPEND), clock gating only
++ */
++uint32_t sweet_idle_cache = 1;
++uint64_t sweet_idle_entries[MAX_CPUS];
++uint64_t sweet_idle_cache_abs[MAX_CPUS];
++extern void sweet_FlushL1_Dcache(void);
++
++static void
++sweet_idle_cache_enter(void)
++{
++	unsigned int cpu = (unsigned int)cpu_number();
++	uint32_t mode = os_atomic_load(&sweet_idle_cache, relaxed);
++	uint64_t t0 = mach_absolute_time();
++
++	if (mode == 1) {
++		platform_cache_idle_enter();
++	} else if (mode == 2) {
++		sweet_FlushL1_Dcache();
++	}
++	if (cpu < MAX_CPUS) {
++		sweet_idle_entries[cpu]++;
++		sweet_idle_cache_abs[cpu] += mach_absolute_time() - t0;
++	}
++}
++
++struct sweet_cpuregs {
++	uint64_t midr, mpidr, clidr, ccsidr_l1d, ccsidr_l1i, ccsidr_l2, ctr, sctlr, tcr, mair, valid;
++};
++struct sweet_cpuregs sweet_cpuregs[MAX_CPUS];
++
++/* Architectural registers only, all readable at EL1 (xnu itself reads them at boot: do_cpuid, do_cacheid). */
++static void
++sweet_cpuregs_cbk(__unused void *arg)
++{
++	unsigned int cpu = (unsigned int)cpu_number();
++	if (cpu >= MAX_CPUS) {
++		return;
++	}
++	struct sweet_cpuregs *r = &sweet_cpuregs[cpu];
++	uint64_t csselr = __builtin_arm_rsr64("CSSELR_EL1");
++	r->midr = __builtin_arm_rsr64("MIDR_EL1");
++	r->mpidr = __builtin_arm_rsr64("MPIDR_EL1");
++	r->clidr = __builtin_arm_rsr64("CLIDR_EL1");
++	__builtin_arm_wsr64("CSSELR_EL1", 0);   /* L1 data */
++	__builtin_arm_isb(ISB_SY);
++	r->ccsidr_l1d = __builtin_arm_rsr64("CCSIDR_EL1");
++	__builtin_arm_wsr64("CSSELR_EL1", 1);   /* L1 instruction */
++	__builtin_arm_isb(ISB_SY);
++	r->ccsidr_l1i = __builtin_arm_rsr64("CCSIDR_EL1");
++	__builtin_arm_wsr64("CSSELR_EL1", 2);   /* L2 */
++	__builtin_arm_isb(ISB_SY);
++	r->ccsidr_l2 = __builtin_arm_rsr64("CCSIDR_EL1");
++	__builtin_arm_wsr64("CSSELR_EL1", csselr);
++	__builtin_arm_isb(ISB_SY);
++	r->ctr = __builtin_arm_rsr64("CTR_EL0");
++	r->sctlr = __builtin_arm_rsr64("SCTLR_EL1");
++	r->tcr = __builtin_arm_rsr64("TCR_EL1");
++	r->mair = __builtin_arm_rsr64("MAIR_EL1");
++	r->valid = 1;
++}
++
++void sweet_cpuregs_collect(void);
++void
++sweet_cpuregs_collect(void)
++{
++	static int dummy;
++	cpu_broadcast_xcall_simple(TRUE, sweet_cpuregs_cbk, &dummy);
++}
++#endif /* SWEET */
++
+ /*
+  *	Routine:	cpu_idle
+  *	Function:
+@@ -568,7 +650,9 @@ cpu_idle(void)
+ #endif /* MONOTONIC */
+ 
+ 	if (wfi) {
+-#if !defined(APPLE_ARM64_ARCH_FAMILY)
++#if defined(SWEET)
++		sweet_idle_cache_enter();
++#elif !defined(APPLE_ARM64_ARCH_FAMILY)
+ 		platform_cache_idle_enter();
+ #endif
+ 
+@@ -1163,6 +1247,13 @@ cpu_machine_idle_init(boolean_t from_boot)
+ 		uint32_t        production = 1;
+ 		DTEntry         entry;
+ 
++#if defined(SWEET)
++		uint32_t idle_cache = 1;
++		if (PE_parse_boot_argn("sweet_idle_cache", &idle_cache, sizeof(idle_cache)) && idle_cache <= 2) {
++			sweet_idle_cache = idle_cache;
++		}
++#endif
++
+ 		unsigned long   jtag = 0;
+ 
+ 		if (PE_parse_boot_argn("jtag", &jtag, sizeof(jtag))) {

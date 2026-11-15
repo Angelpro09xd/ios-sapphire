@@ -1,0 +1,339 @@
+0339: SapphireGpu, SweetSurface: per-surface account of CPU access for cache maintenance (kern.sweet_gpu_flush, default 0)
+
+Needs 0336. No change of behaviour unless switched on.
+
+A submission cleans and invalidates (dc civac) all of every surface it names that its client has mapped,
+and the Metal driver maps every surface it imports, so the window server's frame surface (4.9 MB) is
+maintained at every submission, inside the ring's lock (measured: ~1.5 ms per submission, 8.64 s of 8.91 s
+in GEM_SUBMIT over 15 minutes). The GPU alone writes that surface.
+
+- SweetSurface gets cpuEpoch, cleanEpoch and invalEpoch. cpuEpoch moves at every CPU access the kernel is
+  told of: IOSurfaceLock/Unlock traps, mapping or unmapping a GPU buffer over the surface, GEM_CPU_PREP and
+  GEM_CPU_FINI, the kernel's own CPU copies. cleanEpoch/invalEpoch are cpuEpoch as read before the last
+  full dc cvac / dc civac.
+- kern.sweet_gpu_flush (read-write, boot-arg gpu_flush): 0 (default) unchanged; 1 a submission maintains a
+  surface by that account: dc civac when it may write it (MSM_SUBMIT_BO_WRITE, or neither flag) and
+  invalEpoch != cpuEpoch, dc cvac when it only reads it and cleanEpoch != cpuEpoch, nothing otherwise; the
+  panel copy cleans by the same account; 2 as 1, and the client mapping of a surface's buffer is refused (a
+  client then reaches the pixels through IOSurface and its locks only).
+- kern.sweet_gpu_flush_stats (read only): surfaces named, skipped, cleaned, cleaned and invalidated (with
+  bytes), mappings refused.
+
+Mode 1 is complete only if no process accesses a surface through its GPU client mapping without locking
+the surface; mode 2 makes such an access visible.
+
+Locking: epochs are 32-bit words; cpuEpoch is only incremented atomically; clean/invalEpoch are stored
+under service_lock or fPresentLock with the value read before the pass. Nothing new sleeps or spins.
+
+Measured (one boot, n=1 per condition, home screen swipes): with kern.sweet_fb_queue=1, cache maintenance
+per submission 1.63 ms with kern.sweet_gpu_flush=0 and 0.01 ms with 1; App Library and Control Center
+render the same in screenshots.
+
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -4044,6 +4044,95 @@ struct msm_bo {
+ };
+ #define MSM_LEFT            256u                /* buffers given back while the GPU still had them */
+ 
++/*
++ * sapphire 0339: what the CPU caches hold of a surface, kept account of, so that a submission maintains only what a
++ * processor may have touched. kern.sweet_gpu_flush (boot-arg gpu_flush):
++ *   0  as before: a submission cleans and invalidates (dc civac) all of every surface it names whose seed moved or
++ *      that its program has mapped. HakiosMetal maps every surface it imports (Gpu::surfaceBo), so that is the
++ *      frame's own surface, 4.9 MB and 1.5 ms inside the ring's lock, on every submission (measured with 0336).
++ *   1  by the surface's own account (SweetSurface.h: cpuEpoch, cleanEpoch, invalEpoch). There are two hazards:
++ *        - the GPU reads memory that a processor wrote and still holds dirty in a cache. Cleaned (dc cvac) when
++ *          cleanEpoch is not cpuEpoch;
++ *        - the GPU writes memory of which a cache holds a line: a dirty line is written back later over what the
++ *          GPU drew, a clean one is what a processor reads afterwards in place of it. Cleaned and invalidated (dc
++ *          civac) when invalEpoch is not cpuEpoch.
++ *      Otherwise nothing: what the GPU writes puts no line in a cache, so a surface that only the GPU touches is
++ *      maintained once. Whether a submission writes a buffer is what it says in the buffer's flags
++ *      (MSM_SUBMIT_BO_WRITE, which HakiosMetal sets for what it draws into; neither flag counts as writing).
++ *      cpuEpoch moves at every access the kernel is told of: IOSurfaceLock and IOSurfaceUnlock (traps here, each
++ *      one comes through the kernel), the buffer's client memory being mapped or unmapped, GEM_CPU_PREP and
++ *      GEM_CPU_FINI, the kernel's own CPU copies. What it is NOT told of is a program reading or writing the
++ *      pixels through the mapping its GPU client gave it without locking the surface: HakiosMetal does that in
++ *      Texture::replace and Texture::read (-replaceRegion: and -getBytes: of a texture made straight over an
++ *      IOSurface). 1 is as good as the absence of those, which is why 0 is the default, and 2 is how to find out.
++ *   2  as 1, and a surface's buffer is not mapped into its program (the client memory is refused; one that is
++ *      mapped already stays so). The program then reaches the pixels through IOSurface alone, with its locks, and
++ *      the account is complete. HakiosMetal takes a surface it cannot map (Bo::cpu() null) and refuses by name, on
++ *      its console, a -replaceRegion: or -getBytes: of it: a session without such a line lost nothing with 1.
++ * It may be changed at any time: the account is kept in every mode, so a change costs at most one maintenance more.
++ */
++#define MSM_SUBMIT_BO_READ  0x0001u
++#define MSM_SUBMIT_BO_WRITE 0x0002u
++static int gpu_flush_mode;
++static struct {
++	uint64_t looked, nothing, cleaned, cleaned_bytes, flushed, flushed_bytes, maps_refused;
++} gflush;
++
++/* A submission names surface buffer b with these flags (mode 1 or 2). service_lock held. */
++static void
++msm_surface_sync(struct msm_bo *b, uint32_t flags)
++{
++	SweetSurface *s = b->surf;
++	/* read before the maintenance: an access announced while it runs is maintained again the next time */
++	uint32_t epoch = s->cpuEpoch;
++	bool writes = (flags & MSM_SUBMIT_BO_WRITE) != 0 || (flags & MSM_SUBMIT_BO_READ) == 0;
++
++	gflush.looked++;
++	if (s->mapCache == kIOMapWriteCombineCache || (writes ? s->invalEpoch == epoch : s->cleanEpoch == epoch)) {
++		gflush.nothing++;                       /* (write-combined: the panel's own memory, which no cache holds) */
++		return;
++	}
++	uint64_t t0 = mach_absolute_time();
++	if (writes) {
++		sweet_dcache_flush((vm_offset_t)b->kva, (unsigned)b->size);
++		s->invalEpoch = epoch;
++		gflush.flushed++;
++		gflush.flushed_bytes += b->size;
++	} else {
++		sweet_dcache_clean((vm_offset_t)b->kva, (unsigned)b->size);
++		gflush.cleaned++;
++		gflush.cleaned_bytes += b->size;
++	}
++	s->cleanEpoch = epoch;
++	gdiag_since(&gdiag.sub_flush, t0);              /* 0336's "cache flush" counts both kinds, and their bytes */
++	gdiag.sub_flush_bytes += b->size;
++}
++
++/* For SweetFramebuffer: whether surfaces go by their own account (kern.sweet_gpu_flush 1 or 2). */
++int sapphire_gpu_flush_tracking(void);
++
++int
++sapphire_gpu_flush_tracking(void)
++{
++	return gpu_flush_mode != 0;
++}
++
++static int
++sweet_gpu_flush_stats_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char line[320];
++
++	snprintf(line, sizeof(line), "surface account (kern.sweet_gpu_flush %d): named %llu, nothing to do %llu, cleaned %llu (%llu bytes), "
++	    "cleaned and invalidated %llu (%llu bytes), mappings refused %llu\n", gpu_flush_mode, gflush.looked, gflush.nothing,
++	    gflush.cleaned, gflush.cleaned_bytes, gflush.flushed, gflush.flushed_bytes, gflush.maps_refused);
++	return SYSCTL_OUT(req, line, strlen(line) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_flush_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_flush_stats_sysctl, "A", "sapphire 0339: what submissions did to the surfaces they named, by the surfaces' account");
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_flush, CTLFLAG_RW | CTLFLAG_LOCKED, &gpu_flush_mode, 0,
++    "sapphire 0339: cache maintenance of surfaces at a submission: 0 = every mapped one every time (as before), 1 = by the surface's account, 2 = as 1 and surfaces are not mapped through the GPU client");
++
+ class SapphireGPU : public IOService {
+ 	OSDeclareDefaultStructors(SapphireGPU);
+ };
+@@ -4294,9 +4383,17 @@ SapphireGPUClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMem
+ 
+ 	IOLockLock(service_lock);
+ 	struct msm_bo *b = fBo != NULL ? bo(type) : NULL;
+-	if (b != NULL) {
++	if (b != NULL && b->surf != NULL && !b->mapped && gpu_flush_mode == 2) {
++		/* 0339: a surface's pixels are the program's through IOSurface and its locks alone (an unmapping, which
++		 * also asks here, is of one mapped before and goes through) */
++		gflush.maps_refused++;
++		r = kIOReturnUnsupported;
++	} else if (b != NULL) {
+ 		b->md->retain();
+ 		b->mapped = true;
++		if (b->surf != NULL) {
++			OSIncrementAtomic((volatile SInt32 *)&b->surf->cpuEpoch);      /* 0339: mapped, or unmapped after use */
++		}
+ 		*memory = b->md;
+ 		/* pool memory write-combined; kernel memory never (see above). libdrm asks for the same. */
+ 		*options = b->pooled ? kIOMapWriteCombineCache : kIOMapDefaultCache;
+@@ -4568,6 +4665,11 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 				/* the GPU has drawn it since that seed: the display need not clean it (SweetFramebuffer) */
+ 				b->surf->gpuSeed = seed;
+ 				b->surf->gpuDrawn = true;
++				if (gpu_flush_mode != 0) {
++					msm_surface_sync(b, bos[i].flags);      /* 0339: by the surface's own account */
++					b->seed = seed;
++					continue;
++				}
+ 				/*
+ 				 * 0165: a surface is cleaned only when the CPU may have written it since: its seed
+ 				 * moved (IOSurfaceLock for writing) or it is mapped as a buffer. The 4 ms window that
+@@ -4583,7 +4685,12 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 				continue;                       /* never written by the CPU since it was cleaned */
+ 			}
+ 			uint64_t flush_t0 = mach_absolute_time();
++			uint32_t epoch = b->surf != NULL ? b->surf->cpuEpoch : 0;      /* 0339: the account is kept in every mode */
+ 			sweet_dcache_flush((vm_offset_t)b->kva, (unsigned)b->size);
++			if (b->surf != NULL) {
++				b->surf->invalEpoch = epoch;
++				b->surf->cleanEpoch = epoch;
++			}
+ 			gdiag_since(&gdiag.sub_flush, flush_t0);
+ 			gdiag.sub_flush_bytes += b->size;
+ 		}
+@@ -4719,9 +4826,18 @@ SapphireGPUClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 		ret = msm_param(r.param.param, &r.param.value) ? kIOReturnSuccess : kIOReturnBadArgument;
+ 		break;
+ 	case kMsmSetParam:
+-	case kMsmGemCpuFini:
+ 	case kMsmSubmitQueueClose:
+ 		break;
++	case kMsmGemCpuFini: {
++		/* 0339: the program has finished reading or writing the buffer (its handle comes first, as in CPU_PREP) */
++		IOLockLock(service_lock);
++		struct msm_bo *b = bo(r.cpuPrep.handle);
++		if (b != NULL && b->surf != NULL) {
++			OSIncrementAtomic((volatile SInt32 *)&b->surf->cpuEpoch);
++		}
++		IOLockUnlock(service_lock);
++		break;
++	}
+ 	case kMsmGemNew:
+ 		ret = gemNew(&r.gemNew);
+ 		break;
+@@ -4746,8 +4862,15 @@ SapphireGPUClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 		b = bo(r.cpuPrep.handle);
+ 		gdiag.prep_n++;                         /* 0336 */
+ 		if (b != NULL && b->kva != NULL) {
++			uint32_t epoch = b->surf != NULL ? b->surf->cpuEpoch : 0;
+ 			sweet_dcache_flush((vm_offset_t)b->kva, (unsigned)b->size);
+ 			gdiag.prep_flush_bytes += b->size;
++			if (b->surf != NULL) {
++				/* 0339: nothing of it in a cache now, and the program is about to touch it */
++				b->surf->invalEpoch = epoch;
++				b->surf->cleanEpoch = epoch;
++				OSIncrementAtomic((volatile SInt32 *)&b->surf->cpuEpoch);
++			}
+ 		}
+ 		IOLockUnlock(service_lock);
+ 		break;
+@@ -4820,6 +4943,7 @@ msm_publish(void)
+ 	}
+ 	gpu->setProperty(kIOUserClientClassKey, "SapphireGPUClient");
+ 	gpu->setName("SapphireGPU");
++	(void)PE_parse_boot_argn("gpu_flush", &gpu_flush_mode, sizeof(gpu_flush_mode));     /* 0339 */
+ 	if (gpu->attach(provider)) {
+ 		if (gpu->start(provider)) {
+ 			gpu->registerService();
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1643,6 +1643,38 @@ sweet_fb_gpucopy_on(void)
+ 	return sweet_fb_gpucopy != 0;
+ }
+ 
++/*
++ * sapphire 0339: the GPU is about to read surface s for the panel's copy. The kernel sees the surface's memory at va;
++ * [part, part + length) is what the copy reads. What a processor may still hold dirty of it is cleaned out of the
++ * caches (dc cvac), and the answer is whether anything was cleaned. With kern.sweet_gpu_flush=0 it is decided as
++ * before: cleaned unless the GPU drew the surface at its present seed. Otherwise by the surface's own account
++ * (SweetSurface.h): cleaned when a processor may have touched it since it was last cleaned, by this path or by a
++ * submission, and then all of its memory, so that the account stands for whoever asks next. A surface around a
++ * program's own memory is written without a lock and has no account: as before.
++ */
++extern int sapphire_gpu_flush_tracking(void);           /* SapphireGpu.cpp */
++
++static bool
++sweet_fb_clean_for_gpu(SweetSurface *s, uintptr_t va, vm_offset_t part, uint64_t length)
++{
++	uint32_t seed_now = s->state != NULL ? *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
++	uint32_t epoch = s->cpuEpoch;           /* read first: an access announced meanwhile is cleaned the next time */
++
++	if (sapphire_gpu_flush_tracking() && !s->wrapped && s->memory != NULL) {
++		if (s->cleanEpoch == epoch) {
++			return false;
++		}
++		sweet_dcache_clean((vm_offset_t)va, (unsigned)s->memory->getLength());
++		s->cleanEpoch = epoch;
++		return true;
++	}
++	if (s->gpuDrawn && seed_now == s->gpuSeed) {
++		return false;
++	}
++	sweet_dcache_clean(part, (unsigned)length);
++	return true;
++}
++
+ void
+ AppleCLCD::flipFrom(const uint8_t *src, uint32_t srcStride)
+ {
+@@ -1721,6 +1753,7 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 					scanFrom(pa, s->bytesPerRow);
+ 				}
+ 				ok = true;
++				OSIncrementAtomic((volatile SInt32 *)&s->cpuEpoch);     /* 0339: the CPU has read it (flipFrom): lines of it are in the caches */
+ 				IOLockLock(fLock);
+ 				if (fLastSurf != s) {
+ 					s->retain();
+@@ -1851,10 +1884,8 @@ AppleCLCD::present(const uint8_t *rec)
+ 			if (gpu_frame && bpe == 4 && src != 0 && s->width >= fLogicalW && s->height >= fLogicalH &&
+ 			    s->elementWidth == 1 && s->elementHeight == 1 && s->memory != NULL) {
+ 				uint64_t dbase = fFlip[0] != NULL ? fFlipPhys[fFlipIdx ^ 1] : fPhys;
+-				uint32_t seed_now = s->state != NULL ? *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
+-				if (!(s->gpuDrawn && seed_now == s->gpuSeed)) {
+-					uint64_t clean_t0 = mach_absolute_time();
+-					sweet_dcache_clean((vm_offset_t)(src + s->offset), (unsigned)((uint64_t)s->height * s->bytesPerRow));
++				uint64_t clean_t0 = mach_absolute_time();
++				if (sweet_fb_clean_for_gpu(s, src, (vm_offset_t)(src + s->offset), (uint64_t)s->height * s->bytesPerRow)) {
+ 					sweet_fbd.cleans++;             /* 0336: the whole surface out of the CPU caches for this frame */
+ 					sweet_fbd.clean_us += sweet_fbd_us(clean_t0, mach_absolute_time());
+ 				}
+@@ -1938,10 +1969,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			 * sapphire 0151: a surface the GPU drew (msm client) and nobody locked since -- its seed
+ 			 * is the one of that submission -- has nothing of the CPU's in the caches to push out.
+ 			 */
+-			uint32_t seed_now = s->state != NULL ? *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
+-			if (!(s->gpuDrawn && seed_now == s->gpuSeed)) {
+-				sweet_dcache_clean((vm_offset_t)(src + soff), (unsigned)((uint64_t)(h - 1) * s->bytesPerRow + (uint64_t)w * 4));
+-			}
++			(void)sweet_fb_clean_for_gpu(s, src, (vm_offset_t)(src + soff), (uint64_t)(h - 1) * s->bytesPerRow + (uint64_t)w * 4);
+ 			uint64_t t1 = mach_absolute_time();
+ 			if (sapphire_gpu_copy(s->memory, soff, s->bytesPerRow,
+ 			    dbase + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4, fRowBytes, (uint32_t)w, (uint32_t)h,
+@@ -1969,6 +1997,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
++			OSIncrementAtomic((volatile SInt32 *)&s->cpuEpoch);     /* 0339: the CPU has read it: lines of it are in the caches */
+ 		}
+ 		s->release();
+ 	}
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1399,6 +1399,12 @@ IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category
+ static IOReturn
+ sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
+ {
++	/*
++	 * 0339: a lock or an unlock, for reading or for writing: a processor is about to touch the pixels, or has
++	 * (SweetSurface.h, cpuEpoch). The lock says so before the first access and the unlock after the last one,
++	 * so whatever cleans the caches in between cleans again after the unlock.
++	 */
++	OSIncrementAtomic((volatile SInt32 *)&s->cpuEpoch);
+ 	uint32_t seed = bump ? OSIncrementAtomic((volatile SInt32 *)sweet_surface_seed(s)) + 1 :
+ 	    *sweet_surface_seed(s);
+ 	if (seedOut != NULL && copyout(&seed, (user_addr_t)seedOut, sizeof(seed)) != 0) {
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -49,10 +49,21 @@ public:
+ 	uint32_t                  purgeable;    /* IOSurfaceSetPurgeable state */
+ 	volatile uint32_t         gpuSeed;      /* sapphire 0151: the seed when the GPU last drew into it ... */
+ 	volatile bool             gpuDrawn;     /* ... (msm client): the display needs no cache clean then */
++	/*
++	 * sapphire 0339: who touched the pixels last, for the cache maintenance the GPU needs (SapphireGpu.cpp,
++	 * kern.sweet_gpu_flush). cpuEpoch moves whenever a processor may read or write them: every IOSurfaceLock and
++	 * IOSurfaceUnlock (the two traps), a GPU buffer over them being mapped or unmapped by its program,
++	 * GEM_CPU_PREP and GEM_CPU_FINI, a copy the kernel makes with the CPU. cleanEpoch is cpuEpoch as it was read
++	 * before the pixels were last cleaned out of the CPU caches (dc cvac or civac: all that a processor wrote
++	 * up to then is in memory), invalEpoch the same for the last clean that also invalidated (dc civac: no line
++	 * of them was left in a cache). A surface is made with its memory zeroed through the kernel's mapping, so
++	 * it starts touched and never cleaned.
++	 */
++	volatile uint32_t         cpuEpoch, cleanEpoch, invalEpoch;
+ 	uint32_t                  wrapDelta;    /* wrapped client memory: where it starts in its first page */
+ 	bool                      wrapped;      /* memory is a prepared range of a task (IOSurfaceWrapClient*) */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { sweet_surface_counted(1); gpuSeed = 0; gpuDrawn = false; scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { sweet_surface_counted(1); gpuSeed = 0; gpuDrawn = false; cpuEpoch = 1; cleanEpoch = 0; invalEpoch = 0; scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */

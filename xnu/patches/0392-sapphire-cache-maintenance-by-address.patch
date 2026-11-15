@@ -1,0 +1,70 @@
+0392: cpu: cache maintenance for DMA and for cache-mode changes by address, reaching every core
+
+1. c_bulksize_op = 0 on SWEET. Above it (2 MB), dcache_incoherent_io_flush64/store64 (performOperation,
+   IODMACommand), flush_dcache_syscall and platform_cache_flush_wimg maintained the whole cache by set/way,
+   which reaches only the calling core's L1 and its cluster's L2 and leaves lines other cores hold dirty; by
+   address the maintenance reaches every cache of the shareability domain.
+2. pmap_batch_set_cache_attributes cleans (pass 3, by address) a page that leaves a cacheable mode for an
+   uncached one, as pmap_set_cache_attributes does for one page (pmap_sync_wimg); xnu-4903 did it for every
+   change, this tree only for RT. Otherwise what the kernel wrote through the cacheable physmap before the
+   change (vm_object_iopl_request zero-fills first) can be written back later over what was stored through
+   the uncached mapping.
+
+No current user of either path is known in this port; with 0351 dirty lines are no longer written back by
+the maintenance before every WFI. Not measured on the phone beyond booting with it (one boot, no incident).
+
+--- a/osfmk/arm/cpuid.c
++++ b/osfmk/arm/cpuid.c
+@@ -389,6 +389,20 @@ do_cacheid(void)
+ 		cpuid_cache_info_p->c_bulksize_op = cpuid_cache_info_p->c_dsize;
+ 	}
+ 
++#if defined(SWEET)
++	/*
++	 * sapphire 0392: no "bulk" cache operations. Above c_bulksize_op, dcache_incoherent_io_flush64/store64 (the DMA
++	 * maintenance of IOMemoryDescriptor::performOperation and IODMACommand), flush_dcache_syscall and
++	 * platform_cache_flush_wimg clean the whole cache by set/way instead of the range by address. Set/way reaches
++	 * the calling core's L1 and its cluster's L2 only: the lines another core holds dirty stay there (by address,
++	 * DC CVAC/CIVAC reaches every cache of the shareability domain). Upstream only ever compiles these paths for
++	 * SoCs without coherent I/O, where nothing more is done; here, with two clusters, the range goes by address
++	 * whatever its size. Until 0351 every core also cleaned its L1 and L2 before each WFI, which wrote such lines
++	 * back within milliseconds.
++	 */
++	cpuid_cache_info_p->c_bulksize_op = 0;
++#endif
++
+ 	if (cpuid_cache_info_p->c_unified == 0) {
+ 		machine_write_csselr(CSSELR_L1, CSSELR_INSTR);
+ 		arm_cache_ccsidr_info.value = machine_read_ccsidr();
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -10423,6 +10423,20 @@ pmap_batch_set_cache_attributes_internal(
+ 			if (wimg_bits_new == VM_WIMG_RT && wimg_bits_prev != VM_WIMG_RT) {
+ 				rt_cache_flush_pass_needed = true;
+ 			}
++#if !defined(__ARM_COHERENT_IO__)
++			/*
++			 * sapphire 0392: a page that leaves a cacheable mode for an uncached one (write-combined, I/O, posted)
++			 * is cleaned out of the CPU caches too, as pmap_set_cache_attributes() does for one page
++			 * (pmap_sync_wimg). Without it, what the kernel wrote through the cacheable physmap before the change
++			 * (vm_object_iopl_request zero-fills the pages before setting their mode) stays dirty in a cache and
++			 * is written back later over what the CPU, through the uncached mapping, or a device stored there.
++			 * Pass 3 cleans by address, which reaches every core's caches.
++			 */
++			if (wimg_bits_new != wimg_bits_prev && !(wimg_bits_prev & VM_MEM_NOT_CACHEABLE) &&
++			    (wimg_bits_new & VM_MEM_NOT_CACHEABLE)) {
++				rt_cache_flush_pass_needed = true;
++			}
++#endif /* !__ARM_COHERENT_IO__ */
+ 
+ 			pvh_unlock(pai);
+ 
+@@ -10509,7 +10523,7 @@ pmap_batch_set_cache_attributes_internal(
+ 	}
+ 
+ 	if (state == PMAP_BATCH_SET_CACHE_ATTRIBUTES_CACHEFLUSH_PASS) {
+-		/* Pass 3: Flush the cache if the page is recently set to RT */
++		/* Pass 3: Flush the cache if the page is recently set to RT (sapphire 0392: or uncached, on a non-coherent SoC) */
+ 		PMAP_TRACE(2, PMAP_CODE(PMAP__BATCH_UPDATE_CACHING), page_cnt, cacheattr, 0xCECC0DE3, page_index);
+ #if !XNU_MONITOR
+ 		/**

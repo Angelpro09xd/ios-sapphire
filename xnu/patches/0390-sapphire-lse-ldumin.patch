@@ -1,0 +1,30 @@
+0390: cpu: LDUMIN of the LSE emulation stores the minimum
+
+The kernel emulates the LSE atomics the iOS 16 userland uses on these ARMv8.0 cores (sleh.c
+sweet_emulate_lse -> machine_routines_asm.s _sweet_lse_{b,h,w,x}). For UMAX (op 6) and UMIN (op 7) the macro
+compared the old value with the operand, selected the UMAX result, then compared w1 with 6 to tell the two
+apart and selected the UMIN result on the flags of that compare: w1 = 7 is not lower than 6, so LDUMIN stored
+the operand whatever the old value was. UMIN now compares the old value with the operand again.
+
+Checked on the phone in EL0 with the macro copied as is (80000 cases per operation and size, against a
+reference): before, UMIN mismatched in 40049 of 80000 cases and every other operation (ADD, CLR, EOR, SET,
+SMAX, SMIN, UMAX, SWP, CAS) matched; after, 0 mismatches. The emulation in the kernel itself has not been exercised with that test.
+
+--- a/osfmk/arm64/machine_routines_asm.s
++++ b/osfmk/arm64/machine_routines_asm.s
+@@ -1378,10 +1378,15 @@ LEXT(_sweet_lse_\sfx)
+ 	cmp	\r\()12, \r\()13
+ 	csel	\r\()11, \r\()10, \r\()2, lt
+ 	b	5f
++	/*
++	 * sapphire 0390: UMAX (6) and UMIN (7) each select on the flags of their own compare of the old value with the
++	 * operand; UMIN selected on those of "cmp w1, #6" and stored the operand whatever the old value was.
++	 */
+ 27:	cmp	\r\()10, \r\()2
+ 	csel	\r\()11, \r\()10, \r\()2, hi
+ 	cmp	w1, #6
+ 	b.eq	5f
++	cmp	\r\()10, \r\()2
+ 	csel	\r\()11, \r\()10, \r\()2, lo
+ 5:	\stx	w9, \r\()11, [x0]
+ 	cbnz	w9, 1b

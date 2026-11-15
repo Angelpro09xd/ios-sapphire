@@ -1,0 +1,644 @@
+0340: SweetFramebuffer: frame queue with three flip buffers, flips as the copies finish, bounded wait in SwapEnd (kern.sweet_fb_queue, default 0)
+
+Needs 0336. No change of behaviour unless switched on, except a third flip buffer taken from the low pool
+at start (10.4 MB that nothing else uses) and a thread that sleeps.
+
+How frames reach the panel with flip buffers (measured with 0336: "present 0", "flips by swap 0, by tick
+5920"): SwapEnd only records the swap; the 120 Hz timer hands it to present() at its next tick, the GPU
+copy goes into the one back buffer, and the flip is written by the first tick that finds the last copy's
+fence done. A frame whose copy is still pending when the next one is presented is copied over and never
+shown.
+
+With kern.sweet_fb_queue=1 (read-write; boot-arg sweetfb_queue=1):
+- a frame is presented in SwapEnd itself: its copy is queued at once, behind the drawing that made it;
+- three flip buffers and a queue of (buffer, fence, surfaces): a copy goes into a buffer that is neither
+  the one the MDP reads, nor one it may still be reading, nor one of a waiting frame;
+- a thread flips the oldest waiting frame as soon as its copy's fence is done (polling every
+  kern.sweet_fb_queue_poll_us, 500, while a frame waits), and not before the MDP has taken the previous
+  flip (INTF_FRAME_COUNT moved since it was written; twice if written in the last sixteenth of a refresh;
+  34 ms if the counter stands still);
+- a frame's surfaces stay in use until it is flipped;
+- a SwapEnd that finds no free buffer, or kern.sweet_fb_queue_depth (2) frames waiting, waits up to
+  kern.sweet_fb_queue_hold_ms (50, boot-arg sweetfb_queue_hold; 200 at most); then the newest waiting
+  frame gives up its buffer (counted as "overwritten").
+present() is not changed; the queue fills the slot present() takes its back buffer from and takes over
+the flip it leaves pending. The switch can be thrown while frames are in flight.
+
+kern.sweet_fb_queue_diag (read only): frames queued, flips (and by the thread), waits in SwapEnd and their
+time, timeouts, forced, late flips, polls, depth, SwapEnd-to-flip histogram.
+
+Locking: all queue state is under fPresentLock (a mutex); SwapEnd and the thread sleep with
+IOLockSleepDeadline. Lock order unchanged (fPresentLock, then service_lock; fLock is never held when
+fPresentLock is taken).
+
+Checked on the host: the queue functions and scanFrom() cut out of the patched file, run against a model of
+the GPU, panel, timer and window server (19 scenarios x 300 seeds x 600 frames): no copy into a buffer the
+panel reads, no flip over one not taken, frames in order, every surface released.
+Measured on the phone (one boot, n=1 per condition, home screen swipes): overwritten frames 94 of 886
+(10.6 %) with 0, 0 of 781 with 1 (flips = swaps).
+
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -2681,6 +2681,26 @@ sapphire_gpu_copy_pending(void)
+ 	return service_ready && last_copy_fence != 0 && pool != NULL && !fence_done(last_copy_fence);
+ }
+ 
++/*
++ * 0340, for SweetFramebuffer's frame queue, which waits for each copy by its own fence: the fence of the last copy
++ * handed to the CP (0: none yet), and whether a given one is done. A GPU that takes no more work has nothing pending
++ * (as sapphire_gpu_copy_pending() has it).
++ */
++uint32_t sapphire_gpu_copy_fence(void);
++bool sapphire_gpu_fence_done(uint32_t fence);
++
++uint32_t
++sapphire_gpu_copy_fence(void)
++{
++	return last_copy_fence;
++}
++
++bool
++sapphire_gpu_fence_done(uint32_t fence)
++{
++	return !service_ready || fence == 0 || pool == NULL || fence_done(fence);
++}
++
+ /* So a caller does not pay for cache maintenance before a copy the GPU would refuse. */
+ bool
+ sapphire_gpu_ready(void)
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -278,6 +278,51 @@ sweet_fbd_flip(volatile uint32_t *intf)
+ 	}
+ }
+ 
++/*
++ * sapphire 0340: the frame queue. kern.sweet_fb_queue=1 (boot-arg sweetfb_queue=1; default 0: as before).
++ *
++ * As it is without it (measured with 0336: "present: 0", "flips by swap 0"): a SwapEnd only records its swap (swap():
++ * `now` needs fFadeOrig == NULL, and fFadeOrig comes with the flip buffers, which this phone has had since 0233); the
++ * 120 Hz timer hands it to present() at its next tick, replacing one not yet presented; the GPU's copy goes into the
++ * one back buffer; and the flip is written by the first tick that finds the fence of the LAST copy queued done. A
++ * frame whose copy is still pending when the next one is presented is copied over in that buffer and never shown
++ * (13.8 % of them, measured), and a frame waits for a tick twice (up to 8.3 ms each time).
++ *
++ * With the queue:
++ *   - a frame is presented in SwapEnd itself: its copy is queued at once, behind the drawing that made it;
++ *   - there are three flip buffers and a queue of (buffer, fence, the frame's surfaces). The copy goes into a buffer
++ *     that is neither the one the MDP reads, nor the one it is leaving (it reads that one until it has taken the last
++ *     flip, at its vsync), nor one that holds a frame still waiting: no frame is copied over, and nothing is written
++ *     into what the panel is showing;
++ *   - a thread flips the oldest frame as soon as its copy's fence is done, looking every kern.sweet_fb_queue_poll_us
++ *     (500) while there is one to wait for, and not before the MDP has taken the flip before it (INTF_FRAME_COUNT has
++ *     moved on since it was written, two refreshes if it was written in the last sixteenth of one): two flips in one
++ *     refresh would leave the first unseen. The timer's ticks look too;
++ *   - a frame's surfaces stay in use until it is flipped: whoever draws cannot run further ahead than its surfaces;
++ *   - a SwapEnd that finds no free buffer (two frames waiting, or one and the buffer being left), or as many frames
++ *     waiting as kern.sweet_fb_queue_depth allows (2; 1 keeps whoever draws one frame less ahead of the panel, at the
++ *     price of more waits), waits, up to kern.sweet_fb_queue_hold_ms (50; boot-arg sweetfb_queue_hold). After that
++ *     the newest waiting frame gives up its buffer to the new one and is never shown (counted in 0336's
++ *     "overwritten"): the caller is never held longer, and the last frame of a run is always the one that stays.
++ * present() itself is unchanged: the queue puts the buffer it chose where present() looks for the back buffer
++ * (slot fFlipIdx ^ 1 of fFlip[]), and takes over the flip that present() leaves pending (fFlipWait). Switching the
++ * sysctl while frames are in flight is safe either way: each side takes over what the other left (presentQueued(),
++ * queueDrain()).
++ */
++#include <kern/thread.h>
++#define SWEET_FB_BUFS           3
++static int sweet_fb_queue = 0;
++static int sweet_fb_queue_hold_ms = 50;
++static int sweet_fb_queue_poll_us = 500;
++static int sweet_fb_queue_depth = 2;
++static struct {
++	uint64_t frames, flips, flips_thread, holds, hold_us, hold_max_us, timeouts, forced, dropped, drained, adopted;
++	uint64_t by_time, late, polls, depth_max;
++	struct sweet_fbd_hist lat;              /* from the SwapEnd coming in to the flip, waits included */
++} sweet_fbq;
++extern uint32_t sapphire_gpu_copy_fence(void);          /* SapphireGpu.cpp: the fence of the last copy queued */
++extern bool sapphire_gpu_fence_done(uint32_t fence);    /* ... and whether a given one is done */
++
+ struct SweetLowBuf {
+ 	IOMemoryMap *map;
+ 	uint8_t     *va;
+@@ -371,8 +416,8 @@ public:
+ 	IOBufferMemoryDescriptor *fFadeOrig;
+ 	/* kernel-drawn frames (console, fade) are double buffered like iOS's:
+ 	 * built in the back buffer, then the MDP flips to it at vsync */
+-	SweetLowBuf  *fFlip[2];
+-	uint64_t      fFlipPhys[2];
++	SweetLowBuf  *fFlip[SWEET_FB_BUFS];     /* 0340: a third one for the frame queue (NULL if the low pool had no room) */
++	uint64_t      fFlipPhys[SWEET_FB_BUFS];
+ 	uint32_t      fFlipIdx;
+ 	bool          fConsShown;     /* console frames on the panel (no iOS frame yet) */
+ 	void          flipFrom(const uint8_t *src, uint32_t srcStride);
+@@ -412,6 +457,32 @@ public:
+ 	void presentHeld(bool late);
+ 	IOLock       *fPresentLock;   /* 0201: present() from SwapEnd and from the vsync timer */
+ 	bool          fNow;           /* 0201: boot-arg sweetfb_now (default 1): present at SwapEnd */
++	/* 0340: the frame queue (see sweet_fb_queue above). All of it with fPresentLock. */
++	struct SweetQFrame {
++		uint64_t      pa;             /* the flip buffer the GPU copies the frame into */
++		uint32_t      fence;          /* that copy's fence */
++		uint64_t      queued, arrived; /* when the copy was queued; when the frame's SwapEnd came in */
++		SweetSurface *held[4];        /* the frame's surfaces: in use until it is flipped */
++	};
++	struct SweetQFrame fQ[SWEET_FB_BUFS];     /* the frames waiting for the panel, oldest first */
++	uint32_t      fQCount;
++	uint64_t      fQRetirePa[2];  /* the flip buffers the MDP may still be reading until it takes the last flip (0: none) */
++	bool          fQLatchWait;    /* the last flip written has not been seen taken yet */
++	bool          fQFlipLate;     /* ... it was written in the last sixteenth of a refresh (taken a refresh later, maybe) */
++	uint32_t      fQFlipFrame;    /* ... INTF_FRAME_COUNT when it was written */
++	uint64_t      fQFlipAbs;      /* ... and when */
++	uint64_t      fQArrived;      /* when the SwapEnd now being presented came in */
++	bool          fQThread;       /* the thread that flips is running */
++	bool          queueOn(void);
++	bool          flipTaken(uint64_t now);
++	void          queueFront(uint64_t pa);
++	int           queueFreeSlot(void);
++	void          queueDrop(void);
++	void          queueFlip(void);
++	void          queueDrain(void);
++	bool          presentQueued(const uint8_t *rec, SweetSurface **held, bool *queued);
++	void          queueThread(void) __attribute__((noreturn));
++	static void   queueThreadMain(void *self, wait_result_t result) __attribute__((noreturn));
+ };
+ 
+ /*
+@@ -720,6 +791,11 @@ AppleCLCD::start(IOService *provider)
+ 		} else {
+ 			OSSafeReleaseNULL(fCons);
+ 		}
++		if (fFlip[0] != NULL) {
++			/* 0340: the frame queue's third flip buffer, after everything else so that nothing moves */
++			fFlip[2] = SweetLowBuf::alloc(fsz);
++			fFlipPhys[2] = fFlip[2] ? fFlip[2]->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
++		}
+ 	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+@@ -747,6 +823,18 @@ AppleCLCD::start(IOService *provider)
+ 	fStartAbs = mach_absolute_time();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	/* 0340: the frame queue's thread (asleep until a frame is queued), and its boot-args */
++	PE_parse_boot_argn("sweetfb_queue", &sweet_fb_queue, sizeof(sweet_fb_queue));
++	PE_parse_boot_argn("sweetfb_queue_hold", &sweet_fb_queue_hold_ms, sizeof(sweet_fb_queue_hold_ms));
++	if (fFlip[0] != NULL && fPresentLock != NULL) {
++		thread_t thread;
++		if (kernel_thread_start(&AppleCLCD::queueThreadMain, this, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			fQThread = true;
++		}
++		IOLog("SWEET FB: frame queue %s (kern.sweet_fb_queue), %u flip buffers, its thread %s\n", sweet_fb_queue ? "on" : "off",
++		    fFlip[2] != NULL ? 3u : 2u, fQThread ? "started" : "NOT started (the timer's ticks flip)");
++	}
+ 	return true;
+ }
+ 
+@@ -987,6 +1075,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		/* 0235: a back buffer whose GPU copy has landed since the last swap goes on the panel now */
+ 		IOLockLock(fb->fPresentLock);
+ 		uint64_t flips_before = sweet_fbd.flips;
++		fb->queueFlip();                /* 0340: the frame queue's turn (nothing to do when it is empty) */
+ 		(void)fb->flipWhenCopied(false);
+ 		if (sweet_fbd.flips != flips_before) {
+ 			sweet_fbd.flips_by_tick++;      /* 0336: this tick found the copy done */
+@@ -997,9 +1086,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	    sweet_console_copy_dirty(fb->backBuffer())) {
+ 		fb->flipBack();
+ 	}
+-	if (rec != NULL) {
++	if (rec != NULL && fb->queueOn()) {
++		/* 0340: the timer's own frames (the latest one after "on", a swap recorded while off) go the queue's way */
++		fb->presentNow(rec, taken);
++		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++	} else if (rec != NULL) {
+ 		if (fb->fPresentLock != NULL) {
+ 			IOLockLock(fb->fPresentLock);
++			fb->queueDrain();               /* 0340: (the queue was just turned off: what it still holds goes first) */
+ 		}
+ 		fb->present(rec);
+ 		if (fb->fPresentLock != NULL) {
+@@ -1103,6 +1197,11 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	 */
+ 	IOLockLock(fLock);
+ 	bool now = fNow && !fPowerOff && fFadeOrig == NULL;
++	if (!now && !fPowerOff && queueOn()) {
++		/* 0340: the frame queue presents in SwapEnd, flip buffers or not; the swap stays the latest one for "on" */
++		memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++		now = true;
++	}
+ 	IOLockUnlock(fLock);
+ 	if (now) {
+ 		/*
+@@ -1166,7 +1265,14 @@ AppleCLCD::presentNow(const uint8_t *rec, SweetSurface **held)
+ 	uint64_t diag_t0 = mach_absolute_time();        /* 0336: what a SwapEnd costs its caller here, lock included */
+ 	IOLockLock(fPresentLock);
+ 	uint64_t flips_before = sweet_fbd.flips;
+-	bool copied = present(rec);
++	bool queued = false, copied;
++	if (queueOn()) {
++		fQArrived = diag_t0;
++		copied = presentQueued(rec, held, &queued);     /* 0340: queued, the frame keeps its surfaces until its flip */
++	} else {
++		queueDrain();                           /* (the queue was just turned off: what it still holds goes first) */
++		copied = present(rec);
++	}
+ 	if (sweet_fbd.flips != flips_before) {
+ 		sweet_fbd.flips_by_swap++;              /* this swap found the copy before it done */
+ 	}
+@@ -1186,7 +1292,9 @@ AppleCLCD::presentNow(const uint8_t *rec, SweetSurface **held)
+ 	SweetSurface *pend[4];
+ 	memcpy(pend, fPendHold, sizeof(pend));         /* (a frame of the timer's path, now replaced) */
+ 	bzero(fPendHold, sizeof(fPendHold));
+-	if (copied) {
++	if (queued) {
++		/* 0340: (the queue lets go of them) */
++	} else if (copied) {
+ 		memcpy(release, held, sizeof(release));
+ 	} else {
+ 		memcpy(release, fRetireHold, sizeof(release));
+@@ -1233,6 +1341,37 @@ AppleCLCD::presentHeld(bool late)
+ void
+ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ {
++	/*
++	 * 0340: the MDP goes on reading what it reads until it takes this flip at its vsync. Which flip buffer that
++	 * is, and where the panel's scan was when the flip was written, are kept for the frame queue: the buffer is
++	 * not written and no other flip is made before the flip is seen taken (flipTaken()). If the flip before this
++	 * one has not been seen taken, the MDP may be reading either the buffer noted then or that flip's own.
++	 */
++	uint64_t now = mach_absolute_time();
++	bool taken = flipTaken(now);
++	uint64_t leaving = 0;
++	for (unsigned i = 0; i < SWEET_FB_BUFS; i++) {
++		if (fFlip[i] != NULL && fFlipPhys[i] == fScanPhys) {
++			leaving = fFlipPhys[i];
++		}
++	}
++	if (pa != fScanPhys) {
++		if (taken) {
++			fQRetirePa[0] = leaving;
++			fQRetirePa[1] = 0;
++		} else if (leaving != fQRetirePa[0]) {
++			fQRetirePa[1] = leaving;
++		}
++		fQFlipLate = true;
++		if (fIntf1 != NULL) {
++			uint32_t hsync = fIntf1[(0x800 + 0x008) / 4] >> 16;
++			uint32_t vtotal = hsync != 0 ? fIntf1[(0x800 + 0x00c) / 4] / hsync : 0;
++			fQFlipFrame = fIntf1[(0x800 + 0x0ac) / 4];
++			fQFlipLate = vtotal == 0 || (uint64_t)fIntf1[(0x800 + 0x0b0) / 4] * 16 >= (uint64_t)vtotal * 15;
++		}
++		fQFlipAbs = now;
++		fQLatchWait = true;
++	}
+ 	fVig0[0x14 / 4] = (uint32_t)pa;
+ 	fVig0[0x24 / 4] = stride;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+@@ -2032,6 +2171,305 @@ AppleCLCD::present(const uint8_t *rec)
+ 	return true;                    /* copied by the CPU: the surface is free */
+ }
+ 
++/* ---------------------------------------------------------------- sapphire 0340: the frame queue */
++
++bool
++AppleCLCD::queueOn(void)
++{
++	return sweet_fb_queue != 0 && fFlip[0] != NULL && fFlip[1] != NULL && fPresentLock != NULL && fVig0 != NULL;
++}
++
++/*
++ * Whether the MDP has taken the last flip written (scanFrom()), so that the buffer it was reading is free and the
++ * next flip may be written. Its frame counter has moved on since the flip was written: once, or twice if the flip was
++ * written in the last sixteenth of a refresh, where it may have come too late for the vsync that followed. Without
++ * the counter, or if it stands still, 34 ms (two refreshes at 60 Hz) are enough.
++ */
++bool
++AppleCLCD::flipTaken(uint64_t now)
++{
++	uint64_t limit;
++
++	if (!fQLatchWait) {
++		return true;
++	}
++	bool taken = fIntf1 != NULL && (uint32_t)(fIntf1[(0x800 + 0x0ac) / 4] - fQFlipFrame) >= (fQFlipLate ? 2u : 1u);
++	if (!taken) {
++		nanoseconds_to_absolutetime(34 * NSEC_PER_MSEC, &limit);
++		if (now - fQFlipAbs < limit) {
++			return false;
++		}
++		sweet_fbq.by_time++;
++	}
++	fQLatchWait = false;
++	fQRetirePa[0] = fQRetirePa[1] = 0;
++	return true;
++}
++
++/* The buffer at pa is the one the MDP is pointed at now: it goes to slot fFlipIdx, where everything else looks for it. */
++void
++AppleCLCD::queueFront(uint64_t pa)
++{
++	for (uint32_t k = 0; k < SWEET_FB_BUFS; k++) {
++		if (fFlip[k] != NULL && fFlipPhys[k] == pa && k != fFlipIdx) {
++			SweetLowBuf *b = fFlip[k];
++			fFlip[k] = fFlip[fFlipIdx];
++			fFlipPhys[k] = fFlipPhys[fFlipIdx];
++			fFlip[fFlipIdx] = b;
++			fFlipPhys[fFlipIdx] = pa;
++			return;
++		}
++	}
++}
++
++/* A flip buffer nothing is using: not the one the MDP reads, nor the one it is leaving, nor one of a waiting frame. */
++int
++AppleCLCD::queueFreeSlot(void)
++{
++	for (int i = 0; i < SWEET_FB_BUFS; i++) {
++		bool busy = fFlip[i] == NULL || fFlipPhys[i] == fScanPhys || fFlipPhys[i] == fQRetirePa[0] || fFlipPhys[i] == fQRetirePa[1];
++		for (uint32_t k = 0; !busy && k < fQCount; k++) {
++			busy = fQ[k].pa == fFlipPhys[i];
++		}
++		if (!busy) {
++			return i;
++		}
++	}
++	return -1;
++}
++
++/* The waiting frames are given up: none of them is shown. Their copies still run, each into its own buffer. */
++void
++AppleCLCD::queueDrop(void)
++{
++	for (uint32_t k = 0; k < fQCount; k++) {
++		sweet_hold_set(fQ[k].held, false);
++		sweet_fbq.dropped++;
++	}
++	if (fQCount != 0) {
++		fQCount = 0;
++		IOLockWakeup(fPresentLock, &fQCount, false);
++	}
++}
++
++/*
++ * The queue's turn, from its thread, from the timer's ticks and from SwapEnd: the oldest waiting frame goes to the
++ * panel if its copy is done and the MDP has taken the flip before it. With the display off the waiting frames are
++ * given up (0295: what was drawn before "off" is not what "on" shows).
++ */
++void
++AppleCLCD::queueFlip(void)
++{
++	uint64_t now = mach_absolute_time();
++	bool waiting = fQLatchWait;
++	bool taken = flipTaken(now);
++	bool wake = waiting && taken;           /* the buffer the MDP was leaving is free from now on */
++
++	if (fPowerOff) {
++		queueDrop();
++	} else if (fQCount != 0 && taken && sapphire_gpu_fence_done(fQ[0].fence)) {
++		struct SweetQFrame f = fQ[0];
++		for (uint32_t k = 1; k < fQCount; k++) {
++			fQ[k - 1] = fQ[k];
++		}
++		fQCount--;
++		sweet_fbd.pend_swap = f.queued;         /* 0336's "swap to flip" is this frame's, from its copy being queued */
++		scanFrom(f.pa, fRowBytes);
++		sweet_fbd_flip(fIntf1);
++		queueFront(f.pa);
++		sweet_fbq.flips++;
++		sweet_fbq.late += fQFlipLate;
++		if (f.arrived != 0 && now > f.arrived) {
++			sweet_fbd_add(&sweet_fbq.lat, sweet_fbd_lat_us, sizeof(sweet_fbd_lat_us) / sizeof(sweet_fbd_lat_us[0]),
++			    sweet_fbd_us(f.arrived, now));
++		}
++		sweet_hold_set(f.held, false);
++		wake = true;                            /* ... and one frame fewer waits */
++	}
++	if (wake) {
++		IOLockWakeup(fPresentLock, &fQCount, false);    /* whoever waits in SwapEnd for a buffer or for its turn */
++	}
++}
++
++/*
++ * Before the CPU writes a flip buffer, and when the queue is switched off with frames still in it: the copies queued
++ * are waited for (the GPU runs them in order, so the newest one's fence covers them all; up to 20 ms, as
++ * flipWhenCopied(true) waits), the newest frame goes to the panel and the older ones are given up.
++ */
++void
++AppleCLCD::queueDrain(void)
++{
++	if (fQCount == 0) {
++		return;
++	}
++	struct SweetQFrame f = fQ[fQCount - 1];
++	for (unsigned i = 0; i < 200 && !sapphire_gpu_fence_done(f.fence); i++) {
++		IODelay(100);
++	}
++	fQCount--;
++	queueDrop();
++	if (!fPowerOff) {
++		sweet_fbd.pend_swap = f.queued;
++		scanFrom(f.pa, fRowBytes);
++		sweet_fbd_flip(fIntf1);
++		queueFront(f.pa);
++		sweet_fbq.flips++;
++	}
++	sweet_hold_set(f.held, false);
++	sweet_fbq.drained++;
++	IOLockWakeup(fPresentLock, &fQCount, false);
++}
++
++/*
++ * A frame presented through the queue (fPresentLock held; from SwapEnd, or from the timer for its own frames). Says
++ * what present() says, and in *queued whether the frame now waits in the queue, which then holds its surfaces.
++ */
++bool
++AppleCLCD::presentQueued(const uint8_t *rec, SweetSurface **held, bool *queued)
++{
++	uint32_t mask = get32(rec, 0x104), nlayers = 0;
++
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		if ((mask & (1u << layer)) && get32(rec, 0x54 + 4 * layer) != 0) {
++			nlayers++;
++		}
++	}
++	bool gpu_frame = nlayers == 1 && sweet_fb_gpucopy_on() && sapphire_gpu_ready();   /* as present() decides it */
++
++	if (fFlipWait) {
++		/* the queue was just turned on: the copy the old path left pending is the queue's first frame */
++		if (fQCount < SWEET_FB_BUFS) {
++			struct SweetQFrame *f = &fQ[fQCount++];
++			bzero(f, sizeof(*f));
++			f->pa = fFlipPhys[fFlipIdx ^ 1];
++			f->fence = sapphire_gpu_copy_fence();
++			f->queued = sweet_fbd.pend_swap;
++			sweet_fbq.adopted++;
++		}
++		fFlipWait = false;
++		sweet_fbd.pend_swap = 0;
++	}
++	queueFlip();
++	if (!gpu_frame) {
++		queueDrain();           /* the CPU writes its buffer at once: nothing older may still be on its way */
++	}
++
++	uint32_t depth = sweet_fb_queue_depth < 1 ? 1 : (uint32_t)sweet_fb_queue_depth;
++	int slot = fQCount < depth ? queueFreeSlot() : -1;
++	if (slot < 0) {
++		/* every buffer is taken, or enough frames wait already: until the oldest one's flip is taken, but not for long */
++		uint64_t t0 = mach_absolute_time(), deadline;
++		int ms = sweet_fb_queue_hold_ms;
++		if (ms > 0) {
++			clock_interval_to_deadline((uint32_t)(ms > 200 ? 200 : ms), kMillisecondScale, &deadline);
++			do {
++				IOLockWakeup(fPresentLock, &fQThread, true);
++				int result = IOLockSleepDeadline(fPresentLock, &fQCount, deadline, THREAD_UNINT);
++				queueFlip();
++				slot = fQCount < depth ? queueFreeSlot() : -1;
++				if (result == THREAD_TIMED_OUT) {
++					if (fQCount != 0 || !fQLatchWait) {
++						break;
++					}
++					/* no frame waits, only the vsync that frees the buffer the MDP is leaving: 34 ms from its flip at most */
++					clock_interval_to_deadline(1, kMillisecondScale, &deadline);
++				}
++			} while (slot < 0);
++		}
++		uint64_t us = sweet_fbd_us(t0, mach_absolute_time());
++		sweet_fbq.holds++;
++		sweet_fbq.hold_us += us;
++		if (us > sweet_fbq.hold_max_us) {
++			sweet_fbq.hold_max_us = us;
++		}
++	}
++	if (slot < 0 && fQCount != 0) {
++		/* still none: the newest waiting frame gives up its buffer to this one and is never shown */
++		struct SweetQFrame *f = &fQ[--fQCount];
++		for (int i = 0; i < SWEET_FB_BUFS; i++) {
++			if (fFlip[i] != NULL && fFlipPhys[i] == f->pa) {
++				slot = i;
++			}
++		}
++		sweet_hold_set(f->held, false);
++		sweet_fbd.overwritten++;
++		sweet_fbq.timeouts++;
++	}
++	if (slot < 0 && fQLatchWait) {
++		/* (no frame waits and nobody is to be kept waiting, kern.sweet_fb_queue_hold_ms=0: a buffer the MDP may
++		 * still be reading, as if it had taken the last flip. The one way left to write into what the panel shows.) */
++		fQLatchWait = false;
++		fQRetirePa[0] = fQRetirePa[1] = 0;
++		slot = queueFreeSlot();
++		sweet_fbq.forced++;
++	}
++	uint32_t back = fFlipIdx ^ 1;           /* where present() takes its back buffer from */
++	if (slot >= 0 && (uint32_t)slot != back) {
++		SweetLowBuf *b = fFlip[slot];
++		uint64_t b_pa = fFlipPhys[slot];
++		fFlip[slot] = fFlip[back];
++		fFlipPhys[slot] = fFlipPhys[back];
++		fFlip[back] = b;
++		fFlipPhys[back] = b_pa;
++	}
++	uint64_t pa = fFlipPhys[back];
++
++	bool copied = present(rec);
++
++	if (fFlipWait) {
++		/* the GPU's copy into that buffer is queued: the frame waits its turn, and keeps its surfaces until then */
++		fFlipWait = false;
++		if (fQCount < SWEET_FB_BUFS) {
++			struct SweetQFrame *f = &fQ[fQCount++];
++			f->pa = pa;
++			f->fence = sapphire_gpu_copy_fence();
++			f->queued = sweet_fbd.pend_swap;
++			f->arrived = fQArrived;
++			memcpy(f->held, held, sizeof(f->held));
++			*queued = true;
++			sweet_fbq.frames++;
++			if (fQCount > sweet_fbq.depth_max) {
++				sweet_fbq.depth_max = fQCount;
++			}
++		}
++		sweet_fbd.pend_swap = 0;
++		queueFlip();                            /* (a copy with nothing ahead of it may be done already) */
++		IOLockWakeup(fPresentLock, &fQThread, true);
++	} else if (fScanPhys == pa) {
++		queueDrop();            /* the CPU wrote the frame and flipped to it: whatever still waited is older */
++	}
++	return copied;
++}
++
++void
++AppleCLCD::queueThreadMain(void *self, __unused wait_result_t result)
++{
++	((AppleCLCD *)self)->queueThread();
++}
++
++/* The thread that flips: asleep while nothing waits, otherwise looking every kern.sweet_fb_queue_poll_us. */
++void
++AppleCLCD::queueThread(void)
++{
++	IOLockLock(fPresentLock);
++	for (;;) {
++		if (fQCount != 0 || fQLatchWait) {
++			uint64_t flips = sweet_fbq.flips;
++			queueFlip();
++			sweet_fbq.flips_thread += sweet_fbq.flips - flips;
++		}
++		if (fQCount != 0 || (fQLatchWait && queueOn())) {
++			uint64_t deadline;
++			int us = sweet_fb_queue_poll_us;
++			clock_interval_to_deadline((uint32_t)(us < 100 ? 100 : us > 8000 ? 8000 : us), kMicrosecondScale, &deadline);
++			(void)IOLockSleepDeadline(fPresentLock, &fQThread, deadline, THREAD_UNINT);
++			sweet_fbq.polls++;
++		} else {
++			(void)IOLockSleep(fPresentLock, &fQThread, THREAD_UNINT);
++		}
++	}
++}
++
+ bool
+ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
+@@ -2642,3 +3080,39 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_diag, CTLTYPE_STRING | CTLFLAG_RD | CTLFLA
+     NULL, 0, sweet_fb_diag_sysctl, "A", "sapphire 0336: presentation path counters and histograms");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hold_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_hold_ms, 0,
+     "sapphire 0338: ms a SwapEnd waits for the GPU's copy of the frame before its own (0 = off, as before)");
++
++/* sapphire 0340: the frame queue's switches and counters (sweet_fbq, at the top). */
++static int
++sweet_fb_queue_diag_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[1024];
++	int n;
++
++	n = snprintf(buf, sizeof(buf), "queue (kern.sweet_fb_queue %d, depth %d, hold %d ms, poll %d us): frames %llu flips %llu (by its thread %llu) "
++	    "adopted %llu dropped %llu drained %llu; swaps that waited %llu, %llu us in all, max %llu; "
++	    "timed out %llu forced %llu; flips taken by time %llu, written late %llu; polls %llu; depth max %llu\n"
++	    "arrival to flip (ms <2 <4 <8 <12 <16 <24 <32 <48 <64 <100 <200 more; us):", sweet_fb_queue, sweet_fb_queue_depth,
++	    sweet_fb_queue_hold_ms, sweet_fb_queue_poll_us, sweet_fbq.frames, sweet_fbq.flips, sweet_fbq.flips_thread, sweet_fbq.adopted, sweet_fbq.dropped,
++	    sweet_fbq.drained, sweet_fbq.holds, sweet_fbq.hold_us, sweet_fbq.hold_max_us, sweet_fbq.timeouts, sweet_fbq.forced,
++	    sweet_fbq.by_time, sweet_fbq.late, sweet_fbq.polls, sweet_fbq.depth_max);
++	for (unsigned k = 0; k < 12 && n > 0 && (size_t)n < sizeof(buf); k++) {
++		n += snprintf(buf + n, sizeof(buf) - (size_t)n, " %llu", sweet_fbq.lat.n[k]);
++	}
++	if (n > 0 && (size_t)n < sizeof(buf)) {
++		n += snprintf(buf + n, sizeof(buf) - (size_t)n, "; count %llu sum %llu max %llu\n", sweet_fbq.lat.count, sweet_fbq.lat.sum,
++		    sweet_fbq.lat.max);
++	}
++	buf[sizeof(buf) - 1] = 0;
++	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_queue_diag, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_fb_queue_diag_sysctl, "A", "sapphire 0340: the frame queue's counters");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_queue, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_queue, 0,
++    "sapphire 0340: 1 = frames presented in SwapEnd through a queue of three flip buffers, flipped by a thread as their copies finish (0 = as before)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_queue_hold_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_queue_hold_ms, 0,
++    "sapphire 0340: the longest a SwapEnd waits for a free flip buffer, ms (200 at most; 0 = never)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_queue_poll_us, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_queue_poll_us, 0,
++    "sapphire 0340: how often the queue's thread looks at a pending copy's fence, us (100 to 8000)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_queue_depth, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_queue_depth, 0,
++    "sapphire 0340: how many frames may wait for the panel before a SwapEnd is held (1 or 2)");
