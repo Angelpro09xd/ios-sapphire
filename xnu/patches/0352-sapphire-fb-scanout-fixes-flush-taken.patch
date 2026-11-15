@@ -1,0 +1,281 @@
+0352: SweetFramebuffer: scanout fixes, no frame of a surface shown half drawn, flips taken by CTL_FLUSH (kern.sweet_fb_flush_taken, default 0)
+
+Needs 0349 and 0350. Nothing changes unless kern.sweet_fb_scanout (0350) or kern.sweet_fb_flush_taken is
+switched on, except item 1, which only matters once frames of surfaces have been in the queue.
+
+1. presentQueued() (0340) now clears the queue entry it fills: a copy queued where a scanned-out frame had
+   been inherited its scan flag and was shown as one.
+2. scanFrom() and planeScaled() note the flip (frame counter, line) when it is written, not before waiting
+   for a writable plane; a note a refresh old let flipTaken() release a surface the panel was still reading.
+3. A frame of a surface is not shown before its drawing is done (0350 showed it after 250 ms); a hung GPU is
+   reset after 2 s and its fences complete (0317), as for the copies. queueDrain() drops such a frame instead.
+4. CTL_FLUSH, measured with 0349 (kernel 0350, 14388 flips): its bits read set right after the write in 14386
+   flips and clear at the programmable fetch (line 2420 of 2432), ~12 lines before INTF_FRAME_COUNT moves; of
+   14324 flips followed, 99.5 % cleared by the counter's first move; in the second-to-last sixteenth of the
+   refresh 11 of 922 cleared only at the second move. Once 16 flips have been seen and at most one in 64 read
+   clear right after the write, CTL_FLUSH is taken to read back:
+   - planeWritable(): bits clear are enough, at any line (Linux msm_atomic_commit_tail does no more); the line
+     window of 0350 stays for a CTL_FLUSH that does not read back;
+   - kern.sweet_fb_flush_taken (read-write, boot-arg sweetfb_flush_taken), default 0: flips are taken by the
+     frame counter (0340), and by the bits once a scanned-out frame has been on the panel; 1: every flip,
+     copies too, is taken when the bits read clear.
+5. kern.sweet_fb_scanout_diag says how many flips read the bits back and which rule takes the flips.
+
+Items 1 and 2 were found by a host simulation of the queue and scanout code extracted from the file, against
+a model of the GPU, the display engine and the window server.
+Measured on the phone (one boot): kern.sweet_fb_scanout=1 ran without hangs, flushes not taken 0.
+kern.sweet_fb_flush_taken=1 is not measured. Off: kern.sweet_fb_scanout=0 and kern.sweet_fb_flush_taken=0.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -466,7 +466,7 @@ sweet_fbl_sample(volatile uint32_t *ctl, volatile uint32_t *intf)
+  *     the flip of a later frame. The window server then draws into another one, or makes one more;
+  *   - the frame drawn before it is shown: the flip waits for the msm fence of the last submission made before the
+  *     SwapEnd (HakiosMetal's commit submits before it returns, and the CP runs one ring in order), and for any later
+- *     one that named the surface (its gpuFence); 250 ms at most;
++ *     one that named the surface (its gpuFence); a hung GPU is reset after 2 s and its fences jump ahead (0317);
+  *   - the plane rewritten only when it cannot be latched half written: the MDP has taken the last flush (CTL_FLUSH's
+  *     bits clear) and the scan is between a sixteenth and three quarters of the refresh, milliseconds from the next
+  *     frame start, where the registers are latched; a write takes microseconds. A flip of a flip buffer rewrites the
+@@ -485,8 +485,21 @@ sweet_fbl_sample(volatile uint32_t *ctl, volatile uint32_t *intf)
+ #define SWEET_FB_FMT_BGRA       0x42475241
+ static int sweet_fb_scanout = 0;
+ static bool sweet_fb_scan_ready;                /* start() found the plane as it should be and set up the pool */
++/*
++ * sapphire 0352: when a flip counts as taken (flipTaken()). CTL_FLUSH holds the bits a flip writes until the MDP takes
++ * them, as Linux and the stock driver read it (dpu_encoder_phys_vid.c, sde_encoder_phys_vid.c, vblank): measured on the
++ * phone with 0349, the bits read set right after the write in 14 386 of 14 388 flips (the two others were written as
++ * the MDP took them), and they clear at the programmable fetch (INTF_PROG_FETCH_START 0x156ad1: line 2420 of 2432), ~12
++ * lines before INTF_FRAME_COUNT moves. 0340 takes a flip as taken when the counter has moved (twice if written in the
++ * last sixteenth); a flip written later than line ~2420 is taken a refresh later, and the counter alone cannot tell.
++ * kern.sweet_fb_flush_taken (boot-arg sweetfb_flush_taken):
++ *   0 (default)  as 0340, and with the bits once a frame of a surface has been on the panel (as 0350);
++ *   1            by the bits for every flip, once 16 flips have shown that they read back (no more than one in 64 read
++ *                clear right after the write); by the counter otherwise.
++ */
++static int sweet_fb_flush_taken = 0;
+ static struct {
+-	uint64_t frames, flips, forced, late_draw, not_one_layer, not_pool, unfit, reused, queue_off;
++	uint64_t frames, flips, late_draw, not_one_layer, not_pool, unfit, reused, queue_off;
+ 	uint64_t holds, hold_us, hold_max_us, timeouts, to_scaled, to_unscaled, unscaled_waits, unscaled_wait_max_us;
+ 	uint64_t window_waits, released, stops, stuck;
+ } sweet_fbs;
+@@ -744,7 +757,10 @@ public:
+ 	uint32_t      fPlaneStride;
+ 	SweetSurface *fScanShow[4];   /* the surfaces of the frame on the panel, when it is a frame of a surface */
+ 	SweetSurface *fScanLeave[4][4]; /* ... of frames left since the MDP was last seen to take a flip, oldest first */
+-	bool          fFlushKnown, fFlushReadback;    /* CTL_FLUSH has been read right after a write; it read the bits set */
++	bool          fFlushKnown, fFlushReadback;    /* CTL_FLUSH has been read after 16 writes or more; it reads back (0352) */
++	uint32_t      fFlushSet, fFlushClear;         /* 0352: what it read right after each write: the bits set, or clear */
++	bool          fScanUsed;      /* 0352: a frame of a surface has been on the panel */
++	void          flushNote(void);
+ 	bool          fScanStuck;     /* the MDP did not take a flush of the scaled plane in 100 ms */
+ 	void          scanoutInit(void);
+ 	bool          scanoutOn(void);
+@@ -1127,6 +1143,7 @@ void
+ AppleCLCD::scanoutInit(void)
+ {
+ 	PE_parse_boot_argn("sweetfb_scanout", &sweet_fb_scanout, sizeof(sweet_fb_scanout));
++	PE_parse_boot_argn("sweetfb_flush_taken", &sweet_fb_flush_taken, sizeof(sweet_fb_flush_taken));     /* 0352 */
+ 	if (fVig0 == NULL || fCtl0 == NULL) {
+ 		fScanWhy = "the plane is not mapped";
+ 		return;
+@@ -1698,19 +1715,37 @@ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ 	 * 0350: a flip buffer is shown unscaled, the plane as the bootloader set it up: a scaled plane (a surface on the
+ 	 * panel) is set back first, where it cannot be latched half written; that surface is read until this flip is taken.
+ 	 */
+-	flipNote(pa, fPlaneScaled);
+-	planeUnscaled();
++	bool geometry = fPlaneScaled;
++	planeUnscaled();                /* 0352: (waits for a writable plane first: the flip is noted after, when it is written) */
++	flipNote(pa, geometry);
+ 	scanoutLeave();
+ 	fVig0[0x14 / 4] = (uint32_t)pa;
+ 	fVig0[0x24 / 4] = stride;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	fCtl0[0x18 / 4] = 0x20001;      /* flush VIG0 + CTL: latched at the next vsync */
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	flushNote();                    /* 0352 */
+ 	sweet_fbl_wrote(fCtl0, fIntf1); /* 0349: what CTL_FLUSH reads back, and when it clears (read only) */
+ 	fScanPhys = pa;
+ 	fScanStride = stride;
+ }
+ 
++/* 0352: what CTL_FLUSH reads right after a flip wrote it (sweet_fb_flush_taken, at the top). */
++void
++AppleCLCD::flushNote(void)
++{
++	if (fCtl0 == NULL) {
++		return;
++	}
++	if ((fCtl0[0x18 / 4] & 0x20001) != 0) {
++		fFlushSet++;
++	} else {
++		fFlushClear++;
++	}
++	fFlushKnown = fFlushSet + fFlushClear >= 16;
++	fFlushReadback = fFlushKnown && (uint64_t)fFlushClear * 64 <= (uint64_t)fFlushSet + fFlushClear;
++}
++
+ /*
+  * 0350 (0340's bookkeeping of a flip, from scanFrom(), shared with planeScaled()): a flip to pa is about to be written.
+  * Which flip buffer the MDP is leaving, and where the scan is, for flipTaken(); force: a flip that rewrites the plane
+@@ -2562,9 +2597,11 @@ AppleCLCD::flipTaken(uint64_t now)
+ 	if (!fQLatchWait) {
+ 		return true;
+ 	}
+-	bool taken = fIntf1 != NULL && (uint32_t)(fIntf1[(0x800 + 0x0ac) / 4] - fQFlipFrame) >= (fQFlipLate ? 2u : 1u);
+-	if (taken && fFlushReadback && (fCtl0[0x18 / 4] & 0x20001) != 0) {
+-		taken = false;                          /* 0350: CTL_FLUSH says the MDP has not taken it yet (seen to read back) */
++	bool taken;
++	if (fFlushReadback && (sweet_fb_flush_taken != 0 || fScanUsed) && fCtl0 != NULL) {
++		taken = (fCtl0[0x18 / 4] & 0x20001) == 0;      /* 0352: the MDP has taken the flush (sweet_fb_flush_taken) */
++	} else {
++		taken = fIntf1 != NULL && (uint32_t)(fIntf1[(0x800 + 0x0ac) / 4] - fQFlipFrame) >= (fQFlipLate ? 2u : 1u);
+ 	}
+ 	if (!taken) {
+ 		nanoseconds_to_absolutetime(34 * NSEC_PER_MSEC, &limit);
+@@ -2698,9 +2735,11 @@ AppleCLCD::queueDrain(void)
+ 	}
+ 	fQCount--;
+ 	queueDrop();
+-	if (!fPowerOff) {
++	if (!fPowerOff && (!f.scan || frameDone(&f, mach_absolute_time()))) {
+ 		sweet_fbd.pend_swap = f.queued;
+ 		frameShow(&f);                  /* (0350: a frame of a surface rewrites the plane where it may) */
++	} else if (f.scan) {
++		sweet_fbq.dropped++;            /* 0352: a frame of a surface still being drawn is not shown half drawn */
+ 	}
+ 	sweet_hold_set(f.held, false);
+ 	sweet_fbq.drained++;
+@@ -2808,6 +2847,7 @@ AppleCLCD::presentQueued(const uint8_t *rec, SweetSurface **held, bool *queued)
+ 		fFlipWait = false;
+ 		if (fQCount < SWEET_FB_BUFS) {
+ 			struct SweetQFrame *f = &fQ[fQCount++];
++			bzero(f, sizeof(*f));           /* 0352: (a frame of a surface may have had this place: scan, surf) */
+ 			f->pa = pa;
+ 			f->fence = sapphire_gpu_copy_fence();
+ 			f->queued = sweet_fbd.pend_swap;
+@@ -2946,6 +2986,10 @@ AppleCLCD::scanoutRetire(void)
+  * clear: what is written while one is pending is latched with it), and the scan is between a sixteenth and three
+  * quarters of the refresh (INTF_LINE_COUNT, in lines of vtotal), milliseconds away from the next frame start and from the
+  * programmable fetch before it, where the plane is latched; writing it takes microseconds.
++ * 0352: once CTL_FLUSH is seen to read back (flushNote()), bits clear are enough, at any line: nothing written then is
++ * latched before the flush written after it. Linux does no more (msm_atomic.c, msm_atomic_commit_tail: wait_flush, "now
++ * that there is no in-progress flush", the planes' registers, then the flush), and the window cost a refresh to every
++ * frame whose drawing ended in the last quarter of one.
+  */
+ bool
+ AppleCLCD::planeWritable(void)
+@@ -2953,6 +2997,9 @@ AppleCLCD::planeWritable(void)
+ 	if (fCtl0 == NULL || fIntf1 == NULL || (fCtl0[0x18 / 4] & 0x20001) != 0) {
+ 		return false;
+ 	}
++	if (fFlushReadback) {
++		return true;
++	}
+ 	uint32_t hsync = fIntf1[(0x800 + 0x008) / 4] >> 16;
+ 	uint32_t vtotal = hsync != 0 ? fIntf1[(0x800 + 0x00c) / 4] / hsync : 0;
+ 	uint64_t line = fIntf1[(0x800 + 0x0b0) / 4];
+@@ -3002,10 +3049,10 @@ AppleCLCD::planeScaled(uint64_t pa, uint32_t stride, const struct SweetGeo *g)
+ {
+ 	bool geometry = !fPlaneScaled || memcmp(g, &fPlaneGeo, sizeof(*g)) != 0;
+ 
+-	flipNote(pa, geometry);
+ 	if (!planeWritable()) {
+ 		sweet_plane_wait(this);         /* (from queueDrain(); the queue's flips come here writable) */
+ 	}
++	flipNote(pa, geometry);                 /* 0352: (after the wait: the frame and line the flip is written in) */
+ 	if (geometry) {
+ 		uint32_t v[SWEET_PLANE_REGS];
+ 		sweet_plane_scaled_regs(v, g->sx, g->sy, g->sw, g->sh, fWidth, fHeight, fPlane0[3], fPlaneFormat, fPlane0[26]);
+@@ -3024,12 +3071,12 @@ AppleCLCD::planeScaled(uint64_t pa, uint32_t stride, const struct SweetGeo *g)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	fCtl0[0x18 / 4] = 0x20001;      /* flush VIG0 + CTL: latched at the next frame start */
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	if (!fFlushKnown) {
+-		fFlushReadback = (fCtl0[0x18 / 4] & 0x20001) != 0;
+-		fFlushKnown = true;
++	flushNote();                    /* 0352: (the one-shot look of 0350 is now the count of every flip) */
++	if (!fScanUsed) {
++		fScanUsed = true;
+ 		IOLog("SWEET FB: scanout: first frame of a surface on the panel (%u,%u %ux%u of it scaled to %ux%u); CTL_FLUSH %s\n",
+ 		    g->sx, g->sy, g->sw, g->sh, fWidth, fHeight, fFlushReadback ? "reads back until taken: flips are taken by it" :
+-		    "reads clear at once: flips are taken by the frame counter");
++		    fFlushKnown ? "reads clear at once: flips are taken by the frame counter" : "not known yet (fewer than 16 flips)");
+ 	}
+ 	sweet_fbl_wrote(fCtl0, fIntf1); /* 0349 */
+ 	fScanPhys = pa;
+@@ -3037,9 +3084,13 @@ AppleCLCD::planeScaled(uint64_t pa, uint32_t stride, const struct SweetGeo *g)
+ 	fPlaneStride = stride;
+ }
+ 
+-/* Whether a frame's drawing is done: a copy's fence, or for a frame of a surface the msm fences (250 ms at most). */
++/*
++ * Whether a frame's drawing is done: a copy's fence, or for a frame of a surface the msm fences. 0352: no time limit (0350
++ * showed a frame of a surface after 250 ms, half drawn): a GPU that hangs is reset after 2 s and its fences jump to the
++ * last number (0317), as for the copies.
++ */
+ bool
+-AppleCLCD::frameDone(const struct SweetQFrame *f, uint64_t now)
++AppleCLCD::frameDone(const struct SweetQFrame *f, __unused uint64_t now)
+ {
+ 	if (!f->scan) {
+ 		return sapphire_gpu_fence_done(f->fence);
+@@ -3048,12 +3099,7 @@ AppleCLCD::frameDone(const struct SweetQFrame *f, uint64_t now)
+ 	if (last != 0 && (int32_t)(last - want) > 0) {
+ 		want = last;                    /* a submission after the SwapEnd named the surface: wait for that one too */
+ 	}
+-	if (sapphire_gpu_msm_fence_done(want)) {
+-		return true;
+-	}
+-	uint64_t limit;
+-	nanoseconds_to_absolutetime(250 * NSEC_PER_MSEC, &limit);
+-	return now - f->queued > limit;
++	return sapphire_gpu_msm_fence_done(want);
+ }
+ 
+ /* The frame goes to the panel (fPresentLock held). A frame of a surface keeps its surfaces in use: its held[] is taken. */
+@@ -3065,9 +3111,6 @@ AppleCLCD::frameShow(struct SweetQFrame *f)
+ 		if (last != 0 && (int32_t)(last - f->fence) > 0) {
+ 			sweet_fbs.late_draw++;          /* drawn by a submission made after its SwapEnd */
+ 		}
+-		if (!sapphire_gpu_msm_fence_done((int32_t)(last - f->fence) > 0 ? last : f->fence)) {
+-			sweet_fbs.forced++;             /* 250 ms and still drawing: shown anyway */
+-		}
+ 		planeScaled(f->pa, f->stride, &f->geo);
+ 		memcpy(fScanShow, f->held, sizeof(fScanShow));
+ 		bzero(f->held, sizeof(f->held));
+@@ -4029,17 +4072,21 @@ sweet_fb_scanout_diag_sysctl SYSCTL_HANDLER_ARGS
+ 
+ 	sweet_scanout_pool_census(&used, &slots, &made, &refused);
+ 	buf[0] = 0;
+-	SWEET_FBD_CAT("scanout (kern.sweet_fb_scanout %d): %s; plane now %s, scaler %#x; CTL_FLUSH %s\n", sweet_fb_scanout,
++	SWEET_FBD_CAT("scanout (kern.sweet_fb_scanout %d): %s; plane now %s, scaler %#x; CTL_FLUSH read its bits back right after "
++	    "%u of %u flips: %s (kern.sweet_fb_flush_taken %d)\n", sweet_fb_scanout,
+ 	    fb == NULL ? "no framebuffer" : fb->fScanWhy != NULL ? fb->fScanWhy : fb->fScanStuck ? "stopped: a flush was not taken" :
+ 	    "ready", fb != NULL && fb->fPlaneScaled ? "scaled" : "unscaled", fb != NULL ? fb->fScalerVersion : 0,
+-	    fb == NULL || !fb->fFlushKnown ? "not looked at yet" : fb->fFlushReadback ? "reads back" : "does not read back");
++	    fb != NULL ? fb->fFlushSet : 0, fb != NULL ? fb->fFlushSet + fb->fFlushClear : 0,
++	    fb == NULL || !fb->fFlushKnown ? "not known yet" : !fb->fFlushReadback ? "it does not read back" :
++	    sweet_fb_flush_taken != 0 || fb->fScanUsed ? "flips are taken by it" : "flips are taken by the frame counter",
++	    sweet_fb_flush_taken);
+ 	SWEET_FBD_CAT("pool: %u of %u slots in use, %llu surfaces made in it, %llu refused (full)\n", used, slots, made, refused);
+ 	SWEET_FBD_CAT("frames %llu flips %llu; copied instead: not one layer %llu, not from the pool %llu, unfit %llu, "
+ 	    "swapped again while on the panel or waiting %llu, queue off %llu\n", sweet_fbs.frames, sweet_fbs.flips,
+ 	    sweet_fbs.not_one_layer, sweet_fbs.not_pool, sweet_fbs.unfit, sweet_fbs.reused, sweet_fbs.queue_off);
+-	SWEET_FBD_CAT("drawn after the SwapEnd %llu, shown before done (250 ms) %llu; swaps that waited %llu, %llu us in all, "
+-	    "max %llu; given up %llu; flips waiting for a writable plane %llu\n", sweet_fbs.late_draw, sweet_fbs.forced,
+-	    sweet_fbs.holds, sweet_fbs.hold_us, sweet_fbs.hold_max_us, sweet_fbs.timeouts, sweet_fbs.window_waits);
++	SWEET_FBD_CAT("drawn after the SwapEnd %llu; swaps that waited %llu, %llu us in all, max %llu; given up %llu; flips "
++	    "waiting for a writable plane %llu\n", sweet_fbs.late_draw, sweet_fbs.holds, sweet_fbs.hold_us, sweet_fbs.hold_max_us,
++	    sweet_fbs.timeouts, sweet_fbs.window_waits);
+ 	SWEET_FBD_CAT("plane to scaled %llu, to unscaled %llu (waited %llu times, max %llu us); frames let go after the "
+ 	    "panel left them %llu; stops %llu; flushes not taken %llu\n", sweet_fbs.to_scaled, sweet_fbs.to_unscaled,
+ 	    sweet_fbs.unscaled_waits, sweet_fbs.unscaled_wait_max_us, sweet_fbs.released, sweet_fbs.stops, sweet_fbs.stuck);
+@@ -4051,3 +4098,5 @@ sweet_fb_scanout_diag_sysctl SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_scanout_diag, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     NULL, 0, sweet_fb_scanout_diag_sysctl, "A", "sapphire 0350: the scanout's state and counters");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_flush_taken, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_flush_taken, 0,
++    "sapphire 0352: 1 = a flip is taken when CTL_FLUSH's bits read clear (once they are seen to read back), for every flip; 0 = by the frame counter, as 0340");
