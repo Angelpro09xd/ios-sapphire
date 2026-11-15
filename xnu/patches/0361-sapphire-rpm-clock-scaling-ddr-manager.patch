@@ -1,0 +1,809 @@
+0361: TopazModem: the RPM's clock scaling with every bus clock held first, and a DDR manager (kern.sweet_bus_scale, default 0)
+
+Inert unless kern.sweet_bus_scale=1 is written: with nothing written the kernel behaves as with 0360 and
+0347's votes go to the RPM unchanged. Needs 0343, 0347 and 0360.
+
+The DDR clock is the RPM's BIMC clock ("clk2" 0, key "KHz"); the RPM picks the row of the DDR plan (200,
+547.2, 768, 1017.6, 1555.2, 1804.8, 2092.8 MHz) that covers the vote, but applies no rate vote until the OS
+turns clock scaling on ("Enab" = 1 on "clk0" 2, as clk_smd_rpm_enable_scaling()). Nothing in this kernel did:
+the DDR stays at 1555.2 MHz and votes are accepted without effect (measured with 0347). With scaling on,
+each RPM bus clock is what the masters vote and one nobody votes is gated, while every consumer of this
+kernel (UFS, USB, display, GPU, IPA, audio, QUP) is already running and votes none. So
+kern.sweet_bus_scale=1:
+1. measures the buses and the DDR (GCC debug mux inputs of debugcc-khaje.c; the DDR from mccc);
+2. votes XO on in the active set (the stock keepalive);
+3. holds every rate clock of khaje's table in both sets, as Linux clk_smd_rpm_handoff() (INT_MAX, or with
+   kern.sweet_bus_hold=1 cnoc, snoc and mmrt at the measured rate plus 2 %);
+4. holds the BIMC in both sets at the vote of the row the DDR runs at, so it does not move at the switch;
+5. sends "Enab" in the sleep set, then the active set; stops at the first refusal or timeout (state -1,
+   nothing changed; -2 if the active "Enab" got no good answer);
+6. measures again 20 ms later and logs before -> after.
+Then: kern.sweet_ddr_set=<row> moves the DDR by hand and times the switch; kern.sweet_ddr_gov=1 starts a
+manager thread (every kern.sweet_ddr_gov_ms, 20) that takes the GPU's input (0347's per-level vote with
+kern.sweet_gpu_ddr=1) and the CPUs' (0362), keeps the row between kern.sweet_ddr_floor and kern.sweet_ddr_cap
+(1555200 and 2092800 kHz by default: never under the boot row), goes up at once and down after
+kern.sweet_ddr_down_ms (100), and stays at the switch's row while any TSENS sensor is at or over
+kern.sweet_ddr_temp_max (95000 m°C) until 5 C under it. kern.sweet_bus_scale=0 stops the manager and puts
+the BIMC back at the switch's row; scaling stays on in the RPM (Linux never sends "Enab" 0).
+kern.sweet_bus_vote, kern.sweet_bus_clocks and kern.sweet_bus_stats give a single hold, a measurement and
+the state with all counters. SapphireGpu exports 0343's measurements and routes 0347's vote through the
+manager. Lock order: opp_lock -> bus_lock -> rpm_lock / clk_lock.
+
+Checked on the host (138 checks against a model of the RPM): message order of the switch, no bus under its
+boot rate in either hold mode, a refused hold stops before "Enab", manager floor, cap, delay and thermal cap.
+Measured on the phone (one boot for the switch): rc 0; qup 19.2 -> 200 MHz, disp_hf_axi 345 -> 417 MHz,
+ipa_2x 1.5 -> 30 MHz, DDR unchanged; kern.sweet_ddr_set=1804 -> 1805054 kHz, =2092 -> 2096436 kHz, 1.65 ms per
+switch, 0 votes refused. Sequential memory latency (median of 3, 4-64 MB) 6.3-7.1 -> 5.0-5.1 ns. GPU time per
+Control Center animation frame (3 traces per condition, order high-low-high-manager): 15.9-16.7 ms at 2092.8
+MHz, 19.4-19.8 ms at 1555.2 MHz, 17.3-17.8 ms with the manager. One boot with scaling and the manager turned
+on at boot: no incident. Temperature over long runs is not measured.
+
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -1469,6 +1469,51 @@ sweet_gpu_temp_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_temp, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
+     NULL, 0, sweet_gpu_temp_sysctl, "I", "sapphire 0343: the GPU's temperature sensor (TSENS 15), milli-degrees C");
+ 
++/*
++ * 0361: for the RPM's clock scaling and the DDR manager (TopazModem.cpp): an input of the GCC debug mux
++ * measured as kern.sweet_gpu_clocks does and under its lock (0: off, or the clock pages not mapped yet), the DDR's
++ * clock (mccc's period), and the hottest of the sixteen sensors.
++ */
++extern "C" uint32_t
++sapphire_clk_measure_khz(uint32_t sel)
++{
++	uint32_t khz = 0;
++
++	if (!clocks_up || clk_lock == NULL || gcc == NULL) {
++		return 0;
++	}
++	IOLockLock(clk_lock);
++	khz = meas_khz(sel, 1);
++	IOLockUnlock(clk_lock);
++	return khz;
++}
++
++extern "C" uint32_t
++sapphire_ddr_khz(void)
++{
++	return ddr_khz();
++}
++
++extern "C" int
++sapphire_tsens_max_mc(int32_t *mc)
++{
++	bool any = false;
++	int32_t best = 0;
++
++	for (unsigned n = 0; n < TSENS_SENSORS; n++) {
++		int32_t v = 0;
++		if (tsens_read(n, &v) == 0 && (!any || v > best)) {
++			best = v;
++			any = true;
++		}
++	}
++	if (!any) {
++		return EIO;
++	}
++	*mc = best;
++	return 0;
++}
++
+ static void
+ power_down(void)
+ {
+@@ -4520,12 +4565,17 @@ ddr_khz_for(uint32_t gpu_khz)
+ 	return MAX(khz, (uint32_t)MAX(ddr_floor_khz, 0));
+ }
+ 
+-/* One BIMC vote (active set); 0 or the RPM's answer. */
++/*
++ * One BIMC vote (active set); 0 or the RPM's answer. 0361: through the DDR manager (TopazModem.cpp), which sends it
++ * as it is while the RPM's clock scaling is off, and with scaling on takes it as the GPU's input with the others.
++ */
++extern "C" int sweet_ddr_gpu_vote(uint32_t khz);
++
+ static int
+ ddr_vote(uint32_t khz)
+ {
+ 	gddr.before_khz = ddr_khz();
+-	int r = topaz_rpm_vote(0, 0x326b6c63, 0, 0x007a484b, khz);          /* "clk2" 0 (the BIMC), "KHz" */
++	int r = sweet_ddr_gpu_vote(khz);                /* "clk2" 0 (the BIMC), "KHz" */
+ 	gddr.last_khz = khz;
+ 	gddr.last_err = r;
+ 	if (r == 0) {
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -11375,6 +11375,692 @@ topaz_rpm_stats(uint64_t *requests, uint64_t *refused, uint64_t *timeouts, uint6
+ 	*wait_us_max = rpm_st.wait_us_max;
+ }
+ 
++/* ---------------- 0361: the RPM's clock scaling and the DDR's clock */
++
++/*
++ * The DDR's clock belongs to the RPM: the BIMC clock, RPM "clk2" 0, key "KHz" (stock clk-smd-rpm.c bimc_clk; this
++ * phone's clk-smd-rpm.ko holi_bimc_clk). The RPM picks the row of the DDR's plan that covers the vote (200, 547.2,
++ * 768, 1017.6, 1555.2, 1804.8, 2092.8 MHz: ddr-freq-table of the stock device tree and xbl_a's table). It applies no
++ * rate vote until the OS turns its clock scaling on: "Enab" = 1 on "clk0" 2, sleep set then active set
++ * (clk_smd_rpm_enable_scaling()). Until then the DDR and the buses stay where the boot chain left them: 1555.2 MHz
++ * here, and votes the RPM takes change nothing (measured: votes of 1761719 and 2042969 kHz answered 0, DDR at
++ * 1555.2 MHz). With scaling on, every bus clock of the RPM is what the
++ * masters (APSS, modem, ADSP...) vote, and one nobody votes is gated; a bus the CPU reaches registers through, gated,
++ * hangs the next access without a panic. So before "Enab" every bus clock of khaje's table is held, as Linux's
++ * clk_smd_rpm_handoff() does (INT_MAX, or 1 for a branch, in both sets), and the BIMC at the row it runs at, so the
++ * DDR does not move at the switch.
++ *
++ * Linux (v6.12 clk-smd-rpm.c rpm_smd_clk_probe): handoff of every clock, then "Enab". Stock khaje (this phone's
++ * clk-smd-rpm.ko): the BIMC to INT_MAX in the active set, "Enab", then XO on and CNOC, SNOC and QUP at 19.2 MHz in
++ * the active set; its interconnect driver keeps the six bus providers at their maximum until every consumer has
++ * probed. Here every consumer runs already when scaling comes on, and none votes: hence the holds.
++ *
++ *   kern.sweet_bus_clocks   (read) the buses and the DDR measured now (GCC debug mux and mccc, SapphireGpu 0343):
++ *                           no RPM message, available with scaling off;
++ *   kern.sweet_bus_scale    write 1: the holds, then "Enab" (sleep set, active set), measured before and after;
++ *                           write 0: the DDR manager stops and the BIMC goes back to the row it had at the switch
++ *                           (scaling stays on in the RPM: Linux never sends "Enab" 0 and what it does is not known);
++ *                           read: 0 never on, 1 on, 2 on with the DDR back at the row of the switch (1 again resumes),
++ *                           -1 a step before "Enab" failed (nothing changed; 1 tries again), -2 "Enab" in the active
++ *                           set got no good answer (state unknown until a reboot);
++ *   kern.sweet_bus_hold     0 (default): the holds at INT_MAX (Linux's handoff); 1: CNOC, SNOC and MMRT at the rate
++ *                           measured before the switch plus 2 %, the others INT_MAX. Read at the switch;
++ *   kern.sweet_bus_vote     write "<resource> <kHz>": one hold voted again, both sets (scaling on only); the DDR has
++ *                           its own controls below;
++ *   kern.sweet_ddr_set      write a row (kHz, or MHz under 10000): the BIMC to it now (scaling on, manager off);
++ *                           0 back to the row of the switch; measured until the DDR moves;
++ *   kern.sweet_ddr_gov      1: the DDR follows its inputs (the GPU's level through 0347 with kern.sweet_gpu_ddr=1, the
++ *                           CPU's traffic from 0362), between kern.sweet_ddr_floor and kern.sweet_ddr_cap (kHz),
++ *                           up at once, down after kern.sweet_ddr_down_ms below; capped at the row of the switch while
++ *                           a sensor is at kern.sweet_ddr_temp_max (m°C) or above, until 5 °C under it;
++ *   kern.sweet_bus_stats    (read) state, every vote and answer, the measurements, the DDR's rows and time in each,
++ *                           the switch latencies, the inputs, and the RPM client's counters (0360).
++ * The DDR manager votes the BIMC in the active set only; the sleep set keeps the hold of the switch. This kernel never
++ * lets the APSS sleep (no PSCI CPU_SUSPEND or CPU_OFF), so the RPM never applies the APSS's sleep set while it runs.
++ */
++#include <sys/sysctl.h>
++#include <libkern/libkern.h>
++
++extern "C" uint32_t sapphire_clk_measure_khz(uint32_t sel);   /* SapphireGpu.cpp 0361: a GCC debug mux input */
++extern "C" uint32_t sapphire_ddr_khz(void);                   /* SapphireGpu.cpp 0361: mccc's period (0343) */
++extern "C" int sapphire_tsens_max_mc(int32_t *mc);            /* SapphireGpu.cpp 0361: the hottest TSENS sensor */
++
++#define RPM_CLK0        0x306b6c63u                 /* "clk0" misc */
++#define RPM_CLK1        0x316b6c63u                 /* "clk1" bus */
++#define RPM_CLK2        0x326b6c63u                 /* "clk2" memory */
++#define RPM_QUP         0x00707571u                 /* "qup" */
++#define RPM_MMXI        0x69786d6du                 /* "mmxi" */
++#define RPM_IPA         0x00617069u                 /* "ipa" */
++#define RPM_CE          0x00006563u                 /* "ce" */
++#define RPM_KEY_KHZ     0x007a484bu                 /* "KHz" */
++#define RPM_KEY_ENAB    0x62616e45u                 /* "Enab" */
++#define RPM_RATE_MAX    0x7fffffffu                 /* INT_MAX: the top level of any rate */
++#define RPM_SET_ACTIVE  0u
++#define RPM_SET_SLEEP   1u
++
++/*
++ * khaje's RPM clocks with a rate (stock clk-smd-rpm.c khaje_clks, holi's definitions; Linux sm6115_clks and
++ * sm_qnoc_icc_clks). meas: the GCC debug mux input that measures the clock itself (debugcc-khaje.c:
++ * measure_only_cnoc_clk 0x1c, measure_only_snoc_clk 0x7, gcc_disp_hf_axi_clk 0x40, the MMRT's branch to the display);
++ * floor: what another driver of this kernel votes for it (TopazModem ipa_hw_init 100 MHz, SweetQsee 192 MHz).
++ */
++struct bus_res {
++	const char *name;
++	uint32_t type, id, meas, floor;
++};
++static const struct bus_res bus_res[] = {
++	{ "snoc_periph", RPM_CLK1, 0, 0,    0 },
++	{ "cnoc",        RPM_CLK1, 1, 0x1c, 0 },
++	{ "snoc",        RPM_CLK1, 2, 0x07, 0 },
++	{ "snoc_lpass",  RPM_CLK1, 5, 0,    0 },
++	{ "qup",         RPM_QUP,  0, 0,    0 },
++	{ "mmnrt",       RPM_MMXI, 0, 0,    0 },
++	{ "mmrt",        RPM_MMXI, 1, 0x40, 0 },
++	{ "ipa",         RPM_IPA,  0, 0,    100000 },
++	{ "ce1",         RPM_CE,   0, 0,    192000 },
++};
++#define BUS_N           (sizeof(bus_res) / sizeof(bus_res[0]))
++
++/*
++ * The DDR's rows and the vote that selects each: kgsl's bus table of this phone (qcom,bus-table-ddr, kB/s) over the
++ * 8-byte buswidth of the ebi node, rounded up as clk-smd-rpm does: 97.7 % of 8 bytes a cycle of the row, which the
++ * RPM covers with that row.
++ */
++static const uint32_t ddr_row_khz[] = { 200000, 547200, 768000, 1017600, 1555200, 1804800, 2092800 };
++static const uint32_t ddr_row_vote[] = { 195313, 534180, 750000, 993164, 1518555, 1761719, 2042969 };
++#define DDR_ROWS        7u
++
++/* the GCC debug mux inputs kern.sweet_bus_clocks measures (debugcc-khaje.c gcc_debug_mux_sels) */
++static const struct { const char *name; uint32_t sel; } bus_meas[] = {
++	{ "cnoc", 0x1c }, { "snoc", 0x07 }, { "ipa_2x", 0xcd }, { "cpuss_gnoc", 0xb1 }, { "disp_hf_axi(mmrt)", 0x40 },
++	{ "qup_core_2x", 0x71 }, { "ufs_axi", 0x116 }, { "usb30_master", 0x60 }, { "bimc_gpu_axi", 0x97 },
++};
++#define BUS_MEAS_N      (sizeof(bus_meas) / sizeof(bus_meas[0]))
++
++static IOLock *bus_lock;
++static int bus_state;                               /* kern.sweet_bus_scale: 0 off, 1 on, -1 a step failed */
++static int bus_hold_mode;                           /* kern.sweet_bus_hold */
++static uint32_t bus_hold[BUS_N];                    /* the kHz held for each, both sets */
++static int ddr_gov;                                 /* kern.sweet_ddr_gov */
++static int ddr_floor = 1555200, ddr_cap = 2092800;  /* kHz */
++static int ddr_down_ms = 100, ddr_gov_ms = 20, ddr_temp_max = 95000;
++static bool ddr_gov_running;
++static unsigned ddr_boot_row;                       /* the row at the switch */
++static unsigned ddr_row;                            /* the row the BIMC is voted at */
++static uint32_t ddr_in_gpu, ddr_in_cpu;             /* inputs, kHz of BIMC vote (0: none) */
++static uint32_t ddr_manual;                         /* kern.sweet_ddr_set, kHz of a row (0: none) */
++static bool ddr_hot;                                /* the temperature cap is on */
++static uint64_t ddr_low_since;                      /* when the inputs first asked for a lower row (0: they do not) */
++static uint64_t ddr_row_since;
++static struct {
++	const char *failed;                             /* the step that failed, or NULL */
++	int failed_err;
++	uint32_t before[BUS_MEAS_N + 1], after[BUS_MEAS_N + 1];  /* measured around the switch; the last is the DDR */
++	int hold_err[BUS_N], xo_err, enab_sleep, enab_active;
++	uint64_t votes, refused, ups, downs, hot_caps;
++	uint64_t row_ns[DDR_ROWS];
++	uint32_t last_vote, last_seen_khz;
++	int last_err;
++	uint32_t sw_us_last, sw_us_max, sw_unseen;      /* from the vote until mccc shows the new row */
++	uint32_t ack_us_last, ack_us_max;
++	int32_t temp_mc;
++} gbus;
++
++static uint64_t
++bus_ns(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns;
++}
++
++static IOLock *
++bus_lock_get(void)
++{
++	if (bus_lock == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (!OSCompareAndSwapPtr(NULL, l, (void * volatile *)&bus_lock)) {
++			IOLockFree(l);
++		}
++	}
++	return bus_lock;
++}
++
++/* The row that covers khz (a BIMC vote or a DDR rate): the first whose vote is not under it; the top row above all. */
++static unsigned
++ddr_row_for(uint32_t khz)
++{
++	for (unsigned i = 0; i < DDR_ROWS; i++) {
++		if (ddr_row_vote[i] >= khz) {
++			return i;
++		}
++	}
++	return DDR_ROWS - 1;
++}
++
++/* The first row whose rate is not under khz (a DDR rate: kern.sweet_ddr_floor and _cap); the top row above all. */
++static unsigned
++ddr_row_of_rate(uint32_t khz)
++{
++	for (unsigned i = 0; i < DDR_ROWS; i++) {
++		if (ddr_row_khz[i] >= khz) {
++			return i;
++		}
++	}
++	return DDR_ROWS - 1;
++}
++
++/* The row a measured DDR rate is (the nearest), or DDR_ROWS if it is none within 2 %. */
++static unsigned
++ddr_row_measured(uint32_t khz)
++{
++	for (unsigned i = 0; i < DDR_ROWS; i++) {
++		uint32_t d = khz > ddr_row_khz[i] ? khz - ddr_row_khz[i] : ddr_row_khz[i] - khz;
++		if (d <= ddr_row_khz[i] / 50) {
++			return i;
++		}
++	}
++	return DDR_ROWS;
++}
++
++/* One RPM vote, both sets as Linux's handoff (active, then sleep): 0 or the first answer that is not. */
++static int
++bus_vote_both(uint32_t type, uint32_t id, uint32_t key, uint32_t value)
++{
++	int r = topaz_rpm_vote(RPM_SET_ACTIVE, type, id, key, value);
++	if (r == 0) {
++		r = topaz_rpm_vote(RPM_SET_SLEEP, type, id, key, value);
++	}
++	return r;
++}
++
++static void
++bus_measure(uint32_t *out)
++{
++	for (unsigned i = 0; i < BUS_MEAS_N; i++) {
++		out[i] = sapphire_clk_measure_khz(bus_meas[i].sel);
++	}
++	out[BUS_MEAS_N] = sapphire_ddr_khz();
++}
++
++/*
++ * The BIMC to row r, active set. The time the RPM takes to answer, and the time until mccc's period shows the row
++ * (polled every 5 us for 3 ms after the answer), go to the statistics. bus_lock held. 0 or the RPM's answer.
++ */
++static int
++ddr_vote_row(unsigned r)
++{
++	uint64_t t0 = mach_absolute_time(), t1, now = t0;
++	int e = topaz_rpm_vote(RPM_SET_ACTIVE, RPM_CLK2, 0, RPM_KEY_KHZ, ddr_row_vote[r]);
++
++	t1 = mach_absolute_time();
++	gbus.votes++;
++	gbus.last_vote = ddr_row_vote[r];
++	gbus.last_err = e;
++	gbus.ack_us_last = (uint32_t)(bus_ns(t1 - t0) / 1000);
++	gbus.ack_us_max = MAX(gbus.ack_us_max, gbus.ack_us_last);
++	if (e != 0) {
++		gbus.refused++;
++		LOG("bus: the BIMC to %u kHz (row %u kHz) refused: %d", ddr_row_vote[r], ddr_row_khz[r], e);
++		return e;
++	}
++	if (r != ddr_row) {
++		bool seen = false;
++		for (unsigned i = 0; i < 600 && !seen; i++) {
++			gbus.last_seen_khz = sapphire_ddr_khz();
++			unsigned m = ddr_row_measured(gbus.last_seen_khz);
++			seen = m == r || (r > ddr_row && m < DDR_ROWS && m > r);
++			if (!seen) {
++				IODelay(5);
++			}
++		}
++		now = mach_absolute_time();
++		if (seen) {
++			gbus.sw_us_last = (uint32_t)(bus_ns(now - t0) / 1000);
++			gbus.sw_us_max = MAX(gbus.sw_us_max, gbus.sw_us_last);
++		} else {
++			gbus.sw_unseen++;
++		}
++		if (ddr_row_since != 0) {
++			gbus.row_ns[ddr_row] += bus_ns(now - ddr_row_since);
++		}
++		ddr_row_since = now;
++		if (r > ddr_row) {
++			gbus.ups++;
++		} else {
++			gbus.downs++;
++		}
++		ddr_row = r;
++	}
++	return 0;
++}
++
++/*
++ * The row the inputs ask for now, within floor and cap, and under the temperature cap. The inputs are BIMC votes (a
++ * row covers them); floor and cap are DDR rates (rows). bus_lock held.
++ */
++static unsigned
++ddr_want(void)
++{
++	uint32_t in = MAX(ddr_in_gpu, ddr_in_cpu);
++	unsigned r = MAX(in != 0 ? ddr_row_for(in) : 0u, ddr_row_of_rate((uint32_t)MAX(ddr_floor, 0)));
++
++	r = MIN(r, ddr_row_of_rate((uint32_t)MAX(ddr_cap, 0)));
++	if (ddr_hot) {
++		r = MIN(r, ddr_boot_row);
++	}
++	return r;
++}
++
++/* Applies what the inputs ask: up at once, down after ddr_down_ms of asking for less. bus_lock held. */
++static void
++ddr_apply(bool tick)
++{
++	if (bus_state != 1 || ddr_gov == 0) {
++		return;
++	}
++	unsigned r = ddr_want();
++	uint64_t now = mach_absolute_time();
++	if (r > ddr_row) {
++		ddr_low_since = 0;
++		(void)ddr_vote_row(r);
++	} else if (r < ddr_row) {
++		if (ddr_low_since == 0) {
++			ddr_low_since = now;
++		}
++		if (bus_ns(now - ddr_low_since) >= (uint64_t)MAX(ddr_down_ms, 0) * NSEC_PER_MSEC || (!tick && ddr_down_ms == 0)) {
++			ddr_low_since = 0;
++			(void)ddr_vote_row(r);
++		}
++	} else {
++		ddr_low_since = 0;
++	}
++}
++
++/*
++ * 0347's vote for the GPU's level (SapphireGpu ddr_vote, opp_lock held there). With scaling off it goes to the RPM
++ * as before. With scaling on it is the GPU's input to the manager; INT_MAX (0347 switched off) withdraws it.
++ */
++extern "C" int
++sweet_ddr_gpu_vote(uint32_t khz)
++{
++	IOLock *l = bus_lock_get();
++	IOLockLock(l);
++	if (bus_state == 0 || bus_state == -1) {
++		IOLockUnlock(l);
++		return topaz_rpm_vote(RPM_SET_ACTIVE, RPM_CLK2, 0, RPM_KEY_KHZ, khz);
++	}
++	ddr_in_gpu = khz == RPM_RATE_MAX ? 0 : khz;
++	uint64_t votes = gbus.votes;
++	ddr_apply(false);
++	int e = gbus.votes != votes ? gbus.last_err : 0;
++	IOLockUnlock(l);
++	return e;
++}
++
++/* The governor's tick: the temperature cap, the down hysteresis (0362 adds the CPU's traffic here). bus_lock held. */
++static void ddr_cpu_sample(void);
++
++static void
++ddr_tick(void)
++{
++	int32_t mc = 0;
++	if (sapphire_tsens_max_mc(&mc) == 0) {
++		gbus.temp_mc = mc;
++		if (!ddr_hot && mc >= ddr_temp_max) {
++			ddr_hot = true;
++			gbus.hot_caps++;
++			LOG("bus: a sensor at %d mC: the DDR capped at %u kHz", mc, ddr_row_khz[ddr_boot_row]);
++		} else if (ddr_hot && mc < ddr_temp_max - 5000) {
++			ddr_hot = false;
++		}
++	}
++	ddr_cpu_sample();
++	ddr_apply(true);
++}
++
++static void
++ddr_gov_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	LOG("bus: DDR manager on (%d ms; floor %d, cap %d kHz; down after %d ms; temperature cap %d mC)", ddr_gov_ms,
++	    ddr_floor, ddr_cap, ddr_down_ms, ddr_temp_max);
++	IOLock *l = bus_lock_get();
++	IOLockLock(l);
++	while (ddr_gov != 0 && bus_state == 1) {
++		ddr_tick();
++		IOLockUnlock(l);
++		IOSleep((uint32_t)MIN(MAX(ddr_gov_ms, 5), 1000));
++		IOLockLock(l);
++	}
++	ddr_gov_running = false;
++	ddr_in_cpu = 0;
++	ddr_hot = false;
++	ddr_low_since = 0;
++	if (bus_state == 1) {
++		(void)ddr_vote_row(ddr_manual != 0 ? ddr_row_for(ddr_manual) : ddr_boot_row);
++	}
++	LOG("bus: DDR manager off, the DDR at row %u kHz", ddr_row_khz[ddr_row]);
++	IOLockUnlock(l);
++	thread_terminate(current_thread());
++}
++
++/*
++ * The switch: XO, then every hold in both sets, then "Enab" in the sleep set and the active set. Nothing is sent
++ * after a step that fails. bus_lock held. 0 or an errno.
++ */
++static int
++bus_scale_on(void)
++{
++	uint32_t ddr = sapphire_ddr_khz();
++	unsigned row = ddr_row_measured(ddr);
++
++	gbus.failed = NULL;
++	if (row >= DDR_ROWS) {
++		gbus.failed = "the DDR's clock is no row of the plan (mccc)";
++		gbus.failed_err = (int)ddr;
++		return ENODEV;
++	}
++	bus_measure(gbus.before);
++	ddr_boot_row = row;
++	/* XO: the stock keepalive, an active-set vote (clk-smd-rpm.c bi_tcxo_ao) */
++	gbus.xo_err = topaz_rpm_vote(RPM_SET_ACTIVE, RPM_CLK0, 0, RPM_KEY_ENAB, 1);
++	if (gbus.xo_err != 0) {
++		gbus.failed = "XO (clk0 0)";
++		gbus.failed_err = gbus.xo_err;
++		return EIO;
++	}
++	for (unsigned i = 0; i < BUS_N; i++) {
++		uint32_t v = RPM_RATE_MAX;
++		if (bus_hold_mode == 1 && bus_res[i].meas != 0) {
++			uint32_t m = 0;
++			for (unsigned j = 0; j < BUS_MEAS_N; j++) {
++				if (bus_meas[j].sel == bus_res[i].meas) {
++					m = gbus.before[j];
++				}
++			}
++			v = m != 0 ? MAX(m + m / 50, bus_res[i].floor) : RPM_RATE_MAX;
++		}
++		bus_hold[i] = v;
++		gbus.hold_err[i] = bus_vote_both(bus_res[i].type, bus_res[i].id, RPM_KEY_KHZ, v);
++		if (gbus.hold_err[i] != 0) {
++			gbus.failed = bus_res[i].name;
++			gbus.failed_err = gbus.hold_err[i];
++			return EIO;
++		}
++	}
++	int e = bus_vote_both(RPM_CLK2, 0, RPM_KEY_KHZ, ddr_row_vote[row]);
++	if (e != 0) {
++		gbus.failed = "bimc";
++		gbus.failed_err = e;
++		return EIO;
++	}
++	ddr_row = row;
++	ddr_row_since = mach_absolute_time();
++	gbus.enab_sleep = topaz_rpm_vote(RPM_SET_SLEEP, RPM_CLK0, 2, RPM_KEY_ENAB, 1);
++	if (gbus.enab_sleep != 0) {
++		gbus.failed = "Enab, sleep set";
++		gbus.failed_err = gbus.enab_sleep;
++		return EIO;
++	}
++	gbus.enab_active = topaz_rpm_vote(RPM_SET_ACTIVE, RPM_CLK0, 2, RPM_KEY_ENAB, 1);
++	if (gbus.enab_active != 0) {
++		gbus.failed = "Enab, active set";
++		gbus.failed_err = gbus.enab_active;
++		return EIO;
++	}
++	bus_state = 1;
++	IOSleep(20);
++	bus_measure(gbus.after);
++	LOG("bus: RPM clock scaling on; DDR %u -> %u kHz, cnoc %u -> %u, snoc %u -> %u, mmrt %u -> %u (hold mode %d)",
++	    gbus.before[BUS_MEAS_N], gbus.after[BUS_MEAS_N], gbus.before[0], gbus.after[0], gbus.before[1], gbus.after[1],
++	    gbus.before[4], gbus.after[4], bus_hold_mode);
++	return 0;
++}
++
++static int
++sweet_bus_scale_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = bus_state;
++	int error = sysctl_io_number(req, v, sizeof(v), &v, NULL);
++
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	IOLock *l = bus_lock_get();
++	IOLockLock(l);
++	if (v == 1 && (bus_state == 0 || bus_state == -1)) {
++		error = bus_scale_on();
++		if (error != 0) {
++			/* -2: "Enab" went out and its answer says it failed: whether the RPM took it is not known */
++			bus_state = gbus.enab_sleep == 0 && gbus.failed != NULL && strcmp(gbus.failed, "Enab, active set") == 0 ?
++			    -2 : -1;
++			LOG("bus: scaling not turned on: %s (%d)", gbus.failed, gbus.failed_err);
++		}
++	} else if (v == 1 && bus_state == 2) {
++		bus_state = 1;                              /* the holds and "Enab" are in place already */
++	} else if (v == 0 && bus_state == 1) {
++		ddr_gov = 0;                                /* the thread sees it and stops */
++		ddr_manual = 0;
++		ddr_in_gpu = 0;
++		bus_state = 2;
++		error = ddr_vote_row(ddr_boot_row) == 0 ? 0 : EIO;
++		LOG("bus: DDR manager off, the BIMC back at %u kHz; RPM scaling stays on", ddr_row_khz[ddr_boot_row]);
++	} else if (v != 0 && v != 1) {
++		error = EINVAL;
++	} else if (v == 1 && bus_state == -2) {
++		error = EIO;                                /* a reboot clears it */
++	}
++	IOLockUnlock(l);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_bus_scale, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sweet_bus_scale_sysctl, "I", "sapphire 0361: 1 = hold the RPM's bus clocks and turn its clock scaling on");
++SYSCTL_INT(_kern, OID_AUTO, sweet_bus_hold, CTLFLAG_RW | CTLFLAG_LOCKED, &bus_hold_mode, 0,
++    "sapphire 0361: 0 = hold the buses at INT_MAX, 1 = at the rate measured before the switch");
++
++/* "<resource> <kHz>": one hold again, both sets */
++static int
++sweet_bus_vote_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char in[48] = {};
++	size_t len = 0;
++	int error;
++
++	if (req->newptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, "", 1);
++	}
++	len = MIN(req->newlen, sizeof(in) - 1);
++	error = SYSCTL_IN(req, in, len);
++	if (error != 0) {
++		return error;
++	}
++	char *sp = strchr(in, ' ');
++	if (sp == NULL) {
++		return EINVAL;
++	}
++	*sp = 0;
++	uint32_t khz = (uint32_t)strtoul(sp + 1, NULL, 0);
++	IOLock *l = bus_lock_get();
++	IOLockLock(l);
++	error = bus_state == 1 ? ENOENT : ENXIO;
++	for (unsigned i = 0; i < BUS_N && bus_state == 1; i++) {
++		if (strcmp(in, bus_res[i].name) == 0) {
++			khz = MAX(khz, MAX(bus_res[i].floor, 19200u));
++			int e = bus_vote_both(bus_res[i].type, bus_res[i].id, RPM_KEY_KHZ, khz);
++			if (e == 0) {
++				bus_hold[i] = khz;
++			}
++			LOG("bus: %s held at %u kHz: %d", bus_res[i].name, khz, e);
++			error = e == 0 ? 0 : EIO;
++			break;
++		}
++	}
++	IOLockUnlock(l);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_bus_vote, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sweet_bus_vote_sysctl, "A", "sapphire 0361: \"<resource> <kHz>\", one bus hold voted again (scaling on)");
++
++static int
++sweet_ddr_set_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = (int)ddr_manual;
++	int error = sysctl_io_number(req, v, sizeof(v), &v, NULL);
++
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	uint32_t khz = v > 0 && v < 10000 ? (uint32_t)v * 1000 : (uint32_t)MAX(v, 0);
++	unsigned r = DDR_ROWS;
++	for (unsigned i = 0; i < DDR_ROWS && khz != 0; i++) {
++		if (ddr_row_khz[i] / 1000 == khz / 1000) {
++			r = i;
++		}
++	}
++	if (khz != 0 && r == DDR_ROWS) {
++		return EINVAL;
++	}
++	IOLock *l = bus_lock_get();
++	IOLockLock(l);
++	if (bus_state != 1) {
++		error = ENXIO;
++	} else if (ddr_gov != 0) {
++		error = EBUSY;
++	} else {
++		ddr_manual = khz != 0 ? ddr_row_khz[r] : 0;
++		error = ddr_vote_row(khz != 0 ? r : ddr_boot_row) == 0 ? 0 : EIO;
++		LOG("bus: DDR set to row %u kHz by hand: %d (seen %u kHz, %u us from the vote; answer in %u us)",
++		    ddr_row_khz[ddr_row], error, gbus.last_seen_khz, gbus.sw_us_last, gbus.ack_us_last);
++	}
++	IOLockUnlock(l);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ddr_set, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sweet_ddr_set_sysctl, "I", "sapphire 0361: the DDR to a row of its plan (kHz or MHz), by hand");
++
++static int
++sweet_ddr_gov_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = ddr_gov;
++	int error = sysctl_io_number(req, v, sizeof(v), &v, NULL);
++
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	IOLock *l = bus_lock_get();
++	IOLockLock(l);
++	if (v != 0 && bus_state != 1) {
++		error = ENXIO;
++	} else if (v != 0) {
++		ddr_gov = 1;
++		ddr_manual = 0;
++		if (!ddr_gov_running) {                     /* a thread on its way out runs its exit under this lock */
++			thread_t thread;
++			ddr_gov_running = true;
++			if (kernel_thread_start(ddr_gov_thread, NULL, &thread) == KERN_SUCCESS) {
++				thread_deallocate(thread);
++			} else {
++				ddr_gov_running = false;
++				ddr_gov = 0;
++				error = ENOMEM;
++			}
++		}
++	} else {
++		ddr_gov = 0;
++	}
++	IOLockUnlock(l);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ddr_gov, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sweet_ddr_gov_sysctl, "I", "sapphire 0361: 1 = the DDR follows the GPU's level and the CPU's traffic");
++SYSCTL_INT(_kern, OID_AUTO, sweet_ddr_floor, CTLFLAG_RW | CTLFLAG_LOCKED, &ddr_floor, 0,
++    "sapphire 0361: the DDR manager never goes under this, kHz (1555200)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_ddr_cap, CTLFLAG_RW | CTLFLAG_LOCKED, &ddr_cap, 0,
++    "sapphire 0361: the DDR manager never goes over this, kHz (2092800)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_ddr_down_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &ddr_down_ms, 0,
++    "sapphire 0361: ms of asking for less before the DDR goes down (100)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_ddr_gov_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &ddr_gov_ms, 0,
++    "sapphire 0361: the DDR manager's period, ms (20)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_ddr_temp_max, CTLFLAG_RW | CTLFLAG_LOCKED, &ddr_temp_max, 0,
++    "sapphire 0361: from this (m°C, any sensor) the DDR stays at the row of the switch (95000)");
++
++#define BUS_CAT(...) do { if (off < sizeof(buf)) { off += (size_t)snprintf(buf + off, sizeof(buf) - off, __VA_ARGS__); } } while (0)
++
++static int
++sweet_bus_clocks_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[512];
++	size_t off = 0;
++	uint32_t m[BUS_MEAS_N + 1];
++
++	bus_measure(m);
++	buf[0] = 0;
++	BUS_CAT("measured, kHz (0: off, or the GPU's clock pages not mapped):");
++	for (unsigned i = 0; i < BUS_MEAS_N; i++) {
++		BUS_CAT(" %s %u,", bus_meas[i].name, m[i]);
++	}
++	BUS_CAT(" ddr %u (row %u)", m[BUS_MEAS_N], ddr_row_measured(m[BUS_MEAS_N]) < DDR_ROWS ?
++	    ddr_row_khz[ddr_row_measured(m[BUS_MEAS_N])] : 0);
++	return SYSCTL_OUT(req, buf, MIN(off, sizeof(buf) - 1) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_bus_clocks, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_bus_clocks_sysctl, "A", "sapphire 0361: the RPM's buses and the DDR, measured at the read");
++
++static int
++sweet_bus_stats_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[1536];
++	size_t off = 0;
++	uint64_t rq, rf, to, st, wmax;
++
++	IOLock *l = bus_lock_get();
++	IOLockLock(l);
++	buf[0] = 0;
++	BUS_CAT("scaling %d (hold mode %d)%s%s (%d); xo %d, Enab sleep %d active %d\nholds:", bus_state, bus_hold_mode,
++	    gbus.failed != NULL ? ", failed at " : "", gbus.failed != NULL ? gbus.failed : "", gbus.failed_err, gbus.xo_err,
++	    gbus.enab_sleep, gbus.enab_active);
++	for (unsigned i = 0; i < BUS_N; i++) {
++		BUS_CAT(" %s %u (%d)", bus_res[i].name, bus_hold[i], gbus.hold_err[i]);
++	}
++	BUS_CAT("\nmeasured before -> after the switch, kHz:");
++	for (unsigned i = 0; i < BUS_MEAS_N; i++) {
++		BUS_CAT(" %s %u -> %u,", bus_meas[i].name, gbus.before[i], gbus.after[i]);
++	}
++	BUS_CAT(" ddr %u -> %u\n", gbus.before[BUS_MEAS_N], gbus.after[BUS_MEAS_N]);
++	BUS_CAT("ddr: manager %d (running %d), row %u kHz (boot %u), manual %u; inputs gpu %u cpu %u, floor %d cap %d, "
++	    "hot %d (%d mC, caps %llu); votes %llu refused %llu ups %llu downs %llu; last vote %u (answer %d); "
++	    "answer us last %u max %u; switch us last %u max %u, not seen %u; now %u kHz\ntime at each row, ms:",
++	    ddr_gov, ddr_gov_running, ddr_row_khz[ddr_row], ddr_row_khz[ddr_boot_row], ddr_manual, ddr_in_gpu, ddr_in_cpu,
++	    ddr_floor, ddr_cap, ddr_hot, gbus.temp_mc, gbus.hot_caps, gbus.votes, gbus.refused, gbus.ups, gbus.downs,
++	    gbus.last_vote, gbus.last_err, gbus.ack_us_last, gbus.ack_us_max, gbus.sw_us_last, gbus.sw_us_max,
++	    gbus.sw_unseen, sapphire_ddr_khz());
++	uint64_t now = mach_absolute_time();
++	for (unsigned i = 0; i < DDR_ROWS; i++) {
++		uint64_t ns = gbus.row_ns[i] + (bus_state >= 1 && i == ddr_row && ddr_row_since != 0 ?
++		    bus_ns(now - ddr_row_since) : 0);
++		BUS_CAT(" %u:%llu", ddr_row_khz[i] / 1000, ns / NSEC_PER_MSEC);
++	}
++	IOLockUnlock(l);
++	topaz_rpm_stats(&rq, &rf, &to, &st, &wmax);
++	BUS_CAT("\nrpm client: requests %llu refused %llu timeouts %llu stale answers %llu, longest wait %llu us\n", rq, rf,
++	    to, st, wmax);
++	return SYSCTL_OUT(req, buf, MIN(off, sizeof(buf) - 1) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_bus_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_bus_stats_sysctl, "A", "sapphire 0361: the RPM's clock scaling and the DDR manager");
++
++/* 0361 alone: no CPU input yet (0362 replaces this) */
++static void
++ddr_cpu_sample(void)
++{
++}
++
+ /* ---------------- the codec: from the RX macro to the speaker (audio=2) */
+ 
+ /*
