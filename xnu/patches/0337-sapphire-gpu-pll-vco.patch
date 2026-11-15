@@ -1,0 +1,468 @@
+0337: SapphireGpu: boot-arg gpu_vco2=1 programs the GPU PLL as the stock driver does, so gpu_mhz is the core clock
+
+gx_gfx3d's RCG takes gpu_cc_pll0's OUT_MAIN with divider 1, and OUT_MAIN is the VCO divided by two
+(USER_CTL[9:8] = 1, the 0x01000101 that both stock gpucc-khaje.c and 0161's gpu_pll_start() write). The
+stock clock framework therefore sets the VCO to twice the OPP: 1260 MHz is a VCO of 2520 MHz (L 131, alpha
+0x4000). With the existing path gpu_mhz is the VCO rate, and the core runs at half of it: gpu_mhz=1260
+measures 630.00 MHz (15 of 15 samples, CP and RBBM always-count counters against the 19.2 MHz always-on
+counter).
+
+gpu_vco2=1 (default 0: nothing changes) makes gpu_mhz the core clock:
+- gpu_mhz must be a row of the stock table (320 465 600 785 820 980 1025 1100 1114 1260) and not above the
+  speed bin's top (fuse QFPROM 0x6006 bits 5-12: 0 -> 1260, 235 -> 1114.8, 216 -> 1025); gpu_bin=N gives
+  the bin, gpu_anybin=1 lifts the limit.
+- Before the clock, the rails: CX (RPM rwcx 0) to the level the stock driver votes for the rate, never
+  under the 0x1a0 that 0204 votes, and MX (RPM rwmx 0) to 0x1a0; gpu_cx=N / gpu_mx=N override them.
+- From 900 MHz up, the CX peak-current votes kgsl makes (qcom,gpu-cx-ipeak, clients 1 and 10 of
+  cx_ipeak@3ed000); if the limits manager answers with danger the rate is 820 MHz. gpu_ipeak=0: no votes.
+- The PLL is configured and enabled in the order of clk_zonda_pll_configure()/clk_zonda_pll_enable(), L and
+  alpha as clk_zonda_pll_set_rate() computes them, waiting for the lock bit.
+- A rate outside the table, a refused vote or a PLL that does not lock fall back to the existing path.
+
+The boot log prints the core clock read back from the registers; kern.sweet_gpu_pll (read only) gives
+mode, L, alpha, USER_CTL, CONFIG_CTL, TEST_CTL, the RCG, the branch, the votes and the speed bin.
+
+Measured on the phone (gxfreq, the core clock counted by the CP): gpu_vco2=1 gpu_mhz=1260 -> 1260.00 MHz
+(3 of 3 samples, one boot); gpu_mhz=820 -> 820.00 MHz (two boots). Nothing here manages heat: the clock
+stays where it is put (0345 and 0346 change it at run time).
+
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -315,6 +315,38 @@ static uint32_t core_div = 2;
+  */
+ static uint32_t core_mhz;
+ extern "C" int topaz_rpm_vote(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++/*
++ * 0337: boot-arg gpu_vco2=1 makes gpu_mhz the frequency of the core clock, made the way the stock
++ * driver makes it. gx_gfx3d takes gpu_cc_pll0's OUT_MAIN with a divider of 1 (stock gpucc-khaje.c,
++ * every row of ftbl_gpu_cc_gx_gfx3d_clk_src), and OUT_MAIN is the VCO divided by two: USER_CTL[9:8]
++ * = 1 in the 0x01000101 that the stock driver and gpu_pll_start() both write
++ * (post_div_table_gpu_cc_pll0_out_main { 0x1, 2 }; the stock "640MHz configuration" of the PLL is
++ * its 320 MHz OPP). So the stock clock framework runs the VCO at twice the OPP, 2520 MHz for 1260,
++ * while gpu_mhz=N alone (0161) programs the VCO to N and the core runs at N / 2: 630.00 MHz measured
++ * with gpu_mhz=1260 (the CP's and the RBBM's always-count counters against the 19.2 MHz always-on
++ * counter). With gpu_vco2=1:
++ *   - gpu_mhz must be a row of the stock table (320 465 600 785 820 980 1025 1100 1114 1260; 1114
++ *     is 1114.8) and not above what the stock device tree gives this phone's speed bin (the fuse
++ *     at QFPROM 0x6006, bits 5 to 12: 0 goes to 1260, 235 to 1114.8, 216 to 1025). gpu_bin=N gives
++ *     the bin instead of reading the fuse, gpu_anybin=1 lifts the limit;
++ *   - before the clock is raised the rails go to what the stock driver votes for the rate: CX (RPM
++ *     rwcx 0) by rate_max of gpu_cc_gx_gfx3d_clk_src (464 for 1260, 416 for 1100 and 1114.8, 384
++ *     down to 820, 256 for 785), but never under the 0x1a0 that 0204 votes today, because this
++ *     kernel has one voter where Android adds up every consumer of the rail; and MX (RPM rwmx 0),
++ *     which gpu_cc_pll0 hangs from (256 for a VCO above 2400 MHz), to 0x1a0. gpu_cx=N and gpu_mx=N
++ *     give the levels instead (0: no vote);
++ *   - from 900 MHz on, the CX peak-current votes kgsl makes (cx_ipeak@3ed000, clients 1 and 10);
++ *     refused, the rate is 820 MHz. gpu_ipeak=0: no votes;
++ *   - the PLL is configured and enabled as clk_zonda_pll_configure() and clk_zonda_pll_enable() do
++ *     it, with L and alpha as clk_zonda_pll_set_rate() computes them for twice the OPP.
++ * A rate that is not in the table, a refused vote or a PLL that does not lock leave it all to the
++ * old path (gpu_mhz as the VCO, then gpu_div). gpu_vco2=0, the default, changes nothing.
++ * kern.sweet_gpu_pll reads the PLL and the RCG back at any time.
++ */
++static uint32_t vco2;
++static uint32_t cx_arg = ~0u, mx_arg = ~0u;
++static uint32_t cx_voted, mx_voted;             /* the levels this driver asked the RPM for (0: none) */
++static uint32_t bin_fuse = ~0u;                 /* the speed bin (~0: not read) */
+ /*
+  * boot-arg gpu_smmu_early: program the identity context bank as soon as its clock is voted,
+  * before the GX domain comes up, instead of in cp_start(). The GPU's SMMU comes out of the
+@@ -516,6 +548,8 @@ static const struct reg_desc clock_regs[] = {
+ 	{ 0, 0, 0x79004, "gcc_vote (b15 gpll0)" },
+ 	{ 1, 4, 0x0000,  "gpucc_pll0_mode" },
+ 	{ 1, 0, 0x0004,  "gpucc_pll0_l" },
++	{ 1, 0, 0x0008,  "gpucc_pll0_alpha" },
++	{ 1, 0, 0x000c,  "gpucc_pll0_user_ctl" },
+ 	{ 1, 4, 0x0100,  "gpucc_pll1_mode" },
+ 	{ 1, 3, 0x101c,  "gpucc_gx_gfx3d_rcg_cmd" },
+ 	{ 1, 0, 0x1020,  "gpucc_gx_gfx3d_rcg_cfg" },
+@@ -693,6 +727,309 @@ gpu_pll_start(uint32_t mhz)
+ 	return true;
+ }
+ 
++/* ---- 0337: the core clock as the stock driver makes it ---- */
++#define ZP_TEST         0x1c
++#define ZP_STAY_IN_CFA  (1u << 16)
++#define ZP_FREQ_LOCK    (1u << 29)
++#define QFPROM_PA       0x01b40000ull
++#define CXIP_PA         0x003ed000ull           /* cx_ipeak@3ed000, qcom,cx-ipeak-v2 */
++#define CXIP_SIZE       0x0000f000u
++
++/* The rows of the stock ftbl_gpu_cc_gx_gfx3d_clk_src, in kHz. */
++static const uint32_t stock_khz[] = { 320000, 465000, 600000, 785000, 820000, 980000, 1025000, 1100000, 1114800, 1260000 };
++
++static uint32_t
++stock_opp_khz(uint32_t mhz)
++{
++	for (unsigned i = 0; i < sizeof(stock_khz) / sizeof(stock_khz[0]); i++) {
++		if (stock_khz[i] / 1000 == mhz) {
++			return stock_khz[i];
++		}
++	}
++	return 0;
++}
++
++/*
++ * L and alpha for a VCO rate, as the stock clk_zonda_pll_set_rate() computes them: alpha is the
++ * fraction in 16 bits, rounded down (alpha_pll_round_rate), and when its top bit is set L is the
++ * nearest integer and not the floor (zonda_pll_adjust_l_val): alpha is then a negative fraction.
++ * 2520000 kHz is L 131 alpha 0x4000; 640000 kHz is the stock L 0x21 alpha 0x5555.
++ */
++static void
++zonda_la_khz(uint32_t vco_khz, uint32_t *l, uint32_t *a)
++{
++	uint32_t rem = vco_khz % 19200u;
++
++	*l = vco_khz / 19200u;
++	*a = (uint32_t)(((uint64_t)rem << 16) / 19200u);
++	if ((*a & 0x8000u) != 0 && 2 * rem >= 19200u) {
++		*l += 1;
++	}
++}
++
++/* And back: the VCO in kHz that L and alpha stand for (clk_zonda_pll_recalc_rate). */
++static uint32_t
++zonda_khz(uint32_t l, uint32_t a)
++{
++	a &= 0xffffu;
++	l &= 0xffffu;
++	if ((a & 0x8000u) != 0 && l != 0) {
++		l -= 1;
++	}
++	return (uint32_t)(((((uint64_t)l << 16) + a) * 19200000ull >> 16) + 999) / 1000;
++}
++
++/* The speed bin: the nvmem cell gpu_speed_bin of the stock device tree, reg <0x6006 2>, bits <5 8>. */
++static uint32_t
++speed_bin_fuse(void)
++{
++	uint32_t bin = ~0u;
++
++	if (PE_parse_boot_argn("gpu_bin", &bin, sizeof(bin))) {
++		LOG("  speed bin %u (boot-arg gpu_bin)", bin);
++		return bin;
++	}
++	IOMemoryMap *m = map_phys(QFPROM_PA + 0x6000, 0x1000, false);
++	if (m == NULL) {
++		LOG("  the QFPROM could not be mapped: speed bin unknown");
++		return ~0u;
++	}
++	volatile uint8_t *q = (volatile uint8_t *)m->getVirtualAddress();
++	uint32_t w = rd(q, 0x04), g = rd(q, 0x2c);
++	m->release();
++	bin = (w >> 21) & 0xff;
++	LOG("  speed bin fuse %u (QFPROM 6004: %08x), gaming bin %u (602c: %08x)", bin, w, (g >> 13) & 1, g);
++	return bin;
++}
++
++/* The fastest rate the stock device tree gives a speed bin (qcom,gpu-pwrlevels-N of this phone's tree). */
++static uint32_t
++bin_max_khz(uint32_t bin)
++{
++	return bin == 0 ? 1260000 : bin == 235 ? 1114800 : bin == 216 ? 1025000 : (bin == 157 || bin == 127) ? 600000 : 1025000;
++}
++
++/* The CX level the stock driver votes for a core rate (rate_max of gpu_cc_gx_gfx3d_clk_src, vdd_l2_corner). */
++static uint32_t
++cx_level_for(uint32_t khz)
++{
++	return khz <= 320000 ? 64 : khz <= 465000 ? 128 : khz <= 600000 ? 192 : khz <= 785000 ? 256 :
++	       khz <= 1025000 ? 384 : khz <= 1114800 ? 416 : 464;
++}
++
++/* The MX level the stock driver votes for the PLL's VCO (rate_max of gpu_cc_pll0, vdd_corner). */
++static uint32_t
++mx_level_for(uint32_t vco_khz)
++{
++	return vco_khz <= 1800000 ? 64 : vco_khz <= 2400000 ? 128 : vco_khz <= 3000000 ? 256 : 384;
++}
++
++/*
++ * The CX peak-current votes kgsl makes before it crosses 900 and 950 MHz (stock device tree
++ * qcom,gpu-cx-ipeak: client 1 of cx_ipeak@3ed000 from 900 MHz, client 10 from 950 MHz; "hardware
++ * damage is possible at peak current if mitigation not done", kgsl_pwrctrl.c). As the stock
++ * cx_ipeak.c does for the v2 block: client N's register is at (N + 1) * 0x1000, plus 0x3000 from
++ * client 10 on; a client votes by writing 1 there unless the feature is off (+ 0x10 of the block)
++ * or the client is bypassed (+ 4 of the client), and the vote stands if the danger register (+ 0x24)
++ * reads 0 within 50 ms. Votes for the rates khz reaches, none for the others; false when the
++ * limits manager answers with danger, and then no vote is left. gpu_ipeak=0: no votes at all.
++ */
++static bool
++cx_ipeak_set(uint32_t khz)
++{
++	static const struct { uint32_t khz, off; } client[] = { { 900000, 2 * 0x1000 }, { 950000, 11 * 0x1000 + 0x3000 } };
++	static volatile uint8_t *cxip;
++	static bool voted[2];
++	uint32_t on = 1, enabled;
++	bool ok = true;
++
++	(void)PE_parse_boot_argn("gpu_ipeak", &on, sizeof(on));
++	if (on == 0 || (khz < client[0].khz && !voted[0] && !voted[1])) {
++		return true;
++	}
++	if (cxip == NULL) {
++		IOMemoryMap *m = map_phys(CXIP_PA, CXIP_SIZE, false);
++		if (m == NULL) {
++			LOG("  cx_ipeak could not be mapped: no peak-current vote");
++			return true;
++		}
++		cxip = (volatile uint8_t *)m->getVirtualAddress();
++	}
++	enabled = rd(cxip, 0x10);
++	for (unsigned i = 0; i < 2; i++) {
++		if (khz < client[i].khz || !ok) {
++			if (voted[i]) {
++				wr(cxip, client[i].off, 0);
++				voted[i] = false;
++			}
++			continue;
++		}
++		if (voted[i]) {
++			continue;
++		}
++		if (enabled == 0 || (rd(cxip, client[i].off + 4) & 1) != 0) {
++			LOG("  cx_ipeak: no vote for %u kHz and above (feature enable %08x, the client's bypass %08x)", client[i].khz,
++			    enabled, rd(cxip, client[i].off + 4));
++			continue;
++		}
++		wr(cxip, client[i].off, 1);
++		ok = poll(cxip, 0x24, 0xFFFFFFFFu, 0, 50000);
++		LOG("  cx_ipeak: vote for %u kHz and above (client register %x): danger %08x: %s", client[i].khz, client[i].off,
++		    rd(cxip, 0x24), ok ? "taken" : "REFUSED");
++		if (ok) {
++			voted[i] = true;
++		} else {
++			wr(cxip, client[i].off, 0);
++			if (voted[0]) {
++				wr(cxip, client[0].off, 0);
++				voted[0] = false;
++			}
++		}
++	}
++	return ok;
++}
++
++/* clk_zonda_pll_configure() and then clk_zonda_pll_enable(), for a VCO rate. */
++static bool
++gpu_pll_start_vco(uint32_t vco_khz)
++{
++	uint32_t l, a, lock;
++
++	zonda_la_khz(vco_khz, &l, &a);
++	wr(gpucc, ZP_L, l);
++	wr(gpucc, ZP_ALPHA, a);
++	wr(gpucc, ZP_CFG, 0x08200800);
++	wr(gpucc, ZP_CFG_U, 0x05022001);
++	wr(gpucc, ZP_CFG_U1, 0x00000010);
++	wr(gpucc, ZP_USER, 0x01000101);             /* bits 9:8 = 1: OUT_MAIN is the VCO / 2 */
++	rmw(gpucc, ZP_MODE, ZP_BYPASSNL, 0);
++	rmw(gpucc, ZP_MODE, ZP_OUTCTRL, 0);
++	wr(gpucc, ZP_OPMODE, 0);                    /* standby */
++	rmw(gpucc, ZP_MODE, 0, ZP_RESET_N);
++	rmw(gpucc, ZP_MODE, 0, ZP_BYPASSNL);
++	IODelay(1);
++	rmw(gpucc, ZP_MODE, 0, ZP_RESET_N);
++	wr(gpucc, ZP_OPMODE, 1);                    /* run */
++	lock = (rd(gpucc, ZP_TEST) & ZP_STAY_IN_CFA) != 0 ? ZP_FREQ_LOCK : ZP_LOCK;
++	if (!poll(gpucc, ZP_MODE, lock, lock, 1000)) {
++		LOG("gpu_cc_pll0: no lock with the VCO at %u kHz (l %u alpha %04x, mode %08x, test %08x)", vco_khz, l, a,
++		    rd(gpucc, ZP_MODE), rd(gpucc, ZP_TEST));
++		rmw(gpucc, ZP_MODE, ZP_OUTCTRL, 0);     /* clk_zonda_pll_disable() */
++		rmw(gpucc, ZP_USER, 0xF, 0);
++		rmw(gpucc, ZP_MODE, ZP_RESET_N | ZP_BYPASSNL, 0);
++		wr(gpucc, ZP_OPMODE, 0);
++		return false;
++	}
++	rmw(gpucc, ZP_USER, 0, 0xF);
++	rmw(gpucc, ZP_MODE, 0, ZP_OUTCTRL);
++	IODelay(100);
++	LOG("gpu_cc_pll0 locked: VCO %u kHz (l %u alpha %04x), USER_CTL %08x: OUT_MAIN = VCO / 2 = %u kHz", vco_khz, l, a,
++	    rd(gpucc, ZP_USER), vco_khz / 2);
++	return true;
++}
++
++/*
++ * gpu_vco2=1: the speed bin, the rails, then the PLL at twice the OPP. The core clock in kHz, or 0
++ * when the old path has to do it (nothing here is left half done: the old path redoes the PLL and
++ * the votes it wants).
++ */
++static uint32_t
++core_clock_stock(void)
++{
++	uint32_t khz = stock_opp_khz(core_mhz), vco_khz, cx, mx, top, anybin = 0;
++	int r;
++
++	if (khz == 0) {
++		LOG("gpu_vco2: gpu_mhz=%u is not a rate of the stock table (320 465 600 785 820 980 1025 1100 1114 1260)",
++		    core_mhz);
++		return 0;
++	}
++	bin_fuse = speed_bin_fuse();
++	top = bin_max_khz(bin_fuse);
++	(void)PE_parse_boot_argn("gpu_anybin", &anybin, sizeof(anybin));
++	if (khz > top && anybin == 0) {
++		LOG("gpu_vco2: %u kHz is above what the stock device tree gives speed bin %u: %u kHz (gpu_anybin=1 lifts this)",
++		    khz, bin_fuse, top);
++		khz = top;
++	}
++	if (!cx_ipeak_set(khz)) {
++		LOG("gpu_vco2: the CX peak-current limit refuses %u kHz: 820000 kHz, the fastest stock rate that needs no vote", khz);
++		khz = 820000;
++	}
++	vco_khz = 2 * khz;
++	cx = cx_arg != ~0u ? cx_arg : MAX(cx_level_for(khz), 0x1a0u);
++	mx = mx_arg != ~0u ? mx_arg : MAX(mx_level_for(vco_khz), 0x1a0u);
++	if (cx != 0) {
++		r = topaz_rpm_vote(0, 0x78637772, 0, 0x6c766c76, cx);          /* "rwcx" 0, "vlvl" */
++		LOG("  CX rail (RPM rwcx 0) to level %u for a %u kHz core clock (the stock driver votes %u): %d", cx, khz,
++		    cx_level_for(khz), r);
++		if (r != 0) {
++			(void)cx_ipeak_set(0);
++			return 0;
++		}
++		cx_voted = cx;
++	}
++	if (mx != 0) {
++		r = topaz_rpm_vote(0, 0x786d7772, 0, 0x6c766c76, mx);          /* "rwmx" 0, "vlvl" */
++		LOG("  MX rail (RPM rwmx 0) to level %u for a %u kHz VCO (the stock driver votes %u): %d", mx, vco_khz,
++		    mx_level_for(vco_khz), r);
++		if (r != 0) {
++			(void)cx_ipeak_set(0);
++			return 0;
++		}
++		mx_voted = mx;
++	}
++	if (!gpu_pll_start_vco(vco_khz)) {
++		(void)cx_ipeak_set(0);
++		return 0;
++	}
++	return khz;
++}
++
++/*
++ * What the core clock is, read back from the PLL and the RCG (kern.sweet_gpu_pll, and one line of
++ * the boot log). The GPU CC answers whether or not the GPU's domains are up.
++ */
++static void
++gpu_pll_line(char *line, size_t size)
++{
++	uint32_t mode = rd(gpucc, ZP_MODE), l = rd(gpucc, ZP_L), a = rd(gpucc, ZP_ALPHA), user = rd(gpucc, ZP_USER);
++	uint32_t cmd = rd(gpucc, 0x101c), cfg = rd(gpucc, 0x1020), cbcr = rd(gpucc, 0x1054);
++	uint32_t src = (cfg >> 8) & 7, hid = cfg & 0x1f, post = (user >> 8) & 3;
++	uint32_t postdiv = post == 0 ? 1 : post == 1 ? 2 : 4;                  /* 1 << fls(), as the stock postdiv reads it */
++	uint32_t vco = (mode & ZP_OUTCTRL) != 0 ? zonda_khz(l, a) : 0;
++	uint32_t from = src == SRC_GPLL0 ? 600000 : src == SRC_GPU_PLL0 ? vco / postdiv : src == 2 ? vco : src == 0 ? 19200 : 0;
++	uint32_t core = (cbcr & CBCR_OFF) != 0 || (cmd & RCG_ROOT_OFF) != 0 ? 0 : 2 * from / (hid + 1);
++
++	snprintf(line, size, "gx_gfx3d %u kHz from %s; gpu_cc_pll0 mode %08x l %u alpha %04x user_ctl %08x opmode %u "
++	    "test_ctl %08x config_ctl %08x %08x %08x: VCO %u kHz, OUT_MAIN = VCO / %u; rcg cmd %08x cfg %08x (source %u, "
++	    "divider %u.%u); branch %08x; RPM votes of this driver: CX %u MX %u; speed bin %d; gpu_mhz %u gpu_vco2 %u "
++	    "gpu_div %u", core, src == SRC_GPLL0 ? "GPLL0 (600000 kHz)" : src == SRC_GPU_PLL0 ? "gpu_cc_pll0 OUT_MAIN" :
++	    src == 2 ? "gpu_cc_pll0's VCO" : src == 0 ? "the crystal" : "another source", mode, l, a & 0xffff, user,
++	    rd(gpucc, ZP_OPMODE), rd(gpucc, ZP_TEST), rd(gpucc, ZP_CFG), rd(gpucc, ZP_CFG_U), rd(gpucc, ZP_CFG_U1), vco,
++	    postdiv, cmd, cfg, src, (hid + 1) / 2, ((hid + 1) & 1) * 5, cbcr, cx_voted, mx_voted, (int)bin_fuse, core_mhz,
++	    vco2, core_div);
++}
++
++#include <sys/sysctl.h>
++#include <libkern/libkern.h>
++
++static int
++sweet_gpu_pll_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char line[640];
++
++	if (gpucc == NULL) {
++		strlcpy(line, "the GPU clock controller is not mapped (no gpu= boot-arg, or too early)", sizeof(line));
++	} else {
++		gpu_pll_line(line, sizeof(line));
++	}
++	return SYSCTL_OUT(req, line, strlen(line) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_pll, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_pll_sysctl, "A", "0337: the GPU's PLL and core clock, read back from the GPU clock controller");
++
+ static bool
+ rcg_set(uint32_t cmd, uint32_t src, uint32_t div, const char *name)
+ {
+@@ -701,8 +1038,14 @@ rcg_set(uint32_t cmd, uint32_t src, uint32_t div, const char *name)
+ 	wr(gpucc, cmd + 4, (src << 8) | (2 * div - 1));
+ 	rmw(gpucc, cmd, 0, RCG_UPDATE);
+ 	ok = poll(gpucc, cmd, RCG_UPDATE, 0, 500);
+-	LOG("  %s src %u div %u (GPLL0/%u = %u MHz): cmd %08x cfg %08x %s", name, src, div, div, 600 / div,
+-	    rd(gpucc, cmd), rd(gpucc, cmd + 4), ok ? "updated" : "UPDATE STUCK");
++	if (src == SRC_GPLL0) {
++		LOG("  %s src %u div %u (GPLL0/%u = %u MHz): cmd %08x cfg %08x %s", name, src, div, div, 600 / div,
++		    rd(gpucc, cmd), rd(gpucc, cmd + 4), ok ? "updated" : "UPDATE STUCK");
++	} else {
++		/* 0337: not GPLL0; OUT_MAIN is half the VCO */
++		LOG("  %s src %u div %u (gpu_cc_pll0 OUT_MAIN / %u; OUT_MAIN = VCO / 2): cmd %08x cfg %08x %s", name, src, div,
++		    div, rd(gpucc, cmd), rd(gpucc, cmd + 4), ok ? "updated" : "UPDATE STUCK");
++	}
+ 	step_done();
+ 	return ok;
+ }
+@@ -750,17 +1093,25 @@ power_up(void)
+ 	 * gpu_gx_gdsc's parent in the device tree). The stock levels: 1025 MHz TURBO (0x180),
+ 	 * 1114.8 and 1260 MHz TURBO_L1 (0x1a0). Raised before the clock, never lowered.
+ 	 */
+-	if (core_mhz >= 980) {
++	uint32_t stock = vco2 != 0 && core_mhz != 0 ? core_clock_stock() : 0;      /* 0337: the core clock in kHz */
++	if (stock == 0 && core_mhz >= 980) {
+ 		uint32_t level = core_mhz > 1025 ? 0x1a0 : 0x180;
+ 		int r = topaz_rpm_vote(0, 0x78637772, 0, 0x6c766c76, level);
+ 		LOG("  CX rail to RPM level %#x for %u MHz: %d", level, core_mhz, r);
++		if (r == 0) {
++			cx_voted = level;                       /* 0337: for kern.sweet_gpu_pll */
++		}
+ 		if (r != 0 && core_mhz > 1025) {
+ 			LOG("  the CX level was not taken: 1025 MHz instead of %u", core_mhz);
+ 			core_mhz = 1025;
+ 		}
+ 	}
+-	if (core_mhz != 0 && gpu_pll_start(core_mhz)) {
++	if (stock != 0) {
+ 		ok &= rcg_set(0x101c, SRC_GPU_PLL0, 1, "gx_gfx3d_clk_src");
++	} else if (core_mhz != 0 && gpu_pll_start(core_mhz)) {
++		ok &= rcg_set(0x101c, SRC_GPU_PLL0, 1, "gx_gfx3d_clk_src");
++		LOG("  gpu_mhz=%u without gpu_vco2=1 is the PLL's VCO: the core clock is half of it, %u.%u MHz", core_mhz,
++		    core_mhz / 2, (core_mhz & 1) * 5);
+ 	} else {
+ 		ok &= rcg_set(0x101c, SRC_GPLL0, core_div, "gx_gfx3d_clk_src");
+ 	}
+@@ -768,6 +1119,11 @@ power_up(void)
+ 	step_done();
+ 	ok &= branch_on(gpucc, 0x1054, "gpucc_gx_gfx3d");
+ 	branch_on(gpucc, 0x1060, "gpucc_gx_cxo");
++	{
++		char line[640];                         /* 0337: what the core clock is, read back */
++		gpu_pll_line(line, sizeof(line));
++		LOG("*** core clock: %s ***", line);
++	}
+ 	/* the line three boots have died just after this point */
+ 	gic_report("with the GPU powered");
+ 	step_done();
+@@ -2687,6 +3043,9 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+ 	(void)PE_parse_boot_argn("gpu_slow", &slow_ms, sizeof(slow_ms));
+ 	/* 0152: gpu_div=1 is GPLL0 undivided, 600 MHz -- the rail is the bootloader's, so try it, do not assume it */
+ 	(void)PE_parse_boot_argn("gpu_mhz", &core_mhz, sizeof(core_mhz));
++	(void)PE_parse_boot_argn("gpu_vco2", &vco2, sizeof(vco2));           /* 0337 */
++	(void)PE_parse_boot_argn("gpu_cx", &cx_arg, sizeof(cx_arg));
++	(void)PE_parse_boot_argn("gpu_mx", &mx_arg, sizeof(mx_arg));
+ 	if (PE_parse_boot_argn("gpu_div", &core_div, sizeof(core_div)) && (core_div < 1 || core_div > 16)) {
+ 		core_div = 2;
+ 	}
+@@ -2709,6 +3068,12 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ 	LOG("stage %u (Adreno 610 v2, regs %llx, GPU CC %llx), core GPLL0/%u = %u MHz, %u ms after each step",
+ 	    stage, GPU_PA, GPUCC_PA, core_div, 600 / core_div, slow_ms);
++	if (core_mhz != 0) {
++		/* 0337: the line above speaks of gpu_div, which only decides when gpu_mhz does not */
++		LOG("gpu_mhz=%u gpu_vco2=%u: %s", core_mhz, vco2, vco2 != 0 ?
++		    "gpu_mhz is the core clock; the PLL's VCO runs at twice that, as the stock driver sets it" :
++		    "gpu_mhz is the PLL's VCO and the core clock is half of it (gpu_vco2=1: gpu_mhz is the core clock)");
++	}
+ 
+ 	gcc_map = map_phys(GCC_PA, GCC_SIZE, false);
+ 	gpucc_map = map_phys(GPUCC_PA, GPUCC_SIZE, false);
