@@ -1,0 +1,282 @@
+0342: SapphireGpu: pool buffers a client closes are kept and handed out again (kern.sweet_gpu_bocache, default 0)
+
+Needs 0336. No change of behaviour unless switched on.
+
+Measured with 0336 (15 minutes): 6575 GEM_NEW and 6670 frees; 1.44 s zeroing, 0.79 s mapping, 0.85 s
+freeing. The Metal driver pools only its own slabs: every MTLBuffer and texture is a GEM_NEW and a
+GEM_CLOSE.
+
+kern.sweet_gpu_bocache (read-write, boot-arg gpu_bocache):
+  0 (default)  nothing is kept;
+  1  a pool buffer whose client closes it is kept, once the GPU is done with it, with its memory, GPU
+     addresses and page table entries; a GEM_NEW of exactly that size by the same client gets it back under
+     a new handle, zeroed again: no pool search, no mapping, no unmapping or TLB invalidation;
+  2  as 1 without the zeroing: a client can find in a new buffer what an older buffer of its own held
+     (never another client's). Metal promises zeroed buffers: for experiments only.
+Limits: 32 buffers and 64 MB per client, none over 16 MB, each kept 2 s at most; all go back to the pool
+when the client closes, and when the pool has no room for a new buffer.
+
+kern.sweet_gpu_bocache_stats (read only): kept, handed out again (and bytes), freed for age, freed for room.
+
+Locking: the kept buffers and counters are under service_lock, as the handle table is.
+
+Measured (one boot, opening the app switcher twice, n=1): kept 282, handed out again 146 (92.6 MB); the
+time of the first opening's slowest frame did not improve (470 ms against 228 ms without it).
+
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -4105,6 +4105,45 @@ msm_hung(const char *who, uint32_t fence, bool locked)
+ 	}
+ }
+ 
++/*
++ * sapphire 0342: buffers of the GPU pool that their program gives back are kept for it, with their memory, their GPU
++ * addresses and their page table entries, and handed out again for a GEM_NEW of the same size: no search of the pool,
++ * no mapping, and at the other end no unmapping and no TLB invalidation (measured with 0336: 6575 GEM_NEW and 6670
++ * frees in 15 minutes, 0.79 s mapping and 0.85 s freeing, beside 1.44 s zeroing). HackiOS's driver keeps them the
++ * same way (hakios.gpu.cpp, keep / dropKept).
++ * kern.sweet_gpu_bocache (boot-arg gpu_bocache), 0 by default:
++ *   0  as before: nothing is kept;
++ *   1  kept, and zeroed again when handed out (what GEM_NEW has always answered with);
++ *   2  kept, and handed out as it is: the program finds in a new buffer what an older buffer of its own held. Never
++ *      another program's: a buffer is only kept for the client that had it. Faster (the zeroing is most of a large
++ *      buffer's cost), and to be tried with care: without zeroing, 0205 showed white frames (0215).
++ * A client keeps at most MSM_KEEP buffers and 64 MB, none over 16 MB, each for 2 s at most (looked at by every
++ * submission); they are freed when it closes, and when the pool has no room for a new buffer.
++ */
++#define MSM_KEEP            32u
++#define MSM_KEEP_BYTES      (64ull << 20)
++#define MSM_KEEP_ONE        (16ull << 20)
++#define MSM_KEEP_MS         2000u
++static int gpu_bocache;
++static struct {
++	uint64_t kept, reused, reused_bytes, aged, flushed;
++} gkeep;
++
++static int
++sweet_gpu_bocache_stats_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char line[224];
++
++	snprintf(line, sizeof(line), "buffers kept (kern.sweet_gpu_bocache %d): kept %llu, handed out again %llu (%llu bytes), freed for their age %llu, "
++	    "freed to make room %llu\n", gpu_bocache, gkeep.kept, gkeep.reused, gkeep.reused_bytes, gkeep.aged, gkeep.flushed);
++	return SYSCTL_OUT(req, line, strlen(line) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_bocache_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_bocache_stats_sysctl, "A", "sapphire 0342: the GPU buffers kept for their programs");
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_bocache, CTLFLAG_RW | CTLFLAG_LOCKED, &gpu_bocache, 0,
++    "sapphire 0342: pool buffers given back are kept for their program: 0 = no (as before), 1 = and zeroed again when reused, 2 = and reused as they are");
++
+ struct msm_bo {
+ 	IOMemoryDescriptor *md;                 /* NULL: free handle */
+ 	SweetSurface       *surf;
+@@ -4223,6 +4262,11 @@ public:
+ 	struct msm_bo  *fLeft;                  /* MSM_LEFT of them: kept until their fence */
+ 	uint32_t        fCount, fSubmits, fQueue;
+ 	uint64_t        fBytes;
++	struct msm_bo  *fKeep;                  /* 0342: MSM_KEEP buffers given back and kept (service_lock) */
++	uint64_t       *fKeepWhen;              /* ... and when each was */
++	uint64_t        fKeepBytes;
++	bool keepBo(struct msm_bo *b);
++	uint32_t dropKept(uint64_t before);
+ 
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+ 	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+@@ -4268,6 +4312,18 @@ SapphireGPUClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
+ 	bzero(fLeft, sizeof(struct msm_bo) * MSM_LEFT);
+ 	fCount = fSubmits = fQueue = 0;
+ 	fBytes = 0;
++	/* 0342: room for the buffers kept (without it nothing is kept), and the boot-arg, once */
++	fKeep = IONew(struct msm_bo, MSM_KEEP);
++	fKeepWhen = IONew(uint64_t, MSM_KEEP);
++	fKeepBytes = 0;
++	if (fKeep != NULL && fKeepWhen != NULL) {
++		bzero(fKeep, sizeof(struct msm_bo) * MSM_KEEP);
++	}
++	static bool keep_arg;
++	if (!keep_arg) {
++		keep_arg = true;
++		(void)PE_parse_boot_argn("gpu_bocache", &gpu_bocache, sizeof(gpu_bocache));
++	}
+ 	LOG("msm: %s opened the GPU", fName);
+ 	return true;
+ }
+@@ -4380,6 +4436,50 @@ SapphireGPUClient::freeBo(struct msm_bo *b)
+ 	gdiag_since(&gdiag.bo_free, diag_t0);
+ }
+ 
++/*
++ * 0342: b, a buffer the GPU is done with and that is still counted as its client's, is kept instead of freed, if
++ * the cache is on and has room. Then it is counted out, as a buffer left is, and b is an empty handle. service_lock held.
++ */
++bool
++SapphireGPUClient::keepBo(struct msm_bo *b)
++{
++	if (gpu_bocache == 0 || fKeep == NULL || fKeepWhen == NULL || !b->pooled || b->surf != NULL || !service_ready ||
++	    b->size > MSM_KEEP_ONE || fKeepBytes + b->size > MSM_KEEP_BYTES) {
++		return false;
++	}
++	for (uint32_t i = 0; i < MSM_KEEP; i++) {
++		if (fKeep[i].md == NULL) {
++			fKeep[i] = *b;
++			fKeepWhen[i] = mach_absolute_time();
++			fKeepBytes += b->size;
++			fCount--;
++			fBytes -= b->size;
++			bzero(b, sizeof(*b));
++			gkeep.kept++;
++			return true;
++		}
++	}
++	return false;
++}
++
++/* The buffers kept since before `before` are freed (~0: all of them); how many. service_lock held. */
++uint32_t
++SapphireGPUClient::dropKept(uint64_t before)
++{
++	uint32_t n = 0;
++
++	for (uint32_t i = 0; fKeep != NULL && fKeepWhen != NULL && fKeepBytes != 0 && i < MSM_KEEP; i++) {
++		if (fKeep[i].md != NULL && fKeepWhen[i] < before) {
++			fKeepBytes -= fKeep[i].size;
++			fCount++;                       /* (counted out when it was kept: freeBo counts it out again) */
++			fBytes += fKeep[i].size;
++			freeBo(&fKeep[i]);
++			n++;
++		}
++	}
++	return n;
++}
++
+ /* Buffers given back earlier whose submissions are done now: freed. service_lock held. */
+ void
+ SapphireGPUClient::reap(void)
+@@ -4388,9 +4488,20 @@ SapphireGPUClient::reap(void)
+ 		if (fLeft[i].md != NULL && msm_fence_done(fLeft[i].fence)) {
+ 			fCount++;                       /* (counted out when it was left: release counts it again) */
+ 			fBytes += fLeft[i].size;
++			if (keepBo(&fLeft[i])) {
++				continue;               /* 0342 */
++			}
+ 			freeBo(&fLeft[i]);
+ 		}
+ 	}
++	if (fKeepBytes != 0) {
++		/* 0342: what has been kept for longer than MSM_KEEP_MS goes back to the pool */
++		uint64_t age, now = mach_absolute_time();
++		nanoseconds_to_absolutetime((uint64_t)MSM_KEEP_MS * NSEC_PER_MSEC, &age);
++		if (now > age) {
++			gkeep.aged += dropKept(now - age);
++		}
++	}
+ }
+ 
+ /*
+@@ -4402,6 +4513,9 @@ SapphireGPUClient::drop(struct msm_bo *b)
+ {
+ 	gdiag.close_n++;                                /* 0336 */
+ 	if (b->fence == 0 || msm_fence_done(b->fence) || !service_ready) {
++		if (keepBo(b)) {
++			return;                         /* 0342: kept for the next GEM_NEW of its size */
++		}
+ 		freeBo(b);
+ 		return;
+ 	}
+@@ -4430,6 +4544,15 @@ SapphireGPUClient::clientClose(void)
+ 		msm_hung(fName, msm_seq, false);
+ 	}
+ 	IOLockLock(service_lock);
++	(void)dropKept(~0ull);                          /* 0342 */
++	if (fKeep != NULL) {
++		IODelete(fKeep, struct msm_bo, MSM_KEEP);
++		fKeep = NULL;
++	}
++	if (fKeepWhen != NULL) {
++		IODelete(fKeepWhen, uint64_t, MSM_KEEP);
++		fKeepWhen = NULL;
++	}
+ 	for (uint32_t i = 0; fBo != NULL && i < MSM_BUFFERS; i++) {
+ 		if (fBo[i].md != NULL) {
+ 			freeBo(&fBo[i]);
+@@ -4500,15 +4623,31 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 	}
+ 	uint64_t diag_t0;
+ 	if (gpool_enabled()) {
++		/* 0342: one kept of this size, if there is one, in place of a new one */
++		struct msm_bo kept;
++		bool reuse = false;
++		bzero(&kept, sizeof(kept));
+ 		IOLockLock(service_lock);
+-		uint64_t pa = gpool_alloc(size >> 12);
++		for (uint32_t i = 0; gpu_bocache != 0 && fKeep != NULL && fKeepWhen != NULL && fKeepBytes != 0 && !reuse && i < MSM_KEEP; i++) {
++			if (fKeep[i].md != NULL && fKeep[i].size == size) {
++				kept = fKeep[i];
++				bzero(&fKeep[i], sizeof(fKeep[i]));
++				fKeepBytes -= size;
++				reuse = true;
++			}
++		}
++		uint64_t pa = reuse ? kept.pa : gpool_alloc(size >> 12);
++		if (pa == 0 && fKeepBytes != 0) {
++			gkeep.flushed += dropKept(~0ull);       /* no room: what is kept goes back to the pool first */
++			pa = gpool_alloc(size >> 12);
++		}
+ 		IOLockUnlock(service_lock);
+ 		if (pa == 0) {
+ 			LOG("msm: %s: the GPU pool has no %llu KB in one piece (%u buffers, %llu MB)", fName, size >> 10, fCount,
+ 			    fBytes >> 20);
+ 			return kIOReturnNoMemory;
+ 		}
+-		IOMemoryDescriptor *pm = IOMemoryDescriptor::withPhysicalAddress(pa, size, kIODirectionInOut);
++		IOMemoryDescriptor *pm = reuse ? kept.md : IOMemoryDescriptor::withPhysicalAddress(pa, size, kIODirectionInOut);
+ 		/*
+ 		 * 0205: zeroed only when small. CoreAnimation makes and drops screen-sized textures many
+ 		 * times a second while it animates (render targets it then draws all of); mapping 11 MB into
+@@ -4525,7 +4664,7 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 			zero_all = z != 0;
+ 		}
+ 		bool zeroed = pm != NULL;
+-		if (pm != NULL && (zero_all || size < 256 * 1024)) {
++		if (pm != NULL && (zero_all || size < 256 * 1024) && !(reuse && gpu_bocache == 2)) {
+ 			diag_t0 = mach_absolute_time();
+ 			IOMemoryMap *km = pm->map(kIOMapWriteCombineCache);
+ 			if (km != NULL) {
+@@ -4538,7 +4677,24 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 		}
+ 		IOLockLock(service_lock);
+ 		struct msm_bo *b = zeroed ? slot(&h) : NULL;
+-		if (b != NULL) {
++		if (b != NULL && reuse) {
++			/* 0342: as it was kept, GPU addresses and all, under a new handle; mapped by nobody now */
++			*b = kept;
++			b->flags = r->flags;
++			b->mapped = false;
++			b->fence = 0;
++			fCount++;
++			fBytes += size;
++			r->handle = h;
++			gkeep.reused++;
++			gkeep.reused_bytes += size;
++		} else if (reuse) {
++			/* no handle left, or it could not be zeroed: freed as any buffer of the client's is */
++			fCount++;
++			fBytes += size;
++			freeBo(&kept);
++			pm = NULL;
++		} else if (b != NULL) {
+ 			b->md = pm;
+ 			b->kva = NULL;                  /* never cleaned: write-combined everywhere */
+ 			b->size = size;
+@@ -4553,7 +4709,9 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 				b = NULL;
+ 			}
+ 		}
+-		if (b != NULL) {
++		if (reuse) {
++			/* (counted above) */
++		} else if (b != NULL) {
+ 			fCount++;
+ 			fBytes += size;
+ 			msm_census(b, 1);
