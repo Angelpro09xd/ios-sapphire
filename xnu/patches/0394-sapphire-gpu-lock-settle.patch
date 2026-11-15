@@ -1,0 +1,194 @@
+0394: SapphireGpu, SweetSurface: IOSurfaceLock waits for the GPU's last write to the surface and invalidates its lines (kern.sweet_gpu_lock_settle, default 1)
+
+Needs 0339 (the surface account), 0350 (gpuFence, the scanout pool) and 0380 (applies after it).
+
+The GPU writes an IOSurface behind the CPU caches, and 0339's account invalidates a surface only before a
+submission that writes it. A line a CPU fetched while the GPU wrote (speculation, a prefetch, a read of
+another word of the line) can be what a later read of the surface returns instead of what the GPU drew, and
+a later partial write merged into such a line can put its old bytes back over the GPU's when it is written
+back. With 0351 such lines are no longer flushed at every idle entry. The Metal driver's own reads go through
+GEM_CPU_PREP (which waits and invalidates); other processes' reads (SpringBoard snapshots, screenshots, any
+IOSurfaceLock of a surface the window server drew) do not.
+
+IOSurfaceLock is where a CPU says it is about to touch the pixels; on Apple's platforms it waits for the GPU's
+pending writes to the surface unless kIOSurfaceLockAvoidSync says not to. So:
+1. submitIt notes in the surface the fence of the last submission that writes it (gpuWriteFence:
+   MSM_SUBMIT_BO_WRITE, or neither flag, as 0339 counts a write).
+2. trapLock (any process, read or write lock) calls sapphire_gpu_surface_settle first: when gpuWriteFence is
+   newer than the last fence settled, it waits for it (msm_wait, 2 s at most), cleans and invalidates the
+   surface's lines through the kernel's mapping (dc civac) and records it in 0339's account. With
+   kIOSurfaceLockAvoidSync a submission not yet done is left to the caller. Write-combined surfaces (the
+   scanout pool's) and a stopped GPU service are skipped.
+3. kern.sweet_gpu_lock_settle (boot-arg gpu_lock_settle): 1 (default) as above, 0 off.
+   kern.sweet_gpu_lock_settle_stats: locks, settled (bytes, time), waits for the GPU (timeouts), not waited.
+
+Cost: one dc civac of the surface the first time it is locked after the GPU wrote it (~1.5 ms for 5 MB at the
+rate 0336 measured), and a wait when the submission is still running.
+Checked: clang -fsyntax-only of SapphireGpu.cpp, SweetSurface.cpp and SweetFramebuffer.cpp with stub headers,
+0 errors, and an undeclared identifier put into each new or changed function is reported. Booted once on the
+phone; its effect is not measured.
+
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -6106,6 +6106,84 @@ SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_usermem, CTLFLAG_RW | CTLFLAG_LOCKED, &gpu
+ SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_usermem_track, CTLFLAG_RW | CTLFLAG_LOCKED, &gpu_usermem_track, 0,
+     "sapphire 0380: 1 = only the pages a processor wrote since are maintained at a submission (default), 0 = every page");
+ 
++/*
++ * sapphire 0394: an IOSurfaceLock of a surface the GPU wrote, by any process. The GPU writes memory behind the
++ * processor's caches, and 0339's account invalidates a surface only before a submission writes it: a line a processor
++ * fetched while the GPU wrote (by speculation, a prefetch, or a read of another word of the line) was what a later
++ * read of the surface got in place of what the GPU drew, and a later partial write merged into such a stale line put
++ * its old bytes back over the GPU's. Before the kernel flushed the
++ * caches at every idle entry, those lines did not live long; with 0344/0351 they do.
++ * IOSurfaceLock is where a processor says it is about to touch the pixels, and on Apple's platforms it waits for the
++ * GPU's pending writes to the surface unless kIOSurfaceLockAvoidSync says not to. So here: when a submission wrote the
++ * surface (gpuWriteFence, set by submitIt) since the last settle (settledFence), wait for it (up to 2 s, as every msm
++ * wait), then clean and invalidate the surface's lines through the kernel's mapping and note it in 0339's account
++ * (invalEpoch, cleanEpoch: nothing of it is in a cache now). With AvoidSync, a submission not done yet is left to the
++ * caller. Write-combined surfaces (the scanout pool's) are skipped: no cache holds them.
++ * kern.sweet_gpu_lock_settle (boot-arg gpu_lock_settle): 1 (default) as above, 0 as before. kern.sweet_gpu_lock_settle_stats.
++ */
++static int gpu_lock_settle = -1;
++static struct {
++	uint64_t locks, settled, settled_bytes, waited, timeouts, not_waited;
++	struct gdiag_time time;
++} glock;
++
++void
++sapphire_gpu_surface_settle(SweetSurface *s, bool avoidSync)
++{
++	if (gpu_lock_settle < 0) {
++		int on = 1;
++		(void)PE_parse_boot_argn("gpu_lock_settle", &on, sizeof(on));
++		gpu_lock_settle = on != 0;
++	}
++	OSAddAtomic64(1, (volatile SInt64 *)&glock.locks);
++	const uint32_t f = s->gpuWriteFence;
++	if (gpu_lock_settle == 0 || f == 0 || f == s->settledFence || s->lowPool || s->mapCache == kIOMapWriteCombineCache || !service_ready ||
++	    pool == NULL || s->memory == NULL) {
++		return;
++	}
++	if (!msm_fence_done(f)) {
++		if (avoidSync) {
++			OSAddAtomic64(1, (volatile SInt64 *)&glock.not_waited);
++			return;
++		}
++		OSAddAtomic64(1, (volatile SInt64 *)&glock.waited);
++		if (!msm_wait(f, 2000)) {
++			OSAddAtomic64(1, (volatile SInt64 *)&glock.timeouts);
++			return;
++		}
++	}
++	const uintptr_t kva = s->kernelAddress();
++	if (kva == 0) {
++		return;
++	}
++	const uint64_t t0 = mach_absolute_time();
++	const uint32_t epoch = s->cpuEpoch;             /* (read before: an access announced while it runs is maintained again) */
++	const uint64_t length = s->memory->getLength();
++	sweet_dcache_flush((vm_offset_t)kva, (unsigned)length);
++	s->invalEpoch = epoch;
++	s->cleanEpoch = epoch;
++	s->settledFence = f;
++	OSAddAtomic64(1, (volatile SInt64 *)&glock.settled);
++	OSAddAtomic64((SInt64)length, (volatile SInt64 *)&glock.settled_bytes);
++	gdiag_since(&glock.time, t0);
++}
++
++static int
++sweet_gpu_lock_settle_stats_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char line[320];
++
++	snprintf(line, sizeof(line), "surface locks (kern.sweet_gpu_lock_settle %d): %llu, settled after the GPU wrote %llu (%llu bytes, %llu us, "
++	    "max %llu us), waited for the GPU %llu (timed out %llu), not waited (AvoidSync) %llu\n", gpu_lock_settle, glock.locks, glock.settled,
++	    glock.settled_bytes, glock.time.ns / 1000, glock.time.max / 1000, glock.waited, glock.timeouts, glock.not_waited);
++	return SYSCTL_OUT(req, line, strlen(line) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_lock_settle_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_lock_settle_stats_sysctl, "A", "sapphire 0394: IOSurfaceLocks of surfaces the GPU wrote: waited for and invalidated");
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_lock_settle, CTLFLAG_RW | CTLFLAG_LOCKED, &gpu_lock_settle, 0,
++    "sapphire 0394: an IOSurfaceLock waits for the GPU's writes to the surface and invalidates its lines: 1 = yes (default), 0 = as before");
++
+ class SapphireGPU : public IOService {
+ 	OSDeclareDefaultStructors(SapphireGPU);
+ };
+@@ -6982,6 +7060,9 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 				b->fence = r->fence;
+ 				if (b->surf != NULL) {
+ 					b->surf->gpuFence = r->fence;   /* 0350: what a scanout of the surface waits for */
++					if ((bos[i].flags & MSM_SUBMIT_BO_WRITE) != 0 || (bos[i].flags & MSM_SUBMIT_BO_READ) == 0) {
++						b->surf->gpuWriteFence = r->fence;      /* 0394: what an IOSurfaceLock settles */
++					}
+ 				}
+ 				if (b->user && ((bos[i].flags & MSM_SUBMIT_BO_WRITE) != 0 || (bos[i].flags & MSM_SUBMIT_BO_READ) == 0)) {
+ 					if (b->wfence == 0) {
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -100,6 +100,7 @@ enum {
+ #define SWEET_SURFACE_STATE_BULK        0x30    /* 0x70 bytes of bulk attachments */
+ #define SWEET_SURFACE_BULK_SIZE         0x70
+ #define kIOSurfaceLockReadOnly          0x1
++#define kIOSurfaceLockAvoidSync         0x2     /* IOSurface.h: do not wait for the GPU (0394) */
+ 
+ static IOLock       *sweet_surface_lock;
+ static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
+@@ -1649,13 +1650,16 @@ sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
+ }
+ 
+ IOReturn
+-IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
++IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
+     void *, void *, void *)
+ {
+ 	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	/* 0394: what the GPU wrote, waited for and out of the processor's caches before the lock is held (IOSurfaceLock
++	 * waits for the GPU's writes unless kIOSurfaceLockAvoidSync says not to) */
++	sapphire_gpu_surface_settle(s, ((uintptr_t)options & kIOSurfaceLockAvoidSync) != 0);
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
+ 	s->release();
+ 	return ret;
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -70,6 +70,13 @@ public:
+ 	 */
+ 	bool                      lowPool;
+ 	volatile uint32_t         gpuFence;
++	/*
++	 * sapphire 0394: gpuWriteFence, the msm fence of the last submission that wrote the surface (MSM_SUBMIT_BO_WRITE,
++	 * or neither flag); settledFence, the one whose writes an IOSurfaceLock last waited for and invalidated the caches
++	 * after (SapphireGpu.cpp, sapphire_gpu_surface_settle). Equal: nothing the GPU wrote is newer than the lines a
++	 * processor may hold.
++	 */
++	volatile uint32_t         gpuWriteFence, settledFence;
+ 	/*
+ 	 * sapphire 0354: who made it and when (for the pool's census), and how often the window server has swapped it
+ 	 * onto the panel and when last (SweetFramebuffer.cpp, with its fPresentLock).
+@@ -79,7 +86,7 @@ public:
+ 	uint32_t                  swaps;
+ 	uint64_t                  swapAbs;
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { sweet_surface_counted(1); gpuSeed = 0; gpuDrawn = false; cpuEpoch = 1; cleanEpoch = 0; invalEpoch = 0; scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; lowPool = false; gpuFence = 0; creator[0] = 0; madeAbs = 0; swaps = 0; swapAbs = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { sweet_surface_counted(1); gpuSeed = 0; gpuDrawn = false; cpuEpoch = 1; cleanEpoch = 0; invalEpoch = 0; scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; lowPool = false; gpuFence = 0; gpuWriteFence = 0; settledFence = 0; creator[0] = 0; madeAbs = 0; swaps = 0; swapAbs = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+@@ -118,6 +125,13 @@ size_t sweet_scanout_pool_describe(char *buf, size_t len);
+ /* sapphire 0354: whether s is still the surface published under id (not freed, not released by every user) */
+ bool sweet_surface_alive(uint32_t id, const SweetSurface *s);
+ 
++/*
++ * sapphire 0394 (SapphireGpu.cpp): before a processor reads or writes a surface the GPU wrote -- an IOSurfaceLock, of
++ * any process -- wait for that submission and clean and invalidate the surface's lines; AVOID_SYNC (the lock's
++ * kIOSurfaceLockAvoidSync): do not wait, settle only what is done.
++ */
++void sapphire_gpu_surface_settle(SweetSurface *s, bool avoidSync);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
