@@ -1,0 +1,499 @@
+0345: SapphireGpu: GPU core clock changed at run time (kern.sweet_gpu_khz, kern.sweet_gpu_opp)
+
+Nothing changes unless kern.sweet_gpu_khz is written. Needs 0337's stock path (gpu_vco2=1 with a gpu_mhz of
+the stock table) and 0343.
+
+kern.sweet_gpu_khz (int, read-write): reads the core clock; writing a row of the stock table (kHz, or MHz)
+moves the clock there, not above the speed bin's top (gpu_anybin=1 lifts it), with the votes kgsl makes:
+- up: CX peak-current votes from 900 and 950 MHz, the CX rail by the rate and the MX rail by the VCO
+  (never under 0337's 0x1a0 unless gpu_cx/gpu_mx say so), then the clock; down: the clock, then the rails,
+  then the peak-current votes the new rate does not need (stock clk_pre/post_change_regmap order);
+- the clock: with service_lock held and the GPU idle (ring read to its end, RBBM_STATUS idle; boot-arg
+  gpu_opp_drain=N ms, 100), gpu_cc_pll0 takes its new L and alpha while running, as the stock
+  clk_zonda_pll_set_rate() does for a PLL that is on (SUPPORTS_DYNAMIC_UPDATE), then waits for the lock
+  bit; going down L is written first, so that between the two writes the PLL never aims above the higher
+  of the two rates;
+- kern.sweet_gpu_opp_park=1 (boot-arg gpu_opp_park=1): the RCG to GPLL0/2 (300 MHz) while the PLL is
+  restarted at the new rate, then back.
+Errors: EINVAL (not a row, above the bin), ENODEV (no stock path, no service, failed recovery), EBUSY (GPU
+not idle in time; votes taken back), EAGAIN (peak-current limit refused), EIO (rail vote refused, or no PLL
+lock). A PLL without lock within 1 ms is brought back the long way at its old rate; if that fails, the core
+stays on GPLL0/2 and later changes are refused; if the RCG does not switch, the GPU service is stopped.
+
+kern.sweet_gpu_opp (read only): rate, mode, changes, refusals by cause, PLL failures and recoveries, the last
+and worst changes with their times, the votes in place, time at each row.
+
+Locking: opp_lock serialises changes and is taken before service_lock; RPM and peak-current votes run under
+opp_lock only.
+
+Checked on the host against a model of the Zonda PLL, the RCG, the GPU, the RPM and cx_ipeak (every step of
+the table both ways and both modes, busy GPU, refused votes, no lock, stuck RCG): the core clock stays within
+the voted CX level and the VCO within the MX level at every register write.
+Measured on the phone (n=1): 820 -> 1025 -> 1260 MHz without errors, 312 and 1344 us per change; gxfreq
+reads 1025.00 and 1260.00 MHz.
+
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -363,6 +363,12 @@ static uint32_t bin_fuse = ~0u;                 /* the speed bin (~0: not read)
+ static uint32_t clkdiag;
+ static bool clocks_up;                          /* power_up() succeeded: the GPU CC's clocks may be measured */
+ static IOLock *clk_lock;
++/* sapphire 0345: the core clock the stock path of 0337 set (kHz; 0: none, so no change of rate is possible) */
++static uint32_t opp_khz;
++static bool opp_quiet;                          /* rate changes after boot: cx_ipeak and the PLL log only failures */
++static IOLock *opp_lock;                        /* serialises changes of rate (taken before service_lock) */
++static uint32_t opp_drain_ms = 100;             /* boot-arg gpu_opp_drain: how long a change waits for an idle GPU */
++static int opp_park;                            /* kern.sweet_gpu_opp_park (boot-arg gpu_opp_park) */
+ /*
+  * boot-arg gpu_smmu_early: program the identity context bank as soon as its clock is voted,
+  * before the GX domain comes up, instead of in cp_start(). The GPU's SMMU comes out of the
+@@ -884,14 +890,18 @@ cx_ipeak_set(uint32_t khz)
+ 			continue;
+ 		}
+ 		if (enabled == 0 || (rd(cxip, client[i].off + 4) & 1) != 0) {
+-			LOG("  cx_ipeak: no vote for %u kHz and above (feature enable %08x, the client's bypass %08x)", client[i].khz,
+-			    enabled, rd(cxip, client[i].off + 4));
++			if (!opp_quiet) {                   /* 0345: not at every change of rate */
++				LOG("  cx_ipeak: no vote for %u kHz and above (feature enable %08x, the client's bypass %08x)",
++				    client[i].khz, enabled, rd(cxip, client[i].off + 4));
++			}
+ 			continue;
+ 		}
+ 		wr(cxip, client[i].off, 1);
+ 		ok = poll(cxip, 0x24, 0xFFFFFFFFu, 0, 50000);
+-		LOG("  cx_ipeak: vote for %u kHz and above (client register %x): danger %08x: %s", client[i].khz, client[i].off,
+-		    rd(cxip, 0x24), ok ? "taken" : "REFUSED");
++		if (!opp_quiet || !ok) {
++			LOG("  cx_ipeak: vote for %u kHz and above (client register %x): danger %08x: %s", client[i].khz,
++			    client[i].off, rd(cxip, 0x24), ok ? "taken" : "REFUSED");
++		}
+ 		if (ok) {
+ 			voted[i] = true;
+ 		} else {
+@@ -939,8 +949,10 @@ gpu_pll_start_vco(uint32_t vco_khz)
+ 	rmw(gpucc, ZP_USER, 0, 0xF);
+ 	rmw(gpucc, ZP_MODE, 0, ZP_OUTCTRL);
+ 	IODelay(100);
+-	LOG("gpu_cc_pll0 locked: VCO %u kHz (l %u alpha %04x), USER_CTL %08x: OUT_MAIN = VCO / 2 = %u kHz", vco_khz, l, a,
+-	    rd(gpucc, ZP_USER), vco_khz / 2);
++	if (!opp_quiet) {                           /* 0345 */
++		LOG("gpu_cc_pll0 locked: VCO %u kHz (l %u alpha %04x), USER_CTL %08x: OUT_MAIN = VCO / 2 = %u kHz", vco_khz, l,
++		    a, rd(gpucc, ZP_USER), vco_khz / 2);
++	}
+ 	return true;
+ }
+ 
+@@ -1124,6 +1136,7 @@ power_up(void)
+ 	}
+ 	if (stock != 0) {
+ 		ok &= rcg_set(0x101c, SRC_GPU_PLL0, 1, "gx_gfx3d_clk_src");
++		opp_khz = ok ? stock : 0;               /* 0345: the rate kern.sweet_gpu_khz starts from */
+ 	} else if (core_mhz != 0 && gpu_pll_start(core_mhz)) {
+ 		ok &= rcg_set(0x101c, SRC_GPU_PLL0, 1, "gx_gfx3d_clk_src");
+ 		LOG("  gpu_mhz=%u without gpu_vco2=1 is the PLL's VCO: the core clock is half of it, %u.%u MHz", core_mhz,
+@@ -3448,6 +3461,12 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ 	(void)PE_parse_boot_argn("gpu_clkdiag", &clkdiag, sizeof(clkdiag));         /* 0343 */
+ 	clk_lock = IOLockAlloc();
++	(void)PE_parse_boot_argn("gpu_opp_drain", &opp_drain_ms, sizeof(opp_drain_ms));      /* 0345 */
++	(void)PE_parse_boot_argn("gpu_opp_park", &opp_park, sizeof(opp_park));
++	if (opp_drain_ms == 0 || opp_drain_ms > 1000) {
++		opp_drain_ms = 100;
++	}
++	opp_lock = IOLockAlloc();
+ 	(void)PE_parse_boot_argn("gpu_copy_async", &copy_async, sizeof(copy_async));
+ 	(void)PE_parse_boot_argn("gpu_smmu_early", &smmu_early, sizeof(smmu_early));
+ 	(void)PE_parse_boot_argn("gpu_irq", &gpu_irq, sizeof(gpu_irq));
+@@ -4229,6 +4248,392 @@ msm_gpu_idle(void)
+ 	return grd(REG_CP_RB_RPTR) == ring_wptr % RING_DWORDS && (grd(REG_RBBM_STATUS) & ~1u) == 0;
+ }
+ 
++/*
++ * sapphire 0345: kern.sweet_gpu_khz, the GPU's core clock moved between the rows of the stock table while the system
++ * runs, as the stock clock driver moves it and with the votes kgsl makes around it (kgsl_pwrctrl.c, the vdd class of
++ * gpucc-khaje.c: a higher level before a faster clock, the lower one after a slower clock):
++ *   - going up: the CX peak-current votes from 900 and 950 MHz (cx_ipeak_set), the CX rail by rate (rate_max of
++ *     gx_gfx3d_clk_src) and the MX rail by VCO (rate_max of gpu_cc_pll0), each never under the 0x1a0 floor of 0337
++ *     unless gpu_cx/gpu_mx give the level; then the clock;
++ *   - going down: the clock; then the rails; then the peak-current votes the new rate does not need;
++ *   - the clock: with the service lock held and the GPU idle (the ring read to its end and RBBM_STATUS idle, waited
++ *     for up to gpu_opp_drain ms, 100 by default: no new work can be queued meanwhile), gpu_cc_pll0 takes its new
++ *     alpha and L while it runs and the RCG stays on it, as the stock clk_zonda_pll_set_rate() does with a PLL that is
++ *     on (alpha, L, 5 us, the lock bit TEST_CTL says to wait for, 100 us). Every row of the stock
++ *     ftbl_gpu_cc_gx_gfx3d_clk_src is source 1 divider 1, so a change of rate is a change of the PLL alone.
++ *     kern.sweet_gpu_opp_park=1 (boot-arg gpu_opp_park=1) does it the long way: the RCG moves to GPLL0 / 2 (300 MHz,
++ *     under every row and valid at any rail level), the PLL is configured and started again from standby at the new
++ *     rate as at boot, and the RCG goes back to it.
++ * A PLL that reports no lock within 1 ms is brought back the long way at the rate it had. If that fails the core
++ * stays on GPLL0 / 2 (300 MHz) and further changes are refused; if the RCG does not take a switch the GPU service is
++ * stopped (its copies go back to the CPU) rather than leave the core without a known clock.
++ * Needs the stock path of 0337 (gpu_vco2=1 and a gpu_mhz of the table) and a GPU taking work (gpu_service).
++ * Read: the rate in kHz (0: no stock path). Write: a row in kHz (or in MHz, 1114 for 1114.8). Errors: EINVAL not a row
++ * or above the speed bin's top, ENODEV no stock path or no service, EBUSY the GPU did not go idle in time, EAGAIN the
++ * peak-current limit refused, EIO a rail vote refused or the PLL did not lock (kern.sweet_gpu_opp tells which).
++ */
++#define OPP_ROWS            (sizeof(stock_khz) / sizeof(stock_khz[0]))
++#define OPP_CAT(...) do { \
++	if (off + 1 < sizeof(buf)) { \
++		int n_ = snprintf(buf + off, sizeof(buf) - off, __VA_ARGS__); \
++		if (n_ > 0) { \
++			off = off + (size_t)n_ < sizeof(buf) ? off + (size_t)n_ : sizeof(buf) - 1; \
++		} \
++	} \
++} while (0)
++static bool opp_broken;                         /* a recovery failed: no more changes */
++static struct {
++	uint64_t up, down, refused_busy, refused_ipeak, refused_rail, pll_fail, recovered, broken;
++	uint64_t last_ns, last_drain_ns, last_pll_ns, max_ns, max_drain_ns;
++	uint32_t last_from, last_to, last_polls, max_polls;
++	int last_err;
++	uint64_t row_ns[OPP_ROWS];              /* time spent at each row of stock_khz[] */
++	uint64_t since;                         /* when the current rate was set (mach_absolute_time) */
++} gopp;
++
++static int
++opp_row(uint32_t khz)
++{
++	for (unsigned i = 0; i < OPP_ROWS; i++) {
++		if (stock_khz[i] == khz) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++static uint64_t
++ns_since(uint64_t t0)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return ns;
++}
++
++/* The time at the current rate into its row's account (opp_lock held). */
++static void
++opp_account(void)
++{
++	int r = opp_row(opp_khz);
++	uint64_t now = mach_absolute_time();
++
++	if (gopp.since != 0 && r >= 0) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(now - gopp.since, &ns);
++		gopp.row_ns[r] += ns;
++	}
++	gopp.since = now;
++}
++
++/* gx_gfx3d's RCG to a source and divider, without a word in the log; false if the update does not complete. */
++static bool
++opp_rcg(uint32_t src, uint32_t div)
++{
++	rmw(gpucc, 0x1020, 0x71fu, (src << 8) | (2 * div - 1));
++	rmw(gpucc, 0x101c, 0, RCG_UPDATE);
++	return poll(gpucc, 0x101c, RCG_UPDATE, 0, 500);
++}
++
++/*
++ * clk_zonda_pll_set_rate() on a PLL that runs: the new alpha and L, 5 us, the lock bit TEST_CTL says to wait for,
++ * 100 us. Stock writes alpha first in both directions; for the microseconds between the two writes the PLL then aims
++ * at the old L with the new alpha, which on the way down is up to half a step of L (9.6 MHz of core clock) above the
++ * old rate, with the rails still at the old rate's level. Here the way down writes L first: in both directions what
++ * the PLL aims at between the writes stays at or under the higher of the two rates (the GPU is idle either way).
++ */
++static bool
++opp_pll_dynamic(uint32_t vco_khz, bool up, uint32_t *polls)
++{
++	uint32_t l, a, lock, i;
++
++	zonda_la_khz(vco_khz, &l, &a);
++	if (up) {
++		wr(gpucc, ZP_ALPHA, a);
++		wr(gpucc, ZP_L, l);
++	} else {
++		wr(gpucc, ZP_L, l);
++		wr(gpucc, ZP_ALPHA, a);
++	}
++	IODelay(5);                                 /* "Wait before polling for the frequency latch" */
++	lock = (rd(gpucc, ZP_TEST) & ZP_STAY_IN_CFA) != 0 ? ZP_FREQ_LOCK : ZP_LOCK;
++	for (i = 0; i < 1000 && (rd(gpucc, ZP_MODE) & lock) != lock; i++) {
++		IODelay(1);
++	}
++	*polls = i;
++	if (i == 1000) {
++		return false;
++	}
++	IODelay(100);                               /* "Wait for PLL output to stabilize" */
++	return (rd(gpucc, ZP_L) & 0xffffu) == l && (rd(gpucc, ZP_ALPHA) & 0xffffu) == a;
++}
++
++/*
++ * The long way: the RCG to GPLL0 / 2, the PLL started again at vco_khz, the RCG back to it. 1 done, 0 the core was
++ * left on GPLL0 / 2 (the PLL did not start), -1 the RCG did not take a switch.
++ */
++static int
++opp_pll_park(uint32_t vco_khz)
++{
++	if (!opp_rcg(SRC_GPLL0, 2)) {
++		return -1;
++	}
++	if (!gpu_pll_start_vco(vco_khz)) {
++		return 0;
++	}
++	return opp_rcg(SRC_GPU_PLL0, 1) ? 1 : -1;
++}
++
++/*
++ * The rails and the peak-current votes toward the rate khz, only upward (raise) or only downward: 0, or EAGAIN (the
++ * peak-current limit refused) or EIO (a rail vote refused) when raising. Lowering cannot fail: a vote the RPM refuses
++ * there leaves the higher level in place, which is safe. opp_lock held.
++ */
++static int
++opp_votes(uint32_t khz, bool raise)
++{
++	uint32_t cx = cx_arg != ~0u ? cx_arg : MAX(cx_level_for(khz), 0x1a0u);
++	uint32_t mx = mx_arg != ~0u ? mx_arg : MAX(mx_level_for(2 * khz), 0x1a0u);
++	int r;
++
++	if (raise && !cx_ipeak_set(khz)) {
++		return EAGAIN;
++	}
++	if (cx != 0 && (raise ? cx > cx_voted : cx < cx_voted)) {
++		r = topaz_rpm_vote(0, 0x78637772, 0, 0x6c766c76, cx);          /* "rwcx" 0, "vlvl" */
++		if (r == 0) {
++			cx_voted = cx;
++		} else if (raise) {
++			LOG("opp: CX rail (RPM rwcx 0) to level %u for %u kHz refused: %d", cx, khz, r);
++			return EIO;
++		}
++	}
++	if (mx != 0 && (raise ? mx > mx_voted : mx < mx_voted)) {
++		r = topaz_rpm_vote(0, 0x786d7772, 0, 0x6c766c76, mx);          /* "rwmx" 0, "vlvl" */
++		if (r == 0) {
++			mx_voted = mx;
++		} else if (raise) {
++			LOG("opp: MX rail (RPM rwmx 0) to level %u for %u kHz refused: %d", mx, khz, r);
++			return EIO;
++		}
++	}
++	if (!raise) {
++		(void)cx_ipeak_set(khz);                /* drops the votes the rate does not need */
++	}
++	return 0;
++}
++
++/* Wait, with the service lock held, for the GPU to have nothing queued or running; false after ms. */
++static bool
++opp_drain(uint32_t ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, kMillisecondScale, &deadline);
++	while (!msm_gpu_idle()) {
++		if (mach_absolute_time() >= deadline) {
++			return false;
++		}
++		delay_for_interval(20, NSEC_PER_USEC);
++	}
++	return true;
++}
++
++/* The row of the stock table a request names (kHz, or MHz below 10000), or 0. */
++static uint32_t
++opp_request_khz(uint32_t v)
++{
++	for (unsigned i = 0; i < OPP_ROWS; i++) {
++		if (stock_khz[i] == v || (v < 10000 && stock_khz[i] / 1000 == v)) {
++			return stock_khz[i];
++		}
++	}
++	return 0;
++}
++
++/* Changes the core clock to the stock row khz; 0 or an errno (see above). who: for the log (NULL: say nothing). */
++static int
++gpu_opp_set(uint32_t khz, const char *who)
++{
++	uint32_t old, polls = 0, anybin = 0, actual;
++	uint64_t t0 = mach_absolute_time(), t1 = 0, t2 = 0;
++	bool ok;
++	int err = 0;
++
++	if (opp_lock == NULL) {
++		return ENODEV;
++	}
++	(void)PE_parse_boot_argn("gpu_anybin", &anybin, sizeof(anybin));
++	if (opp_row(khz) < 0 || (khz > bin_max_khz(bin_fuse) && anybin == 0)) {
++		return EINVAL;
++	}
++	IOLockLock(opp_lock);
++	old = opp_khz;
++	if (old == 0 || opp_row(old) < 0 || opp_broken || !service_ready || !clocks_up) {
++		IOLockUnlock(opp_lock);
++		return ENODEV;
++	}
++	if (khz == old) {
++		IOLockUnlock(opp_lock);
++		return 0;
++	}
++	opp_quiet = true;
++	if (khz > old) {
++		err = opp_votes(khz, true);
++		if (err != 0) {
++			(void)opp_votes(old, false);        /* takes back what was raised */
++			if (err == EAGAIN) {
++				gopp.refused_ipeak++;
++			} else {
++				gopp.refused_rail++;
++			}
++			gopp.last_err = err;
++			IOLockUnlock(opp_lock);
++			return err;
++		}
++	}
++	IOLockLock(service_lock);
++	t1 = mach_absolute_time();
++	if (!service_ready || !opp_drain(opp_drain_ms)) {
++		IOLockUnlock(service_lock);
++		(void)opp_votes(old, false);
++		gopp.refused_busy++;
++		gopp.last_err = EBUSY;
++		IOLockUnlock(opp_lock);
++		return EBUSY;
++	}
++	t2 = mach_absolute_time();
++	actual = khz;
++	if (opp_park != 0) {
++		int p = opp_pll_park(2 * khz);
++		ok = p == 1;
++		if (p == 0) {
++			p = gpu_pll_start_vco(2 * old) ? (opp_rcg(SRC_GPU_PLL0, 1) ? 1 : -1) : 0;
++			actual = p == 1 ? old : 300000;
++		} else if (p < 0) {
++			actual = 0;
++		}
++		if (!ok) {
++			gopp.pll_fail++;
++			err = EIO;
++			opp_broken = p != 1;
++			if (p < 0) {
++				service_ready = false;
++			}
++		}
++	} else {
++		ok = opp_pll_dynamic(2 * khz, khz > old, &polls);
++		if (!ok) {
++			int p = opp_pll_park(2 * old);
++			gopp.pll_fail++;
++			err = EIO;
++			actual = p == 1 ? old : p == 0 ? 300000 : 0;
++			if (p == 1) {
++				gopp.recovered++;
++			} else {
++				opp_broken = true;
++				if (p < 0) {
++					service_ready = false;
++				}
++			}
++		}
++	}
++	IOLockUnlock(service_lock);
++	if (opp_broken) {
++		gopp.broken++;
++		LOG("opp: %u -> %u kHz: the PLL %s; %s", old, khz, ok ? "changed" : "did not lock",
++		    actual == 300000 ? "the core stays on GPLL0 / 2 (300 MHz), no more changes" :
++		    "the RCG did not take a switch: the GPU service is stopped");
++	} else if (!ok) {
++		LOG("opp: %u -> %u kHz: the PLL did not lock (mode %08x test %08x); back at %u kHz the long way", old, khz,
++		    rd(gpucc, ZP_MODE), rd(gpucc, ZP_TEST), actual);
++	}
++	opp_account();
++	opp_khz = actual;
++	if (actual != 0) {
++		(void)opp_votes(actual, false);         /* the levels the rate it runs at needs, no more (0: unknown, all kept) */
++	}
++	if (ok) {
++		if (khz > old) {
++			gopp.up++;
++		} else {
++			gopp.down++;
++		}
++	}
++	gopp.last_from = old;
++	gopp.last_to = khz;
++	gopp.last_polls = polls;
++	if (polls > gopp.max_polls) {
++		gopp.max_polls = polls;
++	}
++	gopp.last_ns = ns_since(t0);
++	absolutetime_to_nanoseconds(t2 - t1, &gopp.last_drain_ns);
++	gopp.last_pll_ns = ns_since(t2);
++	if (gopp.last_ns > gopp.max_ns) {
++		gopp.max_ns = gopp.last_ns;
++	}
++	if (gopp.last_drain_ns > gopp.max_drain_ns) {
++		gopp.max_drain_ns = gopp.last_drain_ns;
++	}
++	gopp.last_err = err;
++	IOLockUnlock(opp_lock);
++	if (who != NULL && err == 0) {
++		LOG("opp (%s): %u -> %u kHz in %llu us (GPU idle after %llu us, PLL %llu us, %u lock polls)", who, old, khz,
++		    gopp.last_ns / 1000, gopp.last_drain_ns / 1000, gopp.last_pll_ns / 1000, polls);
++	}
++	return err;
++}
++
++static int
++sweet_gpu_khz_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = (int)opp_khz;
++	int error = sysctl_io_number(req, v, sizeof(v), &v, NULL);
++
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	uint32_t khz = v > 0 ? opp_request_khz((uint32_t)v) : 0;
++	return khz == 0 ? EINVAL : gpu_opp_set(khz, "sysctl");
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_khz, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_khz_sysctl, "I", "sapphire 0345: the GPU's core clock in kHz; write a row of the stock table to change it");
++
++static int
++sweet_gpu_opp_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[900];
++	size_t off = 0;
++
++	if (opp_lock != NULL) {
++		IOLockLock(opp_lock);
++		opp_account();
++	}
++	buf[0] = 0;
++	OPP_CAT("now %u kHz%s (%s); up %llu down %llu; refused: GPU busy %llu, peak current %llu, rail %llu; PLL without lock %llu "
++	    "(recovered %llu, broken %llu); last %u -> %u kHz err %d: %llu us, idle after %llu us, PLL %llu us, %u lock polls; "
++	    "max %llu us, idle after %llu us, %u polls; drain limit %u ms; votes CX %u MX %u\n", opp_khz,
++	    opp_broken ? " BROKEN" : "", opp_park ? "the long way (park)" : "dynamic (stock)", gopp.up, gopp.down,
++	    gopp.refused_busy, gopp.refused_ipeak, gopp.refused_rail, gopp.pll_fail, gopp.recovered, gopp.broken,
++	    gopp.last_from, gopp.last_to, gopp.last_err, gopp.last_ns / 1000, gopp.last_drain_ns / 1000, gopp.last_pll_ns / 1000,
++	    gopp.last_polls, gopp.max_ns / 1000, gopp.max_drain_ns / 1000, gopp.max_polls, opp_drain_ms, cx_voted, mx_voted);
++	OPP_CAT("time at each rate, ms:");
++	for (unsigned i = 0; i < OPP_ROWS; i++) {
++		OPP_CAT(" %u %llu", stock_khz[i], gopp.row_ns[i] / 1000000);
++	}
++	OPP_CAT("\n");
++	if (opp_lock != NULL) {
++		IOLockUnlock(opp_lock);
++	}
++	return SYSCTL_OUT(req, buf, off + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_opp, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_opp_sysctl, "A", "sapphire 0345: changes of the GPU's core clock: counts, times, refusals, time at each rate");
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_opp_park, CTLFLAG_RW | CTLFLAG_LOCKED, &opp_park, 0,
++    "sapphire 0345: 1 = change the PLL the long way (RCG on GPLL0 / 2 meanwhile) instead of the stock dynamic update");
++
+ /*
+  * GPU memory (0151): the gigabyte from 0x1_0000_0000 to 0x1_4000_0000 is DDR that nobody uses
+  * here -- xnu runs from 0x1_4000_0000 (the shim clamps it there), the fixed firmware carve-outs

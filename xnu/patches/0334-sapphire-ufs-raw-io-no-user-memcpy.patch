@@ -1,0 +1,154 @@
+0334: sweet_ufs: raw device read/write without physio (no kernel memcpy into user memory)
+
+Raw reads and writes of rufsroot0 went through physio(), which puts the caller's user address in the buf;
+buf_map() returns that address for a buf without B_CLUSTER, so sweet_ufs_strategy() memcpy'd device data
+straight into user memory. These cores have no PAN (0081), and memcpy is not in copyio's recovery table: a
+fault on that page (e.g. the pmap's modified-bit emulation, writable pages entered read-only) is taken as a
+kernel fault and panics. Seen once: `dd if=/dev/rufsroot0 bs=4096 count=1025` as root, data abort at
+memcpy+72 called from sweet_ufs_strategy+604, ESR 0x9600004f (write, permission fault, level 3).
+
+sweet_ufs_rw() now loops over the uio in chunks of at most 1 MiB: under sweet_ufs_lock it runs the same
+ufs_read_blocks/ufs_write_blocks as the strategy routine (read-merge-write of partial device blocks) into a
+kalloc_data buffer, and moves the data with uiomove() with the mutex dropped. Offsets must be multiples of
+the sector size (EINVAL otherwise); a read is cut at the end of the partition (0 bytes = EOF); a write that
+does not fit is refused before anything is written. The block path (buf cache, cluster I/O) is unchanged;
+the strategy routine refuses a B_PHYS buf without B_CLUSTER (ENOTSUP).
+
+Measured: the dd above 30 of 30 times, 4 MiB blocks 10 of 10, a 64 MiB read with exact size, and an
+unaligned offset answered EINVAL; no panic. Raw writes (ufsrw=1) are not tested.
+
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -537,6 +537,16 @@ sweet_ufs_strategy(buf_t bp)
+ 	bool rd = buf_flags(bp) & B_READ;
+ 
+ 	buf_setresid(bp, count);
++	/*
++	 * sapphire 0334: a physio() buffer (B_PHYS without B_CLUSTER) points at user memory, which
++	 * buf_map() hands back as is. The raw device no longer sends any here (sweet_ufs_rw); refuse
++	 * one rather than memcpy to it. Cluster direct I/O (B_PHYS | B_CLUSTER, e.g. HFS uncached
++	 * reads) is fine: buf_map() maps its UPL into the kernel.
++	 */
++	if ((buf_flags(bp) & (B_PHYS | B_CLUSTER)) == B_PHYS) {
++		error = ENOTSUP;
++		goto done;
++	}
+ 	if (!rd && !su.writable) {
+ 		error = EROFS;
+ 		goto done;
+@@ -664,19 +674,108 @@ sweet_ufs_psize(__unused dev_t dev)
+ 	return su.ready ? (int)MIN(su.nblocks * UFS_BLOCK / su.secsize, INT_MAX) : -1;
+ }
+ 
++/*
++ * sapphire 0334: read/write of the raw device (rufsroot0). These used physio(), whose buf
++ * carries the caller's USER address; sweet_ufs_strategy() memcpy'd straight to/from it. That
++ * memcpy is not in copyio's recovery table, so any fault on the user page -- even one the VM
++ * resolves on every copyout, like the first write to a page mapped read-only to track the
++ * modified bit -- is driven against kernel_map and panics (osfmk/arm64/sleh.c,
++ * handle_kernel_abort). 2026-11-14: dd if=/dev/rufsroot0 bs=4096 ... -> data abort in memcpy
++ * from sweet_ufs_strategy, far 0x1006f4000, esr 0x9600004f.
++ *
++ * Now: chunks of at most BOUNCE_SIZE. The device I/O goes through the bounce buffer under
++ * sweet_ufs_lock exactly as in strategy (partial device blocks of a write are read, merged and
++ * written back); the data is staged in a kernel buffer and moved with uiomove() (copyin /
++ * copyout, faults handled) with the lock dropped, since such a fault may page in from this
++ * same disk. Offsets must be multiples of the sector size (physio silently rounded them down);
++ * a read is cut at the end of the partition (0 = end of file); a write that does not fit is
++ * refused whole, before anything is written.
++ */
+ static int
+-sweet_ufs_read(dev_t dev, struct uio *uio, __unused int ioflag)
++sweet_ufs_rw(struct uio *uio, bool rd)
+ {
+-	return physio(sweet_ufs_strategy, NULL, dev, B_READ, minphys, uio, (int)su.secsize);
++	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
++	uint32_t secsize = su.secsize;
++	off_t off = uio_offset(uio);
++	user_ssize_t resid = uio_resid(uio);
++	int error = 0;
++
++	if (!su.ready) {
++		return ENXIO;
++	}
++	if (!rd && !su.writable) {
++		return EROFS;
++	}
++	if (off < 0 || (uint64_t)off % secsize) {
++		return EINVAL;
++	}
++	if (resid <= 0 || (rd && (uint64_t)off >= part_bytes)) {
++		return 0;
++	}
++	if ((uint64_t)off > part_bytes) {
++		return EINVAL;
++	}
++	uint64_t total = MIN((uint64_t)resid, part_bytes - (uint64_t)off);
++	if (!rd && total < (uint64_t)resid) {
++		return EINVAL;
++	}
++
++	uint32_t bufsize = (uint32_t)MIN(total, (uint64_t)BOUNCE_SIZE);
++	char *kbuf = kalloc_data(bufsize, Z_WAITOK);
++	if (kbuf == NULL) {
++		return ENOMEM;
++	}
++	char *bounce = (char *)(su.dma + DMA_BOUNCE);
++	for (uint64_t done = 0; done < total;) {
++		uint64_t pos = (uint64_t)off + done;
++		uint64_t lba = su.first_block + pos / UFS_BLOCK;
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t want = (uint32_t)MIN(total - done, (uint64_t)(BOUNCE_SIZE - skip));
++		want = MIN(want, bufsize);
++		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
++
++		if (!rd && (error = uiomove(kbuf, (int)want, uio))) {
++			break;
++		}
++		lck_mtx_lock(&sweet_ufs_lock);
++		if (rd) {
++			error = ufs_read_blocks(lba, blocks);
++			if (!error) {
++				memcpy(kbuf, bounce + skip, want);
++			}
++		} else {
++			/* Partial device blocks at either end: read, merge, write back. */
++			if (skip || (want % UFS_BLOCK)) {
++				error = ufs_read_blocks(lba, blocks);
++			}
++			if (!error) {
++				memcpy(bounce + skip, kbuf, want);
++				error = ufs_write_blocks(lba, blocks);
++			}
++		}
++		lck_mtx_unlock(&sweet_ufs_lock);
++		if (!error && rd) {
++			error = uiomove(kbuf, (int)want, uio);
++		}
++		if (error) {
++			break;
++		}
++		done += want;
++	}
++	kfree_data(kbuf, bufsize);
++	return error;
+ }
+ 
+ static int
+-sweet_ufs_write(dev_t dev, struct uio *uio, __unused int ioflag)
++sweet_ufs_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+-	if (!su.writable) {
+-		return EROFS;
+-	}
+-	return physio(sweet_ufs_strategy, NULL, dev, B_WRITE, minphys, uio, (int)su.secsize);
++	return sweet_ufs_rw(uio, true);
++}
++
++static int
++sweet_ufs_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return sweet_ufs_rw(uio, false);
+ }
+ 
+ static const struct bdevsw sweet_ufs_bdevsw = {

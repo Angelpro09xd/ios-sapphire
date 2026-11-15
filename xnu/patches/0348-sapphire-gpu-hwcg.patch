@@ -1,0 +1,132 @@
+0348: SapphireGpu: hardware clock gating of the GPU blocks as kgsl turns it on (boot-arg gpu_hwcg, kern.sweet_gpu_hwcg, default 0)
+
+Off unless gpu_hwcg=1 or kern.sweet_gpu_hwcg=1. Uses 0345's opp_drain().
+
+kgsl turns hardware clock gating on at every start of this GPU (a6xx_hwcg_set() from a6xx_start): the
+a612_hwcg table that adreno-gpulist.h gives the a610 -- the same 46 registers and values as Linux's
+a6xx_catalog.c a612_hwcg, compared one by one -- then UCHE_GBIF_GX_CONFIG[18:16] = 2 and RBBM_CLOCK_CNTL =
+0xaaa8aa82; off writes 0 to all of them. Nothing is written when RBBM_CLOCK_CNTL already says so. Without a
+GMU, kgsl skips the GMU's always-on CGC registers; this follows kgsl.
+- boot-arg gpu_hwcg=1: at every start of the CP (end of hw_init_regs(), also after a GPU reset, 0317);
+- kern.sweet_gpu_hwcg: read, whether RBBM_CLOCK_CNTL has it on; write 0/1 now, with service_lock held and the
+  GPU idle (EBUSY if it does not go idle within gpu_opp_drain ms; ENODEV without the GPU service), and at
+  every start after.
+With gating on, the CP and RBBM always-count counters may stop while the GPU idles (gxfreq measures while its
+own commands run); 0346's busy counter is the GMU's and is not affected.
+
+Checked on the host: hwcg_set() against a simulated register file (48 writes on, RBBM_CLOCK_CNTL last, other
+bits of UCHE_GBIF_GX_CONFIG kept, nothing written when already in the requested state).
+Not run on the phone. What to watch: rendering errors or a GPU hang (0317's recovery in the log).
+
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -2018,6 +2018,47 @@ smmu_fault(const char *tag)
+ /* ---------------------------------------------------------------- CP bring-up */
+ 
+ /* The subset of Linux a6xx_gpu.c hw_init the command processor needs to run at all. */
++/*
++ * sapphire 0348: hardware clock gating of the GPU's blocks, as kgsl turns it on for this GPU at every start
++ * (a6xx_hwcg_set(): the a612_hwcg table, which kgsl's adreno-gpulist.h gives the a610, and which is Linux's
++ * a6xx_catalog.c a612_hwcg, 46 registers equal one by one; then UCHE_GBIF_GX_CONFIG[18:16] = 2, the GBIF's L2 gating;
++ * then RBBM_CLOCK_CNTL = 0xaaa8aa82). Off: every register of the table and RBBM_CLOCK_CNTL to 0, the GBIF field to 0.
++ * Nothing is written if RBBM_CLOCK_CNTL already says so. Without a GMU kgsl skips the GMU's always-on CGC registers
++ * (Linux writes them through its wrapper); so does this. boot-arg gpu_hwcg=1: at every start of the CP (hw_init_regs,
++ * also after a reset of the GPU); kern.sweet_gpu_hwcg: 0/1 now, with the service lock held and the GPU idle, and
++ * from then on at every start. Off by default: with it on, the blocks' clocks stop while they have nothing to do.
++ */
++static int gpu_hwcg;                            /* boot-arg gpu_hwcg, kern.sweet_gpu_hwcg */
++
++static void
++hwcg_set(bool on)
++{
++	static const struct { uint16_t reg; uint32_t val; } hwcg[] = {
++		{ 0x0b0, 0x22222222 }, { 0x0b4, 0x02222220 }, { 0x0b8, 0x00000081 }, { 0x0bc, 0x0000f3cf },
++		{ 0x0c0, 0x22222222 }, { 0x0c4, 0x22222222 }, { 0x0c8, 0x22222222 }, { 0x0cc, 0x00022222 },
++		{ 0x0d0, 0x11111111 }, { 0x0d4, 0x11111111 }, { 0x0d8, 0x11111111 }, { 0x0dc, 0x00011111 },
++		{ 0x0e0, 0x77777777 }, { 0x0e4, 0x77777777 }, { 0x0e8, 0x77777777 }, { 0x0ec, 0x00077777 },
++		{ 0x0f0, 0x22222222 }, { 0x0f4, 0x01202222 }, { 0x0f8, 0x00002220 }, { 0x100, 0x00040f00 },
++		{ 0x104, 0x05522022 }, { 0x105, 0x00005555 }, { 0x106, 0x00000011 }, { 0x107, 0x00445044 },
++		{ 0x108, 0x04222222 }, { 0x111, 0x00002222 }, { 0x114, 0x02222222 }, { 0x117, 0x00000002 },
++		{ 0x11b, 0x00002222 }, { 0x109, 0x00004000 }, { 0x112, 0x00002222 }, { 0x115, 0x00000200 },
++		{ 0x11c, 0x00000000 }, { 0x10a, 0x00000000 }, { 0x113, 0x00000000 }, { 0x116, 0x04104004 },
++		{ 0x11d, 0x00000000 }, { 0x10b, 0x22222222 }, { 0x110, 0x00000004 }, { 0x10f, 0x00000002 },
++		{ 0x533, 0x00000182 }, { 0x044, 0x00000000 }, { 0x042, 0x00000000 }, { 0x118, 0x00000222 },
++		{ 0x119, 0x00000111 }, { 0x11a, 0x00000555 },
++	};
++	uint32_t cntl = grd(0xae);                  /* RBBM_CLOCK_CNTL */
++
++	if ((on && cntl == 0xaaa8aa82u) || (!on && cntl == 0)) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(hwcg) / sizeof(hwcg[0]); i++) {
++		gwr(hwcg[i].reg, on ? hwcg[i].val : 0);
++	}
++	gwr(0xe3a, (grd(0xe3a) & ~0x70000u) | (on ? 2u << 16 : 0));    /* UCHE_GBIF_GX_CONFIG */
++	gwr(0xae, on ? 0xaaa8aa82u : 0);
++}
++
+ static void
+ hw_init_regs(void)
+ {
+@@ -2052,6 +2093,9 @@ hw_init_regs(void)
+ 	gwr(0x98d, 1);                              /* CP_AHB_CNTL */
+ 	gwr(0x1f, (1u << 30) | 0x3ffff);            /* RBBM_INTERFACE_HANG_INT_CNTL */
+ 	gwr(0xe19, 0x81);                           /* UCHE_CLIENT_PF */
++	if (gpu_hwcg != 0) {
++		hwcg_set(true);                         /* 0348 */
++	}
+ }
+ 
+ /* Type-7 packet header: opcode and count each carry an odd-parity bit. */
+@@ -3467,6 +3511,7 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+ 	(void)PE_parse_boot_argn("gpu_clkdiag", &clkdiag, sizeof(clkdiag));         /* 0343 */
+ 	clk_lock = IOLockAlloc();
+ 	(void)PE_parse_boot_argn("gpu_opp_drain", &opp_drain_ms, sizeof(opp_drain_ms));      /* 0345 */
++	(void)PE_parse_boot_argn("gpu_hwcg", &gpu_hwcg, sizeof(gpu_hwcg));                   /* 0348 */
+ 	(void)PE_parse_boot_argn("gpu_opp_park", &opp_park, sizeof(opp_park));
+ 	if (opp_drain_ms == 0 || opp_drain_ms > 1000) {
+ 		opp_drain_ms = 100;
+@@ -5262,6 +5307,43 @@ sweet_gpu_ddr_stats_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_ddr_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     NULL, 0, sweet_gpu_ddr_stats_sysctl, "A", "sapphire 0347: the BIMC votes and the DDR's clock before and after");
+ 
++/* 0348: read, whether RBBM_CLOCK_CNTL has gating on (the switch, if the GPU takes no work); write 0/1, now. */
++static int
++sweet_gpu_hwcg_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = gpu_hwcg;
++	int error;
++
++	if (req->newptr == USER_ADDR_NULL && service_ready && service_lock != NULL) {
++		IOLockLock(service_lock);
++		if (service_ready) {
++			v = grd(0xae) == 0xaaa8aa82u;
++		}
++		IOLockUnlock(service_lock);
++	}
++	error = sysctl_io_number(req, v, sizeof(v), &v, NULL);
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (!service_ready || service_lock == NULL) {
++		return ENODEV;
++	}
++	IOLockLock(service_lock);
++	if (!service_ready || !opp_drain(opp_drain_ms)) {
++		IOLockUnlock(service_lock);
++		return EBUSY;
++	}
++	gpu_hwcg = v != 0;
++	hwcg_set(gpu_hwcg != 0);
++	uint32_t cntl = grd(0xae);
++	IOLockUnlock(service_lock);
++	LOG("hwcg: %s (RBBM_CLOCK_CNTL %08x)", gpu_hwcg ? "on" : "off", cntl);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_hwcg, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_hwcg_sysctl, "I", "sapphire 0348: 1 = hardware clock gating of the GPU's blocks, as kgsl sets it");
++
+ /*
+  * GPU memory (0151): the gigabyte from 0x1_0000_0000 to 0x1_4000_0000 is DDR that nobody uses
+  * here -- xnu runs from 0x1_4000_0000 (the shim clamps it there), the fixed firmware carve-outs

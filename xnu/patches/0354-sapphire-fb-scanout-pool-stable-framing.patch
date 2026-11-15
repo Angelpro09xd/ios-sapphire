@@ -1,0 +1,704 @@
+0354: SweetFramebuffer, SweetSurface, SweetHID: scanout pool for the window server's whole ring, one way of presenting while a ring surface cannot be scanned out, panel window cropped by the source address in both paths
+
+Needs 0350, 0352 and 0353. With kern.sweet_fb_scanout=0 what changes is the window (item 4), 2x frames of
+several layers (item 3) and that a copied frame's SwapEnd is not held (item 6).
+
+Seen on the phone with 0353 and kern.sweet_fb_scanout=1 after hours of use with restarts of backboardd: the
+whole screen jumped a few millimetres up and to the left, repeatedly; "pool: 4 of 4 slots in use, 31
+surfaces made in it, 14 refused (full)"; in 10 s "copied instead: not from the pool" +52 and ~5 plane mode
+changes a second. Two causes: the pool runs out (CoreAnimation keeps three screen surfaces, makes three new
+ones when a page's needs change, and a restarted backboardd makes its own while the kernel holds the one on
+the panel), and the copy (blit_scale(), origin through GRAS_A2D_SRC_XMIN/YMIN) and the scanout (the plane's
+SRC_XY) do not put the window in the same place unless both engines apply their origin.
+
+1. The pool has eight slots of 5 MiB (SWEET_FB_SCAN_SLOTS; 0xe5000000-0xe7800000, below the QSEE pool).
+2. A swapped surface that cannot be scanned out is noted (fScanBlock[]: id and pointer, not retained); while
+   one of them is alive every frame goes the copy's way, so the plane changes mode when the ring changes,
+   not frame by frame.
+3. A 2x frame of several layers is shown by its layer 0 alone when that is the window server's full-screen
+   surface, otherwise not at all; present() no longer flips the back buffer for a 2x frame it did not copy.
+4. The window: fOffX is the multiple of 24 nearest the centre (24: the window at 16, 12 of the 2x picture),
+   and SweetHID's touch mapping uses the same rule. The origin starts on 64 bytes, so both paths crop by the
+   source address: the plane's address (rows and 16-byte groups of columns; SRC_XY 0, 0) and the blit's
+   texture base (rows and 16-pixel groups; the rest in GRAS_A2D_SRC_XMIN/YMIN).
+5. kern.sweet_fb_scanout_diag: a line per slot (surface, IOSurfaceName, creator, age, swaps), the surfaces
+   of item 2, frames shown by layer 0, and where the window's origin goes. SweetSurface keeps who made a
+   surface, when, and how often it was swapped.
+6. The scanout needs kern.sweet_fb_swapwait 1 or 2 (setting 0 while scanning stops it); the SwapEnd after a
+   wait for every swap is held only if a scanned-out frame may be on the panel, up to 250 ms instead of 50
+   (on the phone with 0353: 78 holds, 14 at the limit).
+
+Checked on the host: CoreAnimation's ring with display on/off, backboardd restarts and transient
+screen-sized surfaces (30 seeds x 30 s): with eight slots every frame scanned out, at most five slots used,
+no plane mode change in steady state; and blit_scale() and the window computation extracted with a model of
+both engines: the two paths agree to 1.27 panel px whichever engine ignores its origin.
+Measured on the phone (one boot): with kern.sweet_fb_scanout=1 set before backboardd starts, 1140 frames,
+1140 flips, pool 4 of 8, 0 refused; set at run time, 0 frames scan out (the existing surfaces are not in the
+pool). The framing has not been checked by eye.
+On: kern.sweet_fb_swapwait=1 (default) and kern.sweet_fb_scanout=1 with the window server's surfaces in the
+pool (kern.sweet_fb_scanout=2 and a restart of backboardd). Off: kern.sweet_fb_scanout=2 or 0.
+
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -2604,9 +2604,19 @@ blit_scale(uint64_t src, uint32_t spitch, uint32_t sx, uint32_t sy, uint32_t sw,
+ 		LOG("  blit_scale: pitches %u/%u or sizes do not fit the blitter", spitch, dpitch);
+ 		return false;
+ 	}
+-	uint64_t sb = src & ~63ull;
+-	uint32_t sadd = (uint32_t)(src & 63) / 4;               /* the base's misalignment, as pixels */
+-	uint32_t swidth = sadd + ((sx + sw) >> 8) + 1, sheight = ((sy + sh) >> 8) + 2;
++	/*
++	 * 0354: whole 16-pixel groups of the source origin's column (64 bytes) and, for each pass, its whole rows go into the
++	 * texture's base address; GRAS_A2D_SRC_* get only what is left (under 16 columns, a fraction of a row). The panel's
++	 * window starts at whole 64 bytes of the 2x picture (SweetFramebuffer.cpp, fOffX), so this copy crops by the
++	 * address alone, as the scanout does (presentScanout()): the two ways of putting the window on the panel cannot
++	 * differ by how the blitter applies its source origin.
++	 */
++	uint32_t col = (sx >> 8) & ~15u;
++	uint64_t sbase = src + (uint64_t)col * 4;
++	uint32_t sxr = sx - (col << 8);
++	uint64_t sb = sbase & ~63ull;
++	uint32_t sadd = (uint32_t)(sbase & 63) / 4;             /* the base's misalignment, as pixels */
++	uint32_t swidth = sadd + ((sxr + sw) >> 8) + 1;
+ 	blit_setup(false, 0);
+ 	for (uint32_t j = 0; j < k && j < dh; j++) {
+ 		uint64_t d0 = dst + (uint64_t)j * dpitch;
+@@ -2617,17 +2627,21 @@ blit_scale(uint64_t src, uint32_t spitch, uint32_t sx, uint32_t sy, uint32_t sw,
+ 		if (y0 < 0) {
+ 			y0 = 0;
+ 		}
++		uint32_t row = (uint32_t)(y0 >> 8);
++		uint32_t yr = (uint32_t)(y0 - ((int64_t)row << 8));
++		uint64_t pb = sb + (uint64_t)row * spitch;      /* (spitch is whole 64 bytes: still aligned) */
++		uint32_t sheight = ((yr + (uint32_t)span) >> 8) + 2;
+ 		emit(pkt4(REG_TPL1_A2D_SRC_TEXTURE_INFO, 5));        /* INFO, SIZE, BASE lo/hi, PITCH */
+ 		emit(FMT6_8_8_8_8_UNORM | (1u << 16) | (1u << 20) | (1u << 22));  /* LINEAR, WZYX, FILTER, UNK20, UNK22 */
+ 		emit(swidth | (sheight << 15));
+-		emit((uint32_t)sb);
+-		emit((uint32_t)(sb >> 32));
++		emit((uint32_t)pb);
++		emit((uint32_t)(pb >> 32));
+ 		emit((spitch >> 6) << 9);
+ 		emit(pkt4(REG_GRAS_A2D_SRC_XMIN, 4));
+-		emit((sadd << 8) + sx);
+-		emit((sadd << 8) + sx + sw - 256);
+-		emit((uint32_t)y0);
+-		emit((uint32_t)(y0 + span - 256));
++		emit((sadd << 8) + sxr);
++		emit((sadd << 8) + sxr + sw - 256);
++		emit(yr);
++		emit((uint32_t)(yr + span - 256));
+ 		blit_rect(d0 & ~63ull, k * dpitch, dx, 0, dx + dw - 1, n - 1);
+ 	}
+ 	return blit_end("scale");
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -462,6 +462,11 @@ sweet_fbl_sample(volatile uint32_t *ctl, volatile uint32_t *intf)
+  *     display's SMMU stream bypasses, as it does for the flip buffers): the pool, SWEET_FB_SCAN_SLOTS slots of 5 MiB
+  *     from 0xe5000000, RAM the kernel does not manage, after the flip buffers' pool (0xe2000000-0xe5000000) and below
+  *     the QSEE pool (0xe8000000);
++ *   - one way of presenting while the window server's ring is the same (0354): if one of the surfaces it swaps cannot
++ *     be scanned out (outside the pool, another size or format), all its frames are copied until that surface is gone
++ *     (freed or released by the window server), so that the plane does not change mode frame by frame; and a frame of
++ *     more than one layer, which the 2x path cannot compose (present() copies one layer only), shows its layer 0 when
++ *     that is the window server's full-screen surface, and nothing otherwise (the panel keeps its frame), in either mode;
+  *   - the surface left alone while the panel may read it: in use (sweet_hold) from its SwapEnd until the MDP has taken
+  *     the flip of a later frame. CoreAnimation does not look at the use count of its screen surfaces: it learns this
+  *     from SwapWait, answered from the same state (0353, sweet_fb_swapwait below), and then draws into another
+@@ -481,8 +486,18 @@ sweet_fbl_sample(volatile uint32_t *ctl, volatile uint32_t *intf)
+  * override on. The unscaled plane is what the bootloader left (read in start()) and goes back at the first flip of a flip
+  * buffer.
+  */
++/*
++ * sapphire 0354: eight slots (0xe5000000-0xe7800000, below the QSEE pool). What CoreAnimation keeps (QuartzCore 20H392,
++ * CA::WindowServer::IOMFBDisplay): its screen surfaces are named "CA Framebuffer" (IOSurfaceName, set after they are
++ * made, so the pool cannot tell them by it); three pages hold at most three of them, and when what a page needs changes
++ * (current_page_surface(): size, format, protection; at a display on, for one) it makes new ones while the old ones stay
++ * until their pages are taken back and collect_buffers() frees them: three and three. A restarted window server makes its
++ * own while the framebuffer still holds the surface the panel shows. With four slots the pool runs out (seen after
++ * hours of use, with backboardd restarts: "4 of 4 slots in use, 14 refused") and a surface of the ring goes the
++ * copy's way for as long as it lives.
++ */
+ #define SWEET_FB_SCAN_PA        0xE5000000ull
+-#define SWEET_FB_SCAN_SLOTS     4
++#define SWEET_FB_SCAN_SLOTS     8
+ #define SWEET_FB_SCAN_SLOT      0x00500000u
+ #define SWEET_FB_FMT_BGRA       0x42475241
+ static int sweet_fb_scanout = 0;
+@@ -501,7 +516,9 @@ static bool sweet_fb_scan_ready;                /* start() found the plane as it
+  */
+ static int sweet_fb_flush_taken = 0;
+ static struct {
+-	uint64_t frames, flips, late_draw, not_one_layer, not_pool, unfit, reused, queue_off;
++	uint64_t frames, flips, late_draw, not_one_layer, not_pool, unfit, reused, queue_off, swapwait_off;
++	uint64_t held_off, blockers, not_shown, base_only; /* 0354: copied for a surface of the ring that cannot be; blockers seen;
++	                                         * frames not shown; frames of several layers shown by their layer 0 */
+ 	uint64_t holds, hold_us, hold_max_us, timeouts, to_scaled, to_unscaled, unscaled_waits, unscaled_wait_max_us;
+ 	uint64_t window_waits, released, stops, stuck;
+ } sweet_fbs;
+@@ -538,14 +555,18 @@ extern bool sapphire_gpu_msm_fence_done(uint32_t fence); /* ... and whether a gi
+  *   - without 0x80000000 SwapWait waits for it, 100 ms at most (then kIOReturnTimeout); the timeout scalar is not used;
+  *   - after a wait for every swap (flags 2 without 0x80000000) CoreAnimation clears the swap ids of all its pages, the
+  *     current one's too (idle()): the page of the frame on the panel is then taken back without asking once the next
+- *     frame is current. The first SwapEnd after such a wait is held until its frame is on the panel (swapEndHold()).
++ *     frame is current. If that frame is one of a surface (scanned out; 0354), the first SwapEnd after such a wait is
++ *     held until its frame is on the panel, 250 ms at most (swapEndHold()); a copied frame is in a flip buffer, and its
++ *     surface is free.
+  * kern.sweet_fb_swapwait (boot-arg sweetfb_swapwait):
+  *   1 (default)  as above: CoreAnimation leaves the surface on the panel alone and makes a third one when it needs it;
+- *                with the scanout the pool (four slots) holds the three;
++ *                with the scanout the pool holds them (SWEET_FB_SCAN_SLOTS). The scanout (0350) needs 1 or 2 (0354):
++ *                with 0 its frames are copied (counted in kern.sweet_fb_scanout_diag), and setting 0 while scanning
++ *                copies the frame on the panel at once, as kern.sweet_fb_scanout=0 does;
+  *   2            the surfaces of every swap stay in use until the MDP has taken the flip of a later one, copied frames'
+  *                too (as an IOMobileFramebuffer that retains them): CoreAnimation keeps at most two frames ahead of the
+  *                panel either way, with a third surface also when copying;
+- *   0            SwapWait answers 0 at once.
++ *   0            SwapWait answers 0 at once, as before 0353 (the swap ids are kept all the same).
+  * With the queue off it answers 0 at once. A swap still busy after 1 s of asking is answered 0 (counted): a wait that long
+  * is not a frame's (a hung GPU is reset after 2 s, 0317).
+  */
+@@ -781,6 +802,7 @@ public:
+ 		uint32_t      stride;
+ 		struct SweetGeo geo;
+ 		uint32_t      swap;           /* 0353: the id of the swap it shows (0: none, the timer's or an adopted copy) */
++		uint32_t      ox, oy;         /* 0354: a frame of a surface: the window's origin, in pa already */
+ 	};
+ 	struct SweetQFrame fQ[SWEET_FB_BUFS];     /* the frames waiting for the panel, oldest first */
+ 	uint32_t      fQCount;
+@@ -836,9 +858,21 @@ public:
+ 	uint32_t      fScanLeaveSwap[4]; /* ... fScanLeave[f][] */
+ 	uint32_t      fSwapBusyId[3]; /* by how it is asked (SWEET_FBW_*): the last swap answered busy */
+ 	uint64_t      fSwapBusySince[3]; /* ... since when */
+-	bool          fSwapHoldNext;  /* a wait for every swap was answered: the next SwapEnd waits for its frame */
++	bool          fSwapHoldNext;  /* a wait for every swap found a frame of a surface on the panel: the next SwapEnd waits */
+ 	IOReturn      swapWait(uint32_t id, uint32_t flags, uint32_t held);
+ 	void          swapEndHold(uint32_t id);
++	/* 0354: surfaces of the window server's ring that cannot be scanned out (not retained: id and pointer), fPresentLock */
++	struct SweetScanBlock {
++		uint32_t      id;
++		SweetSurface *s;
++		uint8_t       why;            /* 1 not from the pool, 2 another size or format */
++		uint64_t      since;
++	};
++	struct SweetScanBlock fScanBlock[8];
++	uint32_t      fPlaneOX, fPlaneOY; /* the window's origin in the surface on the panel, taken through its address */
++	bool          scanoutBlocked(void);
++	void          scanoutBlock(SweetSurface *s, uint8_t why);
++	const uint8_t *shownRecord(const uint8_t *rec, uint8_t **one);
+ 	bool          swapShown(uint32_t id, uint32_t held);
+ 	bool          swapFree(uint32_t id, uint32_t held);
+ };
+@@ -983,8 +1017,15 @@ AppleCLCD::start(IOService *provider)
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+-	/* x rounded down to 4 pixels: the panel window must start 16-byte aligned (MDP fetch) */
+-	fOffX = ((int32_t)(fLogicalW - fWidth) / 2) & ~3;
++	/*
++	 * sapphire 0354: x is the multiple of 24 nearest the centre, (1125 - 1080) / 2 = 22.5: 24. The panel's window then
++	 * starts on a 16-byte boundary at 3x (24 pixels, 96 bytes: the MDP fetches from 16-byte aligned addresses) and on a
++	 * 64-byte one in the 2x picture (24 x 2/3 = 16 pixels: the GPU's blitter takes its source base 64-byte aligned), so
++	 * that the scaled copy (present(), blit_scale()) and the scanout (presentScanout()) both crop by the source address
++	 * alone, the same way, and neither depends on how its engine applies an origin (the blitter's GRAS_A2D_SRC_XMIN and
++	 * YMIN, the plane's SRC_XY). The touch mapping (SweetHID.cpp) uses the same rule.
++	 */
++	fOffX = ((((int32_t)(fLogicalW - fWidth) / 2) + 12) / 24) * 24;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	/*
+ 	 * 0239, boot-arg sweetfb_scale=2 (with the ADT's display-scale 2 and canvas 750 x 1624): iOS
+@@ -1695,10 +1736,28 @@ AppleCLCD::presentNow(const uint8_t *rec, SweetSurface **held)
+ 	bool queued = false, copied;
+ 	if (queueOn()) {
+ 		fQArrived = diag_t0;
+-		if (scanoutOn() && presentScanout(rec, held, &queued)) {
++		for (uint32_t i = 0; held != NULL && i < SWEET_FB_LAYERS; i++) {
++			if (held[i] != NULL) {
++				held[i]->swaps++;               /* 0354: (the pool's census) */
++				held[i]->swapAbs = diag_t0;
++			}
++		}
++		if (sweet_fb_scanout == 1 && sweet_fb_swapwait == 0 && sweet_fb_scan_ready) {
++			sweet_fbs.swapwait_off++;       /* 0354: the scanout needs SwapWait answered (kern.sweet_fb_swapwait) */
++		}
++		/* 0354: a 2x frame goes by the record shownRecord() gives, or is not shown (see there) */
++		uint8_t *one = NULL;
++		const uint8_t *r = fScale2 ? shownRecord(rec, &one) : rec;
++		if (r == NULL) {
++			sweet_fbs.not_shown++;
++			copied = true;                  /* (its swap is done for SwapWait; its surfaces are free) */
++		} else if (scanoutOn() && presentScanout(r, held, &queued)) {
+ 			copied = true;                  /* 0350: scanned out as it is; queued, it keeps its surfaces */
+ 		} else {
+-			copied = presentQueued(rec, held, &queued);     /* 0340: queued, the frame keeps its surfaces until its flip */
++			copied = presentQueued(r, held, &queued);       /* 0340: queued, the frame keeps its surfaces until its flip */
++		}
++		if (one != NULL) {
++			IOFreeData(one, SWEET_FB_SWAP_REC_SIZE);
+ 		}
+ 	} else {
+ 		if (sweet_fb_scanout == 1 && sweet_fb_scan_ready) {
+@@ -2633,6 +2692,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		return true;
+ 	}
++	if (fScale2) {
++		/* 0354: nothing of this 2x frame was copied (one full-screen layer, by the GPU, is all it shows): not shown */
++		sweet_fbs.not_shown++;
++		return true;
++	}
+ 	if (fFlip[0] != NULL) {
+ 		flipBack();
+ 		fFlipWait = false;      /* (this frame, the CPU's, replaces one still waiting for its copy) */
+@@ -2978,7 +3042,8 @@ AppleCLCD::queueThread(void)
+ bool
+ AppleCLCD::scanoutOn(void)
+ {
+-	return sweet_fb_scanout == 1 && sweet_fb_scan_ready && !fScanStuck && fQThread && queueOn();
++	/* 0354: and SwapWait answered (kern.sweet_fb_swapwait): without it the window server draws into the surface on the panel */
++	return sweet_fb_scanout == 1 && sweet_fb_swapwait != 0 && sweet_fb_scan_ready && !fScanStuck && fQThread && queueOn();
+ }
+ 
+ /* Whether the panel may still read surface s, or a frame of it to be scanned out waits: then it is not scanned out again. */
+@@ -3003,6 +3068,54 @@ AppleCLCD::scanoutBusy(SweetSurface *s)
+ 	return false;
+ }
+ 
++/*
++ * 0354: whether a surface of the window server's ring that cannot be scanned out is still alive (freed or released by
++ * every user, it is no longer of the ring). While one is, every frame goes the copy's way: the plane keeps one mode.
++ * fPresentLock held.
++ */
++bool
++AppleCLCD::scanoutBlocked(void)
++{
++	bool any = false;
++	for (uint32_t i = 0; i < sizeof(fScanBlock) / sizeof(fScanBlock[0]); i++) {
++		if (fScanBlock[i].s == NULL) {
++			continue;
++		}
++		if (!sweet_surface_alive(fScanBlock[i].id, fScanBlock[i].s)) {
++			bzero(&fScanBlock[i], sizeof(fScanBlock[i]));
++			continue;
++		}
++		any = true;
++	}
++	return any;
++}
++
++/* 0354: s, swapped by the window server, cannot be scanned out (why: 1 not from the pool, 2 unfit). fPresentLock held. */
++void
++AppleCLCD::scanoutBlock(SweetSurface *s, uint8_t why)
++{
++	uint32_t n = sizeof(fScanBlock) / sizeof(fScanBlock[0]), slot = n, oldest = 0;
++	for (uint32_t i = 0; i < n; i++) {
++		if (fScanBlock[i].s == s && fScanBlock[i].id == s->id) {
++			return;
++		}
++		if (fScanBlock[i].s == NULL && slot == n) {
++			slot = i;
++		}
++		if (fScanBlock[i].since < fScanBlock[oldest].since) {
++			oldest = i;
++		}
++	}
++	if (slot == n) {
++		slot = oldest;
++	}
++	fScanBlock[slot].id = s->id;
++	fScanBlock[slot].s = s;
++	fScanBlock[slot].why = why;
++	fScanBlock[slot].since = mach_absolute_time();
++	sweet_fbs.blockers++;
++}
++
+ /*
+  * A flip is being written: the surfaces of the frame on the panel (a frame of a surface) are read until the MDP takes
+  * it, and kept in use until then (scanoutRetire()). With four frames left and no flip seen taken since, the oldest is
+@@ -3194,6 +3307,8 @@ AppleCLCD::frameShow(struct SweetQFrame *f)
+ 			sweet_fbs.late_draw++;          /* drawn by a submission made after its SwapEnd */
+ 		}
+ 		planeScaled(f->pa, f->stride, &f->geo);
++		fPlaneOX = f->ox;                       /* 0354 */
++		fPlaneOY = f->oy;
+ 		memcpy(fScanShow, f->held, sizeof(fScanShow));
+ 		fScanShowSwap = f->swap;        /* 0353 */
+ 		bzero(f->held, sizeof(f->held));
+@@ -3236,18 +3351,26 @@ AppleCLCD::presentScanout(const uint8_t *rec, SweetSurface **held, bool *queued)
+ 	struct SweetGeo g;
+ 	sweet_scan_window(fLogicalW, fLogicalH, fOffX, fOffY, fWidth, fHeight, sweet_fb_rscale, &g.sx, &g.sy, &g.sw, &g.sh);
+ 	bool ok = false;
++	uint8_t why = 0;
+ 	if (!s->lowPool || s->scanoutPhys == 0) {
+ 		sweet_fbs.not_pool++;
++		why = 1;
+ 	} else if (s->width != fLogicalW || s->height != fLogicalH || s->pixelFormat != SWEET_FB_FMT_BGRA ||
+ 	    s->bytesPerElement != 4 || (s->bytesPerRow & 63) != 0 || s->bytesPerRow > 0xffff || s->offset != 0 || g.sw == 0 ||
+ 	    g.sh == 0 || g.sx + g.sw > s->width || g.sy + g.sh > s->height ||
+ 	    s->scanoutPhys + (uint64_t)s->bytesPerRow * s->height > (1ull << 32)) {
+ 		sweet_fbs.unfit++;
++		why = 2;
++	} else if (scanoutBlocked()) {
++		sweet_fbs.held_off++;                   /* 0354: another surface of the ring cannot be: copied as it is */
+ 	} else if (scanoutBusy(s)) {
+ 		sweet_fbs.reused++;                     /* swapped again while the panel may read it: copied instead */
+ 	} else {
+ 		ok = true;
+ 	}
++	if (why != 0) {
++		scanoutBlock(s, why);                   /* 0354: the whole ring goes the copy's way while this one lives */
++	}
+ 	if (!ok) {
+ 		OSSafeReleaseNULL(own[layer]);
+ 		return false;
+@@ -3330,7 +3453,17 @@ AppleCLCD::presentScanout(const uint8_t *rec, SweetSurface **held, bool *queued)
+ 	bzero(f, sizeof(*f));
+ 	f->scan = true;
+ 	f->surf = s;
+-	f->pa = s->scanoutPhys;
++	/*
++	 * 0354: the window's origin goes into the source address -- whole rows, and whole 16 bytes of the row (the MDP
++	 * fetches from a 16-byte aligned address) -- and only what is left into SRC_XY: with the panel's window at 16, 12 of
++	 * the 2x picture (fOffX, start()), nothing. The copy crops the same way (blit_scale(), SapphireGpu.cpp).
++	 */
++	uint32_t ax = g.sx & ~3u;
++	f->pa = s->scanoutPhys + (uint64_t)g.sy * s->bytesPerRow + (uint64_t)ax * 4;
++	f->ox = g.sx;
++	f->oy = g.sy;
++	g.sx -= ax;
++	g.sy = 0;
+ 	f->stride = s->bytesPerRow;
+ 	f->geo = g;
+ 	f->fence = sapphire_gpu_msm_fence();
+@@ -3373,21 +3506,78 @@ AppleCLCD::scanoutStop(void)
+ 	for (uint32_t q = 0; q < fQCount; q++) {
+ 		scanning |= fQ[q].scan;
+ 	}
+-	if (scanning && !off) {
++	uint8_t *one = NULL;
++	const uint8_t *r = fScale2 ? shownRecord(rec, &one) : rec;     /* 0354: as presentNow() showed it */
++	if (scanning && !off && r != NULL) {
+ 		SweetSurface *none[4] = {};
+ 		bool queued = false;
+ 		if (queueOn()) {
+-			(void)presentQueued(rec, none, &queued);
++			(void)presentQueued(r, none, &queued);
+ 		} else {
+ 			queueDrain();
+-			(void)present(rec);
++			(void)present(r);
+ 		}
+ 		sweet_fbs.stops++;
+ 	}
+ 	IOLockUnlock(fPresentLock);
++	if (one != NULL) {
++		IOFreeData(one, SWEET_FB_SWAP_REC_SIZE);
++	}
+ 	IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ }
+ 
++/*
++ * 0354: the record a 2x frame is shown by. The 2x path shows one full-screen layer: the GPU's scaled copy (present())
++ * and the scanout take nothing else, and flipping the back buffer for a frame they did not take would show an older
++ * frame for a refresh. A frame of one layer is shown as it is: rec. One of several whose layer 0 is the window
++ * server's full-screen surface is shown by that layer alone, the others left out, from a copy of the record with only
++ * layer 0 in its mask (*one, IOMallocData(SWEET_FB_SWAP_REC_SIZE), the caller frees it): the panel moves on and the plane
++ * keeps its mode. One of no layer, or without such a layer 0, is not shown (NULL): the panel keeps its frame. The first
++ * frames of several layers are logged, with what their layers bring. fPresentLock held (the log's count).
++ */
++const uint8_t *
++AppleCLCD::shownRecord(const uint8_t *rec, uint8_t **one)
++{
++	uint32_t mask = get32(rec, 0x104), nl = 0;
++	static uint32_t layers_told;
++
++	*one = NULL;
++	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++		if ((mask & (1u << i)) && get32(rec, 0x54 + 4 * i) != 0) {
++			nl++;
++		}
++	}
++	if (nl == 1) {
++		return rec;
++	}
++	if (nl == 0) {
++		return NULL;
++	}
++	SweetSurface *b = (mask & 1u) != 0 ? sweet_surface_copy(get32(rec, 0x54)) : NULL;
++	bool full = b != NULL && b->width == fLogicalW && b->height == fLogicalH;
++	OSSafeReleaseNULL(b);
++	if (layers_told < 8) {
++		layers_told++;
++		for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++			if ((mask & (1u << i)) && get32(rec, 0x54 + 4 * i) != 0) {
++				const uint8_t *a = rec + 0x64 + 16 * i, *d = rec + 0xc4 + 16 * i;
++				IOLog("SWEET FB: 0354: swap %u of %u layers: layer %u surface %u, %u,%u %ux%u onto %u,%u %ux%u%s\n",
++				    get32(rec, 0x50), nl, i, get32(rec, 0x54 + 4 * i), get32(a, 0), get32(a, 4), get32(a, 8),
++				    get32(a, 12), get32(d, 0), get32(d, 4), get32(d, 8), get32(d, 12),
++				    i == 0 && full ? " (shown alone)" : "");
++			}
++		}
++	}
++	if (!full || (*one = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE)) == NULL) {
++		return NULL;
++	}
++	uint32_t m = 1;
++	memcpy(*one, rec, SWEET_FB_SWAP_REC_SIZE);
++	memcpy(*one + 0x104, &m, sizeof(m));
++	sweet_fbs.base_only++;
++	return *one;
++}
++
+ /*
+  * 0353: whether the frame of swap id has reached the panel (id 0: the frame of every swap so far): no frame of it or of an
+  * earlier swap waits in the queue, the MDP has taken the flip written for the last of them, and the swap held back for
+@@ -3474,7 +3664,14 @@ AppleCLCD::swapWait(uint32_t id, uint32_t flags, uint32_t held)
+ 	}
+ 	if (!now) {
+ 		uint64_t us = sweet_fbd_us(t0, t);
+-		fSwapHoldNext |= kind == SWEET_FBW_ALL;
++		if (kind == SWEET_FBW_ALL) {
++			/* (the next SwapEnd waits only if a frame of a surface may be on the panel: a copy's is in a flip buffer) */
++			bool scan = fScanShowSwap != 0;
++			for (uint32_t k = 0; k < 4; k++) {
++				scan |= fScanLeaveSwap[k] != 0 || (k < fQCount && fQ[k].scan);
++			}
++			fSwapHoldNext = scan;
++		}
+ 		sweet_fbw.waits++;
+ 		sweet_fbw.wait_us += us;
+ 		if (us > sweet_fbw.wait_max_us) {
+@@ -3503,9 +3700,10 @@ AppleCLCD::swapWait(uint32_t id, uint32_t flags, uint32_t held)
+ }
+ 
+ /*
+- * 0353: the first SwapEnd after a wait for every swap (fSwapHoldNext; see sweet_fb_swapwait at the top) returns once its
+- * frame is on the panel, 50 ms at most: the frame on the panel before it, whose page CoreAnimation no longer asks about,
+- * has left the panel when the frame after it is drawn. From swap(), after presentNow(): SwapEnd's thread, no lock held.
++ * 0353: the first SwapEnd after a wait for every swap that found a frame of a surface on the panel (fSwapHoldNext; see
++ * sweet_fb_swapwait at the top) returns once its own frame is on the panel, 250 ms at most: the surface on the panel
++ * before it, whose page CoreAnimation no longer asks about, has left the panel when the frame after it is drawn. From
++ * swap(), after presentNow(): SwapEnd's thread, no lock held.
+  */
+ void
+ AppleCLCD::swapEndHold(uint32_t id)
+@@ -3521,7 +3719,7 @@ AppleCLCD::swapEndHold(uint32_t id)
+ 		return;
+ 	}
+ 	uint64_t t0 = mach_absolute_time(), t = t0, deadline, step;
+-	clock_interval_to_deadline(50, kMillisecondScale, &deadline);
++	clock_interval_to_deadline(250, kMillisecondScale, &deadline);         /* 0354: (a first frame can take 200 ms) */
+ 	for (;;) {
+ 		queueFlip();
+ 		t = mach_absolute_time();
+@@ -4315,7 +4513,7 @@ static int
+ sweet_fb_scanout_diag_sysctl SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(oidp, arg1, arg2)
+-	char buf[2048];
++	char buf[3072];                 /* 0354: (eight slots described) */
+ 	size_t off = 0;
+ 	AppleCLCD *fb = sweet_frame_fb;
+ 	uint32_t used = 0, slots = 0;
+@@ -4332,9 +4530,22 @@ sweet_fb_scanout_diag_sysctl SYSCTL_HANDLER_ARGS
+ 	    sweet_fb_flush_taken != 0 || fb->fScanUsed ? "flips are taken by it" : "flips are taken by the frame counter",
+ 	    sweet_fb_flush_taken);
+ 	SWEET_FBD_CAT("pool: %u of %u slots in use, %llu surfaces made in it, %llu refused (full)\n", used, slots, made, refused);
++	if (off + 1 < sizeof(buf)) {
++		off += sweet_scanout_pool_describe(buf + off, sizeof(buf) - off);  /* 0354: what is in each slot */
++	}
++	if (fb != NULL) {
++		uint32_t nb = 0;
++		for (uint32_t i = 0; i < 8; i++) {
++			nb += fb->fScanBlock[i].s != NULL;
++		}
++		SWEET_FBD_CAT("0354: surfaces of the ring that cannot be scanned out, seen %llu, kept now %u (frames copied for them %llu); "
++		    "frames of several layers shown by their layer 0 %llu, frames not shown %llu\n", sweet_fbs.blockers, nb,
++		    sweet_fbs.held_off, sweet_fbs.base_only, sweet_fbs.not_shown);
++	}
+ 	SWEET_FBD_CAT("frames %llu flips %llu; copied instead: not one layer %llu, not from the pool %llu, unfit %llu, "
+-	    "swapped again while on the panel or waiting %llu, queue off %llu\n", sweet_fbs.frames, sweet_fbs.flips,
+-	    sweet_fbs.not_one_layer, sweet_fbs.not_pool, sweet_fbs.unfit, sweet_fbs.reused, sweet_fbs.queue_off);
++	    "swapped again while on the panel or waiting %llu, queue off %llu, kern.sweet_fb_swapwait 0 %llu\n",
++	    sweet_fbs.frames, sweet_fbs.flips, sweet_fbs.not_one_layer, sweet_fbs.not_pool, sweet_fbs.unfit, sweet_fbs.reused,
++	    sweet_fbs.queue_off, sweet_fbs.swapwait_off);
+ 	SWEET_FBD_CAT("drawn after the SwapEnd %llu; swaps that waited %llu, %llu us in all, max %llu; given up %llu; flips "
+ 	    "waiting for a writable plane %llu\n", sweet_fbs.late_draw, sweet_fbs.holds, sweet_fbs.hold_us, sweet_fbs.hold_max_us,
+ 	    sweet_fbs.timeouts, sweet_fbs.window_waits);
+@@ -4342,8 +4553,9 @@ sweet_fb_scanout_diag_sysctl SYSCTL_HANDLER_ARGS
+ 	    "panel left them %llu; stops %llu; flushes not taken %llu\n", sweet_fbs.to_scaled, sweet_fbs.to_unscaled,
+ 	    sweet_fbs.unscaled_waits, sweet_fbs.unscaled_wait_max_us, sweet_fbs.released, sweet_fbs.stops, sweet_fbs.stuck);
+ 	if (fb != NULL && fb->fPlaneScaled) {
+-		SWEET_FBD_CAT("showing %u,%u %ux%u of a surface (rows of %u bytes) at %#llx\n", fb->fPlaneGeo.sx, fb->fPlaneGeo.sy,
+-		    fb->fPlaneGeo.sw, fb->fPlaneGeo.sh, fb->fPlaneStride, fb->fScanPhys);
++		SWEET_FBD_CAT("showing %u,%u %ux%u of a surface (rows of %u bytes) from %#llx: %u,%u of it through the address, "
++		    "SRC_XY %u,%u\n", fb->fPlaneOX, fb->fPlaneOY, fb->fPlaneGeo.sw, fb->fPlaneGeo.sh, fb->fPlaneStride, fb->fScanPhys,
++		    fb->fPlaneOX - fb->fPlaneGeo.sx, fb->fPlaneOY - fb->fPlaneGeo.sy, fb->fPlaneGeo.sx, fb->fPlaneGeo.sy);
+ 	}
+ 	return SYSCTL_OUT(req, buf, off + 1);
+ }
+@@ -4366,7 +4578,11 @@ sweet_fb_swapwait_sysctl SYSCTL_HANDLER_ARGS
+ 	if (v < 0 || v > 2) {
+ 		return EINVAL;
+ 	}
++	int was = sweet_fb_swapwait;
+ 	sweet_fb_swapwait = v;
++	if (was != 0 && v == 0 && sweet_fb_scanout == 1 && sweet_frame_fb != NULL) {
++		sweet_frame_fb->scanoutStop();  /* (the scanout goes with it: the frame on the panel is copied now) */
++	}
+ 	return 0;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_swapwait, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -199,6 +199,7 @@ static uint64_t sweet_pool_pa;
+ static uint32_t sweet_pool_slots, sweet_pool_slot_size, sweet_pool_w, sweet_pool_h;
+ static uint32_t sweet_pool_used;                /* bit per slot, sweet_surface_lock */
+ static uint64_t sweet_pool_made, sweet_pool_refused;
++static SweetSurface *sweet_pool_owner[32];      /* 0354: the surface in each slot (not retained), sweet_surface_lock */
+ 
+ void
+ sweet_scanout_pool_set(uint64_t pa, uint32_t slots, uint32_t slot_size, uint32_t width, uint32_t height)
+@@ -257,7 +258,64 @@ sweet_pool_free_slot(int slot)
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	sweet_pool_used &= ~(1u << slot);
++	if (slot < 32) {
++		sweet_pool_owner[slot] = NULL;          /* 0354 */
++	}
++	IOLockUnlock(sweet_surface_lock);
++}
++
++/* sapphire 0354 (see SweetSurface.h) */
++bool
++sweet_surface_alive(uint32_t id, const SweetSurface *s)
++{
++	bool alive;
++	if (id == 0 || id >= SWEET_SURFACE_MAX_ID || s == NULL || sweet_surface_lock == NULL) {
++		return false;
++	}
++	IOLockLock(sweet_surface_lock);
++	alive = sweet_surface_table[id] == s;
++	IOLockUnlock(sweet_surface_lock);
++	return alive;
++}
++
++/* sapphire 0354 (see SweetSurface.h). The names come from the values the creator set (IOSurfaceName: "CA Framebuffer"). */
++size_t
++sweet_scanout_pool_describe(char *buf, size_t len)
++{
++	size_t off = 0;
++	uint64_t now = mach_absolute_time();
++
++	if (buf == NULL || len == 0 || sweet_surface_lock == NULL) {
++		return 0;
++	}
++	buf[0] = 0;
++	IOLockLock(sweet_surface_lock);
++	for (uint32_t i = 0; i < sweet_pool_slots && i < 32 && off + 1 < len; i++) {
++		SweetSurface *s = sweet_pool_owner[i];
++		if (!(sweet_pool_used & (1u << i)) || s == NULL) {
++			continue;
++		}
++		OSString *name = s->values != NULL ? OSDynamicCast(OSString, s->values->getObject("IOSurfaceName")) : NULL;
++		uint64_t age_ns = 0, swap_ns = 0;
++		absolutetime_to_nanoseconds(now - s->madeAbs, &age_ns);
++		if (s->swapAbs != 0) {
++			absolutetime_to_nanoseconds(now - s->swapAbs, &swap_ns);
++		}
++		int n = snprintf(buf + off, len - off, "  slot %u: surface %u \"%s\" by %s, made %llu s ago, swapped %u times%s",
++		    i, s->id, name != NULL ? name->getCStringNoCopy() : "", s->creator, age_ns / NSEC_PER_SEC, s->swaps,
++		    s->swapAbs != 0 ? ", last " : "\n");
++		if (n > 0) {
++			off = off + (size_t)n < len ? off + (size_t)n : len - 1;
++		}
++		if (s->swapAbs != 0 && off + 1 < len) {
++			n = snprintf(buf + off, len - off, "%llu ms ago\n", swap_ns / NSEC_PER_MSEC);
++			if (n > 0) {
++				off = off + (size_t)n < len ? off + (size_t)n : len - 1;
++			}
++		}
++	}
+ 	IOLockUnlock(sweet_surface_lock);
++	return off;
+ }
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+@@ -269,7 +327,15 @@ SweetSurface::free()
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
+-	OSSafeReleaseNULL(values);
++	/*
++	 * 0354: the values go under the table lock, as every use of them: the pool's census (sweet_scanout_pool_describe())
++	 * reads the name of the surface in a slot until the slot goes back, below.
++	 */
++	IOLockLock(sweet_surface_lock);
++	OSDictionary *gone = values;
++	values = NULL;
++	IOLockUnlock(sweet_surface_lock);
++	OSSafeReleaseNULL(gone);
+ 	if (wrapped && memory != NULL) {
+ 		memory->complete();
+ 	}
+@@ -896,6 +962,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		props->release();
+ 		return kIOReturnNoMemory;
+ 	}
++	proc_selfname(s->creator, sizeof(s->creator));          /* 0354 */
++	s->madeAbs = mach_absolute_time();
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+ 	/*
+@@ -959,6 +1027,9 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 				if (!sweet_surface_publish(s)) {
+ 					ret = kIOReturnNoResources;
+ 				}
++				IOLockLock(sweet_surface_lock);
++				sweet_pool_owner[slot] = s;     /* 0354 (cleared when the slot goes back, in free()) */
++				IOLockUnlock(sweet_surface_lock);
+ 			}
+ 		} else if (slot >= 0) {
+ 			sweet_pool_free_slot(slot);
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -70,8 +70,16 @@ public:
+ 	 */
+ 	bool                      lowPool;
+ 	volatile uint32_t         gpuFence;
++	/*
++	 * sapphire 0354: who made it and when (for the pool's census), and how often the window server has swapped it
++	 * onto the panel and when last (SweetFramebuffer.cpp, with its fPresentLock).
++	 */
++	char                      creator[20];
++	uint64_t                  madeAbs;
++	uint32_t                  swaps;
++	uint64_t                  swapAbs;
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { sweet_surface_counted(1); gpuSeed = 0; gpuDrawn = false; cpuEpoch = 1; cleanEpoch = 0; invalEpoch = 0; scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; lowPool = false; gpuFence = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { sweet_surface_counted(1); gpuSeed = 0; gpuDrawn = false; cpuEpoch = 1; cleanEpoch = 0; invalEpoch = 0; scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; lowPool = false; gpuFence = 0; creator[0] = 0; madeAbs = 0; swaps = 0; swapAbs = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+@@ -105,6 +113,10 @@ void sweet_scanout_set_geometry(uint32_t w1, uint32_t h1, uint32_t w2, uint32_t
+ void sweet_scanout_pool_set(uint64_t pa, uint32_t slots, uint32_t slot_size, uint32_t width, uint32_t height);
+ void sweet_scanout_pool_census(uint32_t *used, uint32_t *slots, uint64_t *made, uint64_t *refused);
+ int sweet_fb_scanout_pool_on(void);
++/* sapphire 0354: one line per slot in use (surface, its IOSurfaceName, who made it, age, swaps); bytes written */
++size_t sweet_scanout_pool_describe(char *buf, size_t len);
++/* sapphire 0354: whether s is still the surface published under id (not freed, not released by every user) */
++bool sweet_surface_alive(uint32_t id, const SweetSurface *s);
+ 
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -436,7 +436,7 @@ SweetHIDTouch::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = native ? 1080 : 1125;
+ 	fLogicalH = native ? 2400 : 2436;
+-	fOffX = ((fLogicalW - 1080) / 2) & ~3;           /* as SweetFramebuffer.cpp */
++	fOffX = ((((fLogicalW - 1080) / 2) + 12) / 24) * 24;     /* as SweetFramebuffer.cpp (sapphire 0354) */
+ 	fOffY = (fLogicalH - 2400) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);

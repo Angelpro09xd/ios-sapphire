@@ -1,0 +1,201 @@
+0347: SapphireGpu: DDR voted with the GPU level, as kgsl votes its bus path (kern.sweet_gpu_ddr, default 0)
+
+No vote unless kern.sweet_gpu_ddr=1 (boot-arg gpu_ddr=1). Needs 0343 and 0345.
+
+kgsl votes the path GPU -> DDR at every level change (ib from qcom,bus-table-ddr of the level, ab 25 % of
+ib); the interconnect driver turns it into a BIMC rate for the RPM: max(ab sum, ib) / 8 bytes, in kHz. So
+the vote is ib / 8: 534180 kHz at 320 MHz, 750000 at 465, 993164 at 600, 1518555 at 785, 1761719 at 1025,
+2042969 at 1114.8 and 1260 (820 and 980 take 1025's, 1100 takes 1114.8's). This driver sends that rate
+itself (RPM "clk2" 0, key "KHz", active set), never under kern.sweet_gpu_ddr_floor (kHz, 0), from
+opp_votes(): going up after the rails and before the clock, going down after the clock. A refused vote is
+counted and leaves the old one.
+
+kern.sweet_gpu_ddr: 1 votes for the current rate at once and at every change; 0 votes INT_MAX, what the stock
+clock driver leaves on the BIMC at probe. Each sysctl write measures the DDR (0343) before and 20 ms after.
+kern.sweet_gpu_ddr_stats (read only): mode, floor, the vote in place and its GPU rate, votes, refusals, the
+last answer, the DDR before/after and now.
+
+While the RPM's clock scaling is off (nothing in this kernel turns it on; 0361 does) a vote is expected to
+change nothing. Measured (n=1 per rate): votes of 1761719 kHz (GPU at 820 MHz) and 2042969 kHz (1260 MHz)
+answered 0 by the RPM, DDR at 1555210 kHz before and 20 ms after in both.
+Checked on the host with 0345's model plus a clk2 resource: vote per level, kgsl's order around the PLL,
+floor, refused vote, INT_MAX when switched off.
+
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -373,6 +373,7 @@ static int opp_park;                            /* kern.sweet_gpu_opp_park (boot
+ static int gov_on;                              /* kern.sweet_gpu_gov (boot-arg gpu_gov) */
+ static uint32_t gov_boot_khz;                   /* the rate the stock path of 0337 set at boot */
+ static void gov_start(void);
++static int ddr_mode_set(int on);                /* 0347 */
+ /*
+  * boot-arg gpu_smmu_early: program the identity context bank as soon as its clock is voted,
+  * before the GX domain comes up, instead of in cp_start(). The GPU's SMMU comes out of the
+@@ -3635,6 +3636,12 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+ 		LOG("*** gpu_service: the GPU stays up and takes copies (%u page tables in use) ***", pt_used);
+ 		msm_publish();
+ 		gov_boot_khz = opp_khz;                 /* 0346 */
++		{
++			uint32_t ddr_on = 0;                /* 0347 */
++			if (PE_parse_boot_argn("gpu_ddr", &ddr_on, sizeof(ddr_on)) && ddr_on != 0 && opp_khz != 0) {
++				(void)ddr_mode_set(1);
++			}
++		}
+ 		if (PE_parse_boot_argn("gpu_gov", &gov_on, sizeof(gov_on)) && gov_on != 0 && opp_khz != 0) {
+ 			gov_start();
+ 		} else {
+@@ -4394,6 +4401,74 @@ opp_pll_park(uint32_t vco_khz)
+ 	return opp_rcg(SRC_GPU_PLL0, 1) ? 1 : -1;
+ }
+ 
++/*
++ * sapphire 0347: the DDR voted with the GPU's level, as kgsl votes its path to the DDR at every level change
++ * (kgsl_bus.c: ib = qcom,bus-table-ddr[qcom,bus-freq of the level], ab = 25 % of ib; kgsl_pwrctrl.c: before the clock
++ * when it goes up, after it when it goes down). The interconnect driver turns that into the BIMC clock it asks the RPM
++ * for: max(ab sum, ib peak) / the buswidth of the ebi node, 8 bytes (icc-rpm.c qcom_icc_rpm_set, bengal.c "ebi"), in
++ * kHz rounded up by clk-smd-rpm; with ab at 25 % of ib, ib decides. This driver sends that rate itself: RPM "clk2" 0,
++ * key "KHz", active set, never under kern.sweet_gpu_ddr_floor (kHz). Rates of the clock's table that are no level of
++ * the device tree take the bus level of the next level up (820 and 980 that of 1025, 1100 that of 1114.8).
++ *   kern.sweet_gpu_ddr (boot-arg gpu_ddr)  0 (default): no vote; 1: a vote per level, from now on and at every
++ *                                          change of rate; writing 0 again votes INT_MAX, what the stock clock
++ *                                          driver leaves on the BIMC before the interconnect driver votes;
++ *   kern.sweet_gpu_ddr_stats              votes, refusals, the last vote, and the DDR measured (0343's mccc period)
++ *                                          before the last vote, 20 ms after the vote made by the sysctl, and now.
++ * While the RPM's clock scaling is off -- nothing in this kernel turns it on (clk_smd_rpm_enable_scaling, "Enab" on
++ * "clk0" 2) -- a vote is expected to change nothing; the before/after reading says whether it
++ * does.
++ */
++static int ddr_mode;                            /* kern.sweet_gpu_ddr */
++static int ddr_floor_khz;                       /* kern.sweet_gpu_ddr_floor */
++static uint32_t ddr_voted;                      /* the BIMC kHz this driver last asked the RPM for (0: none) */
++static struct {
++	uint64_t votes, refused;
++	uint32_t last_khz, before_khz, after_khz;
++	int last_err;
++} gddr;
++
++/* The BIMC kHz kgsl's vote for a GPU rate comes to (bin 0 of this phone's tree). */
++static uint32_t
++ddr_khz_for(uint32_t gpu_khz)
++{
++	static const uint32_t ib[] = { 0, 1562500, 4273437, 6000000, 7945312, 12148437, 14093750, 16343750 };   /* kB/s */
++	unsigned idx = gpu_khz > 1025000 ? 7 : gpu_khz > 785000 ? 6 : gpu_khz > 600000 ? 5 : gpu_khz > 465000 ? 4 :
++	    gpu_khz > 320000 ? 3 : 2;
++	uint32_t khz = (ib[idx] + 7) / 8;
++
++	return MAX(khz, (uint32_t)MAX(ddr_floor_khz, 0));
++}
++
++/* One BIMC vote (active set); 0 or the RPM's answer. */
++static int
++ddr_vote(uint32_t khz)
++{
++	gddr.before_khz = ddr_khz();
++	int r = topaz_rpm_vote(0, 0x326b6c63, 0, 0x007a484b, khz);          /* "clk2" 0 (the BIMC), "KHz" */
++	gddr.last_khz = khz;
++	gddr.last_err = r;
++	if (r == 0) {
++		gddr.votes++;
++		ddr_voted = khz;
++	} else {
++		gddr.refused++;
++	}
++	return r;
++}
++
++/* Toward the GPU rate khz, only upward (raise) or only downward, as opp_votes() moves the rails. opp_lock held. */
++static void
++opp_ddr(uint32_t khz, bool raise)
++{
++	if (ddr_mode == 0) {
++		return;
++	}
++	uint32_t want = ddr_khz_for(khz);
++	if (raise ? want > ddr_voted : want < ddr_voted) {
++		(void)ddr_vote(want);                   /* a refusal leaves the old vote; the GPU's rate changes anyway */
++	}
++}
++
+ /*
+  * The rails and the peak-current votes toward the rate khz, only upward (raise) or only downward: 0, or EAGAIN (the
+  * peak-current limit refused) or EIO (a rail vote refused) when raising. Lowering cannot fail: a vote the RPM refuses
+@@ -4427,6 +4502,7 @@ opp_votes(uint32_t khz, bool raise)
+ 			return EIO;
+ 		}
+ 	}
++	opp_ddr(khz, raise);                        /* 0347: the bus, after the rails going up, with them going down */
+ 	if (!raise) {
+ 		(void)cx_ipeak_set(khz);                /* drops the votes the rate does not need */
+ 	}
+@@ -5121,6 +5197,71 @@ sweet_gpu_gov_stats_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_gov_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     NULL, 0, sweet_gpu_gov_stats_sysctl, "A", "sapphire 0346: what the GPU governor saw and did");
+ 
++/* 0347: on, the vote for the current rate at once (and the DDR 20 ms later); off, INT_MAX. */
++static int
++ddr_mode_set(int on)
++{
++	if (opp_lock == NULL) {
++		return ENODEV;
++	}
++	IOLockLock(opp_lock);
++	int r = 0;
++	if (on != 0 && opp_khz != 0) {
++		ddr_mode = 1;
++		ddr_voted = 0;
++		r = ddr_vote(ddr_khz_for(opp_khz));
++	} else if (on == 0 && ddr_mode != 0) {
++		ddr_mode = 0;
++		r = ddr_vote(0x7fffffffu);
++		ddr_voted = 0;
++	} else if (on != 0) {
++		r = ENODEV;                             /* no stock path: no rate to vote for */
++	}
++	IOLockUnlock(opp_lock);
++	if (r == 0 && gddr.last_khz != 0) {
++		IOSleep(20);
++		gddr.after_khz = ddr_khz();
++		LOG("ddr: BIMC vote %u kHz: the DDR at %u kHz before, %u kHz 20 ms after", gddr.last_khz, gddr.before_khz,
++		    gddr.after_khz);
++	}
++	return r > 0 ? r : r < 0 ? EIO : 0;
++}
++
++static int
++sweet_gpu_ddr_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = ddr_mode;
++	int error = sysctl_io_number(req, v, sizeof(v), &v, NULL);
++
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	return ddr_mode_set(v);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_ddr, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_ddr_sysctl, "I", "sapphire 0347: 1 = vote the BIMC (the DDR) with the GPU's level, as kgsl does");
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_ddr_floor, CTLFLAG_RW | CTLFLAG_LOCKED, &ddr_floor_khz, 0,
++    "sapphire 0347: the BIMC vote never goes under this, kHz (0)");
++
++static int
++sweet_gpu_ddr_stats_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[400];
++	size_t off = 0;
++	uint32_t now = ddr_khz();
++
++	buf[0] = 0;
++	OPP_CAT("ddr vote %d, floor %d kHz; voted %u kHz for the GPU at %u kHz; votes %llu, refused %llu; last vote %u kHz "
++	    "(answer %d): DDR %u kHz before, %u kHz 20 ms after a vote by sysctl; DDR now %u kHz (plan row %u)\n", ddr_mode,
++	    ddr_floor_khz, ddr_voted, opp_khz, gddr.votes, gddr.refused, gddr.last_khz, gddr.last_err, gddr.before_khz,
++	    gddr.after_khz, now, ddr_plan_khz(now));
++	return SYSCTL_OUT(req, buf, off + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_ddr_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_ddr_stats_sysctl, "A", "sapphire 0347: the BIMC votes and the DDR's clock before and after");
++
+ /*
+  * GPU memory (0151): the gigabyte from 0x1_0000_0000 to 0x1_4000_0000 is DDR that nobody uses
+  * here -- xnu runs from 0x1_4000_0000 (the shim clamps it there), the fixed firmware carve-outs
