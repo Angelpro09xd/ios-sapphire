@@ -1,0 +1,68 @@
+0393: SweetFramebuffer: kern.sweet_fb_regs also reads MDSS's own registers (HW_REV, UBWC_DEC_HW_VERSION, UBWC_STATIC), read only
+
+0349's kern.sweet_fb_regs dumps the display engine from MDP TOP (0x5e01000) on. The registers that say how the
+display decodes UBWC are MDSS's own, below it: HW_REV (+0x0), UBWC_DEC_HW_VERSION (+0x58), UBWC_STATIC
+(+0x144), UBWC_CTRL_2 (+0x150), UBWC_PREDICTION_MODE (+0x154) (Linux v6.12 msm_mdss.c). Linux writes
+UBWC_STATIC for this SoC family (sm6115_data: 0x11f with a 2.0 decoder), as does the phone's device tree
+(qcom,sde-ubwc-static 0x11f); this kernel does not. The dump gains a first block "MDSS" (0x5e00000, 0x160
+bytes); VIG0's entry, which the boot copy uses, moves to index 3 (SWEET_FBR_VIG0). Nothing is written.
+
+Measured on the phone (one boot): +0x00 0x600a0000, +0x58 0x20000000, +0x144 0x00000000, +0x150 0x00000001:
+neither the bootloader nor the kernel sets UBWC_STATIC. Read with: sysctl kern.sweet_fb_regs | head -14.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -346,6 +346,10 @@ static const struct {
+ 	const char *name;
+ 	uint32_t    pa, len;
+ } sweet_fbr_blocks[] = {
++	/* 0393: MDSS's own registers below MDP TOP -- HW_REV (+0x0), UBWC_DEC_HW_VERSION (+0x58), UBWC_STATIC (+0x144),
++	 * UBWC_CTRL_2 (+0x150), UBWC_PREDICTION_MODE (+0x154) (Linux v6.12 msm_mdss.c:22-28): how the display decodes UBWC,
++	 * which Linux writes for this SoC (sm6115_data: 0x11f, msm_mdss.c:172-177, 649-656) and this kernel does not */
++	{ "MDSS", 0x05e00000, 0x160 },
+ 	{ "TOP", 0x05e01000, 0x494 },
+ 	{ "CTL0", 0x05e02000, 0x1dc },
+ 	{ "VIG0", 0x05e05000, 0x1f8 },
+@@ -356,6 +360,7 @@ static const struct {
+ 	{ "INTF1", 0x05e6b800, 0x2c0 },
+ };
+ #define SWEET_FBR_N             (sizeof(sweet_fbr_blocks) / sizeof(sweet_fbr_blocks[0]))
++#define SWEET_FBR_VIG0          3       /* VIG0's entry in the table (its scaler the next): 2 before 0393 put MDSS first */
+ static volatile uint32_t *sweet_fbr_va[SWEET_FBR_N];  /* each block, mapped once in start() (its page, uncached) */
+ static uint32_t sweet_fbr_boot[(0x1f8 + 0xa0) / 4];  /* VIG0 0x000-0x1f8 and its scaler 0xa00-0xaa0 at start() */
+ static bool sweet_fbr_have_boot;
+@@ -368,12 +373,12 @@ sweet_fbr_map(void)
+ 		vm_offset_t va = ml_io_map(page, 0x1000);
+ 		sweet_fbr_va[i] = va != 0 ? (volatile uint32_t *)(va + (sweet_fbr_blocks[i].pa - page)) : NULL;
+ 	}
+-	if (sweet_fbr_va[2] != NULL && sweet_fbr_va[3] != NULL) {
++	if (sweet_fbr_va[SWEET_FBR_VIG0] != NULL && sweet_fbr_va[SWEET_FBR_VIG0 + 1] != NULL) {
+ 		for (uint32_t k = 0; k < 0x1f8 / 4; k++) {
+-			sweet_fbr_boot[k] = sweet_fbr_va[2][k];
++			sweet_fbr_boot[k] = sweet_fbr_va[SWEET_FBR_VIG0][k];
+ 		}
+ 		for (uint32_t k = 0; k < 0xa0 / 4; k++) {
+-			sweet_fbr_boot[0x1f8 / 4 + k] = sweet_fbr_va[3][k];
++			sweet_fbr_boot[0x1f8 / 4 + k] = sweet_fbr_va[SWEET_FBR_VIG0 + 1][k];
+ 		}
+ 		sweet_fbr_have_boot = true;
+ 	}
+@@ -4441,15 +4446,15 @@ sweet_fb_regs_sysctl SYSCTL_HANDLER_ARGS
+ 		}
+ 	}
+ 	if (sweet_fbr_have_boot) {
+-		off = sweet_fbr_words(buf, off, "VIG0 at boot", sweet_fbr_blocks[2].pa, NULL, sweet_fbr_boot, 0x1f8);
+-		off = sweet_fbr_words(buf, off, "VIG0 scaler at boot", sweet_fbr_blocks[3].pa, NULL, sweet_fbr_boot + 0x1f8 / 4, 0xa0);
++		off = sweet_fbr_words(buf, off, "VIG0 at boot", sweet_fbr_blocks[SWEET_FBR_VIG0].pa, NULL, sweet_fbr_boot, 0x1f8);
++		off = sweet_fbr_words(buf, off, "VIG0 scaler at boot", sweet_fbr_blocks[SWEET_FBR_VIG0 + 1].pa, NULL, sweet_fbr_boot + 0x1f8 / 4, 0xa0);
+ 	}
+ 	error = SYSCTL_OUT(req, buf, off + 1);
+ 	IOFreeData(buf, SWEET_FBR_BUF);
+ 	return error;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_regs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+-    NULL, 0, sweet_fb_regs_sysctl, "A", "sapphire 0349: the display engine's registers now (TOP, CTL0, VIG0 and its scaler and CSC, LM0, PP0, INTF1) and VIG0's at boot");
++    NULL, 0, sweet_fb_regs_sysctl, "A", "sapphire 0349/0393: the display engine's registers now (MDSS, TOP, CTL0, VIG0 and its scaler and CSC, LM0, PP0, INTF1) and VIG0's at boot");
+ 
+ static int
+ sweet_fb_latch_sysctl SYSCTL_HANDLER_ARGS

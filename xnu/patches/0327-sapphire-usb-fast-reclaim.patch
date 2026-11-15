@@ -1,0 +1,56 @@
+0327: sweet_usb: reclaim a bulk transfer on its TRB's HWO bit at every poll
+
+On every poll of the USB thread (~1 ms), a bulk RX or TX transfer whose TRB has HWO clear is taken as
+complete, in addition to the controller's XferComplete event; ud_watch keeps its 500 ms force-rearm paths.
+
+This is the old data path. Under load (a 4 MiB copy over SSH) it stopped the link after 192 KiB with 130538
+refused Start Transfer commands on ep3 (n=1). 0329 adds the boot-arg sweetusb_reclaim=0 to turn it off, and
+0330 adds a data path that never frees an endpoint on HWO alone; 0332 makes that path the default.
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1043,6 +1043,36 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_usb_trace, CTLTYPE_STRING | CTLFLAG_RD | CTLF
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_usb_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_usb_stats, "A", "USB Ethernet gadget state");
+ 
++/*
++ * 0327: on every poll (~1 ms), take a bulk transfer whose TRB has HWO clear as complete,
++ * besides the controller's XferComplete event. ud_watch keeps the slower force-rearm
++ * paths (HWO still set) on its 500 ms cadence. Old data path only: data path v2 (0330)
++ * frees an endpoint on its event alone.
++ */
++static void
++ud_reclaim_fast(void)
++{
++	volatile uint32_t *rt = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
++	volatile uint32_t *tt = (volatile uint32_t *)(ud.dma + UD_TRB_TX);
++
++	if (!ud.configured || ud.lock == NULL) {
++		return;
++	}
++	ud_sync(UD_TRB_RX, 16);
++	if (ud.xfer_active[EP_RX] && !(rt[3] & TRB_HWO)) {
++		ud.xfer_active[EP_RX] = false;
++		ud_rx_done();           /* copies the frame and re-arms RX */
++	}
++	lck_mtx_lock(ud.lock);
++	ud_sync(UD_TRB_TX, 16);
++	if (ud.tx_busy && !(tt[3] & TRB_HWO)) {
++		ud.xfer_active[EP_TX] = false;
++		ud.tx_busy = false;
++		ud_tx_kick_locked();    /* send the next queued frame */
++	}
++	lck_mtx_unlock(ud.lock);
++}
++
+ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -1061,6 +1091,7 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 			}
+ 			dwc_wr(GEVNTCOUNT, count);
+ 		}
++		ud_reclaim_fast();
+ 		if ((ticks % 500) == 0) {
+ 			ud_watch();
+ 		}

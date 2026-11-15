@@ -1,0 +1,1043 @@
+0330: sweet_usb: data path v2 (one owner per endpoint, no HWO reclaim, no printf, non-cacheable DMA), boot-arg sweetusb_dp=2
+
+A second data path for the CDC-ECM gadget, selected with sweetusb_dp=2 (in this patch the default stays the
+old path; 0332 changes it). With any other value only a few `if (ud_dp)` branches and an unused sysctl are
+added. Boot and PHY init, ep0 enumeration and the ECM descriptors are not changed.
+
+- Only the USB thread touches the controller; ud_if_output queues the mbuf and wakes it (ENOBUFS when the
+  queue is full or the gadget is not configured).
+- One state per data endpoint (IDLE/STARTED/ENDING). STARTED ends only with an XferComplete whose TRB has
+  HWO=0, or with an End Transfer that completed plus 1 ms with the event buffer drained (Linux
+  51f1954ad853, gadget.c 3636-3649). A TRB or buffer is written only in IDLE.
+- A refused Start keeps the staged frame, prints nothing, latches a snapshot and is followed by End
+  Transfer (ForceRM) with the index the refusal reports (gadget.c 1653-1660; f7ac582effc6).
+- GUCTL2[14] RST_ACTBITLATER when GSNPSID >= 3.10a; endpoint commands spin on mach_absolute_time (delay()
+  blocks in this port), never with ud.lock held; GUSB2PHYCFG SUSPHY/ENBLSLPM kept clear for each command.
+- Data TRBs at 0x1400/0x1440/0x1480, one per 64-byte line; the DMA area is mapped Normal non-cacheable
+  (VM_WIMG_WCOMB), as arm64 Linux maps dma_alloc_coherent. boot-arg sweetusb_dpnc=0 keeps it cacheable with
+  clean+invalidate per line.
+- Bus reset: ep0 first, End Transfer for every STARTED endpoint, waited for, then ClearStall.
+- GEVNTCOUNT & 0xfffc; no printf on the data path. Counters, End Transfer latency and latched snapshots of
+  every anomaly are in sysctl kern.sweet_usb_dp.
+
+Measured with sweetusb_dp=2 (one boot): 20 copies of 30 MB over SSH, 10 each way, all intact (SHA-256 on
+both ends); after ~660 MB kern.sweet_usb_dp reads start ok 1099317, refused 0, timeout 0, noevt 0. The
+same kind of copy on the old path stopped the link after 192 KiB (n=1).
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -285,6 +285,17 @@ static struct {
+ 	uint64_t    watch_rx, watch_tx;
+ } ud;
+ 
++/* 0330: sweetusb_dp: 2 selects the data path v2 (below, before ud_thread), any other value the old path */
++static int ud_dp;
++#define DP_TRB_RX       0x1400          /* one data TRB per 64-byte line, away from ep0's (0x1000-0x107f) */
++#define DP_TRB_TX       0x1440
++#define DP_TRB_INT      0x1480
++static void ud_dp_notify(void);
++static void ud_dp_reset_seq(unsigned ep);
++static errno_t ud_dp_output(ifnet_t ifp, mbuf_t m);
++static void ud_dp_bus_reset(void);
++static void ud_dp_ep_event(unsigned ep, unsigned type, unsigned status, uint32_t ev);
++
+ static inline void
+ dwc_wr(uint32_t off, uint32_t v)
+ {
+@@ -490,6 +501,10 @@ ut(const char *what, uint32_t a, uint32_t b)
+ static void
+ ud_notify_connected(void)
+ {
++	if (ud_dp) {
++		ud_dp_notify();
++		return;
++	}
+ 	uint8_t *n = (uint8_t *)(ud.dma + UD_NOTIFY);
+ 	n[0] = 0xa1; n[1] = 0x00;       /* NETWORK_CONNECTION */
+ 	n[2] = 1; n[3] = 0;             /* connected */
+@@ -518,7 +533,9 @@ ud_configure(void)
+ 	}
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
+ 	ud.configured = true;
+-	ud_rx_arm();
++	if (!ud_dp) {
++		ud_rx_arm();
++	}
+ 	printf("SWEET USB: ECM endpoints configured\n");
+ }
+ 
+@@ -622,6 +639,10 @@ static void
+ ud_ep_reset_seq(unsigned ep)
+ {
+ 	ud.halt_clears++;
++	if (ud_dp) {
++		ud_dp_reset_seq(ep);
++		return;
++	}
+ 	if (ep == EP_TX) {
+ 		lck_mtx_lock(ud.lock);
+ 		ud_end_transfer(EP_TX);
+@@ -744,6 +765,9 @@ ud_tx_kick_locked(void)
+ static errno_t
+ ud_if_output(ifnet_t ifp, mbuf_t m)
+ {
++	if (ud_dp) {
++		return ud_dp_output(ifp, m);
++	}
+ 	lck_mtx_lock(ud.lock);
+ 	if (ud.txq_count == UD_TXQ || !ud.configured) {
+ 		lck_mtx_unlock(ud.lock);
+@@ -867,6 +891,10 @@ ud_if_create(void)
+ static void
+ ud_bus_reset(void)
+ {
++	if (ud_dp) {
++		ud_dp_bus_reset();
++		return;
++	}
+ 	for (unsigned ep = EP_RX; ep <= EP_INT; ep++) {
+ 		ud_end_transfer(ep);
+ 	}
+@@ -928,6 +956,10 @@ ud_event(uint32_t ev)
+ 	if (ep >= EP_RX && ep <= EP_INT && (type != 1 || (status & 1))) {   /* not a completion, or a bus error */
+ 		ut("EV", ev, (uint32_t)ud.rx_frames);
+ 	}
++	if (ud_dp && ep >= EP_RX) {
++		ud_dp_ep_event(ep, type, status, ev);
++		return;
++	}
+ 	if (ep <= EP_INT && type == 1) {
+ 		ud.xfer_active[ep] = false;
+ 	}
+@@ -1061,10 +1093,11 @@ sysctl_sweet_usb_stats SYSCTL_HANDLER_ARGS
+ 	char buf[320];
+ 	uint32_t rx3 = 0, tx3 = 0, dsts = 0;
+ 	if (ud.dma != 0) {
+-		ud_sync(UD_TRB_RX, 16);
+-		ud_sync(UD_TRB_TX, 16);
+-		rx3 = ((volatile uint32_t *)(ud.dma + UD_TRB_RX))[3];
+-		tx3 = ((volatile uint32_t *)(ud.dma + UD_TRB_TX))[3];
++		uint32_t rxo = ud_dp ? DP_TRB_RX : UD_TRB_RX, txo = ud_dp ? DP_TRB_TX : UD_TRB_TX;
++		ud_sync(rxo, 16);
++		ud_sync(txo, 16);
++		rx3 = ((volatile uint32_t *)(ud.dma + rxo))[3];
++		tx3 = ((volatile uint32_t *)(ud.dma + txo))[3];
+ 		dsts = dwc_rd(DSTS);
+ 	}
+ 	snprintf(buf, sizeof(buf), "configured %d events %u resets %u; rx %llu frames (trb %08x, active %d) tx %llu "
+@@ -1123,6 +1156,856 @@ ud_reclaim_fast(void)
+ 	lck_mtx_unlock(ud.lock);
+ }
+ 
++/*
++ * 0330: data path v2, selected by sweetusb_dp (ud_dp == 2). Otherwise nothing below runs and the
++ * driver uses the old path (ud_thread): the same kernel serves both for an A/B. The rules:
++ *
++ *  R1 Only ud_thread (here ud_dp_thread) touches the controller, the data TRBs and the endpoint state.
++ *     ud_if_output only queues the mbuf and wakes the thread.
++ *  R2 One ownership state per data endpoint (RX 0x01, TX 0x81, INT 0x82), dp.e[ep].st:
++ *       IDLE    -> STARTED  Start Transfer issued (accepted; or refused/timed out: then the controller
++ *                           holds *some* transfer on the endpoint and it is ours to end)
++ *       STARTED -> IDLE     XferComplete for the endpoint whose TRB has HWO=0
++ *       STARTED -> ENDING   End Transfer issued
++ *       ENDING  -> IDLE     the End Transfer completed (CMDACT clear, GUCTL2[14]) and 1 ms more passed,
++ *                           measured from before an event-buffer drain: events of the ended transfer
++ *                           are dropped while ENDING, never taken as a later transfer's completion.
++ *     HWO=0 alone never frees an endpoint: no 0327 reclaim, no ud_watch (Linux 51f1954ad853).
++ *  R3 A TRB or a data buffer is written only while its endpoint is IDLE.
++ *  R4 A refused Start keeps the frame, prints nothing, is counted with a snapshot and is followed by an
++ *     End Transfer (Linux gadget.c 1653-1660, U-Boot -EBUSY).
++ *  R5 Endpoint commands spin on mach_absolute_time, bounded; never delay() (it blocks in this port),
++ *     never with ud.lock held. ud.lock only guards the mbuf queue and `configured`.
++ *  R6 Each data TRB in its own 64-byte line and the DMA area mapped Normal non-cacheable, the way
++ *     Linux maps dma_alloc_coherent on arm64 (the cacheable physmap/kmem aliases are only cleaned once,
++ *     never written again). sweetusb_dpnc=0 keeps it cacheable with clean+invalidate per line.
++ *  R7 A transfer whose TRB was written back (HWO=0) while no event came for DP_NOEVT_POLLS polls and
++ *     2 ms ("noevt(alpha)" in kern.sweet_usb_dp) is counted, snapshotted and ended; its frame is then
++ *     accounted from the TRB. That is the only way out of an event that never comes, and it goes through
++ *     End Transfer.
++ * No printf on the data path: counters and latched snapshots (first 8 and the last of each kind) are in
++ * sysctl kern.sweet_usb_dp.
++ */
++#define DP_GSNPSID      0xc120
++#define DP_GUCTL2       0xc19c
++#define DP_GUCTL2_RST_ACTBITLATER (1u << 14)    /* DWC_usb3 >= 3.10a (Linux core.c 1385-1392) */
++#define DP_GUSB2PHYCFG  0xc200
++#define DP_PHY_SUSP     ((1u << 6) | (1u << 8)) /* SUSPHY | ENBLSLPM (Linux gadget.c 320-345) */
++#define DP_NOEVT_POLLS  8
++#define DP_NSNAP        8
++
++#ifndef VM_WIMG_WCOMB
++#define VM_WIMG_WCOMB   0x6             /* osfmk/arm/memory_types.h: Normal, inner/outer non-cacheable */
++#endif
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++
++enum { DP_IDLE = 0, DP_STARTED, DP_ENDING };
++enum { DPK_START_REFUSED, DPK_START_TIMEOUT, DPK_NOEVT, DPK_EVT_NOT_STARTED, DPK_EVT_HWO_SET,
++       DPK_END_TIMEOUT, DPK_EVCOUNT, DPK_N };
++static const char *const dp_kind[DPK_N] = {
++	"start-refused", "start-timeout", "noevt-alpha", "evt-not-started", "evt-hwo-set",
++	"end-timeout", "evcount-anomaly",
++};
++
++struct dp_snap {
++	uint64_t us;                    /* since boot */
++	uint32_t ep, st, depcmd, trb[4], dsts, evcnt, a;
++};
++
++struct dp_ep {
++	uint8_t  st;
++	uint8_t  rsc;                   /* resource index for End Transfer (0 after an End, as Linux) */
++	uint8_t  rsc_last;              /* of the last accepted Start */
++	bool     end_wanted;            /* STARTED: End Transfer to issue as soon as ep0 allows it */
++	bool     end_cmdact;            /* ENDING: End Transfer issued, CMDACT not seen clear yet */
++	bool     hwo0_at_end;           /* the TRB had been written back when the End completed */
++	bool     evt_seen;              /* an XferComplete for this endpoint in the current drain */
++	uint32_t trb, buf;              /* DMA offsets */
++	uint32_t noevt_polls;
++	uint64_t noevt_since, end_t0, ready_at;
++};
++
++static struct {
++	bool     nc, actbitlater, notify_pending;
++	uint32_t gsnpsid, guctl2;
++	int      chan;                  /* wait channel of ud_dp_thread only */
++	int      kick;                  /* set by ud_dp_output before waking the thread */
++	uint32_t tx_len;                /* frame staged in UD_TX (0: none); only ud_dp_thread */
++	uint64_t abs_cmd, abs_end, abs_spin, abs_125us, abs_1ms, abs_2ms, abs_10ms, abs_30s;
++	uint64_t last_xfer, last_poll, last_report;
++	struct dp_ep e[EP_INT + 1];
++	struct {
++		uint64_t polls, spins, poll_max_us;
++		uint64_t start_ok, start_refused, start_timeout, start_not_idle, cmd_busy, phy_susp_cleared;
++		uint64_t end_issued, end_deferred, end_timeout, end_status, end_lat_max_us, end_lat_last_us, end_lat_sum_us;
++		uint64_t noevt, hwo0_noevt_polls, evt_not_started, evt_hwo_set, evt_other, evt_buserr;
++		uint64_t evcount_over, evcount_bits;
++		uint64_t tx_done, tx_done_by_end, tx_qdrop, tx_bad, tx_reset_drop;
++		uint64_t rx_done, rx_by_end, rx_bad_len, rx_nombuf, int_done, notify_skipped;
++		uint64_t clearstall_fail, bus_resets;
++	} c;
++	struct {
++		uint32_t seq, n;
++		struct dp_snap first[DP_NSNAP], last;
++	} latch[DPK_N];
++} dp;
++
++static void dp_end(unsigned ep, bool force);
++
++static inline bool
++dp_is_data(unsigned ep)
++{
++	return ep == EP_RX || ep == EP_TX || ep == EP_INT;
++}
++
++static inline volatile uint32_t *
++dp_trb(unsigned ep)
++{
++	return (volatile uint32_t *)(ud.dma + dp.e[ep].trb);
++}
++
++/* cacheable fallback only: every range given here is whole 64-byte lines nobody else uses */
++static inline void
++dp_sync(uint32_t off, uint32_t len)
++{
++	if (!dp.nc) {
++		ud_sync(off, len);
++	}
++}
++
++static uint64_t
++dp_us(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000;
++}
++
++/* counter-side snapshot: the first DP_NSNAP of each kind stay, the last is overwritten (seqlock for the sysctl) */
++static void
++dp_snap(unsigned k, unsigned ep, uint32_t depcmd, uint32_t a)
++{
++	struct dp_snap s;
++
++	bzero(&s, sizeof(s));
++	s.us = dp_us(mach_absolute_time());
++	s.ep = ep;
++	s.depcmd = depcmd;
++	s.a = a;
++	if (dp_is_data(ep)) {
++		volatile uint32_t *t = dp_trb(ep);
++		dp_sync(dp.e[ep].trb, 16);
++		s.st = dp.e[ep].st;
++		for (unsigned i = 0; i < 4; i++) {
++			s.trb[i] = t[i];
++		}
++	}
++	s.dsts = dwc_rd(DSTS);
++	s.evcnt = dwc_rd(GEVNTCOUNT);
++	__atomic_add_fetch(&dp.latch[k].seq, 1, __ATOMIC_ACQ_REL);
++	if (dp.latch[k].n < DP_NSNAP) {
++		dp.latch[k].first[dp.latch[k].n] = s;
++	}
++	dp.latch[k].last = s;
++	dp.latch[k].n++;
++	__atomic_add_fetch(&dp.latch[k].seq, 1, __ATOMIC_ACQ_REL);
++}
++
++/*
++ * One endpoint command, polled by spinning. 0 accepted, 1-15 the command status (1 = No Resource),
++ * -1 CMDACT still set after `limit` (still in progress), -2 not issued: the previous command on the
++ * endpoint is still active.
++ */
++static int
++dp_cmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2, uint64_t limit, uint32_t *depcmd)
++{
++	uint32_t v = dwc_rd(DEPCMD(ep));
++
++	if (v & DEPCMD_CMDACT) {
++		dp.c.cmd_busy++;
++		*depcmd = v;
++		return -2;
++	}
++	uint32_t phy = dwc_rd(DP_GUSB2PHYCFG);
++	if (phy & DP_PHY_SUSP) {        /* 0328 clears them once at start; keep them clear for every command */
++		dwc_wr(DP_GUSB2PHYCFG, phy & ~DP_PHY_SUSP);
++		dp.c.phy_susp_cleared++;
++	}
++	dwc_wr(DEPCMDPAR0(ep), p0);
++	dwc_wr(DEPCMDPAR1(ep), p1);
++	dwc_wr(DEPCMDPAR2(ep), p2);
++	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
++	uint64_t end = mach_absolute_time() + limit;
++	do {
++		v = dwc_rd(DEPCMD(ep));
++	} while ((v & DEPCMD_CMDACT) && mach_absolute_time() < end);
++	if (v & DEPCMD_CMDACT) {
++		v = dwc_rd(DEPCMD(ep));         /* preempted past the limit right after a read */
++	}
++	*depcmd = v;
++	if (v & DEPCMD_CMDACT) {
++		return -1;
++	}
++	return (int)((v >> 12) & 0xf);
++}
++
++/* R3/R4: start the endpoint's only TRB. 0 accepted; otherwise the frame/buffer stays as it is. */
++static int
++dp_start(unsigned ep, uint32_t len)
++{
++	struct dp_ep *e = &dp.e[ep];
++	volatile uint32_t *t = dp_trb(ep);
++	uint64_t bpa = ud.dma_pa + e->buf, tpa = ud.dma_pa + e->trb;
++	uint32_t dc = 0;
++	int r;
++
++	if (e->st != DP_IDLE) {
++		dp.c.start_not_idle++;
++		return -1;
++	}
++	t[0] = (uint32_t)bpa;
++	t[1] = (uint32_t)(bpa >> 32);
++	t[2] = len;
++	t[3] = TRBCTL_NORMAL | TRB_HWO | TRB_LST | TRB_ISP_IMI | TRB_IOC;      /* the same bits as ud_start_trb */
++	dp_sync(e->trb, 16);
++	dp_sync(e->buf, ep == EP_RX ? UD_FRAME_MAX : len);
++	__asm__ volatile ("dsb sy" ::: "memory");      /* TRB and data in memory before the controller reads them */
++	r = dp_cmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0, dp.abs_cmd, &dc);
++	if (r == 0) {
++		e->rsc = e->rsc_last = (uint8_t)((dc >> 16) & 0x7f);
++		e->st = DP_STARTED;
++		e->end_wanted = false;
++		e->noevt_polls = 0;
++		dp.c.start_ok++;
++		return 0;
++	}
++	if (r == -2) {                  /* cannot happen in IDLE (ENDING -> IDLE waits for CMDACT): nothing started */
++		return -1;
++	}
++	/*
++	 * Refused (1 = No Resource: the controller still holds a transfer on this endpoint, Linux commit
++	 * f7ac582effc6 cause 3) or timed out. From here the controller may own the TRB: the endpoint is
++	 * STARTED, the frame stays staged, and what the controller holds is ended. Linux reads the resource
++	 * index after a refused Start too (gadget.c 433-434); a timed-out one is read again before the End.
++	 */
++	if (r > 0) {
++		dp.c.start_refused++;
++		dp_snap(DPK_START_REFUSED, ep, dc, (uint32_t)r);
++		e->rsc = (uint8_t)((dc >> 16) & 0x7f);
++		if (e->rsc == 0) {
++			e->rsc = e->rsc_last;
++		}
++	} else {
++		dp.c.start_timeout++;
++		dp_snap(DPK_START_TIMEOUT, ep, dc, 0);
++		e->rsc = 0;
++	}
++	e->st = DP_STARTED;
++	e->end_wanted = true;
++	e->noevt_polls = 0;
++	dp_end(ep, false);
++	return -1;
++}
++
++/* The End Transfer has completed: nobody owns the TRB any more. */
++static void
++dp_end_done(unsigned ep)
++{
++	struct dp_ep *e = &dp.e[ep];
++	volatile uint32_t *t = dp_trb(ep);
++	uint64_t now = mach_absolute_time(), lat = dp_us(now - e->end_t0);
++
++	e->end_cmdact = false;
++	dp.c.end_lat_last_us = lat;
++	dp.c.end_lat_sum_us += lat;
++	if (lat > dp.c.end_lat_max_us) {
++		dp.c.end_lat_max_us = lat;
++	}
++	dp_sync(e->trb, 16);
++	e->hwo0_at_end = !(t[3] & TRB_HWO);
++	t[3] &= ~TRB_HWO;               /* ForceRM leaves HWO set (Linux gadget.c 1687-1695) */
++	dp_sync(e->trb, 16);
++	e->rsc = 0;
++	/* Linux waits 1 ms after a non-IOC End Transfer (gadget.c 441-443); also the window in which a
++	 * stale XferComplete of the ended transfer is drained and dropped */
++	e->ready_at = now + dp.abs_1ms;
++}
++
++/*
++ * R2: End Transfer, ForceRM, no IOC; with GUCTL2[14] CMDACT stays set until it has completed
++ * (Linux gadget.c 3897-3925). A SETUP waiting to be DMAed blocks every End Transfer (gadget.c
++ * 3886-3897): outside a forced call (bus reset, or from inside the SETUP being handled) it is only
++ * issued while ep0 is armed for SETUP, else deferred to a later poll.
++ */
++static void
++dp_end(unsigned ep, bool force)
++{
++	struct dp_ep *e = &dp.e[ep];
++	uint32_t dc = 0;
++	int r;
++
++	if (e->st != DP_STARTED) {
++		return;
++	}
++	e->end_wanted = true;
++	if (!force && ud.state != EP0_SETUP) {
++		dp.c.end_deferred++;
++		return;
++	}
++	if (e->rsc == 0) {
++		uint32_t v = dwc_rd(DEPCMD(ep));
++		e->rsc = (v & DEPCMD_CMDACT) ? 0 : (uint8_t)((v >> 16) & 0x7f);
++		if (e->rsc == 0) {
++			e->rsc = e->rsc_last;
++		}
++	}
++	e->end_t0 = mach_absolute_time();
++	r = dp_cmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_HIPRI_FORCERM | ((uint32_t)e->rsc << 16), 0, 0, 0, dp.abs_end, &dc);
++	if (r == -2) {                  /* a timed-out Start is still running: next poll */
++		return;
++	}
++	dp.c.end_issued++;
++	e->st = DP_ENDING;
++	e->end_wanted = false;
++	e->noevt_polls = 0;
++	if (r == -1) {
++		e->end_cmdact = true;
++		dp.c.end_timeout++;
++		dp_snap(DPK_END_TIMEOUT, ep, dc, e->rsc);
++		return;
++	}
++	if (r > 0) {
++		dp.c.end_status++;
++	}
++	dp_end_done(ep);
++}
++
++/* control path only (bus reset, clear halt): wait, bounded, for an End Transfer issued above */
++static void
++dp_wait_end(unsigned ep)
++{
++	struct dp_ep *e = &dp.e[ep];
++	uint64_t end = mach_absolute_time() + dp.abs_end;
++
++	while (e->st == DP_ENDING && e->end_cmdact && mach_absolute_time() < end) {
++		if (!(dwc_rd(DEPCMD(ep)) & DEPCMD_CMDACT)) {
++			dp_end_done(ep);
++		}
++	}
++}
++
++static void
++dp_rx_frame(void)
++{
++	volatile uint32_t *t = dp_trb(EP_RX);
++	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
++	mbuf_t m = NULL;
++
++	dp.last_xfer = mach_absolute_time();
++	if (ud.ifp == NULL || len < ETHER_HDR_LEN || len > ETHER_MAX_LEN) {
++		dp.c.rx_bad_len++;
++		return;
++	}
++	dp_sync(UD_RX, len);
++	/* as ud_rx_done: one mbuf with a 2 KiB cluster */
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++	    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++	    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= len) {
++		struct ifnet_stat_increment_param stats = {};
++		memcpy(mbuf_data(m), (const void *)(ud.dma + UD_RX), len);
++		mbuf_setlen(m, len);
++		mbuf_pkthdr_setlen(m, len);
++		void *frame_header = mbuf_data(m);
++		mbuf_pkthdr_setrcvif(m, ud.ifp);
++		mbuf_pkthdr_setheader(m, frame_header);
++		mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++		(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++		stats.packets_in = 1;
++		stats.bytes_in = len;
++		ud.rx_frames++;
++		ifnet_input(ud.ifp, m, &stats);
++	} else {
++		dp.c.rx_nombuf++;
++		if (m != NULL) {
++			mbuf_freem(m);
++		}
++	}
++}
++
++/* STARTED -> IDLE on its XferComplete with HWO=0 */
++static void
++dp_complete(unsigned ep)
++{
++	if (ep == EP_TX) {
++		dp.tx_len = 0;
++		ud.tx_frames++;
++		dp.c.tx_done++;
++		dp.last_xfer = mach_absolute_time();
++	} else if (ep == EP_RX) {
++		dp.c.rx_done++;
++		dp_rx_frame();
++	} else {
++		dp.c.int_done++;
++	}
++}
++
++/* ENDING -> IDLE: a TRB written back before the End is a transfer that did happen */
++static void
++dp_ended(unsigned ep)
++{
++	struct dp_ep *e = &dp.e[ep];
++
++	if (!e->hwo0_at_end) {
++		return;                 /* not done: TX sends the staged frame again, RX arms again */
++	}
++	e->hwo0_at_end = false;
++	if (ep == EP_TX && dp.tx_len != 0) {
++		dp.tx_len = 0;
++		ud.tx_frames++;
++		dp.c.tx_done_by_end++;
++	} else if (ep == EP_RX) {
++		dp.c.rx_by_end++;
++		dp_rx_frame();
++	}
++}
++
++/* from ud_event, ud_dp_thread only */
++static void
++ud_dp_ep_event(unsigned ep, unsigned type, unsigned status, uint32_t ev)
++{
++	if (!dp_is_data(ep) || type != 1) {     /* only XferComplete is enabled on the data endpoints */
++		dp.c.evt_other++;
++		return;
++	}
++	struct dp_ep *e = &dp.e[ep];
++	volatile uint32_t *t = dp_trb(ep);
++
++	e->evt_seen = true;
++	if (e->st != DP_STARTED) {      /* of a transfer already ended: never a reason to start another */
++		dp.c.evt_not_started++;
++		dp_snap(DPK_EVT_NOT_STARTED, ep, dwc_rd(DEPCMD(ep)), ev);
++		return;
++	}
++	dp_sync(e->trb, 16);
++	if (t[3] & TRB_HWO) {           /* not the completion of the TRB armed now; R7 ends it if none comes */
++		dp.c.evt_hwo_set++;
++		dp_snap(DPK_EVT_HWO_SET, ep, dwc_rd(DEPCMD(ep)), ev);
++		return;
++	}
++	if (status & 1) {
++		dp.c.evt_buserr++;
++	}
++	e->st = DP_IDLE;
++	e->end_wanted = false;
++	e->noevt_polls = 0;
++	dp_complete(ep);
++}
++
++static void
++dp_tx_pump(void)
++{
++	if (dp.e[EP_TX].st != DP_IDLE) {
++		return;
++	}
++	while (dp.tx_len == 0) {        /* R3: UD_TX is only written with the endpoint IDLE and nothing staged */
++		mbuf_t m = NULL;
++		lck_mtx_lock(ud.lock);
++		if (ud.txq_count > 0) {
++			m = ud.txq[ud.txq_head];
++			ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++			ud.txq_count--;
++		}
++		lck_mtx_unlock(ud.lock);
++		if (m == NULL) {
++			return;
++		}
++		size_t len = mbuf_pkthdr_len(m);
++		if (len == 0 || len > ETHER_MAX_LEN - ETHER_CRC_LEN ||
++		    mbuf_copydata(m, 0, len, (void *)(ud.dma + UD_TX)) != 0) {
++			dp.c.tx_bad++;
++			mbuf_freem(m);
++			continue;
++		}
++		mbuf_freem(m);
++		if ((len % 512) == 0) {         /* as ud_tx_kick_locked: one pad byte instead of a ZLP */
++			((uint8_t *)(ud.dma + UD_TX))[len++] = 0;
++		}
++		dp.tx_len = (uint32_t)len;
++	}
++	(void)dp_start(EP_TX, dp.tx_len);       /* refused: the frame stays staged and goes after the End */
++}
++
++static void
++dp_pump(uint64_t now0)
++{
++	static const unsigned eps[3] = { EP_RX, EP_TX, EP_INT };
++
++	for (unsigned i = 0; i < 3; i++) {
++		unsigned ep = eps[i];
++		struct dp_ep *e = &dp.e[ep];
++
++		if (e->st == DP_STARTED && e->end_wanted) {
++			dp_end(ep, false);
++		} else if (e->st == DP_STARTED) {
++			volatile uint32_t *t = dp_trb(ep);
++			dp_sync(e->trb, 16);
++			if (!(t[3] & TRB_HWO) && !e->evt_seen) {        /* R7 */
++				dp.c.hwo0_noevt_polls++;
++				if (e->noevt_polls++ == 0) {
++					e->noevt_since = now0;
++				}
++				if (e->noevt_polls >= DP_NOEVT_POLLS && now0 - e->noevt_since >= dp.abs_2ms) {
++					dp.c.noevt++;
++					dp_snap(DPK_NOEVT, ep, dwc_rd(DEPCMD(ep)), e->noevt_polls);
++					dp_end(ep, false);
++				}
++			} else {
++				e->noevt_polls = 0;
++			}
++		}
++		if (e->st == DP_ENDING) {
++			if (e->end_cmdact) {
++				if (!(dwc_rd(DEPCMD(ep)) & DEPCMD_CMDACT)) {
++					dp_end_done(ep);
++				}
++			} else if (now0 >= e->ready_at) {       /* now0 was taken before this poll's drain */
++				e->st = DP_IDLE;
++				dp_ended(ep);
++			}
++		}
++		e->evt_seen = false;
++	}
++	if (!ud.configured) {
++		return;
++	}
++	if (dp.e[EP_RX].st == DP_IDLE) {
++		(void)dp_start(EP_RX, UD_FRAME_MAX);
++	}
++	if (dp.notify_pending && dp.e[EP_INT].st == DP_IDLE) {
++		uint8_t *n = (uint8_t *)(ud.dma + UD_NOTIFY);   /* NETWORK_CONNECTION, connected, interface 0 */
++		n[0] = 0xa1; n[1] = 0x00; n[2] = 1; n[3] = 0;
++		n[4] = 0; n[5] = 0; n[6] = 0; n[7] = 0;
++		if (dp_start(EP_INT, 8) == 0) {
++			dp.notify_pending = false;
++		}
++	}
++	dp_tx_pump();
++}
++
++/* one pass: drain the event buffer, then advance every data endpoint */
++static void
++dp_poll(uint64_t now0)
++{
++	uint32_t raw = dwc_rd(GEVNTCOUNT);
++	uint32_t count = raw & 0xfffc;          /* Linux core.h 78 */
++	uint32_t take = count;
++
++	if ((raw & 0x7fff0003) != 0) {          /* bits outside the count and EVNT_HANDLER_BUSY */
++		dp.c.evcount_bits++;
++	}
++	if (count > UD_EVT_SIZE) {              /* cannot happen with a 4 KiB buffer polled every ms: record it */
++		dp.c.evcount_over++;
++		dp_snap(DPK_EVCOUNT, 0, raw, ud.evt_pos);
++		take = UD_EVT_SIZE;
++	}
++	if (count) {
++		dp_sync(UD_EVT, UD_EVT_SIZE);
++		for (uint32_t done = 0; done < take; done += 4) {
++			uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
++			ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
++			/* the first 200 control/device events are printed as before; data events never */
++			if (((ev & 1) || !dp_is_data((ev >> 1) & 0x1f)) && ud.events < 200) {
++				printf("SWEET USB: event 0x%08x\n", ev);
++			}
++			ud.events++;
++			ud_event(ev);
++		}
++		__asm__ volatile ("dmb sy" ::: "memory");      /* the event words are read before the slots are given back */
++		dwc_wr(GEVNTCOUNT, count);
++	}
++	dp_pump(now0);
++}
++
++/* R1: no hardware here, from any thread */
++static errno_t
++ud_dp_output(ifnet_t ifp, mbuf_t m)
++{
++	lck_mtx_lock(ud.lock);
++	if (ud.txq_count == UD_TXQ || !ud.configured) {
++		dp.c.tx_qdrop++;
++		lck_mtx_unlock(ud.lock);
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return ENOBUFS;         /* back-pressure; the log thread stops on it */
++	}
++	ifnet_stat_increment_out(ifp, 1, mbuf_pkthdr_len(m), 0);
++	ud.txq[(ud.txq_head + ud.txq_count) % UD_TXQ] = m;
++	ud.txq_count++;
++	lck_mtx_unlock(ud.lock);
++	__atomic_store_n(&dp.kick, 1, __ATOMIC_RELEASE);
++	thread_wakeup(&dp.chan);
++	return 0;
++}
++
++/* SET_INTERFACE: the CDC notification, sent by dp_pump once the interrupt endpoint is idle */
++static void
++ud_dp_notify(void)
++{
++	if (dp.e[EP_INT].st == DP_STARTED) {
++		dp.c.notify_skipped++;          /* the one still armed says the same */
++		return;
++	}
++	dp.notify_pending = true;
++}
++
++/*
++ * CLEAR_FEATURE(ENDPOINT_HALT) / SET_INTERFACE (0289), from inside the SETUP being handled (ep0 is in
++ * its SETUP phase for Linux there too): End Transfer, wait for it, then ClearStall (Linux commit
++ * d97c78a1908e: CLEAR_STALL after END_TRANSFER completes). dp_pump arms the endpoint again after 1 ms.
++ */
++static void
++ud_dp_reset_seq(unsigned ep)
++{
++	struct dp_ep *e = &dp.e[ep];
++	uint32_t dc = 0;
++
++	if (!dp_is_data(ep)) {
++		return;
++	}
++	if (e->st == DP_STARTED) {
++		dp_end(ep, true);
++	}
++	dp_wait_end(ep);
++	if (e->st == DP_STARTED || (e->st == DP_ENDING && e->end_cmdact) ||
++	    dp_cmd(ep, DEPCMD_CLEARSTALL, 0, 0, 0, dp.abs_cmd, &dc) != 0) {
++		dp.c.clearstall_fail++;
++	}
++	if (ep == EP_TX && dp.tx_len != 0) {    /* the host cancelled it */
++		dp.tx_len = 0;
++		dp.c.tx_reset_drop++;
++	}
++}
++
++/*
++ * USB reset: ep0 back to its SETUP phase first (Linux dwc3_ep0_reset_state, gadget.c 4035-4041),
++ * then End Transfer for every active transfer (databook 3.30a §4.1.2 Table 4-2, gadget.c 4043-4049),
++ * waited for, then ClearStall (gadget.c dwc3_clear_stall_all_ep), then forget the configuration.
++ */
++static void
++ud_dp_bus_reset(void)
++{
++	static const unsigned eps[3] = { EP_RX, EP_TX, EP_INT };
++	bool was_configured = ud.configured;
++
++	dp.c.bus_resets++;
++	if (ud.state != EP0_SETUP || !ud.xfer_active[0]) {
++		ud_end_transfer(0);
++		ud_end_transfer(1);
++		ud_start_setup();
++	}
++	for (unsigned i = 0; i < 3; i++) {
++		if (dp.e[eps[i]].st == DP_STARTED) {
++			dp_end(eps[i], true);
++		}
++		dp_wait_end(eps[i]);
++	}
++	for (unsigned i = 0; was_configured && i < 3; i++) {
++		struct dp_ep *e = &dp.e[eps[i]];
++		uint32_t dc = 0;
++		if (e->st == DP_STARTED || (e->st == DP_ENDING && e->end_cmdact) ||
++		    dp_cmd(eps[i], DEPCMD_CLEARSTALL, 0, 0, 0, dp.abs_cmd, &dc) != 0) {
++			dp.c.clearstall_fail++;
++		}
++	}
++	dwc_wr(DALEPENA, dwc_rd(DALEPENA) & ~((1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT)));
++	lck_mtx_lock(ud.lock);
++	ud.configured = false;
++	ud.data_alt = 0;
++	ud.tx_busy = false;
++	while (ud.txq_count > 0) {
++		mbuf_freem(ud.txq[ud.txq_head]);
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++		ud.txq_count--;
++	}
++	lck_mtx_unlock(ud.lock);
++	dp.tx_len = 0;
++	dp.notify_pending = false;
++}
++
++static void
++ud_dp_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	for (;;) {
++		uint64_t now0 = mach_absolute_time();
++
++		if (dp.last_poll != 0) {
++			uint64_t p = dp_us(now0 - dp.last_poll);
++			if (p > dp.c.poll_max_us) {
++				dp.c.poll_max_us = p;
++			}
++		}
++		dp.last_poll = now0;
++		dp.c.polls++;
++		__atomic_store_n(&dp.kick, 0, __ATOMIC_RELAXED);
++		dp_poll(now0);
++		if (now0 - dp.last_report >= dp.abs_30s) {
++			dp.last_report = now0;
++			printf("SWEET USB: ue0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
++		}
++		/*
++		 * Frames moved in the last 10 ms: spin up to 50 us for the next event (a 1514-byte frame is
++		 * ~30 us on the wire, and with one TRB per endpoint each poll moves at most one frame each
++		 * way), then sleep 125 us. Otherwise sleep 1 ms; ud_dp_output wakes the thread at once.
++		 */
++		bool busy = mach_absolute_time() - dp.last_xfer < dp.abs_10ms;
++		if (busy) {
++			uint64_t until = mach_absolute_time() + dp.abs_spin;
++			bool more;
++			do {
++				more = (dwc_rd(GEVNTCOUNT) & 0xfffc) != 0 || __atomic_load_n(&dp.kick, __ATOMIC_RELAXED);
++			} while (!more && mach_absolute_time() < until);
++			if (more) {
++				dp.c.spins++;
++				continue;
++			}
++		}
++		(void)assert_wait_deadline(&dp.chan, THREAD_UNINT,
++		    mach_absolute_time() + (busy ? dp.abs_125us : dp.abs_1ms));
++		if (__atomic_load_n(&dp.kick, __ATOMIC_ACQUIRE)) {
++			(void)clear_wait(current_thread(), THREAD_AWAKENED);    /* woken before the assert_wait */
++		} else {
++			(void)thread_block(THREAD_CONTINUE_NULL);
++		}
++	}
++}
++
++/* before ud_if_create: DMA mapping (R6), TRB layout, time constants */
++static void
++ud_dp_init(void)
++{
++	int nc = 1;
++
++	nanoseconds_to_absolutetime(2 * NSEC_PER_MSEC, &dp.abs_cmd);
++	nanoseconds_to_absolutetime(5 * NSEC_PER_MSEC, &dp.abs_end);
++	nanoseconds_to_absolutetime(50 * NSEC_PER_USEC, &dp.abs_spin);
++	nanoseconds_to_absolutetime(125 * NSEC_PER_USEC, &dp.abs_125us);
++	nanoseconds_to_absolutetime(NSEC_PER_MSEC, &dp.abs_1ms);
++	nanoseconds_to_absolutetime(2 * NSEC_PER_MSEC, &dp.abs_2ms);
++	nanoseconds_to_absolutetime(10 * NSEC_PER_MSEC, &dp.abs_10ms);
++	nanoseconds_to_absolutetime(30 * NSEC_PER_SEC, &dp.abs_30s);
++	dp.e[EP_RX].trb = DP_TRB_RX;
++	dp.e[EP_RX].buf = UD_RX;
++	dp.e[EP_TX].trb = DP_TRB_TX;
++	dp.e[EP_TX].buf = UD_TX;
++	dp.e[EP_INT].trb = DP_TRB_INT;
++	dp.e[EP_INT].buf = UD_NOTIFY;
++	PE_parse_boot_argn("sweetusb_dpnc", &nc, sizeof(nc));
++	if (nc) {
++		/* the zeros of KMA_ZERO reach DRAM and no line of the area stays in the cache; from here on
++		 * the CPU only uses the non-cacheable alias (the ud_sync() of the ep0 code then cleans and
++		 * invalidates clean lines of the physmap alias: harmless) */
++		flush_dcache64((addr64_t)ud.dma_pa, UD_SIZE, TRUE);
++		vm_offset_t wc = ml_io_map_unmappable((vm_offset_t)ud.dma_pa, UD_SIZE, VM_WIMG_WCOMB);
++		if (wc != 0) {
++			ud.dma = wc;
++			dp.nc = true;
++		}
++	}
++	printf("SWEET USB: data path v2 (sweetusb_dp=2), DMA %s\n", dp.nc ? "non-cacheable" : "cacheable");
++}
++
++/* after the device soft reset: End Transfer polling (GUCTL2[14], DWC_usb3 >= 3.10a) */
++static void
++ud_dp_core_init(void)
++{
++	dp.gsnpsid = dwc_rd(DP_GSNPSID);
++	if ((dp.gsnpsid & 0xffff0000) == 0x55330000 && (dp.gsnpsid & 0xffff) >= 0x310a) {
++		dwc_wr(DP_GUCTL2, dwc_rd(DP_GUCTL2) | DP_GUCTL2_RST_ACTBITLATER);
++	}
++	dp.guctl2 = dwc_rd(DP_GUCTL2);
++	dp.actbitlater = (dp.guctl2 & DP_GUCTL2_RST_ACTBITLATER) != 0;
++	printf("SWEET USB: GSNPSID 0x%08x GUCTL2 0x%08x (End Transfer polling %s)\n", dp.gsnpsid, dp.guctl2,
++	    dp.actbitlater ? "on" : "off");
++}
++
++static int
++sysctl_sweet_usb_dp SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	static char out[12288];
++	static int busy;
++	size_t n = 0;
++	int err;
++
++#define DPF(...) do { if (n < sizeof(out)) { n += (size_t)snprintf(out + n, sizeof(out) - n, __VA_ARGS__); } } while (0)
++	if (__atomic_exchange_n(&busy, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	DPF("dp %d nc %d actbitlater %d gsnpsid %08x guctl2 %08x configured %d ep0state %d tx_len %u queue %u\n",
++	    ud_dp, dp.nc, dp.actbitlater, dp.gsnpsid, dp.guctl2, ud.configured, (int)ud.state, dp.tx_len, ud.txq_count);
++	for (unsigned ep = EP_RX; ud_dp && ud.dma != 0 && ep <= EP_INT; ep++) {
++		if (!dp_is_data(ep)) {
++			continue;
++		}
++		volatile uint32_t *t = dp_trb(ep);
++		dp_sync(dp.e[ep].trb, 16);
++		DPF("ep%u st %u rsc %u end_wanted %d end_cmdact %d noevt_polls %u trb %08x %08x %08x %08x\n", ep,
++		    dp.e[ep].st, dp.e[ep].rsc, dp.e[ep].end_wanted, dp.e[ep].end_cmdact, dp.e[ep].noevt_polls,
++		    t[0], t[1], t[2], t[3]);
++	}
++	DPF("polls %llu spins %llu poll_max_us %llu\n", dp.c.polls, dp.c.spins, dp.c.poll_max_us);
++	DPF("start ok %llu refused %llu timeout %llu not_idle %llu cmd_busy %llu phy_susp_cleared %llu\n",
++	    dp.c.start_ok, dp.c.start_refused, dp.c.start_timeout, dp.c.start_not_idle, dp.c.cmd_busy,
++	    dp.c.phy_susp_cleared);
++	DPF("end issued %llu deferred %llu timeout %llu status %llu lat_us max %llu last %llu sum %llu\n",
++	    dp.c.end_issued, dp.c.end_deferred, dp.c.end_timeout, dp.c.end_status, dp.c.end_lat_max_us,
++	    dp.c.end_lat_last_us, dp.c.end_lat_sum_us);
++	DPF("noevt(alpha) %llu hwo0_noevt_polls %llu evt not_started %llu hwo_set %llu other %llu buserr %llu "
++	    "evcount over %llu bits %llu\n", dp.c.noevt, dp.c.hwo0_noevt_polls, dp.c.evt_not_started,
++	    dp.c.evt_hwo_set, dp.c.evt_other, dp.c.evt_buserr, dp.c.evcount_over, dp.c.evcount_bits);
++	DPF("tx done %llu by_end %llu qdrop %llu bad %llu reset_drop %llu; rx done %llu by_end %llu bad_len %llu "
++	    "nombuf %llu; int done %llu notify_skipped %llu; clearstall_fail %llu bus_resets %llu\n",
++	    dp.c.tx_done, dp.c.tx_done_by_end, dp.c.tx_qdrop, dp.c.tx_bad, dp.c.tx_reset_drop, dp.c.rx_done,
++	    dp.c.rx_by_end, dp.c.rx_bad_len, dp.c.rx_nombuf, dp.c.int_done, dp.c.notify_skipped,
++	    dp.c.clearstall_fail, dp.c.bus_resets);
++	for (unsigned k = 0; k < DPK_N; k++) {
++		static struct dp_snap first[DP_NSNAP], last;
++		uint32_t cnt = 0, s1, s2;
++		for (int tries = 0; tries < 4; tries++) {
++			s1 = __atomic_load_n(&dp.latch[k].seq, __ATOMIC_ACQUIRE);
++			cnt = dp.latch[k].n;
++			memcpy(first, dp.latch[k].first, sizeof(first));
++			last = dp.latch[k].last;
++			__atomic_thread_fence(__ATOMIC_ACQUIRE);
++			s2 = __atomic_load_n(&dp.latch[k].seq, __ATOMIC_ACQUIRE);
++			if (s1 == s2 && !(s1 & 1)) {
++				break;
++			}
++		}
++		if (cnt == 0) {
++			continue;
++		}
++		DPF("%s n %u (us ep st depcmd trb0-3 dsts evcnt a)\n", dp_kind[k], cnt);
++		for (uint32_t i = 0; i < cnt && i < DP_NSNAP; i++) {
++			DPF(" #%u %llu %u %u %08x %08x %08x %08x %08x %08x %08x %08x\n", i, first[i].us, first[i].ep,
++			    first[i].st, first[i].depcmd, first[i].trb[0], first[i].trb[1], first[i].trb[2], first[i].trb[3],
++			    first[i].dsts, first[i].evcnt, first[i].a);
++		}
++		DPF(" last %llu %u %u %08x %08x %08x %08x %08x %08x %08x %08x\n", last.us, last.ep, last.st, last.depcmd,
++		    last.trb[0], last.trb[1], last.trb[2], last.trb[3], last.dsts, last.evcnt, last.a);
++	}
++#undef DPF
++	if (n >= sizeof(out)) {
++		n = sizeof(out) - 1;
++	}
++	out[n] = 0;
++	err = SYSCTL_OUT(req, out, n + 1);
++	__atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
++	return err;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_usb_dp, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_usb_dp, "A", "USB gadget data path v2 (sweetusb_dp=2): state, counters, snapshots");
++
+ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -1185,7 +2068,7 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			so = NULL;
+ 			continue;
+ 		}
+-		uint32_t n;
++		uint32_t n, sent_n = 0;
+ 		while ((n = sweet_log_copy(&pos, chunk, sizeof(chunk))) > 0) {
+ 			struct iovec iov = { .iov_base = chunk, .iov_len = n };
+ 			struct msghdr msg = {
+@@ -1196,6 +2079,9 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			if (sock_send(so, &msg, 0, &sent) != 0) {
+ 				break;          /* no route/ARP yet: retry later */
+ 			}
++			if (ud_dp && ++sent_n >= 16) {
++				break;          /* 0330: at most 16 datagrams per 100 ms, so it never crowds out TX */
++			}
+ 		}
+ 	}
+ }
+@@ -1206,6 +2092,10 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
++	PE_parse_boot_argn("sweetusb_dp", &ud_dp, sizeof(ud_dp));
++	if (ud_dp != 2) {
++		ud_dp = 0;
++	}
+ 	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET USB: no DMA memory\n");
+@@ -1216,6 +2106,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		return;
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
++	if (ud_dp) {
++		ud_dp_init();
++	}
+ 	ud_if_create();
+ 
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+@@ -1234,6 +2127,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	 * command; Linux dwc3 clears them around every endpoint command. A normal boot leaves
+ 	 * GUSB2PHYCFG at 0x2500 (ENBLSLPM set). */
+ 	dwc_wr(0xc200, dwc_rd(0xc200) & ~((1u << 6) | (1u << 8)));
++	if (ud_dp) {
++		ud_dp_core_init();
++	}
+ 
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+@@ -1276,7 +2172,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		delay(1000);
+ 	}
+ 	printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
+-	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
++	if (kernel_thread_start(ud_dp ? ud_dp_thread : ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+ 	int livelog = 1;

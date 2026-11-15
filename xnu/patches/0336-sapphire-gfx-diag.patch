@@ -1,0 +1,943 @@
+0336: SapphireGpu, SweetFramebuffer: read-only diagnostics of the GPU driver and the presentation path
+
+Counters, times and histograms behind two read-only sysctls; nothing changes what is submitted, copied or
+presented, except with kern.sweet_gpu_marks=1 (default 0). Both sysctls are cumulative: read twice and
+subtract.
+
+kern.sweet_fb_diag: SwapEnd-to-SwapEnd intervals; intervals between flips counted in the panel's own
+refreshes (INTF_FRAME_COUNT read at each flip); SwapEnd-to-flip latency; frames whose copy was replaced in
+the back buffer before any flip ("overwritten"); vsync timer lateness; the eighth of the refresh in which
+flips are written (INTF_LINE_COUNT); time in SwapEnd's present; SwapWait calls; and one more line every
+5 s beside "SWEET FB: 5 s".
+
+kern.sweet_gpu_diag: GEM_SUBMIT (count, command buffers, buffers named; time in the call, waiting for and
+holding service_lock, and in dc civac of surfaces, with bytes; ring fill); GEM_NEW by size class with the
+time to zero and to map; GEM_CLOSE, frees, IOSurface imports; SMMU TLB flushes and their time; fence waits;
+panel copies.
+
+kern.sweet_gpu_marks=1: each msm submission and each panel copy is put between two CP_REG_TO_MEM of
+CP_ALWAYS_ON_COUNTER (19.2 MHz), as Linux's a6xx_submit does for its stats: the GPU's own time for each,
+with histograms (8 more dwords in the ring per submission or copy).
+
+Measured with it on the phone (one boot, ~15 min of use): 5520 submissions spent 8.91 s in GEM_SUBMIT, of
+which 8.64 s in cache maintenance (28.0 GB in 5675 passes, ~1.5 ms and ~4.9 MB per submission, under the
+ring's lock); 931 of 6758 swapped frames (13.8 %) were overwritten before reaching the panel; 13358 TLB
+invalidations took 0.97 s, 13251 of them slept. With kern.sweet_gpu_marks=1 (one window of 1268
+submissions): 8.3 ms of GPU time per submission and 4.15 ms per panel copy on average.
+
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -109,6 +109,7 @@ extern "C" int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, ui
+ #define OFF_PT              0x80000u            /* GPU page tables: 128 pages of 4 KB */
+ #define OFF_CS              0x30000u            /* compute shader binary */
+ #define OFF_CSOUT           0x31000u            /* what it writes */
++#define OFF_DIAG            0x20000u            /* 0336: the GPU's time marks, 2 x 64 pairs of 64-bit counters (2 KB) */
+ #define PT_PAGES            128u
+ #define DRAW_W              256u
+ #define DRAW_H              256u
+@@ -153,6 +154,7 @@ extern "C" int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, ui
+ #define CP_EVENT_WRITE          0x46
+ #define CP_SET_MARKER           0x65
+ #define CP_BLIT                 0x2c
++#define CP_REG_TO_MEM           0x3e                /* 0336: REG | CNT << 18 | 64B << 30, then the address (adreno_pm4.xml) */
+ 
+ /*
+  * The 2D blitter, as Mesa's freedreno does a buffer clear on a6xx gen1 (fd6_blitter.cc
+@@ -247,6 +249,56 @@ static uint32_t *ring, *test_buf;
+ static uint32_t ring_wptr;
+ static unsigned scm_resumes;
+ static uint32_t slow_ms;                        /* boot-arg gpu_slow: see step_done() */
++
++/*
++ * sapphire 0336: diagnostics, read with sysctl kern.sweet_gpu_diag (at the end of this file): counters and times of
++ * what the msm client and the panel's copies cost here. Nothing in them changes what the driver does. The one
++ * exception is opt-in and off by default: kern.sweet_gpu_marks=1 puts every msm submission and every panel copy
++ * between two CP_REG_TO_MEM of CP_ALWAYS_ON_COUNTER (the GPU's 19.2 MHz counter), the way Linux's a6xx_submit takes
++ * its per-submission stats (a6xx_gpu.c, get_stats_counter), and the differences are the GPU's own time for each one:
++ * 8 more dwords in the ring and two 64-bit words the CP writes into the pool at OFF_DIAG.
++ */
++struct gdiag_time {
++	uint64_t n, ns, max;
++};
++#define GDIAG_SLOTS         64u
++#define GDIAG_HIST          10u
++static struct {
++	/* GEM_SUBMIT */
++	uint64_t sub, sub_cmds, sub_bos, sub_behind, sub_ring_max, ring_waits, sub_flush_bytes;
++	struct gdiag_time sub_all, sub_lock, sub_hold, sub_flush;
++	/* buffers: GEM_NEW by size (under 256 KB, under 4 MB, larger), GEM_CLOSE, IOSurfaces, the SMMU's TLB */
++	uint64_t new_n[3], new_bytes[3], close_n, close_left, surf_new, surf_again, tlb_slept, poll_sleeps;
++	struct gdiag_time new_zero, new_place, bo_free, tlb;
++	/* waits for a fence (WAIT_FENCE, CPU_PREP, a close) */
++	uint64_t wait_n, wait_done, wait_loops, prep_n, prep_flush_bytes;
++	struct gdiag_time wait;
++	/* the panel's copies */
++	uint64_t copy_n, copy_behind, copy_gpu_busy;
++	struct gdiag_time copy_lock;
++	/* the GPU's own time, in ticks of 19.2 MHz (kern.sweet_gpu_marks) */
++	uint64_t gt_sub_n, gt_sub_ticks, gt_sub_max, gt_sub_hist[GDIAG_HIST];
++	uint64_t gt_copy_n, gt_copy_ticks, gt_copy_max, gt_copy_hist[GDIAG_HIST];
++	uint64_t gt_lost;
++} gdiag;
++static int gpu_marks;                           /* kern.sweet_gpu_marks */
++static uint32_t gdiag_sub_fence[GDIAG_SLOTS], gdiag_copy_fence[GDIAG_SLOTS];    /* the fence each pair of marks goes with */
++static uint32_t gdiag_sub_head, gdiag_sub_tail, gdiag_copy_head, gdiag_copy_tail;
++static uint64_t gdiag_end_pa;                   /* where blit_end() puts a copy's end mark (0: none) */
++
++static void
++gdiag_since(struct gdiag_time *t, uint64_t t0)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	OSAddAtomic64(1, (volatile SInt64 *)&t->n);
++	OSAddAtomic64((SInt64)ns, (volatile SInt64 *)&t->ns);
++	if (ns > t->max) {
++		t->max = ns;
++	}
++}
++
+ /*
+  * boot-arg gpu_div: the GPLL0 divider for the core clock, 2 = 300 MHz. Nothing here raises
+  * VDD_GFX (Linux does it through the OPP table and RPMh, and there is no GMU to do it for
+@@ -367,6 +419,7 @@ poll(volatile uint8_t *b, uint32_t off, uint32_t mask, uint32_t want, uint32_t u
+ 		if ((rd(b, off) & mask) == want) {
+ 			return true;
+ 		}
++		gdiag.poll_sleeps++;                    /* 0336: IODelay blocks the thread on this port */
+ 		IODelay(1);
+ 	}
+ 	return false;
+@@ -1117,10 +1170,17 @@ unmap_page_4k(uint64_t va)
+ static bool
+ tlb_flush(void)
+ {
++	uint64_t t0 = mach_absolute_time(), sleeps = gdiag.poll_sleeps;         /* 0336 */
++
+ 	gmb();
+ 	wr(smmu, 0x8610, 0);
+ 	wr(smmu, 0x87f0, 0);
+-	return poll(smmu, 0x87f4, 1, 0, 1000);
++	bool ok = poll(smmu, 0x87f4, 1, 0, 1000);
++	gdiag_since(&gdiag.tlb, t0);
++	if (gdiag.poll_sleeps != sleeps) {
++		gdiag.tlb_slept++;                      /* the sync was not over at the first look: the thread slept */
++	}
++	return ok;
+ }
+ 
+ static bool
+@@ -1304,9 +1364,19 @@ ring_room(uint32_t need, uint32_t ms)
+ {
+ 	for (uint32_t i = 0; i < ms * 100; i++) {
+ 		uint32_t rptr = grd(REG_CP_RB_RPTR), w = ring_wptr % RING_DWORDS;
++		if (i == 0) {
++			/* 0336: how much the CP has not read yet when more is added, and how often there is no room */
++			uint32_t waiting = (w + RING_DWORDS - rptr) % RING_DWORDS;
++			if (waiting > gdiag.sub_ring_max) {
++				gdiag.sub_ring_max = waiting;
++			}
++		}
+ 		if ((rptr + RING_DWORDS - w - 1) % RING_DWORDS >= need) {
+ 			return true;
+ 		}
++		if (i == 0) {
++			gdiag.ring_waits++;
++		}
+ 		IODelay(10);
+ 	}
+ 	return false;
+@@ -1320,6 +1390,92 @@ kick(void)
+ 	gwr(REG_CP_RB_WPTR, ring_wptr % RING_DWORDS);
+ }
+ 
++/*
++ * 0336 (kern.sweet_gpu_marks): the CP copies its always-on counter, 64 bits, to pa when it gets here. A pair of
++ * these around a piece of work, each after a CP_WAIT_FOR_IDLE, is the GPU's own time for it.
++ */
++static void
++gdiag_mark(uint64_t pa)
++{
++	emit(pkt7(CP_REG_TO_MEM, 3));
++	emit(REG_CP_ALWAYS_ON_COUNTER | (2u << 18) | (1u << 30));
++	emit((uint32_t)pa);
++	emit((uint32_t)(pa >> 32));
++}
++
++static void
++gdiag_gpu_time(uint64_t ticks, const uint32_t *edges, uint64_t *n, uint64_t *sum, uint64_t *max, uint64_t *hist)
++{
++	unsigned k = 0;
++
++	while (k < GDIAG_HIST - 1 && ticks >= edges[k]) {
++		k++;
++	}
++	hist[k]++;
++	(*n)++;
++	*sum += ticks;
++	if (ticks > *max) {
++		*max = ticks;
++	}
++}
++
++/*
++ * The marks of the work that is done by now, into the statistics. The ring's lock held. A submission's end mark is
++ * written before its fence; a copy's after it (blit_end), so a copy whose end is not there yet gets another look.
++ */
++static void
++gdiag_harvest(void)
++{
++	/* ticks of 19.2 MHz: under 1 2 4 8 12 16 24 32 48 ms, more; and under 0.5 1 1.5 2 3 4 6 8 12 ms, more */
++	static const uint32_t sub_edges[GDIAG_HIST - 1] = { 19200, 38400, 76800, 153600, 230400, 307200, 460800, 614400, 921600 };
++	static const uint32_t copy_edges[GDIAG_HIST - 1] = { 9600, 19200, 28800, 38400, 57600, 76800, 115200, 153600, 230400 };
++	uint32_t done_sub, done_copy;
++
++	if (pool == NULL) {
++		return;
++	}
++	done_sub = *(volatile uint32_t *)(pool + OFF_MSM_FENCE);
++	done_copy = *(volatile uint32_t *)(pool + OFF_FENCE);
++	while (gdiag_sub_tail != gdiag_sub_head) {
++		uint32_t i = gdiag_sub_tail % GDIAG_SLOTS;
++		if (gdiag_sub_head - gdiag_sub_tail > GDIAG_SLOTS) {
++			gdiag.gt_lost++;                        /* its place was used again before it was read */
++		} else {
++			volatile uint64_t *m = (volatile uint64_t *)(pool + OFF_DIAG + i * 16u);
++			if ((int32_t)(done_sub - gdiag_sub_fence[i]) < 0) {
++				break;
++			}
++			if (m[0] != 0 && m[1] > m[0]) {
++				gdiag_gpu_time(m[1] - m[0], sub_edges, &gdiag.gt_sub_n, &gdiag.gt_sub_ticks, &gdiag.gt_sub_max,
++				    gdiag.gt_sub_hist);
++			} else {
++				gdiag.gt_lost++;                /* given up at a reset of the GPU */
++			}
++		}
++		gdiag_sub_tail++;
++	}
++	while (gdiag_copy_tail != gdiag_copy_head) {
++		uint32_t i = gdiag_copy_tail % GDIAG_SLOTS;
++		if (gdiag_copy_head - gdiag_copy_tail > GDIAG_SLOTS) {
++			gdiag.gt_lost++;
++		} else {
++			volatile uint64_t *m = (volatile uint64_t *)(pool + OFF_DIAG + (GDIAG_SLOTS + i) * 16u);
++			if ((int32_t)(done_copy - gdiag_copy_fence[i]) < 0) {
++				break;
++			}
++			if (m[0] != 0 && m[1] > m[0]) {
++				gdiag_gpu_time(m[1] - m[0], copy_edges, &gdiag.gt_copy_n, &gdiag.gt_copy_ticks, &gdiag.gt_copy_max,
++				    gdiag.gt_copy_hist);
++			} else if (gdiag_copy_head - gdiag_copy_tail < 3) {
++				break;                          /* the fence is there, the end mark not yet */
++			} else {
++				gdiag.gt_lost++;
++			}
++		}
++		gdiag_copy_tail++;
++	}
++}
++
+ /*
+  * Start the command processor and prove it runs: its microcode (a630_sqe.fw without its
+  * first dword, as adreno_fw_create_bo copies it), a 32 KB ring, CP_ME_INIT, then leaving
+@@ -1541,6 +1697,10 @@ blit_end(const char *what)
+ 	event(EV_PC_CCU_FLUSH_DEPTH_TS, true);
+ 	event(EV_CACHE_FLUSH_TS, true);
+ 	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	if (gdiag_end_pa != 0) {
++		gdiag_mark(gdiag_end_pa);               /* 0336: a panel copy's end, after the wait for idle */
++		gdiag_end_pa = 0;
++	}
+ 	if (copy_async && service_ready) {
+ 		kick();
+ 		return true;
+@@ -2172,6 +2332,43 @@ sapphire_gpu_ready(void)
+ 	return service_ready;
+ }
+ 
++/*
++ * 0336: a panel copy is about to be emitted (the ring's lock held). Counted; with kern.sweet_gpu_marks its start mark
++ * goes in here and blit_end() adds its end mark.
++ */
++static uint32_t
++gdiag_copy_begin(void)
++{
++	uint32_t mark = ~0u;
++
++	gdiag.copy_n++;
++	if (last_copy_fence != 0 && !fence_done(last_copy_fence)) {
++		gdiag.copy_behind++;                    /* the copy before this one has not run yet */
++	}
++	if (msm_seq != 0 && (int32_t)(*(volatile uint32_t *)(pool + OFF_MSM_FENCE) - msm_seq) < 0) {
++		gdiag.copy_gpu_busy++;                  /* drawing is still queued or running ahead of it */
++	}
++	if (gpu_marks) {
++		gdiag_harvest();
++		mark = gdiag_copy_head % GDIAG_SLOTS;
++		volatile uint64_t *m = (volatile uint64_t *)(pool + OFF_DIAG + (GDIAG_SLOTS + mark) * 16u);
++		m[0] = m[1] = 0;
++		gdiag_mark(POOL_PA + OFF_DIAG + (GDIAG_SLOTS + mark) * 16u);
++		gdiag_end_pa = POOL_PA + OFF_DIAG + (GDIAG_SLOTS + mark) * 16u + 8;
++	}
++	return mark;
++}
++
++static void
++gdiag_copy_end(uint32_t mark)
++{
++	gdiag_end_pa = 0;                               /* (blit_end() used it, unless the blit was refused) */
++	if (mark != ~0u) {
++		gdiag_copy_fence[mark] = fence_seq;
++		gdiag_copy_head++;
++	}
++}
++
+ bool
+ sapphire_gpu_copy(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src_pitch, uint64_t dst_pa,
+     uint32_t dst_pitch, uint32_t w, uint32_t h, uint64_t dst_base, uint64_t dst_size)
+@@ -2182,7 +2379,9 @@ sapphire_gpu_copy(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src_pitch,
+ 	if (!service_ready || src == NULL || w == 0 || h == 0) {
+ 		return false;
+ 	}
++	uint64_t diag_t0 = mach_absolute_time();        /* 0336: how long the copy waits for the ring's lock */
+ 	IOLockLock(service_lock);
++	gdiag_since(&gdiag.copy_lock, diag_t0);
+ 	if (service_ready) {
+ 		uint64_t va = map_window(src);
+ 		bool dst_ok = map_identity(dst_base, dst_size);
+@@ -2192,7 +2391,9 @@ sapphire_gpu_copy(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src_pitch,
+ 			return false;
+ 		}
+ 		if (va != 0 && dst_ok && src_off + (uint64_t)(h - 1) * src_pitch + w * 4u <= src->getLength()) {
++			uint32_t mark = gdiag_copy_begin();
+ 			ok = blit_copy(va + src_off, src_pitch, dst_pa, dst_pitch, w, h);
++			gdiag_copy_end(mark);
+ 			uint32_t wi = (uint32_t)((va - WIN_BASE) / WIN_SIZE);
+ 			if (wi < WIN_COUNT) {
+ 				win[wi].fence = fence_seq;      /* blit_end's last event */
+@@ -2229,7 +2430,9 @@ sapphire_gpu_copy_scaled(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src
+ 	if (!service_ready || src == NULL || dw == 0 || dh == 0) {
+ 		return false;
+ 	}
++	uint64_t diag_t0 = mach_absolute_time();        /* 0336 */
+ 	IOLockLock(service_lock);
++	gdiag_since(&gdiag.copy_lock, diag_t0);
+ 	if (service_ready) {
+ 		uint64_t va = map_window(src);
+ 		bool dst_ok = map_identity(dst_base, dst_size);
+@@ -2239,7 +2442,9 @@ sapphire_gpu_copy_scaled(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src
+ 			return false;
+ 		}
+ 		if (va != 0 && dst_ok && last <= src->getLength()) {
++			uint32_t mark = gdiag_copy_begin();
+ 			ok = blit_scale(va + src_off, src_pitch, sx, sy, sw, sh, dst_pa, dst_pitch, dw, dh);
++			gdiag_copy_end(mark);
+ 			uint32_t wi = (uint32_t)((va - WIN_BASE) / WIN_SIZE);
+ 			if (wi < WIN_COUNT) {
+ 				win[wi].fence = fence_seq;
+@@ -3322,16 +3527,20 @@ msm_wait(uint32_t f, uint64_t ms)
+ {
+ 	uint64_t deadline, now;
+ 
++	OSAddAtomic64(1, (volatile SInt64 *)&gdiag.wait_n);             /* 0336: who waits for the GPU, and how long */
+ 	if (msm_fence_done(f)) {
++		OSAddAtomic64(1, (volatile SInt64 *)&gdiag.wait_done);
+ 		return true;
+ 	}
+ 	if (ms == 0) {
+ 		return false;
+ 	}
++	uint64_t diag_t0 = mach_absolute_time();
+ 	clock_interval_to_deadline((uint32_t)ms, kMillisecondScale, &deadline);
+ 	while (!msm_fence_done(f)) {
+ 		now = mach_absolute_time();
+ 		if (now >= deadline) {
++			gdiag_since(&gdiag.wait, diag_t0);
+ 			if (msm_gpu_idle()) {
+ 				static uint32_t said;
+ 				if (said++ < 8) {
+@@ -3342,8 +3551,10 @@ msm_wait(uint32_t f, uint64_t ms)
+ 			}
+ 			return false;
+ 		}
++		OSAddAtomic64(1, (volatile SInt64 *)&gdiag.wait_loops);
+ 		delay_for_interval(50, NSEC_PER_USEC);
+ 	}
++	gdiag_since(&gdiag.wait, diag_t0);
+ 	return true;
+ }
+ 
+@@ -3612,6 +3823,7 @@ void
+ SapphireGPUClient::freeBo(struct msm_bo *b)
+ {
+ 	uint64_t n = b->size >> 12;
++	uint64_t diag_t0 = mach_absolute_time();        /* 0336 */
+ 
+ 	msm_census(b, -1);
+ 
+@@ -3631,6 +3843,7 @@ SapphireGPUClient::freeBo(struct msm_bo *b)
+ 	fCount--;
+ 	fBytes -= b->size;
+ 	bzero(b, sizeof(*b));
++	gdiag_since(&gdiag.bo_free, diag_t0);
+ }
+ 
+ /* Buffers given back earlier whose submissions are done now: freed. service_lock held. */
+@@ -3653,10 +3866,12 @@ SapphireGPUClient::reap(void)
+ void
+ SapphireGPUClient::drop(struct msm_bo *b)
+ {
++	gdiag.close_n++;                                /* 0336 */
+ 	if (b->fence == 0 || msm_fence_done(b->fence) || !service_ready) {
+ 		freeBo(b);
+ 		return;
+ 	}
++	gdiag.close_left++;                             /* given back while the GPU still has it */
+ 	for (uint32_t i = 0; i < MSM_LEFT; i++) {
+ 		if (fLeft[i].md == NULL) {
+ 			fLeft[i] = *b;
+@@ -3735,6 +3950,13 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 	if (size == 0 || size > MSM_BUFFER_MAX) {
+ 		return kIOReturnBadArgument;
+ 	}
++	{
++		/* 0336: how many buffers are made, of what size, and what zeroing and mapping each costs */
++		unsigned k = size < 256 * 1024 ? 0 : size < (4ull << 20) ? 1 : 2;
++		OSAddAtomic64(1, (volatile SInt64 *)&gdiag.new_n[k]);
++		OSAddAtomic64((SInt64)size, (volatile SInt64 *)&gdiag.new_bytes[k]);
++	}
++	uint64_t diag_t0;
+ 	if (gpool_enabled()) {
+ 		IOLockLock(service_lock);
+ 		uint64_t pa = gpool_alloc(size >> 12);
+@@ -3762,6 +3984,7 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 		}
+ 		bool zeroed = pm != NULL;
+ 		if (pm != NULL && (zero_all || size < 256 * 1024)) {
++			diag_t0 = mach_absolute_time();
+ 			IOMemoryMap *km = pm->map(kIOMapWriteCombineCache);
+ 			if (km != NULL) {
+ 				bzero((void *)km->getVirtualAddress(), size);
+@@ -3769,6 +3992,7 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 			} else {
+ 				zeroed = false;
+ 			}
++			gdiag_since(&gdiag.new_zero, diag_t0);
+ 		}
+ 		IOLockLock(service_lock);
+ 		struct msm_bo *b = zeroed ? slot(&h) : NULL;
+@@ -3779,7 +4003,10 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 			b->flags = r->flags;
+ 			b->pooled = true;
+ 			b->pa = pa;
+-			if (!place(b)) {
++			diag_t0 = mach_absolute_time();
++			bool placed = place(b);
++			gdiag_since(&gdiag.new_place, diag_t0);
++			if (!placed) {
+ 				bzero(b, sizeof(*b));
+ 				b = NULL;
+ 			}
+@@ -3805,8 +4032,10 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 		LOG("msm: %s: no memory for %llu KB (%u buffers, %llu MB)", fName, size >> 10, fCount, fBytes >> 20);
+ 		return kIOReturnNoMemory;
+ 	}
++	diag_t0 = mach_absolute_time();
+ 	bzero(m->getBytesNoCopy(), size);
+ 	sweet_dcache_flush((vm_offset_t)m->getBytesNoCopy(), (unsigned)size);
++	gdiag_since(&gdiag.new_zero, diag_t0);
+ 	IOLockLock(service_lock);
+ 	struct msm_bo *b = slot(&h);
+ 	if (b != NULL) {
+@@ -3814,7 +4043,10 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 		b->kva = (uint8_t *)m->getBytesNoCopy();
+ 		b->size = size;
+ 		b->flags = r->flags;
+-		if (!place(b)) {
++		diag_t0 = mach_absolute_time();
++		bool placed = place(b);
++		gdiag_since(&gdiag.new_place, diag_t0);
++		if (!placed) {
+ 			bzero(b, sizeof(*b));
+ 			b = NULL;
+ 		}
+@@ -3887,6 +4119,7 @@ SapphireGPUClient::surface(struct msm_surface *r)
+ 	for (uint32_t i = 0; i < MSM_BUFFERS; i++) {
+ 		if (fBo[i].md != NULL && fBo[i].surf == s) {
+ 			r->handle = i + 1;              /* the same surface is the same buffer, as Linux's handles */
++			gdiag.surf_again++;             /* 0336 */
+ 			IOLockUnlock(service_lock);
+ 			s->release();
+ 			return kIOReturnSuccess;
+@@ -3901,6 +4134,7 @@ SapphireGPUClient::surface(struct msm_surface *r)
+ 		b->size = size;
+ 		b->kva = (uint8_t *)s->kernelAddress();
+ 		if (place(b)) {
++			gdiag.surf_new++;               /* 0336 */
+ 			fCount++;
+ 			fBytes += size;
+ 			msm_census(b, 1);
+@@ -3924,6 +4158,7 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 	struct msm_gem_submit_bo *bos = NULL;
+ 	struct msm_gem_submit_cmd *cmds = NULL;
+ 	IOReturn ret = kIOReturnBadArgument;
++	uint64_t diag_t0 = mach_absolute_time(), diag_t1 = 0;   /* 0336: what a submission costs here, and where */
+ 
+ 	if (r->nr_cmds == 0 || r->nr_cmds > MSM_SUBMIT_CMDS || r->nr_bos == 0 || r->nr_bos > MSM_SUBMIT_BOS) {
+ 		LOG("msm: %s: a submission of %u commands in %u buffers: not taken", fName, r->nr_cmds, r->nr_bos);
+@@ -3940,14 +4175,17 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 		ret = kIOReturnVMError;
+ 		goto out;
+ 	}
++	diag_t1 = mach_absolute_time();
+ 	IOLockLock(service_lock);
++	gdiag_since(&gdiag.sub_lock, diag_t1);
++	diag_t1 = mach_absolute_time();
+ 	if (!service_ready) {
+ 		IOLockUnlock(service_lock);
+ 		ret = kIOReturnNotReady;
+ 		goto out;
+ 	}
+ 	reap();
+-	if (!ring_room(4 * r->nr_cmds + 16, 2000)) {
++	if (!ring_room(4 * r->nr_cmds + 16 + (gpu_marks ? 8 : 0), 2000)) {
+ 		msm_hung(fName, msm_seq, true);
+ 		IOLockUnlock(service_lock);
+ 		ret = kIOReturnTimeout;
+@@ -3979,7 +4217,21 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 			} else if (!b->mapped) {
+ 				continue;                       /* never written by the CPU since it was cleaned */
+ 			}
++			uint64_t flush_t0 = mach_absolute_time();
+ 			sweet_dcache_flush((vm_offset_t)b->kva, (unsigned)b->size);
++			gdiag_since(&gdiag.sub_flush, flush_t0);
++			gdiag.sub_flush_bytes += b->size;
++		}
++		if (msm_seq != 0 && !msm_fence_done(msm_seq)) {
++			gdiag.sub_behind++;                     /* the submission before this one is not done yet */
++		}
++		uint32_t mark = ~0u;
++		if (gpu_marks) {
++			gdiag_harvest();
++			mark = gdiag_sub_head % GDIAG_SLOTS;
++			volatile uint64_t *m = (volatile uint64_t *)(pool + OFF_DIAG + mark * 16u);
++			m[0] = m[1] = 0;
++			gdiag_mark(POOL_PA + OFF_DIAG + mark * 16u);    /* the CP begins this submission */
+ 		}
+ 		uint32_t n = 0;
+ 		for (uint32_t i = 0; i < r->nr_cmds; i++) {
+@@ -4002,11 +4254,21 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 			n++;
+ 		}
+ 		emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++		if (mark != ~0u) {
++			gdiag_mark(POOL_PA + OFF_DIAG + mark * 16u + 8);        /* all of it drawn */
++		}
+ 		emit(pkt7(CP_EVENT_WRITE, 4));          /* CACHE_FLUSH_TS into the msm slot (event() writes the shared one) */
+ 		emit(EV_CACHE_FLUSH_TS);                /* (not TIMESTAMP: see event()) */
+ 		emit((uint32_t)(POOL_PA + OFF_MSM_FENCE));
+ 		emit((uint32_t)((POOL_PA + OFF_MSM_FENCE) >> 32));
+ 		emit(++msm_seq);
++		if (mark != ~0u) {
++			gdiag_sub_fence[mark] = msm_seq;
++			gdiag_sub_head++;
++		}
++		gdiag.sub++;
++		gdiag.sub_cmds += n;
++		gdiag.sub_bos += r->nr_bos;
+ 		r->fence = msm_seq;
+ 		kick();                                 /* and back to the program: msm_wait() is how it waits */
+ 		for (uint32_t i = 0; i < r->nr_bos; i++) {
+@@ -4023,9 +4285,11 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 			    r->nr_bos);
+ 		}
+ 		ret = kIOReturnSuccess;
++		gdiag_since(&gdiag.sub_hold, diag_t1);
+ 	}
+ 	IOLockUnlock(service_lock);
+ out:
++	gdiag_since(&gdiag.sub_all, diag_t0);
+ 	if (bos != NULL) {
+ 		IODelete(bos, struct msm_gem_submit_bo, r->nr_bos);
+ 	}
+@@ -4115,8 +4379,10 @@ SapphireGPUClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 		}
+ 		IOLockLock(service_lock);
+ 		b = bo(r.cpuPrep.handle);
++		gdiag.prep_n++;                         /* 0336 */
+ 		if (b != NULL && b->kva != NULL) {
+ 			sweet_dcache_flush((vm_offset_t)b->kva, (unsigned)b->size);
++			gdiag.prep_flush_bytes += b->size;
+ 		}
+ 		IOLockUnlock(service_lock);
+ 		break;
+@@ -4214,6 +4480,69 @@ sapphire_gpu_init(void)
+ 	}
+ }
+ 
++/*
++ * sapphire 0336: kern.sweet_gpu_diag, the counters of gdiag (near the top of this file). Read only: two readings
++ * subtracted give what happened in between. Times are "n total max" in nanoseconds; the GPU's own times are in ticks
++ * of 19.2 MHz (19200 a millisecond) and only move with kern.sweet_gpu_marks=1.
++ */
++#include <sys/sysctl.h>
++#include <libkern/libkern.h>
++
++#define GDIAG_CAT(...) do { \
++	if (off + 1 < sizeof(buf)) { \
++		int n_ = snprintf(buf + off, sizeof(buf) - off, __VA_ARGS__); \
++		if (n_ > 0) { \
++			off = off + (size_t)n_ < sizeof(buf) ? off + (size_t)n_ : sizeof(buf) - 1; \
++		} \
++	} \
++} while (0)
++#define GDIAG_T(t)  (t).n, (t).ns, (t).max
++
++static int
++sweet_gpu_diag_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[2560];
++	size_t off = 0;
++
++	if (gpu_marks && service_lock != NULL && service_ready) {
++		IOLockLock(service_lock);
++		gdiag_harvest();
++		IOLockUnlock(service_lock);
++	}
++	buf[0] = 0;
++	GDIAG_CAT("submit: %llu, %llu command buffers, %llu buffers named; the one before not done %llu; ring max %llu dwords, no room %llu\n",
++	    gdiag.sub, gdiag.sub_cmds, gdiag.sub_bos, gdiag.sub_behind, gdiag.sub_ring_max, gdiag.ring_waits);
++	GDIAG_CAT("submit ns: whole call %llu %llu %llu; waiting for the lock %llu %llu %llu; holding it %llu %llu %llu; cache flush %llu %llu %llu, %llu bytes\n",
++	    GDIAG_T(gdiag.sub_all), GDIAG_T(gdiag.sub_lock), GDIAG_T(gdiag.sub_hold), GDIAG_T(gdiag.sub_flush), gdiag.sub_flush_bytes);
++	GDIAG_CAT("new: under 256K %llu (%llu bytes), under 4M %llu (%llu), larger %llu (%llu); zeroing ns %llu %llu %llu; mapping ns %llu %llu %llu\n",
++	    gdiag.new_n[0], gdiag.new_bytes[0], gdiag.new_n[1], gdiag.new_bytes[1], gdiag.new_n[2], gdiag.new_bytes[2],
++	    GDIAG_T(gdiag.new_zero), GDIAG_T(gdiag.new_place));
++	GDIAG_CAT("close: %llu, still the GPU's %llu; freeing ns %llu %llu %llu; surfaces: new %llu, again %llu; tlb flush ns %llu %llu %llu, slept %llu (poll sleeps %llu)\n",
++	    gdiag.close_n, gdiag.close_left, GDIAG_T(gdiag.bo_free), gdiag.surf_new, gdiag.surf_again, GDIAG_T(gdiag.tlb),
++	    gdiag.tlb_slept, gdiag.poll_sleeps);
++	GDIAG_CAT("wait: %llu, done already %llu; slept ns %llu %llu %llu in %llu looks; cpu prep %llu, %llu bytes flushed\n",
++	    gdiag.wait_n, gdiag.wait_done, GDIAG_T(gdiag.wait), gdiag.wait_loops, gdiag.prep_n, gdiag.prep_flush_bytes);
++	GDIAG_CAT("copy: %llu, the copy before still queued %llu, drawing still ahead %llu; waiting for the lock ns %llu %llu %llu\n",
++	    gdiag.copy_n, gdiag.copy_behind, gdiag.copy_gpu_busy, GDIAG_T(gdiag.copy_lock));
++	GDIAG_CAT("gpu time (marks %d), submissions: %llu, %llu ticks, max %llu; ms <1 <2 <4 <8 <12 <16 <24 <32 <48 more:", gpu_marks,
++	    gdiag.gt_sub_n, gdiag.gt_sub_ticks, gdiag.gt_sub_max);
++	for (unsigned k = 0; k < GDIAG_HIST; k++) {
++		GDIAG_CAT(" %llu", gdiag.gt_sub_hist[k]);
++	}
++	GDIAG_CAT("\ngpu time, panel copies: %llu, %llu ticks, max %llu; ms <0.5 <1 <1.5 <2 <3 <4 <6 <8 <12 more:", gdiag.gt_copy_n,
++	    gdiag.gt_copy_ticks, gdiag.gt_copy_max);
++	for (unsigned k = 0; k < GDIAG_HIST; k++) {
++		GDIAG_CAT(" %llu", gdiag.gt_copy_hist[k]);
++	}
++	GDIAG_CAT("; marks lost %llu\n", gdiag.gt_lost);
++	return SYSCTL_OUT(req, buf, off + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_diag, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_diag_sysctl, "A", "sapphire 0336: what submissions, buffers, waits and panel copies cost in the GPU driver");
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_marks, CTLFLAG_RW | CTLFLAG_LOCKED, &gpu_marks, 0,
++    "sapphire 0336: 1 = time every msm submission and panel copy on the GPU (two CP_REG_TO_MEM of the always-on counter each)");
++
+ #else  /* !ARM64_BOARD_CONFIG_SWEET */
+ 
+ extern "C" void sapphire_gpu_init(void) {}
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -176,6 +176,97 @@ static unsigned sweet_fb_ids_next;
+ #define SWEET_FB_LOW_SIZE       0x03000000ull
+ static uint64_t sweet_fb_low_used;
+ 
++/*
++ * sapphire 0336: diagnostics of the presentation path, read with sysctl kern.sweet_fb_diag. Counters and histograms
++ * only: nothing here changes when or what is presented. What they answer:
++ *   - how far apart the SwapEnds are, and how far apart the frames the panel is really given are, counted in the
++ *     panel's own refreshes (INTF_FRAME_COUNT at each flip: a flip written during refresh c is latched at c + 1, so
++ *     two flips in the same refresh mean the first was never seen);
++ *   - how long a frame waits from its SwapEnd to its flip, and who found its copy done (the next swap or a tick);
++ *   - how many frames had their copy replaced in the back buffer before any flip: drawn, copied and never shown;
++ *   - how late the ticks of the vsync timer run and how often its grid restarts;
++ *   - in which eighth of the refresh (INTF_LINE_COUNT) the flips are written;
++ *   - how often the window server calls SwapWait (selector 6), which is answered at once.
++ * The reader takes two readings and subtracts.
++ */
++#define SWEET_FBD_N     13
++struct sweet_fbd_hist {
++	uint64_t n[SWEET_FBD_N];
++	uint64_t count, sum, max;
++};
++/* microseconds; bucket k is k + 1 refreshes of 8333 us: 1 2 3 4 5 6 7 8, 9-10, 11-12, 13-18, more */
++static const uint32_t sweet_fbd_iv_us[] = { 12500, 20833, 29167, 37500, 45833, 54167, 62500, 70833, 87500, 104167, 154167 };
++/* microseconds: under 2 4 8 12 16 24 32 48 64 100 200 ms, more */
++static const uint32_t sweet_fbd_lat_us[] = { 2000, 4000, 8000, 12000, 16000, 24000, 32000, 48000, 64000, 100000, 200000 };
++/* microseconds: under 50 100 200 400 800 1600 3200 6400 12800, more */
++static const uint32_t sweet_fbd_late_us[] = { 50, 100, 200, 400, 800, 1600, 3200, 6400, 12800 };
++static struct {
++	struct sweet_fbd_hist swap_iv, flip_iv, swap_to_flip, tick_late;
++	uint64_t swaps, flips, flips_by_swap, flips_by_tick, cpu_flips, overwritten, grid_restarts, swap_waits;
++	uint64_t cleans, clean_us, presents, present_us, present_max_us;
++	uint64_t flip_eighth[8];
++	uint64_t last_swap, pend_swap;          /* mach_absolute_time of the last SwapEnd, and of the frame awaiting its flip */
++	uint32_t last_flip_frame;               /* INTF_FRAME_COUNT at the last flip */
++	bool     have_flip;
++} sweet_fbd;
++
++static uint64_t
++sweet_fbd_us(uint64_t a, uint64_t b)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(b - a, &ns);
++	return ns / 1000;
++}
++
++static void
++sweet_fbd_bucket(struct sweet_fbd_hist *h, unsigned k, uint64_t v)
++{
++	OSAddAtomic64(1, (volatile SInt64 *)&h->n[k < SWEET_FBD_N ? k : SWEET_FBD_N - 1]);
++	OSAddAtomic64(1, (volatile SInt64 *)&h->count);
++	OSAddAtomic64((SInt64)v, (volatile SInt64 *)&h->sum);
++	if (v > h->max) {
++		h->max = v;
++	}
++}
++
++static void
++sweet_fbd_add(struct sweet_fbd_hist *h, const uint32_t *edges, unsigned n_edges, uint64_t v)
++{
++	unsigned k = 0;
++	while (k < n_edges && v >= edges[k]) {
++		k++;
++	}
++	sweet_fbd_bucket(h, k, v);
++}
++
++/* A flip is being written (scanFrom): intf is the INTF_1 mapping (INTF at + 0x800), or NULL. */
++static void
++sweet_fbd_flip(volatile uint32_t *intf)
++{
++	uint64_t now = mach_absolute_time(), pend = sweet_fbd.pend_swap;
++
++	OSAddAtomic64(1, (volatile SInt64 *)&sweet_fbd.flips);
++	if (pend != 0 && now > pend) {
++		sweet_fbd_add(&sweet_fbd.swap_to_flip, sweet_fbd_lat_us, sizeof(sweet_fbd_lat_us) / sizeof(sweet_fbd_lat_us[0]),
++		    sweet_fbd_us(pend, now));
++	}
++	sweet_fbd.pend_swap = 0;
++	if (intf != NULL) {
++		uint32_t frame = intf[(0x800 + 0x0ac) / 4], line = intf[(0x800 + 0x0b0) / 4];
++		uint32_t hsync = intf[(0x800 + 0x008) / 4] >> 16;
++		uint32_t vtotal = hsync != 0 ? intf[(0x800 + 0x00c) / 4] / hsync : 0;
++		if (vtotal != 0) {
++			sweet_fbd.flip_eighth[((uint64_t)line * 8 / vtotal) & 7]++;
++		}
++		if (sweet_fbd.have_flip) {
++			uint32_t d = frame - sweet_fbd.last_flip_frame;
++			sweet_fbd_bucket(&sweet_fbd.flip_iv, d <= 8 ? d : d <= 10 ? 9 : d <= 12 ? 10 : d <= 18 ? 11 : 12, d);
++		}
++		sweet_fbd.last_flip_frame = frame;
++		sweet_fbd.have_flip = true;
++	}
++}
++
+ struct SweetLowBuf {
+ 	IOMemoryMap *map;
+ 	uint8_t     *va;
+@@ -753,6 +844,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	if (fb->fNextVsync != 0 && now >= fb->fNextVsync) {
++		/* 0336: how long after its place on the grid this tick runs */
++		sweet_fbd_add(&sweet_fbd.tick_late, sweet_fbd_late_us, sizeof(sweet_fbd_late_us) / sizeof(sweet_fbd_late_us[0]),
++		    sweet_fbd_us(fb->fNextVsync, now));
++	}
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -878,7 +974,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (fb->fPresentLock != NULL) {
+ 		/* 0235: a back buffer whose GPU copy has landed since the last swap goes on the panel now */
+ 		IOLockLock(fb->fPresentLock);
++		uint64_t flips_before = sweet_fbd.flips;
+ 		(void)fb->flipWhenCopied(false);
++		if (sweet_fbd.flips != flips_before) {
++			sweet_fbd.flips_by_tick++;      /* 0336: this tick found the copy done */
++		}
+ 		IOLockUnlock(fb->fPresentLock);
+ 	}
+ 	if (fb->fConsShown && fb->fFlip[0] != NULL && fb->flipWhenCopied(true) &&
+@@ -913,6 +1013,9 @@ AppleCLCD::armVsync(IOTimerEventSource *t)
+ 	uint64_t period, now = mach_absolute_time();
+ 	nanoseconds_to_absolutetime(1000000000ull / (fRateHz ? fRateHz : 60), &period);
+ 	if (fNextVsync == 0 || now > fNextVsync + period) {
++		if (fNextVsync != 0) {
++			sweet_fbd.grid_restarts++;      /* 0336 */
++		}
+ 		fNextVsync = now;
+ 	}
+ 	fNextVsync += period;
+@@ -967,6 +1070,16 @@ AppleCLCD::swap(const uint8_t *rec)
+ 			sweet_hold(held[i], true);
+ 		}
+ 	}
++	if (held[0] != NULL || held[1] != NULL || held[2] != NULL || held[3] != NULL) {
++		/* 0336: SwapEnd to SwapEnd, of the swaps that name a surface */
++		uint64_t t = mach_absolute_time(), last = sweet_fbd.last_swap;
++		sweet_fbd.swaps++;
++		if (last != 0 && t > last) {
++			sweet_fbd_add(&sweet_fbd.swap_iv, sweet_fbd_iv_us, sizeof(sweet_fbd_iv_us) / sizeof(sweet_fbd_iv_us[0]),
++			    sweet_fbd_us(last, t));
++		}
++		sweet_fbd.last_swap = t;
++	}
+ 	/*
+ 	 * 0201: presented here, at SwapEnd, rather than at the next tick of the vsync timer: frames that
+ 	 * came two to a tick were dropped and every frame waited up to a tick (the panel showed 25-30 of
+@@ -1027,9 +1140,22 @@ AppleCLCD::swap(const uint8_t *rec)
+ void
+ AppleCLCD::presentNow(const uint8_t *rec, SweetSurface **held)
+ {
++	uint64_t diag_t0 = mach_absolute_time();        /* 0336: what a SwapEnd costs its caller here, lock included */
+ 	IOLockLock(fPresentLock);
++	uint64_t flips_before = sweet_fbd.flips;
+ 	bool copied = present(rec);
++	if (sweet_fbd.flips != flips_before) {
++		sweet_fbd.flips_by_swap++;              /* this swap found the copy before it done */
++	}
+ 	IOLockUnlock(fPresentLock);
++	{
++		uint64_t us = sweet_fbd_us(diag_t0, mach_absolute_time());
++		sweet_fbd.presents++;
++		sweet_fbd.present_us += us;
++		if (us > sweet_fbd.present_max_us) {
++			sweet_fbd.present_max_us = us;
++		}
++	}
+ 	SweetSurface *release[4] = {};
+ 	IOLockLock(fLock);
+ 	fDirty = false;
+@@ -1373,6 +1499,7 @@ AppleCLCD::flipWhenCopied(bool wait)
+ 	}
+ 	uint32_t idx = fFlipIdx ^ 1;
+ 	scanFrom(fFlipPhys[idx], fRowBytes);
++	sweet_fbd_flip(fIntf1);                 /* 0336 */
+ 	fFlipIdx = idx;
+ 	fFlipWait = false;
+ 	return true;
+@@ -1385,6 +1512,7 @@ AppleCLCD::flipBack(void)
+ 	uint32_t idx = fFlipIdx ^ 1;
+ 	sweet_dcache_clean((vm_offset_t)(uintptr_t)fFlip[idx]->getBytesNoCopy(), (unsigned)fFlip[idx]->getLength());
+ 	scanFrom(fFlipPhys[idx], fRowBytes);
++	sweet_fbd.cpu_flips++;                  /* 0336: a frame the CPU wrote (console, fade, the CPU copy path) */
+ 	fFlipIdx = idx;
+ }
+ 
+@@ -1435,6 +1563,20 @@ sweet_fb_stats_tick(void)
+ 	    g ? sweet_fb_stats.g_inval / g : 0,
+ 	    (sweet_fb_stats.copy + sweet_fb_stats.clean + sweet_fb_stats.comp + sweet_fb_stats.g_clean +
+ 	    sweet_fb_stats.g_copy + sweet_fb_stats.g_inval) / 1000);
++	{
++		/*
++		 * 0336: the same five seconds as the panel was given them. The line above counts SwapEnds; a frame
++		 * whose copy is replaced before its flip is in that count and never on the panel.
++		 */
++		static uint64_t last[4];
++		uint64_t cur[4] = { sweet_fbd.swaps, sweet_fbd.flips, sweet_fbd.overwritten, 0 };
++		for (unsigned k = 6; k < SWEET_FBD_N; k++) {
++			cur[3] += sweet_fbd.flip_iv.n[k];
++		}
++		IOLog("SWEET FB: 5 s (0336): %llu swaps, %llu flips, %llu frames overwritten before their flip, %llu flips 6 or more refreshes after the one before\n",
++		    cur[0] - last[0], cur[1] - last[1], cur[2] - last[2], cur[3] - last[3]);
++		memcpy(last, cur, sizeof(last));
++	}
+ 	sweet_fb_stats.copy = sweet_fb_stats.clean = sweet_fb_stats.comp = sweet_fb_stats.copy_max = 0;
+ 	sweet_fb_stats.g_clean = sweet_fb_stats.g_copy = sweet_fb_stats.g_inval = 0;
+ 	sweet_fb_stats.direct = sweet_fb_stats.composed = sweet_fb_stats.gpu = 0;
+@@ -1688,7 +1830,10 @@ AppleCLCD::present(const uint8_t *rec)
+ 				uint64_t dbase = fFlip[0] != NULL ? fFlipPhys[fFlipIdx ^ 1] : fPhys;
+ 				uint32_t seed_now = s->state != NULL ? *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
+ 				if (!(s->gpuDrawn && seed_now == s->gpuSeed)) {
++					uint64_t clean_t0 = mach_absolute_time();
+ 					sweet_dcache_clean((vm_offset_t)(src + s->offset), (unsigned)((uint64_t)s->height * s->bytesPerRow));
++					sweet_fbd.cleans++;             /* 0336: the whole surface out of the CPU caches for this frame */
++					sweet_fbd.clean_us += sweet_fbd_us(clean_t0, mach_absolute_time());
+ 				}
+ 				/* the panel's window of the 3x picture, in the 2x one's pixels << 8 (0321: of the part drawn) */
+ 				int rs = sweet_fb_rscale >= 400 && sweet_fb_rscale <= 1000 ? sweet_fb_rscale : 1000;
+@@ -1810,7 +1955,12 @@ AppleCLCD::present(const uint8_t *rec)
+ 		 * (0235: flipWhenCopied(), at the next swap or vsync tick), no clean
+ 		 */
+ 		if (fFlip[0] != NULL) {
++			if (fFlipWait) {
++				/* 0336: the frame before this one is still waiting for its flip, and this copy goes over it */
++				sweet_fbd.overwritten++;
++			}
+ 			fFlipWait = true;
++			sweet_fbd.pend_swap = mach_absolute_time();
+ 		}
+ 		if (sweet_fb_stats_on()) {
+ 			sweet_fb_stats.gpu++;
+@@ -2056,6 +2206,8 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
++		sweet_fbd.swap_waits++;         /* 0336: how often the window server asks to wait for a swap (answered at once) */
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -2382,3 +2534,55 @@ sweet_fb_frame_stats SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_frame_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     NULL, 0, sweet_fb_frame_stats, "A", "0286: swaps held until their frame was sent");
++
++/*
++ * sapphire 0336: kern.sweet_fb_diag, the presentation path's counters and histograms (sweet_fbd, at the top). Read
++ * only; two readings subtracted give what happened in between.
++ */
++#define SWEET_FBD_CAT(...) do { \
++	if (off + 1 < sizeof(buf)) { \
++		int n_ = snprintf(buf + off, sizeof(buf) - off, __VA_ARGS__); \
++		if (n_ > 0) { \
++			off = off + (size_t)n_ < sizeof(buf) ? off + (size_t)n_ : sizeof(buf) - 1; \
++		} \
++	} \
++} while (0)
++
++static int
++sweet_fb_diag_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[2048];
++	size_t off = 0;
++	static const struct {
++		const char *name;
++		const struct sweet_fbd_hist *h;
++		unsigned n;
++	} hs[] = {
++		{ "swap interval (refreshes 1 2 3 4 5 6 7 8 9-10 11-12 13-18 more; us)", &sweet_fbd.swap_iv, 12 },
++		{ "flip interval (panel refreshes 0 1 2 3 4 5 6 7 8 9-10 11-12 13-18 more)", &sweet_fbd.flip_iv, 13 },
++		{ "swap to flip (ms <2 <4 <8 <12 <16 <24 <32 <48 <64 <100 <200 more; us)", &sweet_fbd.swap_to_flip, 12 },
++		{ "tick late (us <50 <100 <200 <400 <800 <1600 <3200 <6400 <12800 more)", &sweet_fbd.tick_late, 10 },
++	};
++
++	buf[0] = 0;
++	SWEET_FBD_CAT("swaps %llu flips %llu (by swap %llu, by tick %llu) cpu flips %llu overwritten %llu grid restarts %llu swap waits %llu\n",
++	    sweet_fbd.swaps, sweet_fbd.flips, sweet_fbd.flips_by_swap, sweet_fbd.flips_by_tick, sweet_fbd.cpu_flips,
++	    sweet_fbd.overwritten, sweet_fbd.grid_restarts, sweet_fbd.swap_waits);
++	for (unsigned i = 0; i < sizeof(hs) / sizeof(hs[0]); i++) {
++		SWEET_FBD_CAT("%s:", hs[i].name);
++		for (unsigned k = 0; k < hs[i].n; k++) {
++			SWEET_FBD_CAT(" %llu", hs[i].h->n[k]);
++		}
++		SWEET_FBD_CAT("; count %llu sum %llu max %llu\n", hs[i].h->count, hs[i].h->sum, hs[i].h->max);
++	}
++	SWEET_FBD_CAT("flip written in eighth of the refresh:");
++	for (unsigned k = 0; k < 8; k++) {
++		SWEET_FBD_CAT(" %llu", sweet_fbd.flip_eighth[k]);
++	}
++	SWEET_FBD_CAT("\npresent: %llu, %llu us in all, max %llu us; surface cleans %llu, %llu us in all\n", sweet_fbd.presents,
++	    sweet_fbd.present_us, sweet_fbd.present_max_us, sweet_fbd.cleans, sweet_fbd.clean_us);
++	return SYSCTL_OUT(req, buf, off + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_diag, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_fb_diag_sysctl, "A", "sapphire 0336: presentation path counters and histograms");

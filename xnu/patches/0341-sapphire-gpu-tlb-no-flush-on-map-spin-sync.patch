@@ -1,0 +1,127 @@
+0341: SapphireGpu: GPU SMMU TLB not invalidated after only mapping; TLB sync waited for without sleeping (kern.sweet_gpu_tlb, default 3)
+
+Needs 0336. Both changes are on by default; kern.sweet_gpu_tlb=0 (read-write, boot-arg gpu_tlb=0) restores
+the previous code.
+
+Measured with 0336 (15 minutes): 13358 TLB invalidations, 0.97 s, 73 us each with the ring's lock held;
+13251 of them slept. Every GEM_NEW paid one (place()) and every free another (freeBo()).
+
+- Bit 1 (2): the wait for TLBSTATUS.SACTIVE reads the register without sleeping for up to 200 us before it
+  falls back on poll(). poll() waits with IODelay(1), which blocks the thread in this port
+  (ml_delay_should_spin() is false). Linux reads the status TLB_SPIN_COUNT times before it delays
+  (arm-smmu.c __arm_smmu_tlb_sync, qcom_smmu_tlb_sync).
+- Bit 0 (1): place() does not invalidate after only mapping a buffer: the entries it writes were invalid,
+  and a range of GPU addresses is reused only after freeBo() unmapped and invalidated it. Linux's
+  msm_iommu_pagetable_map() invalidates nothing either; unmap calls iommu_flush_iotlb_all(). Paths that
+  replace live entries (map_window(), map_identity(), place()'s failure path, every unmap) still
+  invalidate. An invalidation not seen to finish sets tlb_stale, and while it is set place() invalidates
+  as before.
+
+kern.sweet_gpu_tlb_stats (read only): invalidations waited for without sleeping, polls, fallbacks to
+sleeping, buffers mapped with and without an invalidation.
+
+Locking: tlb_flush() runs under service_lock as before; the wait spins with the mutex held, preemptible,
+for 200 us at most. Not measured separately on the phone (it is on in every kernel measured since).
+
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -1522,16 +1522,55 @@ unmap_page_4k(uint64_t va)
+ 	l3[(va >> 12) & 511] = 0;
+ }
+ 
++/*
++ * sapphire 0341: kern.sweet_gpu_tlb (boot-arg gpu_tlb), two bits, both set by default; 0 is as before.
++ *   2  the wait for the invalidation to finish looks at TLBSTATUS without sleeping, for up to 200 us, before it
++ *      falls back on poll(). poll() waits with IODelay(1), which on this port blocks the thread (ml_delay_should_spin()
++ *      is false: SweetCPU gives no idle latency), and the sync is almost never over at the first look: 13251 of
++ *      13358 invalidations slept, 73 us each on average, with the ring's lock held (measured with 0336). Linux spins
++ *      too before it delays (arm-smmu.c, __arm_smmu_tlb_sync: TLB_SPIN_COUNT reads, then udelay).
++ *   1  a buffer that is only being mapped is not followed by an invalidation (place()). The entries written were
++ *      invalid before, the SMMU caches no translation it could not make, and a range of GPU addresses is given out
++ *      again only after freeBo() has unmapped it and invalidated: there is nothing stale to remove. Linux does the
++ *      same: msm_iommu_pagetable_map() invalidates nothing, msm_iommu_pagetable_unmap() invalidates everything.
++ *      The windows of the panel's copies replace live entries and go on invalidating (map_window()).
++ * An invalidation that was not seen to finish leaves tlb_stale set, and then nothing is mapped without another.
++ */
++static int gpu_tlb = 3;
++static bool tlb_stale;
++static struct {
++	uint64_t spun, looks, fell_back, maps_plain, maps_flushed;
++} gtlb;
++
+ /* TLBIASID 0, then TLBSYNC and wait for TLBSTATUS.SACTIVE to clear. */
+ static bool
+ tlb_flush(void)
+ {
+ 	uint64_t t0 = mach_absolute_time(), sleeps = gdiag.poll_sleeps;         /* 0336 */
++	bool ok = false;
+ 
+ 	gmb();
+ 	wr(smmu, 0x8610, 0);
+ 	wr(smmu, 0x87f0, 0);
+-	bool ok = poll(smmu, 0x87f4, 1, 0, 1000);
++	if (gpu_tlb & 2) {
++		uint64_t span;
++		nanoseconds_to_absolutetime(200 * NSEC_PER_USEC, &span);
++		gtlb.spun++;
++		do {
++			gtlb.looks++;
++			if ((rd(smmu, 0x87f4) & 1) == 0) {
++				ok = true;
++				break;
++			}
++		} while (mach_absolute_time() - t0 < span);
++		if (!ok) {
++			gtlb.fell_back++;
++		}
++	}
++	if (!ok) {
++		ok = poll(smmu, 0x87f4, 1, 0, 1000);
++	}
++	tlb_stale = !ok;
+ 	gdiag_since(&gdiag.tlb, t0);
+ 	if (gdiag.poll_sleeps != sleeps) {
+ 		gdiag.tlb_slept++;                      /* the sync was not over at the first look: the thread slept */
+@@ -1539,6 +1578,22 @@ tlb_flush(void)
+ 	return ok;
+ }
+ 
++static int
++sweet_gpu_tlb_stats_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char line[256];
++
++	snprintf(line, sizeof(line), "tlb (kern.sweet_gpu_tlb %d): invalidations waited for without sleeping %llu, in %llu looks, %llu fell back on sleeping; "
++	    "buffers mapped without an invalidation %llu, with one %llu\n", gpu_tlb, gtlb.spun, gtlb.looks, gtlb.fell_back, gtlb.maps_plain,
++	    gtlb.maps_flushed);
++	return SYSCTL_OUT(req, line, strlen(line) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_tlb_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_tlb_stats_sysctl, "A", "sapphire 0341: the GPU SMMU's TLB invalidations");
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_tlb, CTLFLAG_RW | CTLFLAG_LOCKED, &gpu_tlb, 0,
++    "sapphire 0341: bit 0 = no TLB invalidation after only mapping a buffer, bit 1 = wait for the sync without sleeping (0 = as before)");
++
+ static bool
+ smmu_pagetables(void)
+ {
+@@ -4263,6 +4318,11 @@ SapphireGPUClient::place(struct msm_bo *b)
+ 			return false;
+ 		}
+ 	}
++	if ((gpu_tlb & 1) && !tlb_stale) {
++		gtlb.maps_plain++;              /* 0341: only mapped: nothing stale to invalidate (see gpu_tlb) */
++		return true;
++	}
++	gtlb.maps_flushed++;
+ 	return tlb_flush();
+ }
+ 
+@@ -4984,6 +5044,7 @@ sapphire_gpu_init(void)
+ 	if (!PE_parse_boot_argn("gpu", &stage, sizeof(stage)) || stage == 0) {
+ 		return;
+ 	}
++	(void)PE_parse_boot_argn("gpu_tlb", &gpu_tlb, sizeof(gpu_tlb));         /* 0341 */
+ 	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}

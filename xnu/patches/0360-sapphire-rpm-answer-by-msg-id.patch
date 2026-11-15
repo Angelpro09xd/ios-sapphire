@@ -1,0 +1,248 @@
+0360: TopazModem: the RPM client takes the answer to the request it waits for (msg#), polls the first 200 us finely, always locks
+
+The RPM client (0194, 0202, 0204, 0248) waited for an answer after each request, not for the answer to it.
+The RPM answers every request with a "msg#" message holding the request's msg_id (Linux smd-rpm.c
+qcom_smd_rpm_callback(); the stock rpm-smd.c matches acks by msg_id too). An answer that arrived after the
+~1 s wait had given up was taken for the next request's.
+
+- rpm_request() sends one request and waits for the answer whose "msg#" is its msg_id; an answer for another
+  msg_id is counted (stale) and dropped, logged the first 8 times.
+- rpm_poll() looks every 10 us for the first 200 us, then every 1 ms as before.
+- rpm_lock_get(): the lock is made by whoever comes first (the audio path's LDO14 votes, 0194, could write
+  the FIFO unlocked as the first user).
+- topaz_rpm_stats(): requests, refusals, timeouts, stale answers and the longest wait, for 0361.
+
+The bytes of a request do not change (the same as Linux v6.12 qcom_rpm_smd_write and the phone's Android
+rpm-smd.c, format V0). Checked on the host against a model of the RPM's message RAM and glink: byte
+comparison with Linux's and the stock code; a late answer during the next request's wait is dropped and the
+next refusal is reported. On the phone it carries every RPM vote of 0361 (below).
+
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -10936,6 +10936,19 @@ static bool rpm_version, rpm_remote_open, rpm_open_sent, rpm_open_acked;
+ static int rpm_status = 1;                      /* the last answer: 1 none yet, 0 ok, < 0 refused */
+ static uint8_t rpm_buf[256];
+ static uint32_t rpm_len;
++/*
++ * 0360: the answer belongs to the request in flight. The RPM answers every request with a "msg#" message holding the
++ * request's msg_id (smd-rpm.c qcom_smd_rpm_callback, RPM_MSG_TYPE_MSG_ID). An answer that comes after the wait gave up
++ * (-4) used to be taken for the next request's, and every later status was one request late; now an answer for
++ * another msg_id is counted and dropped.
++ */
++extern "C" uint64_t mach_absolute_time(void);
++extern "C" void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
++static uint32_t rpm_wait_id;                    /* the msg_id whose answer rpm_status waits for (0: any) */
++static struct {
++	uint64_t requests, refused, timeouts, stale, wait_us_max;
++	uint32_t last_stale_id;
++} rpm_st;
+ 
+ static void
+ rpm_peek(uint32_t off, void *dst, uint32_t n)   /* whole words */
+@@ -11026,17 +11039,32 @@ rpm_answer(const uint8_t *p, uint32_t len)
+ 		rpm_status = -1;
+ 		return;
+ 	}
+-	uint32_t off = 8, end = MIN(len, 8 + h[1]);
++	uint32_t off = 8, end = MIN(len, 8 + h[1]), id = 0;
++	bool has_id = false;
++	char s[40] = {};
+ 	while (off + 8 <= end) {
+ 		uint32_t type = *(const uint32_t *)(p + off), mlen = *(const uint32_t *)(p + off + 4);
+-		if (type == 0x00727265) {                       /* "err" */
+-			char s[40] = {};
++		if (type == 0x2367736d && mlen >= 4 && off + 12 <= end) {     /* 0360: "msg#", the request's msg_id */
++			id = *(const uint32_t *)(p + off + 8);
++			has_id = true;
++		} else if (type == 0x00727265) {                       /* "err" */
+ 			memcpy(s, p + off + 8, MIN(mlen, (uint32_t)sizeof(s) - 1));
+-			LOG("adsp: RPM: refused: \"%s\"", s);
+ 			st = -2;
+ 		}
+ 		off += (8 + mlen + 3) & ~3u;
+ 	}
++	if (has_id && rpm_wait_id != 0 && id != rpm_wait_id) {
++		rpm_st.stale++;
++		rpm_st.last_stale_id = id;
++		if (rpm_st.stale <= 8) {
++			LOG("adsp: RPM: an answer for msg %u (%s) while msg %u waits: dropped", id, st == 0 ? "taken" : s,
++			    rpm_wait_id);
++		}
++		return;
++	}
++	if (st != 0) {
++		LOG("adsp: RPM: refused: \"%s\"", s);
++	}
+ 	rpm_status = st;
+ }
+ 
+@@ -11140,6 +11168,14 @@ rpm_rx_one(void)
+ static void
+ rpm_poll(unsigned ms, bool (*done)(void))
+ {
++	/* 0360: the first 200 us in 10 us steps, then 1 ms ones: an answer in tens of us is not waited for a whole ms */
++	for (unsigned i = 0; i < 20 && !done(); i++) {
++		while (rpm_rx_one()) {
++		}
++		if (!done()) {
++			IODelay(10);
++		}
++	}
+ 	for (unsigned i = 0; i < ms && !done(); i++) {
+ 		while (rpm_rx_one()) {
+ 		}
+@@ -11197,6 +11233,36 @@ rpm_start(void)
+ 	return rpm_open_acked;
+ }
+ 
++/*
++ * 0360: one request out and its own answer back: 0, -2 refused ("err"), -3 the TX FIFO full, -4 no answer for it in
++ * about a second. The caller holds rpm_lock.
++ */
++static int
++rpm_request(const void *pkt, uint32_t size, uint32_t msg_id)
++{
++	uint64_t t0 = mach_absolute_time(), ns;
++
++	rpm_wait_id = msg_id;
++	rpm_status = 1;
++	rpm_st.requests++;
++	if (!rpm_write(pkt, size, NULL, 0)) {
++		return -3;
++	}
++	rpm_poll(1000, rpm_answered);
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	if (ns / 1000 > rpm_st.wait_us_max) {
++		rpm_st.wait_us_max = ns / 1000;
++	}
++	if (rpm_status == 1) {
++		rpm_st.timeouts++;
++		return -4;
++	}
++	if (rpm_status != 0) {
++		rpm_st.refused++;
++	}
++	return rpm_status;
++}
++
+ /* an LDO: on, at uv, for ma; set 0 the active set, 1 the sleep set */
+ static int
+ rpm_ldo(uint32_t id, uint32_t uv, uint32_t ma, uint32_t set)
+@@ -11221,12 +11287,7 @@ rpm_ldo(uint32_t id, uint32_t uv, uint32_t ma, uint32_t set)
+ 	pkt.kvp[0] = 0x6e657773; pkt.kvp[1] = 4; pkt.kvp[2] = 1;       /* "swen" */
+ 	pkt.kvp[3] = 0x00007675; pkt.kvp[4] = 4; pkt.kvp[5] = uv;      /* "uv" */
+ 	pkt.kvp[6] = 0x0000616d; pkt.kvp[7] = 4; pkt.kvp[8] = ma;      /* "ma" */
+-	rpm_status = 1;
+-	if (!rpm_write(&pkt, sizeof(pkt), NULL, 0)) {
+-		return -3;
+-	}
+-	rpm_poll(1000, rpm_answered);
+-	return rpm_status == 1 ? -4 : rpm_status;
++	return rpm_request(&pkt, sizeof(pkt), pkt.msg_id);
+ }
+ 
+ /*
+@@ -11254,12 +11315,7 @@ rpm_kvp(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value)
+ 	pkt.rid = id;
+ 	pkt.dlen = sizeof(pkt.kvp);
+ 	pkt.kvp[0] = key; pkt.kvp[1] = 4; pkt.kvp[2] = value;
+-	rpm_status = 1;
+-	if (!rpm_write(&pkt, sizeof(pkt), NULL, 0)) {
+-		return -3;
+-	}
+-	rpm_poll(1000, rpm_answered);
+-	return rpm_status == 1 ? -4 : rpm_status;
++	return rpm_request(&pkt, sizeof(pkt), pkt.msg_id);
+ }
+ 
+ /*
+@@ -11268,6 +11324,19 @@ rpm_kvp(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value)
+  */
+ static IOLock *rpm_lock;
+ 
++/* 0360: the lock, made by whoever comes first (the audio path took it only if it existed already) */
++static IOLock *
++rpm_lock_get(void)
++{
++	if (rpm_lock == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (!OSCompareAndSwapPtr(NULL, l, (void * volatile *)&rpm_lock)) {
++			IOLockFree(l);
++		}
++	}
++	return rpm_lock;
++}
++
+ static bool
+ rpm_ensure(void)
+ {
+@@ -11277,15 +11346,10 @@ rpm_ensure(void)
+ extern "C" int
+ topaz_rpm_vote(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value)
+ {
+-	if (rpm_lock == NULL) {
+-		IOLock *l = IOLockAlloc();
+-		if (!OSCompareAndSwapPtr(NULL, l, (void * volatile *)&rpm_lock)) {
+-			IOLockFree(l);
+-		}
+-	}
+-	IOLockLock(rpm_lock);
++	IOLock *l = rpm_lock_get();
++	IOLockLock(l);
+ 	int r = rpm_ensure() ? rpm_kvp(set, type, id, key, value) : -5;
+-	IOLockUnlock(rpm_lock);
++	IOLockUnlock(l);
+ 	return r;
+ }
+ 
+@@ -11293,18 +11357,24 @@ topaz_rpm_vote(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t
+ extern "C" int
+ topaz_rpm_ldo(uint32_t id, uint32_t uv, uint32_t ma, uint32_t set)
+ {
+-	if (rpm_lock == NULL) {
+-		IOLock *l = IOLockAlloc();
+-		if (!OSCompareAndSwapPtr(NULL, l, (void * volatile *)&rpm_lock)) {
+-			IOLockFree(l);
+-		}
+-	}
+-	IOLockLock(rpm_lock);
++	IOLock *l = rpm_lock_get();
++	IOLockLock(l);
+ 	int r = rpm_ensure() ? rpm_ldo(id, uv, ma, set) : -5;
+-	IOLockUnlock(rpm_lock);
++	IOLockUnlock(l);
+ 	return r;
+ }
+ 
++/* 0360: the client's counters, for kern.sweet_bus_stats */
++extern "C" void
++topaz_rpm_stats(uint64_t *requests, uint64_t *refused, uint64_t *timeouts, uint64_t *stale, uint64_t *wait_us_max)
++{
++	*requests = rpm_st.requests;
++	*refused = rpm_st.refused;
++	*timeouts = rpm_st.timeouts;
++	*stale = rpm_st.stale;
++	*wait_us_max = rpm_st.wait_us_max;
++}
++
+ /* ---------------- the codec: from the RX macro to the speaker (audio=2) */
+ 
+ /*
+@@ -12332,14 +12402,11 @@ audio_test(void)
+ 	static bool rpm_done;
+ 	if (!rpm_done) {
+ 		rpm_done = true;
+-		if (rpm_lock != NULL) {
+-			IOLockLock(rpm_lock);
+-		}
++		IOLock *rl = rpm_lock_get();                    /* 0360: always under the lock */
++		IOLockLock(rl);
+ 		bool rpm = rpm_ensure();
+ 		int act = rpm ? rpm_ldo(14, 1800000, 650, 0) : -9, slp = rpm ? rpm_ldo(14, 1800000, 650, 1) : -9;
+-		if (rpm_lock != NULL) {
+-			IOLockUnlock(rpm_lock);
+-		}
++		IOLockUnlock(rl);
+ 		LOG("adsp: RPM: LDO14 (cdc-vdd-buck) on at 1.8 V: active set %d, sleep set %d (0: taken)", act, slp);
+ 		IOSleep(10);
+ 	}
