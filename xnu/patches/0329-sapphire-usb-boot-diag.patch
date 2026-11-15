@@ -1,0 +1,88 @@
+0329: sweet_usb: read-only snapshot of the USB block at bring-up; boot-arg sweetusb_reclaim
+
+Diagnostic only. Before the driver writes anything, the log gets the femto HS PHY (0x000-0x120), QSCRATCH
+(0x00-0x80), the GCC USB registers (0x1a000-0x1a0a0, 0x1c000, 0x1d000) and the DWC3 globals and device
+registers, as "SWEET USBDIAG <block> +off w0 w1 w2 w3" lines.
+
+boot-arg sweetusb_reclaim (default 1: 0327's reclaim on) turns 0327's HWO reclaim off with 0.
+
+Measured with it (one boot each way): after `fastboot continue` (enumerates) and after a normal boot (does
+not), the femto PHY and QSCRATCH GENERAL_CFG (0x4) are the same; GCC gcc_usb3_prim_phy_pipe_clk (CBCR
+0x1a058) reads 0x00000001 (running) after fastboot and 0x80000001 (enabled, clock off) on a normal boot,
+and the DWC3 is at reset values on a normal boot.
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -71,6 +71,53 @@ usb_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
++/*
++ * 0329 (diagnostic, read-only): dump what the boot path left in the USB block before this driver
++ * writes anything. Same image, `fastboot continue` enumerates and set_active + reboot does not
++ * (2026-11-14, VBUS present on both: PMIC usb 0x10); the DWC3 summary differs (GUSB2PHYCFG 0x2400 vs
++ * 0x2500, DCFG/DCTL/DEVTEN set vs reset values), but the femto HS PHY (0x01613000), QSCRATCH and the
++ * GCC resets/RCGs were never read. Lines "SWEET USBDIAG <block> +off w0 w1 w2 w3".
++ * sweetusb_reclaim=0 disables 0327's HWO reclaim (default 1 = unchanged), for an A/B under load.
++ */
++static int ud_reclaim_on = 1;
++
++static void
++usbdiag_dump(const char *name, vm_offset_t base, uint32_t from, uint32_t to)
++{
++	for (uint32_t o = from; o < to; o += 16) {
++		printf("SWEET USBDIAG %s +0x%05x %08x %08x %08x %08x\n", name, o,
++		    usb_rd(base, o), usb_rd(base, o + 4), usb_rd(base, o + 8), usb_rd(base, o + 12));
++	}
++}
++
++static void
++usbdiag_snapshot(vm_offset_t gcc, vm_offset_t dwc)
++{
++	vm_offset_t phy = ml_io_map(0x01613000, 0x1000);
++	vm_offset_t qs = ml_io_map(0x04ef8800, 0x100);
++
++	usbdiag_dump("GCC", gcc, 0x1a000, 0x1a0a0);     /* USB30_PRIM BCR, GDSC, CBCRs, master/mock_utmi RCGs */
++	usbdiag_dump("GCC", gcc, 0x1c000, 0x1c010);     /* HS PHY BCR */
++	usbdiag_dump("GCC", gcc, 0x1d000, 0x1d010);     /* ahb2phy */
++	usbdiag_dump("DWC3", dwc, 0xc100, 0xc160);      /* GSBUSCFG, GCTL, GSTS, GUCTL1, GSNPSID, GUCTL */
++	usbdiag_dump("DWC3", dwc, 0xc200, 0xc210);      /* GUSB2PHYCFG */
++	usbdiag_dump("DWC3", dwc, 0xc2c0, 0xc2d0);      /* GUSB3PIPECTL */
++	usbdiag_dump("DWC3", dwc, 0xc300, 0xc320);      /* GTXFIFOSIZ */
++	usbdiag_dump("DWC3", dwc, 0xc380, 0xc390);      /* GRXFIFOSIZ */
++	usbdiag_dump("DWC3", dwc, 0xc600, 0xc640);      /* GUCTL2, GFLADJ */
++	usbdiag_dump("DWC3", dwc, 0xc700, 0xc730);      /* DCFG..DALEPENA */
++	if (qs != 0) {
++		usbdiag_dump("QSCR", qs, 0x00, 0x80);
++	} else {
++		printf("SWEET USBDIAG QSCRATCH map failed\n");
++	}
++	if (phy != 0) {
++		usbdiag_dump("PHY", phy, 0x000, 0x120);
++	} else {
++		printf("SWEET USBDIAG PHY map failed\n");
++	}
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -114,6 +161,9 @@ sweet_usb_probe(void)
+ 	printf("SWEET USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
++	PE_parse_boot_argn("sweetusb_reclaim", &ud_reclaim_on, sizeof(ud_reclaim_on));
++	printf("SWEET USBDIAG reclaim(0327)=%d\n", ud_reclaim_on);
++	usbdiag_snapshot(gcc, dwc);
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+@@ -1055,7 +1105,7 @@ ud_reclaim_fast(void)
+ 	volatile uint32_t *rt = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+ 	volatile uint32_t *tt = (volatile uint32_t *)(ud.dma + UD_TRB_TX);
+ 
+-	if (!ud.configured || ud.lock == NULL) {
++	if (!ud_reclaim_on || !ud.configured || ud.lock == NULL) {
+ 		return;
+ 	}
+ 	ud_sync(UD_TRB_RX, 16);
