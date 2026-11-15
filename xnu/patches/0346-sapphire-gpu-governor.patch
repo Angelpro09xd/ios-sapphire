@@ -1,0 +1,550 @@
+0346: SapphireGpu: GPU clock governor by busy time, with a temperature cap (kern.sweet_gpu_gov, default 0)
+
+Off unless kern.sweet_gpu_gov=1 (boot-arg gpu_gov=1 starts it once the GPU service is up). Needs 0343
+(TSENS) and 0345 (gpu_opp_set).
+
+Every kern.sweet_gpu_gov_ms (50, as Linux's msm devfreq polls):
+- busy: GMU CX power counter 0, counting XO ticks while the GPU is busy, set up as kgsl and Linux set it up
+  for the a610 (GPU_GMU_AO_GPU_CX_BUSY_MASK = 0xff000000, select 0x20, enable 1; re-armed when it reads back
+  changed). Load = busy time / wall time.
+- rate: the levels of the stock device tree (320 465 600 785 1025 1114.8 1260 MHz) between
+  kern.sweet_gpu_khz_min (320000) and kern.sweet_gpu_khz_max (default: the boot rate). Load >= 95 %: the top;
+  >= kern.sweet_gpu_gov_up (80 %): at least one level up; < kern.sweet_gpu_gov_down (40 %) two periods in a
+  row: at least one level down; no work and under 2 % busy for kern.sweet_gpu_gov_idle_ms (100): the lowest
+  level. (kgsl's own policy runs in TrustZone; Linux uses simple_ondemand with up 50 / down 10.)
+- temperature: TSENS 15 (zone "gpu") with the stock zone's passive trips, run the way step_wise runs them:
+  at or over kern.sweet_gpu_temp_max (95000 m°C) one level down per rising reading; 5 C over it, 600 MHz at
+  most; three periods without a valid reading cap the rate at the lowest level.
+It stops (and gives back the boot rate) on a failed recovery, a dead busy counter (0 for 1 s while work is
+submitted) or a runaway one; kern.sweet_gpu_khz cannot be written while it runs (EBUSY).
+
+kern.sweet_gpu_gov_stats (read only): state and stop reason, rate, ladder, caps, tunables, periods, load
+(last, mean, histogram), changes, refusals, GPU temperature (last, max), counter set-ups and bad samples.
+
+Locking: one kernel thread; it changes the rate only through gpu_opp_set() (opp_lock, then service_lock).
+
+Checked on the host with the code of 0337, 0343, 0345 and this patch against the PLL/RCG/RPM/cx_ipeak model
+of 0345 and a TSENS model (idle drop, saturation, light load, both trips, unreadable sensor, dead and runaway
+counter, refused votes, stop path).
+Measured on the phone (n=1, top 1260 MHz): drops to 320 MHz at rest; during one run 25 changes up, 5 down,
+14 to idle, GPU at most 71.0 C, no thermal cap. In that session SpringBoard crashed once (SIGBUS) after a
+restart of backboardd; another SpringBoard crash after a restart happened later with the governor off. The
+cause is not established. The governor has not been run for longer than that session.
+
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -369,6 +369,10 @@ static bool opp_quiet;                          /* rate changes after boot: cx_i
+ static IOLock *opp_lock;                        /* serialises changes of rate (taken before service_lock) */
+ static uint32_t opp_drain_ms = 100;             /* boot-arg gpu_opp_drain: how long a change waits for an idle GPU */
+ static int opp_park;                            /* kern.sweet_gpu_opp_park (boot-arg gpu_opp_park) */
++/* sapphire 0346: the governor (below the msm client); its switch and the rate it gives back when it stops */
++static int gov_on;                              /* kern.sweet_gpu_gov (boot-arg gpu_gov) */
++static uint32_t gov_boot_khz;                   /* the rate the stock path of 0337 set at boot */
++static void gov_start(void);
+ /*
+  * boot-arg gpu_smmu_early: program the identity context bank as soon as its clock is voted,
+  * before the GX domain comes up, instead of in cp_start(). The GPU's SMMU comes out of the
+@@ -3630,6 +3634,12 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+ 		service_ready = true;
+ 		LOG("*** gpu_service: the GPU stays up and takes copies (%u page tables in use) ***", pt_used);
+ 		msm_publish();
++		gov_boot_khz = opp_khz;                 /* 0346 */
++		if (PE_parse_boot_argn("gpu_gov", &gov_on, sizeof(gov_on)) && gov_on != 0 && opp_khz != 0) {
++			gov_start();
++		} else {
++			gov_on = 0;
++		}
+ 	} else if (keep_running || service) {
+ 		LOG("%s: the GPU stays up%s", service ? "gpu_service" : "gpu_keep=1",
+ 		    service ? " but takes no work (needs gpu_mmu=1 and every test passed)" : "");
+@@ -4595,6 +4605,9 @@ sweet_gpu_khz_sysctl SYSCTL_HANDLER_ARGS
+ 		return error;
+ 	}
+ 	uint32_t khz = v > 0 ? opp_request_khz((uint32_t)v) : 0;
++	if (gov_on) {
++		return EBUSY;                           /* 0346: the governor sets the rate (kern.sweet_gpu_gov=0 first) */
++	}
+ 	return khz == 0 ? EINVAL : gpu_opp_set(khz, "sysctl");
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_khz, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+@@ -4634,6 +4647,480 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_opp, CTLTYPE_STRING | CTLFLAG_RD | CTLFLA
+ SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_opp_park, CTLFLAG_RW | CTLFLAG_LOCKED, &opp_park, 0,
+     "sapphire 0345: 1 = change the PLL the long way (RCG on GPLL0 / 2 meanwhile) instead of the stock dynamic update");
+ 
++/*
++ * sapphire 0346: a governor for the GPU's core clock, by how busy the GPU is, with a temperature cap. Off unless
++ * kern.sweet_gpu_gov=1 (boot-arg gpu_gov=1 starts it once the GPU service is up). Every gpu_gov_ms (50):
++ *   - busy: GMU CX power counter 0, which counts XO ticks (19.2 MHz) while the GPU is busy -- the counter kgsl
++ *     (a6xx_power_stats: busy_us = ticks * 10 / 192) and Linux (a6xx_gpu_busy, also for the GMU wrapper of the a610)
++ *     read, set up as both set it up: GPU_GMU_AO_GPU_CX_BUSY_MASK = 0xff000000, GMU_CX_GMU_POWER_COUNTER_SELECT_0[7:0]
++ *     = 0x20, GMU_CX_GMU_POWER_COUNTER_ENABLE = 1 (kgsl a6xx_start; dword offsets 0x23b0e, 0x1f841, 0x1f840 and the
++ *     count at 0x1f844 from the GPU's 0x5900000, so 0x598ec38, 0x597e104, 0x597e100 and 0x597e110); load = busy time /
++ *     wall time;
++ *   - rate: the levels of the stock device tree (320 465 600 785 1025 1114.8 1260 MHz) between kern.sweet_gpu_khz_min
++ *     (320000) and kern.sweet_gpu_khz_max (0: the boot rate; a rate of the stock table that is no level of the tree,
++ *     820 for one, joins the ladder as its top). Load >= 95 %: the top (Linux's simple_ondemand goes to the top over
++ *     its 50 %, kgsl's msm-adreno-tz over 50 ms busy in a window); >= kern.sweet_gpu_gov_up (80 %): at least one level
++ *     up, as far as the level that would bring the load to the middle of up and down; < kern.sweet_gpu_gov_down (40 %)
++ *     for two periods in a row: at least one level down, as far as that same level; no submission, no panel copy and
++ *     under 2 % for kern.sweet_gpu_gov_idle_ms (100): the lowest level (kgsl drops the GPU's clocks at once when
++ *     idle and to its lowest level after 80 ms);
++ *   - temperature: TSENS 15 (zone "gpu"). The stock zone has a passive trip at 95 C, handled by step_wise with the
++ *     kgsl cooling device (state N = level N): one level down for each reading at or over the trip that is higher than
++ *     the one before, one level back up for each reading under it that is not higher; and a trip at 100 C whose
++ *     cooling map starts at state 4 (600 MHz). Here kern.sweet_gpu_temp_max (95000 mC) is the first trip and 5 C over
++ *     it the second, read every period. A GPU sensor that gives no valid value three periods in a row caps the rate at
++ *     the lowest level until it reads again.
++ * A change goes through gpu_opp_set() (0345). A GPU that does not go idle in time is tried again at the next period;
++ * a refused peak-current or rail vote keeps the governor under that level; no stock path, no service, or a failed
++ * recovery stop it. A busy counter that does not move while work is submitted for a second stops it too (it would
++ * keep the GPU at its lowest level). When it stops it gives back the boot rate. kern.sweet_gpu_khz cannot be written
++ * while it runs (EBUSY). kern.sweet_gpu_gov_stats tells what it saw and did; the time at each rate is in
++ * kern.sweet_gpu_opp.
++ */
++#define GMU_PWR_PA          0x0597e000ull
++#define GMU_PWR_ENABLE      0x100u
++#define GMU_PWR_SELECT_0    0x104u
++#define GMU_PWR_XOCLK_0_L   0x110u
++#define GMU_AO_PA           0x0598e000ull
++#define GMU_AO_CX_BUSY_MASK 0xc38u
++#define GOV_LEVELS          8u
++static int gov_khz_max, gov_khz_min = 320000, gov_temp_max = 95000;
++static int gov_ms = 50, gov_up = 80, gov_down = 40, gov_idle_ms = 100;
++static volatile uint8_t *gmu_pwr, *gmu_ao;
++static volatile bool gov_running;
++static struct {
++	uint64_t ticks, up, down, idle_drops, refused_busy, refused_other, capped_ticks, temp_lost, counter_setups;
++	uint64_t bad_samples, load_hist[10], load_sum;
++	uint32_t last_load, cap_khz, refused_khz, last_busy;
++	int32_t last_temp, max_temp;
++	const char *stopped;
++} ggov;
++
++static const uint32_t gov_dt_levels[] = { 320000, 465000, 600000, 785000, 1025000, 1114800, 1260000 };
++
++/* The ladder the governor moves on, lowest first; its length. */
++static unsigned
++gov_ladder(uint32_t *lv)
++{
++	uint32_t top = gov_khz_max > 0 ? (uint32_t)gov_khz_max : gov_boot_khz, low = (uint32_t)MAX(gov_khz_min, 320000);
++	uint32_t anybin = 0;
++	unsigned n = 0;
++
++	(void)PE_parse_boot_argn("gpu_anybin", &anybin, sizeof(anybin));
++	if (anybin == 0 && top > bin_max_khz(bin_fuse)) {
++		top = bin_max_khz(bin_fuse);
++	}
++	for (unsigned i = 0; i < sizeof(gov_dt_levels) / sizeof(gov_dt_levels[0]); i++) {
++		if (gov_dt_levels[i] >= low && gov_dt_levels[i] <= top) {
++			lv[n++] = gov_dt_levels[i];
++		}
++	}
++	if (opp_row(top) >= 0 && (n == 0 || lv[n - 1] != top) && top >= low) {
++		lv[n++] = top;                          /* a rate of the clock's table that is no level of the tree: the top */
++	}
++	return n;
++}
++
++/* The index of the lowest level of the ladder at or above khz (the top if none). */
++static unsigned
++gov_index_for(const uint32_t *lv, unsigned n, uint64_t khz)
++{
++	for (unsigned i = 0; i < n; i++) {
++		if (lv[i] >= khz) {
++			return i;
++		}
++	}
++	return n - 1;
++}
++
++/* The busy counter, set up as kgsl and Linux set it (again if it was changed, e.g. by a reset of the GPU). */
++static bool
++gov_counter(uint32_t *ticks)
++{
++	if (map_reg_page(&gmu_pwr, GMU_PWR_PA) == NULL || map_reg_page(&gmu_ao, GMU_AO_PA) == NULL) {
++		return false;
++	}
++	if ((rd(gmu_pwr, GMU_PWR_SELECT_0) & 0xffu) != 0x20u || (rd(gmu_pwr, GMU_PWR_ENABLE) & 1u) == 0 ||
++	    rd(gmu_ao, GMU_AO_CX_BUSY_MASK) != 0xff000000u) {
++		wr(gmu_ao, GMU_AO_CX_BUSY_MASK, 0xff000000u);
++		rmw(gmu_pwr, GMU_PWR_SELECT_0, 0xffu, 0x20u);
++		wr(gmu_pwr, GMU_PWR_ENABLE, 1);
++		ggov.counter_setups++;
++	}
++	*ticks = rd(gmu_pwr, GMU_PWR_XOCLK_0_L);
++	return true;
++}
++
++/* Thermal state across periods: the cap is a rate (kHz), so that it keeps its meaning if the ladder changes. */
++static struct {
++	uint32_t cap;                           /* the rate may not exceed it; ~0: no cap */
++	int fails;
++	int32_t last;
++	bool have_last;
++} gtherm;
++
++/* The highest level of the ladder at or under khz (the lowest if none). */
++static unsigned
++gov_index_under(const uint32_t *lv, unsigned n, uint32_t khz)
++{
++	unsigned i = 0;
++
++	while (i + 1 < n && lv[i + 1] <= khz) {
++		i++;
++	}
++	return i;
++}
++
++/* The cap from the GPU's temperature, step_wise as the stock zone runs it (see above): an index into the ladder. */
++static unsigned
++gov_thermal(const uint32_t *lv, unsigned n)
++{
++	int32_t t = 0;
++	int e = tsens_read(TSENS_GPU, &t);
++	unsigned top = n - 1;
++
++	if (e != 0) {
++		ggov.temp_lost++;
++		if (++gtherm.fails >= 3) {
++			return 0;                       /* no temperature: the lowest level until it reads again */
++		}
++		return gtherm.cap >= lv[top] ? top : gov_index_under(lv, n, gtherm.cap);
++	}
++	if (gtherm.fails >= 3) {
++		gtherm.cap = ~0u;                       /* it reads again: the step-wise state starts over */
++	}
++	gtherm.fails = 0;
++	int32_t trip = MAX(gov_temp_max, 50000), hard = trip + 5000;
++	bool rising = gtherm.have_last && t > gtherm.last;
++	unsigned c = gtherm.cap >= lv[top] ? top : gov_index_under(lv, n, gtherm.cap);
++	if (t >= trip) {
++		if (rising && c > 0) {
++			c--;                            /* one cooling state more */
++		}
++	} else if (!rising && c < top) {
++		c++;                                    /* one cooling state less */
++	}
++	if (t >= hard) {
++		unsigned h = gov_index_under(lv, n, 600000);
++		if (c > h) {
++			c = h;                          /* the stock 100 C map starts at state 4: 600 MHz */
++		}
++	}
++	gtherm.cap = c >= top ? ~0u : lv[c];
++	gtherm.last = t;
++	gtherm.have_last = true;
++	ggov.last_temp = t;
++	if (t > ggov.max_temp) {
++		ggov.max_temp = t;
++	}
++	return c;
++}
++
++/* Where the governor's state across periods lives (the thread's). */
++static struct {
++	uint32_t busy, seq;
++	uint64_t copies, time;
++	uint32_t idle_ms, low;
++	bool have;
++	uint32_t dead_ms, bad;
++} gstate;
++
++/* One period. false: the governor has to stop (ggov.stopped says why). */
++static bool
++gov_tick(void)
++{
++	uint32_t lv[GOV_LEVELS], busy, seq = msm_seq;
++	uint64_t now = mach_absolute_time(), copies = gdiag.copy_n, wall_ns;
++	unsigned n = gov_ladder(lv);
++
++	if (n == 0) {
++		ggov.stopped = "no level between kern.sweet_gpu_khz_min and kern.sweet_gpu_khz_max";
++		return false;
++	}
++	if (!gov_counter(&busy)) {
++		ggov.stopped = "the GMU's power counter could not be mapped";
++		return false;
++	}
++	unsigned cap = gov_thermal(lv, n);
++	if (!gstate.have) {
++		gstate.have = true;
++		gstate.busy = busy;
++		gstate.seq = seq;
++		gstate.copies = copies;
++		gstate.time = now;
++		return true;
++	}
++	absolutetime_to_nanoseconds(now - gstate.time, &wall_ns);
++	uint64_t busy_ns = (uint64_t)(busy - gstate.busy) * 10000ull / 192ull;      /* 19.2 MHz ticks */
++	bool work = seq != gstate.seq || copies != gstate.copies;
++	gstate.busy = busy;
++	gstate.seq = seq;
++	gstate.copies = copies;
++	gstate.time = now;
++	ggov.ticks++;
++	if (wall_ns == 0 || busy_ns > wall_ns + wall_ns / 20) {
++		ggov.bad_samples++;                     /* a reset of the counter, or a period too short to tell */
++		if (++gstate.bad >= 20) {
++			ggov.stopped = "the busy counter counts faster than the wall clock";
++			return false;
++		}
++		return true;
++	}
++	gstate.bad = 0;
++	uint32_t load = (uint32_t)(busy_ns * 100 / wall_ns), wall_ms = (uint32_t)(wall_ns / 1000000);
++	ggov.last_load = load;
++	ggov.last_busy = (uint32_t)(busy_ns / 1000);
++	ggov.load_sum += load;
++	ggov.load_hist[load >= 100 ? 9 : load / 10]++;
++	/* a counter that never moves while work comes would hold the GPU at its lowest level */
++	if (work) {
++		gstate.dead_ms = busy_ns == 0 ? gstate.dead_ms + wall_ms : 0;
++	}
++	if (gstate.dead_ms >= 1000) {
++		ggov.stopped = "the busy counter does not count while work is submitted";
++		return false;
++	}
++	unsigned cur = gov_index_for(lv, n, opp_khz), target = cur;
++	uint32_t up = (uint32_t)MAX(MIN(gov_up, 99), 2), down = (uint32_t)MIN(MAX(gov_down, 1), (int)up - 1);
++	uint64_t want = (uint64_t)opp_khz * load / ((up + down) / 2);
++	gstate.idle_ms = !work && load < 2 ? gstate.idle_ms + wall_ms : 0;
++	if (gstate.idle_ms >= (uint32_t)MAX(gov_idle_ms, 0)) {
++		target = 0;
++		gstate.low = 0;
++	} else if (load >= 95) {
++		target = n - 1;
++		gstate.low = 0;
++	} else if (load >= up) {
++		target = MAX(cur + 1 < n ? cur + 1 : cur, gov_index_for(lv, n, want));
++		gstate.low = 0;
++	} else if (load < down) {
++		if (++gstate.low >= 2) {
++			unsigned w = gov_index_for(lv, n, want);
++			target = cur > 0 ? MIN(cur - 1, w) : 0;
++			gstate.low = 0;
++		}
++	} else {
++		gstate.low = 0;
++	}
++	if (target > cap) {
++		target = cap;
++		ggov.capped_ticks++;
++	}
++	if (ggov.refused_khz != 0) {
++		while (target > 0 && lv[target] >= ggov.refused_khz) {
++			target--;
++		}
++	}
++	ggov.cap_khz = lv[cap];
++	if (lv[target] == opp_khz) {
++		return true;
++	}
++	int e = gpu_opp_set(lv[target], NULL);
++	if (e == 0) {
++		if (target == 0 && gstate.idle_ms != 0) {
++			ggov.idle_drops++;
++		} else if (lv[target] > opp_khz || target > cur) {
++			ggov.up++;
++		} else {
++			ggov.down++;
++		}
++	} else if (e == EBUSY) {
++		ggov.refused_busy++;
++	} else if (e == EAGAIN || e == EIO || e == EINVAL) {
++		ggov.refused_other++;
++		if (lv[target] > opp_khz && !opp_broken) {
++			ggov.refused_khz = lv[target];   /* stay under it from now on */
++			LOG("gov: %u kHz refused (%d): the governor stays under it", lv[target], e);
++		}
++		if (opp_broken) {
++			ggov.stopped = "a change failed and could not be recovered";
++			return false;
++		}
++	} else {
++		ggov.stopped = "no stock path or no GPU service";
++		return false;
++	}
++	return true;
++}
++
++static void
++gov_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	bzero(&gstate, sizeof(gstate));
++	bzero(&gtherm, sizeof(gtherm));
++	gtherm.cap = ~0u;
++	ggov.stopped = NULL;
++	ggov.refused_khz = 0;
++	LOG("gov: on (%d ms; up %d%%, down %d%%, idle %d ms; %d to %u kHz; temperature trip %d mC)", gov_ms, gov_up, gov_down,
++	    gov_idle_ms, gov_khz_min, gov_khz_max > 0 ? (uint32_t)gov_khz_max : gov_boot_khz, gov_temp_max);
++	while (gov_on && service_ready && !opp_broken) {
++		if (!gov_tick()) {
++			break;
++		}
++		IOSleep((uint32_t)MIN(MAX(gov_ms, 10), 1000));
++	}
++	if (ggov.stopped == NULL) {
++		ggov.stopped = !gov_on ? "kern.sweet_gpu_gov=0" : !service_ready ? "the GPU service stopped" : "a change failed";
++	}
++	gov_on = 0;
++	for (int i = 0; i < 20 && gov_boot_khz != 0 && opp_khz != gov_boot_khz && service_ready && !opp_broken; i++) {
++		if (gpu_opp_set(gov_boot_khz, NULL) != EBUSY) {
++			break;
++		}
++		IOSleep(50);
++	}
++	LOG("gov: off (%s), at %u kHz", ggov.stopped, opp_khz);
++	gov_running = false;
++	thread_terminate(current_thread());
++}
++
++/* Starts the governor's thread unless it runs (gov_on set by the caller). */
++static void
++gov_start(void)
++{
++	thread_t thread;
++
++	if (!OSCompareAndSwap8(false, true, (volatile UInt8 *)&gov_running)) {
++		return;
++	}
++	if (kernel_thread_start(gov_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		gov_running = false;
++		gov_on = 0;
++	}
++}
++
++static int
++sweet_gpu_gov_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = gov_on;
++	int error = sysctl_io_number(req, v, sizeof(v), &v, NULL);
++
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (v != 0) {
++		if (opp_khz == 0 || opp_broken || !service_ready || gov_boot_khz == 0) {
++			return ENODEV;
++		}
++		if (gov_running && !gov_on) {
++			return EBUSY;                   /* still stopping: try again in a moment */
++		}
++		gov_on = 1;
++		gov_start();
++	} else {
++		gov_on = 0;                             /* the thread gives back the boot rate and ends */
++	}
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_gov, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_gov_sysctl, "I", "sapphire 0346: 1 = the GPU's clock follows how busy it is, capped by temperature");
++
++/* kern.sweet_gpu_khz_max / _min: a rate of the stock table (kHz, or MHz), not above the speed bin's top; 0 = default. */
++static int
++gov_khz_sysctl(struct sysctl_req *req, int *where, int dflt)
++{
++	int v = *where != 0 ? *where : dflt;
++	int error = sysctl_io_number(req, v, sizeof(v), &v, NULL);
++	uint32_t anybin = 0;
++
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (v == 0) {
++		*where = 0;
++		return 0;
++	}
++	uint32_t khz = v > 0 ? opp_request_khz((uint32_t)v) : 0;
++	(void)PE_parse_boot_argn("gpu_anybin", &anybin, sizeof(anybin));
++	if (khz == 0 || (khz > bin_max_khz(bin_fuse) && anybin == 0)) {
++		return EINVAL;
++	}
++	*where = (int)khz;
++	return 0;
++}
++
++static int
++sweet_gpu_khz_max_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	return gov_khz_sysctl(req, &gov_khz_max, (int)gov_boot_khz);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_khz_max, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_khz_max_sysctl, "I", "sapphire 0346: the governor's top rate in kHz (0: the boot rate)");
++
++static int
++sweet_gpu_khz_min_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int error = gov_khz_sysctl(req, &gov_khz_min, 320000);
++
++	if (gov_khz_min == 0) {
++		gov_khz_min = 320000;
++	}
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_khz_min, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_khz_min_sysctl, "I", "sapphire 0346: the governor's lowest rate in kHz (320000)");
++
++static int
++sweet_gpu_temp_max_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = gov_temp_max;
++	int error = sysctl_io_number(req, v, sizeof(v), &v, NULL);
++
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (v < 50000 || v > 95000) {
++		return EINVAL;                          /* 50 C to the stock trip, 95 C */
++	}
++	gov_temp_max = v;
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_temp_max, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_temp_max_sysctl, "I", "sapphire 0346: the governor's temperature trip, mC (50000-95000; 5 C over it: 600 MHz at most)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_gov_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gov_ms, 0,
++    "sapphire 0346: the governor's period, ms (10-1000)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_gov_up, CTLFLAG_RW | CTLFLAG_LOCKED, &gov_up, 0,
++    "sapphire 0346: busy percent from which the governor goes up");
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_gov_down, CTLFLAG_RW | CTLFLAG_LOCKED, &gov_down, 0,
++    "sapphire 0346: busy percent under which (two periods in a row) the governor goes down");
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_gov_idle_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gov_idle_ms, 0,
++    "sapphire 0346: ms without work after which the governor goes to the lowest level");
++
++static int
++sweet_gpu_gov_stats_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[900];
++	size_t off = 0;
++
++	buf[0] = 0;
++	OPP_CAT("gov %d%s%s; at %u kHz (boot %u), ladder %d-%u kHz, thermal cap %u kHz, refused from %u kHz; period %d ms, "
++	    "up %d%% down %d%% idle %d ms; trip %d mC (and %d: 600 MHz)\n", gov_on, ggov.stopped != NULL ? ", stopped: " : "",
++	    ggov.stopped != NULL ? ggov.stopped : "", opp_khz, gov_boot_khz, gov_khz_min,
++	    gov_khz_max > 0 ? (uint32_t)gov_khz_max : gov_boot_khz, ggov.cap_khz, ggov.refused_khz, gov_ms, gov_up, gov_down,
++	    gov_idle_ms, gov_temp_max, gov_temp_max + 5000);
++	OPP_CAT("periods %llu; load last %u%% (%u us busy) mean %llu%%; up %llu down %llu to-idle %llu; refused: GPU busy %llu, "
++	    "other %llu; capped by temperature %llu periods; gpu temperature last %d max %d mC, unreadable %llu; busy counter set "
++	    "up %llu times, bad samples %llu\n", ggov.ticks, ggov.last_load, ggov.last_busy,
++	    ggov.ticks != 0 ? ggov.load_sum / ggov.ticks : 0, ggov.up, ggov.down, ggov.idle_drops, ggov.refused_busy,
++	    ggov.refused_other, ggov.capped_ticks, ggov.last_temp, ggov.max_temp, ggov.temp_lost, ggov.counter_setups,
++	    ggov.bad_samples);
++	OPP_CAT("load per period, %% 0-9 10-19 .. 90-100:");
++	for (unsigned i = 0; i < 10; i++) {
++		OPP_CAT(" %llu", ggov.load_hist[i]);
++	}
++	OPP_CAT("\n");
++	return SYSCTL_OUT(req, buf, off + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_gov_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_gov_stats_sysctl, "A", "sapphire 0346: what the GPU governor saw and did");
++
+ /*
+  * GPU memory (0151): the gigabyte from 0x1_0000_0000 to 0x1_4000_0000 is DDR that nobody uses
+  * here -- xnu runs from 0x1_4000_0000 (the shim clamps it there), the fixed firmware carve-outs
