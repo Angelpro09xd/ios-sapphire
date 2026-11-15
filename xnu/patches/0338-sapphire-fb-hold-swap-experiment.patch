@@ -1,0 +1,79 @@
+0338: SweetFramebuffer: experiment, off by default: a SwapEnd waits for the copy of the previous frame (kern.sweet_fb_hold_ms)
+
+Needs 0336 (adds two counters to kern.sweet_fb_diag). kern.sweet_fb_hold_ms=N (read-write) or boot-arg
+sweetfb_hold=N; default 0 = no change.
+
+With N > 0, a SwapEnd that finds the GPU copy of the previous frame still queued (fFlipWait &&
+sapphire_gpu_copy_pending()) waits for it, up to N ms (200 at most), outside every lock, before presenting
+its own frame, so that present() flips the previous frame before the new copy is queued into the same back
+buffer.
+
+On this phone the wait sits in a branch of swap() that is not taken when flip buffers exist (frames are
+presented by the vsync timer, see 0340), so the switch has no effect here; 0340's frame queue is the change
+that applies. Kept as a switch for configurations without flip buffers. Not measured.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -162,6 +162,16 @@ class IOMobileFramebufferUserClient;
+  * cost ~162k dc civac, 10.4 MB, on every frame for nothing. kern.sweet_fb_flipflush=1 puts it back.
+  */
+ static int sweet_fb_flipflush = 0;
++/*
++ * sapphire 0338 (an experiment, off by default): kern.sweet_fb_hold_ms=N, boot-arg sweetfb_hold=N. A SwapEnd that
++ * finds the GPU's copy of the frame before still queued waits for it, up to N ms (200 at most), before it presents its
++ * own frame. With 0, as before, the new copy is queued over the same back buffer and the flip then waits for the new
++ * one: the frame before is drawn, copied and never shown (present(): flipWhenCopied(false), then fFlipPhys[fFlipIdx ^ 1]
++ * again; 0336 counts it as "overwritten"). The wait is what a framebuffer with a full swap queue does to its caller
++ * (HackiOS's MiniIOMobileFramebuffer holds SwapEnd the same way, fb_queue): the window server stays at most one frame
++ * ahead of the panel, and every frame the GPU finishes is shown.
++ */
++static int sweet_fb_hold_ms = 0;
+ /*
+  * 0321: a render scale under the 2x one. kern.sweet_fb_rscale (permille, 400 to 1000; boot-arg sweetrscale, default
+  * 1000) says how much of the 2x surface the window server's GPU driver drew: HakiosMetal draws the frame into the
+@@ -204,6 +214,7 @@ static struct {
+ 	struct sweet_fbd_hist swap_iv, flip_iv, swap_to_flip, tick_late;
+ 	uint64_t swaps, flips, flips_by_swap, flips_by_tick, cpu_flips, overwritten, grid_restarts, swap_waits;
+ 	uint64_t cleans, clean_us, presents, present_us, present_max_us;
++	uint64_t holds, hold_us;                /* 0338: SwapEnds that waited for the copy before theirs, and for how long */
+ 	uint64_t flip_eighth[8];
+ 	uint64_t last_swap, pend_swap;          /* mach_absolute_time of the last SwapEnd, and of the frame awaiting its flip */
+ 	uint32_t last_flip_frame;               /* INTF_FRAME_COUNT at the last flip */
+@@ -564,6 +575,7 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
+ 	PE_parse_boot_argn("sweetfb_w", &width2x, sizeof(width2x));
+ 	PE_parse_boot_argn("sweetrscale", &sweet_fb_rscale, sizeof(sweet_fb_rscale));
++	PE_parse_boot_argn("sweetfb_hold", &sweet_fb_hold_ms, sizeof(sweet_fb_hold_ms));       /* 0338 */
+ 	/* 0320: sweetfb_scale=1 too -- iOS draws its points at 1x (375 x 812, 414 x 896), four times fewer pixels
+ 	 * than 2x for a GPU bound by memory bandwidth; fScale2 means scaled onto the panel, whatever the factor */
+ 	fScale2 = (scale == 2 || scale == 1) && fLogicalW == SWEET_FB_LOGICAL_W && fLogicalH == SWEET_FB_LOGICAL_H &&
+@@ -1120,6 +1132,17 @@ AppleCLCD::swap(const uint8_t *rec)
+ 			fAwaitSent = false;
+ 		}
+ 		IOLockUnlock(fLock);
++		if (sweet_fb_hold_ms > 0 && fFlipWait && sapphire_gpu_copy_pending()) {
++			/* 0338: the copy of the frame before lands (a tick or present() then flips it) before this one is queued */
++			uint64_t hold_t0 = mach_absolute_time(), deadline;
++			clock_interval_to_deadline((uint32_t)(sweet_fb_hold_ms > 200 ? 200 : sweet_fb_hold_ms), kMillisecondScale,
++			    &deadline);
++			while (fFlipWait && sapphire_gpu_copy_pending() && mach_absolute_time() < deadline) {
++				IODelay(200);
++			}
++			sweet_fbd.holds++;
++			sweet_fbd.hold_us += sweet_fbd_us(hold_t0, mach_absolute_time());
++		}
+ 		presentNow(rec, held);
+ 		return;
+ 	}
+@@ -2582,7 +2605,11 @@ sweet_fb_diag_sysctl SYSCTL_HANDLER_ARGS
+ 	}
+ 	SWEET_FBD_CAT("\npresent: %llu, %llu us in all, max %llu us; surface cleans %llu, %llu us in all\n", sweet_fbd.presents,
+ 	    sweet_fbd.present_us, sweet_fbd.present_max_us, sweet_fbd.cleans, sweet_fbd.clean_us);
++	SWEET_FBD_CAT("hold (kern.sweet_fb_hold_ms %d): %llu swaps waited for the copy before theirs, %llu us in all\n",
++	    sweet_fb_hold_ms, sweet_fbd.holds, sweet_fbd.hold_us);
+ 	return SYSCTL_OUT(req, buf, off + 1);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_diag, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     NULL, 0, sweet_fb_diag_sysctl, "A", "sapphire 0336: presentation path counters and histograms");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hold_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_hold_ms, 0,
++    "sapphire 0338: ms a SwapEnd waits for the GPU's copy of the frame before its own (0 = off, as before)");

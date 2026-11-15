@@ -1,0 +1,292 @@
+0349: SweetFramebuffer: display engine registers and CTL_FLUSH latch, read only (kern.sweet_fb_regs, kern.sweet_fb_latch)
+
+Diagnostics only: no register is written that was not written before. The bootloader (continuous splash)
+sets up the display engine; the kernel only points VIG0 at its own buffers (scanFrom(): SRC0_ADDR,
+SRC_YSTRIDE0, CTL_FLUSH = 0x20001). 0350 needs to know the plane the bootloader left and how the MDP takes a
+flush.
+
+kern.sweet_fb_regs (read only, ~12 KB of text): MDP TOP (0x5e01000, 0x494 bytes), CTL0 (0x5e02000, 0x1dc),
+VIG0 (0x5e05000, 0x1f8) with its QSEED3LITE scaler (0x5e05a00, 0xa0) and CSC (0x5e06a00, 0x100), LM0
+(0x5e45000, 0x320), PP0 (0x5e71000, 0xd4) and INTF1 (0x5e6b800, 0x2c0), 8 words a line, plus VIG0 and its
+scaler as they were in start(). Offsets and sizes from the phone's device tree and Linux's
+catalog/dpu_6_3_sm6115.h; Linux's dpu_kms_mdp_snapshot reads the same blocks.
+
+kern.sweet_fb_latch (read only): each flip is followed until CTL_FLUSH reads its bits clear (by the frame
+queue's thread and the ticks): what reads back right after the write, time to clear, how far
+INTF_FRAME_COUNT had moved by then (per sixteenth of the refresh at the write), and flips not seen clear in
+100 ms. Linux and the stock driver take a flip as done when those bits read clear after the vblank; 0340
+takes it as done when the frame counter has moved.
+
+SweetSurface logs the property names and creator of the first 16 screen-sized surfaces ("SWEET SURF:
+screen-sized surface N by P: keys").
+
+Measured on the phone (one boot, 14388 flips): the bits read set right after the write in 14386 flips and
+clear at the programmable fetch (line 2420 of 2432), ~12 lines before INTF_FRAME_COUNT moves.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -323,6 +323,123 @@ static struct {
+ extern uint32_t sapphire_gpu_copy_fence(void);          /* SapphireGpu.cpp: the fence of the last copy queued */
+ extern bool sapphire_gpu_fence_done(uint32_t fence);    /* ... and whether a given one is done */
+ 
++/*
++ * sapphire 0349: the display engine as it is, read only. Nothing here writes a register.
++ *
++ * kern.sweet_fb_regs: the registers of every block the panel's picture goes through -- MDP TOP, CTL0, the VIG0 plane
++ * with its scaler (QSEED3LITE, +0xa00) and its CSC (+0x1a00), the layer mixer LM0, the ping-pong PP0 and the interface
++ * INTF1 -- as they are when read, and the plane and its scaler as the bootloader left them (read in start(), before
++ * this kernel's first flip). Blocks and sizes are the phone's device tree's (qcom,sde-*-off and -size, from mdp_phys
++ * 0x5e00000) and Linux's catalog's (dpu_6_3_sm6115.h, from 0x5e01000). This kernel writes, of all of it, only VIG0's
++ * SRC0_ADDR and SRC_YSTRIDE0, CTL0's CTL_FLUSH and INTF1's FRAME_LINE_COUNT_EN.
++ *
++ * kern.sweet_fb_latch: whether CTL_FLUSH reads back the bits a flip writes (0x20001: VIG0 and CTL) and when the MDP
++ * clears them, against INTF_FRAME_COUNT. Linux and the stock driver take a flip as done when those bits read clear
++ * after a vblank (dpu_encoder_phys_vid.c, sde_encoder_phys_vid.c: "double-check with hw that it accepted the flush
++ * bits"); this kernel takes it as done when the frame counter has moved (0340's flipTaken()). A plane whose geometry is
++ * rewritten (the scaler of a scanout) has to know: what is written while a flush is pending is latched with it. Each
++ * flip is followed until its bits read clear: what reads back right after the write, by how many frames the counter
++ * had moved when they cleared (by where in the refresh the flip was written), how long that took, and whether the
++ * counter moved while they were still set.
++ */
++static const struct {
++	const char *name;
++	uint32_t    pa, len;
++} sweet_fbr_blocks[] = {
++	{ "TOP", 0x05e01000, 0x494 },
++	{ "CTL0", 0x05e02000, 0x1dc },
++	{ "VIG0", 0x05e05000, 0x1f8 },
++	{ "VIG0 scaler", 0x05e05a00, 0xa0 },
++	{ "VIG0 csc", 0x05e06a00, 0x100 },
++	{ "LM0", 0x05e45000, 0x320 },
++	{ "PP0", 0x05e71000, 0xd4 },
++	{ "INTF1", 0x05e6b800, 0x2c0 },
++};
++#define SWEET_FBR_N             (sizeof(sweet_fbr_blocks) / sizeof(sweet_fbr_blocks[0]))
++static volatile uint32_t *sweet_fbr_va[SWEET_FBR_N];  /* each block, mapped once in start() (its page, uncached) */
++static uint32_t sweet_fbr_boot[(0x1f8 + 0xa0) / 4];  /* VIG0 0x000-0x1f8 and its scaler 0xa00-0xaa0 at start() */
++static bool sweet_fbr_have_boot;
++
++static void
++sweet_fbr_map(void)
++{
++	for (unsigned i = 0; i < SWEET_FBR_N; i++) {
++		uint32_t page = sweet_fbr_blocks[i].pa & ~0xfffu;
++		vm_offset_t va = ml_io_map(page, 0x1000);
++		sweet_fbr_va[i] = va != 0 ? (volatile uint32_t *)(va + (sweet_fbr_blocks[i].pa - page)) : NULL;
++	}
++	if (sweet_fbr_va[2] != NULL && sweet_fbr_va[3] != NULL) {
++		for (uint32_t k = 0; k < 0x1f8 / 4; k++) {
++			sweet_fbr_boot[k] = sweet_fbr_va[2][k];
++		}
++		for (uint32_t k = 0; k < 0xa0 / 4; k++) {
++			sweet_fbr_boot[0x1f8 / 4 + k] = sweet_fbr_va[3][k];
++		}
++		sweet_fbr_have_boot = true;
++	}
++}
++
++#define SWEET_FBL_EDGES         7
++static const uint32_t sweet_fbl_us[SWEET_FBL_EDGES] = { 1000, 2000, 4000, 8000, 12000, 17000, 34000 };
++static struct {
++	uint64_t flips, readback_set, readback_clear, set_after_move, gave_up, samples;
++	uint64_t at[16][4];                     /* sixteenth of the refresh at the write x frames moved when cleared (0 1 2 3+) */
++	struct sweet_fbd_hist clear;            /* write to bits read clear, us */
++	uint32_t last_readback, w_frame, w_sixteenth;
++	uint64_t w_abs;
++	bool     watching, moved_told;
++} sweet_fbl;
++
++/* A flip has just written CTL_FLUSH (scanFrom()): what reads back now, and where the panel's scan is. */
++static void
++sweet_fbl_wrote(volatile uint32_t *ctl, volatile uint32_t *intf)
++{
++	if (ctl == NULL || intf == NULL) {
++		return;
++	}
++	uint32_t fl = ctl[0x18 / 4];
++	uint32_t hsync = intf[(0x800 + 0x008) / 4] >> 16;
++	uint32_t vtotal = hsync != 0 ? intf[(0x800 + 0x00c) / 4] / hsync : 0;
++	uint32_t line = intf[(0x800 + 0x0b0) / 4];
++
++	sweet_fbl.flips++;
++	sweet_fbl.last_readback = fl;
++	if ((fl & 0x20001) != 0) {
++		sweet_fbl.readback_set++;
++	} else {
++		sweet_fbl.readback_clear++;
++	}
++	sweet_fbl.w_frame = intf[(0x800 + 0x0ac) / 4];
++	sweet_fbl.w_sixteenth = vtotal != 0 && line < vtotal ? (uint32_t)((uint64_t)line * 16 / vtotal) : 15;
++	sweet_fbl.w_abs = mach_absolute_time();
++	sweet_fbl.watching = (fl & 0x20001) != 0;
++	sweet_fbl.moved_told = false;
++}
++
++/* Whenever the frame queue or a tick looks: have the flush bits of the flip being followed been taken? */
++static void
++sweet_fbl_sample(volatile uint32_t *ctl, volatile uint32_t *intf)
++{
++	if (!sweet_fbl.watching || ctl == NULL || intf == NULL) {
++		return;
++	}
++	uint32_t fl = ctl[0x18 / 4], d = intf[(0x800 + 0x0ac) / 4] - sweet_fbl.w_frame;
++	uint64_t us = sweet_fbd_us(sweet_fbl.w_abs, mach_absolute_time());
++
++	sweet_fbl.samples++;
++	if ((fl & 0x20001) == 0) {
++		sweet_fbl.at[sweet_fbl.w_sixteenth & 15][d < 3 ? d : 3]++;
++		sweet_fbd_add(&sweet_fbl.clear, sweet_fbl_us, SWEET_FBL_EDGES, us);
++		sweet_fbl.watching = false;
++	} else if (us > 100000) {
++		sweet_fbl.gave_up++;                    /* (not taken in 100 ms: the bits may not read back as taken) */
++		sweet_fbl.watching = false;
++	} else if (d != 0 && !sweet_fbl.moved_told) {
++		sweet_fbl.set_after_move++;             /* the frame counter moved, the flush is still pending */
++		sweet_fbl.moved_told = true;
++	}
++}
++
+ struct SweetLowBuf {
+ 	IOMemoryMap *map;
+ 	uint8_t     *va;
+@@ -756,6 +873,7 @@ AppleCLCD::start(IOService *provider)
+ 		    r[0x000 / 4], r[0x004 / 4], r[0x008 / 4], r[0x00c / 4], r[0x03c / 4], r[0x040 / 4],
+ 		    r[0x01c / 4], r[0x024 / 4], r[0x090 / 4], r[0x084 / 4]);
+ 	}
++	sweet_fbr_map();                /* 0349: before the first flip, so that the plane is read as the bootloader left it */
+ 	if (fVig0 != NULL && fCtl0 != NULL) {
+ 		fBootSrc = fVig0[0x14 / 4];
+ 		fBootStride = fVig0[0x24 / 4];
+@@ -1377,6 +1495,7 @@ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	fCtl0[0x18 / 4] = 0x20001;      /* flush VIG0 + CTL: latched at the next vsync */
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	sweet_fbl_wrote(fCtl0, fIntf1); /* 0349: what CTL_FLUSH reads back, and when it clears (read only) */
+ 	fScanPhys = pa;
+ 	fScanStride = stride;
+ }
+@@ -2260,6 +2379,7 @@ AppleCLCD::queueDrop(void)
+ void
+ AppleCLCD::queueFlip(void)
+ {
++	sweet_fbl_sample(fCtl0, fIntf1);        /* 0349 (read only) */
+ 	uint64_t now = mach_absolute_time();
+ 	bool waiting = fQLatchWait;
+ 	bool taken = flipTaken(now);
+@@ -3116,3 +3236,81 @@ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_queue_poll_us, CTLFLAG_RW | CTLFLAG_LOCKED,
+     "sapphire 0340: how often the queue's thread looks at a pending copy's fence, us (100 to 8000)");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_queue_depth, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_queue_depth, 0,
+     "sapphire 0340: how many frames may wait for the panel before a SwapEnd is held (1 or 2)");
++
++/* sapphire 0349: the display engine's registers and the latch of CTL_FLUSH (sweet_fbr, sweet_fbl, at the top). Read only. */
++#define SWEET_FBR_BUF           24576
++
++static size_t
++sweet_fbr_words(char *buf, size_t off, const char *title, uint32_t pa, const volatile uint32_t *r, const uint32_t *copy,
++    uint32_t len)
++{
++	int n = snprintf(buf + off, SWEET_FBR_BUF - off, "%s (%#x, %#x bytes):\n", title, pa, len);
++	off = n > 0 && off + (size_t)n < SWEET_FBR_BUF ? off + (size_t)n : SWEET_FBR_BUF - 1;
++	for (uint32_t k = 0; k < len / 4 && off + 96 < SWEET_FBR_BUF; k += 8) {
++		n = snprintf(buf + off, SWEET_FBR_BUF - off, " +%03x:", k * 4);
++		off += n > 0 ? (size_t)n : 0;
++		for (uint32_t j = k; j < k + 8 && j < len / 4; j++) {
++			n = snprintf(buf + off, SWEET_FBR_BUF - off, " %08x", copy != NULL ? copy[j] : r[j]);
++			off += n > 0 ? (size_t)n : 0;
++		}
++		n = snprintf(buf + off, SWEET_FBR_BUF - off, "\n");
++		off += n > 0 ? (size_t)n : 0;
++	}
++	return off;
++}
++
++static int
++sweet_fb_regs_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char *buf = (char *)IOMallocData(SWEET_FBR_BUF);
++	size_t off = 0;
++	int error;
++
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	buf[0] = 0;
++	for (unsigned i = 0; i < SWEET_FBR_N; i++) {
++		if (sweet_fbr_va[i] != NULL) {
++			off = sweet_fbr_words(buf, off, sweet_fbr_blocks[i].name, sweet_fbr_blocks[i].pa, sweet_fbr_va[i], NULL,
++			    sweet_fbr_blocks[i].len);
++		}
++	}
++	if (sweet_fbr_have_boot) {
++		off = sweet_fbr_words(buf, off, "VIG0 at boot", sweet_fbr_blocks[2].pa, NULL, sweet_fbr_boot, 0x1f8);
++		off = sweet_fbr_words(buf, off, "VIG0 scaler at boot", sweet_fbr_blocks[3].pa, NULL, sweet_fbr_boot + 0x1f8 / 4, 0xa0);
++	}
++	error = SYSCTL_OUT(req, buf, off + 1);
++	IOFreeData(buf, SWEET_FBR_BUF);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_regs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_fb_regs_sysctl, "A", "sapphire 0349: the display engine's registers now (TOP, CTL0, VIG0 and its scaler and CSC, LM0, PP0, INTF1) and VIG0's at boot");
++
++static int
++sweet_fb_latch_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[2048];
++	size_t off = 0;
++
++	buf[0] = 0;
++	SWEET_FBD_CAT("latch (0349): flips %llu; CTL_FLUSH right after the write: bits set %llu, clear %llu (last %#x); "
++	    "still set after the frame counter moved %llu; not clear in 100 ms %llu; looks %llu\n", sweet_fbl.flips,
++	    sweet_fbl.readback_set, sweet_fbl.readback_clear, sweet_fbl.last_readback, sweet_fbl.set_after_move,
++	    sweet_fbl.gave_up, sweet_fbl.samples);
++	SWEET_FBD_CAT("write to clear (ms <1 <2 <4 <8 <12 <17 <34 more; us):");
++	for (unsigned k = 0; k <= SWEET_FBL_EDGES; k++) {
++		SWEET_FBD_CAT(" %llu", sweet_fbl.clear.n[k]);
++	}
++	SWEET_FBD_CAT("; count %llu sum %llu max %llu\n", sweet_fbl.clear.count, sweet_fbl.clear.sum, sweet_fbl.clear.max);
++	SWEET_FBD_CAT("by sixteenth of the refresh at the write, cleared with the frame counter moved by 0/1/2/3+:");
++	for (unsigned k = 0; k < 16; k++) {
++		SWEET_FBD_CAT(" %u:%llu/%llu/%llu/%llu", k, sweet_fbl.at[k][0], sweet_fbl.at[k][1], sweet_fbl.at[k][2], sweet_fbl.at[k][3]);
++	}
++	SWEET_FBD_CAT("\n");
++	return SYSCTL_OUT(req, buf, off + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_latch, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_fb_latch_sysctl, "A", "sapphire 0349: whether CTL_FLUSH reads back a flip's bits and when they clear");
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -925,6 +925,32 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
+ 	}
++	{
++		/*
++		 * sapphire 0349: the property names a screen-sized surface is made with, and by whom (the first 16): which of
++		 * them are the window server's swap chain (the ones its SwapEnds name) is what a scanout pool must tell apart.
++		 */
++		static uint32_t full_told;
++		bool full = false;
++		for (int i = 0; i < 2; i++) {
++			full |= sweet_scanout_w[i] != 0 && s->width == sweet_scanout_w[i] && s->height == sweet_scanout_h[i];
++		}
++		if (full && full_told < 16) {
++			char who[32], keys[384];
++			size_t at = 0;
++			full_told++;
++			proc_selfname(who, sizeof(who));
++			keys[0] = 0;
++			OSCollectionIterator *it = OSCollectionIterator::withCollection(props);
++			const OSSymbol *k;
++			while (it != NULL && (k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL && at + 2 < sizeof(keys)) {
++				int n = snprintf(keys + at, sizeof(keys) - at, " %s", k->getCStringNoCopy());
++				at = n > 0 && at + (size_t)n < sizeof(keys) ? at + (size_t)n : sizeof(keys) - 1;
++			}
++			OSSafeReleaseNULL(it);
++			IOLog("SWEET SURF: screen-sized surface %u by %s (0x%x):%s\n", s->id, who, ret, keys);
++		}
++	}
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {
+ 		s->release();
