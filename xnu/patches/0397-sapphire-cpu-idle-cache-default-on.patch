@@ -1,0 +1,34 @@
+sapphire: the cache maintenance before WFI is on by default again (kern.sweet_idle_cache=1)
+
+With 0351 the default became 0 (nothing before WFI). Booting with 0 panics early in about half the boots:
+Idle_load_context reloads a saved context whose frame pointer and return address were overwritten while the
+CPU waited. Same kernel, same boot-args but this one: sweet_idle_cache=1 boots 7 of 7, =0 failed its first
+boot; with 0 by default 8 of 18 boots failed. The writer is not identified, so this hides the fault. After the
+boot, kern.sweet_idle_cache=0 gives back the CPU time 0351 measured (62-68 -> 25-26 us per Metal draw).
+---
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index 397b8c7..2352208 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -490,11 +490,18 @@ wfe_to_deadline_or_interrupt(uint32_t cid, uint64_t wfe_deadline, cpu_data_t *cd
+  * that cleaned and invalidated by set/way the core's L1 *and* the L2 its cluster shares (a count of levels handed to
+  * a loop that takes the last level, inclusive; fixed in caches_asm.s): every idle entry of any A73 emptied the A73s'
+  * 2 MB L2. The modes are kept to measure that:
+- *   0  nothing (the default)
+- *   1  the core's L1 and its cluster's L2, what upstream did (sweet_FlushL1L2_Dcache)
++ *   0  nothing
++ *   1  the core's L1 and its cluster's L2, what upstream did (sweet_FlushL1L2_Dcache); the default
+  *   2  the core's L1 only (sweet_FlushL1_Dcache)
++ *
++ * 0397: the default is 1. With 0 from the start of the boot the phone panics early in about half its boots: an idle
++ * exit reloads a saved context (Idle_load_context) whose frame pointer and return address were overwritten while
++ * the CPU waited ("Kernel instruction fetch abort", sleh_synchronous_sp1). Measured with the same kernel and
++ * boot-args but this one: 1 boots 7 of 7, 0 failed its first boot; with 0 by default, 8 of 18 boots failed. What
++ * writes there is not known yet, so 1 hides the fault and does not fix it. Once the system is up, 0 has run for
++ * hours: a boot script (or kern.sweet_idle_cache=0) can set it then to get the CPU time back.
+  */
+-uint32_t sweet_idle_cache = 0;
++uint32_t sweet_idle_cache = 1;
+ uint64_t sweet_idle_entries[MAX_CPUS];
+ uint64_t sweet_idle_cache_abs[MAX_CPUS];
+ extern void sweet_FlushL1_Dcache(void);

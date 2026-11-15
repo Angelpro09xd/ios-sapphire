@@ -1,0 +1,569 @@
+0380: SapphireGpu, pmap: a process's own memory as a GPU buffer (msm request 0x7d), its caches maintained by the pages a CPU wrote (kern.sweet_gpu_usermem, default 1)
+
+Needs 0336, 0339 and 0342. What a Metal driver needs for -newBufferWithBytesNoCopy: to be what Metal says: the
+caller's pages themselves. QuartzCore 20H392 wraps an image's own pages with -newBufferWithBytesNoCopy: and
+keeps a texture over them whenever its pixels and row bytes are multiples of
+deviceLinearReadOnlyTextureAlignmentBytes (64), and does not upload that image again; a driver that copies
+the bytes at creation shows the image as it was then (measured: widgets with an opaque background drawn
+empty).
+
+1. Request 0x7d (struct msm_user_memory: address, size, flags 0; returns a handle): the client task's range,
+   whole pages, at most 256 MB, as a buffer, via IOMemoryDescriptor::withAddressRange and
+   prepare(kIODirectionInOut): the pages are wired until the buffer is freed (after the last submission that
+   named it) and marked dirty for the VM. Only pmap-managed pages; a client holds at most 512 MB of it. It is
+   not mapped through the client (clientMemoryForType refuses it). GET_PARAM 0x1001 answers 1 (0 with
+   kern.sweet_gpu_usermem=0, which also refuses the request).
+2. Caches. The GPU is not coherent with the CPU caches (the stock kgsl SMMU node has no dma-coherent) and
+   these pages are cacheable. Cleaning them all at every submission would cost 2-9 ms per submission for
+   QuartzCore's 7-29 MB of client-storage images (at the ~3 GB/s 0336 measured). So each page keeps an
+   account in the pmap: pmap_test_and_clear_modify() (osfmk/arm/pmap/pmap.c, new) answers whether any
+   mapping wrote the page since it was last asked and, if so, write-protects it again and clears the bit, in
+   one step under the page's PV lock. Then a submission that reads the buffer cleans (dc cvac) each page
+   written since; one that writes it (MSM_SUBMIT_BO_WRITE, or neither flag) cleans and invalidates (dc civac)
+   them, and once it is done the whole buffer is cleaned and invalidated again before the client reads it (at
+   its first WAIT_FENCE or CPU_PREP that finds it done, or when it is freed). Maintenance is by line through
+   the kernel's physical map. When a buffer is freed each page's modified bit is set again for the VM.
+3. kern.sweet_gpu_usermem_track=0 (boot-arg gpu_usermem_track=0) maintains every page at every submission,
+   to hold the account against. kern.sweet_gpu_usermem_stats: buffers made, refused, freed, bytes held and
+   peak, pages looked at, cleaned, invalidated, and times.
+
+Not covered: a CPU writing the pages while the GPU reads them (nothing orders that, in Metal either); a page
+wired in the pmap (mlock) cannot be write-protected and is maintained every time. With XNU_MONITOR (not this
+configuration) pmap_test_and_clear_modify answers TRUE.
+
+Checked: clang -fsyntax-only of SapphireGpu.cpp and pmap.c with stub headers, with an undeclared identifier
+put into every new function and reported for each.
+Measured on the phone (one boot, with a Metal driver that uses it, home, Today view, Control Center, app
+switcher, 6 app launches): made 34, refused 22, freed 24, peak 393216 bytes held; 3521 pages looked at, 8
+cleaned; the opaque widgets are drawn. Off: sysctl -w kern.sweet_gpu_usermem=0 (or boot-arg gpu_usermem=0):
+the driver then gets no no-copy buffers and QuartzCore uploads its images.
+
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -4354,6 +4354,7 @@ enum {
+ 	kMsmSubmitQueueClose = 0x4b,
+ 	kMsmSubmitQueueQuery = 0x4c,
+ 	kMsmSurface         = 0x7e,             /* HackiOS's: an IOSurface's memory as a buffer */
++	kMsmUserMemory      = 0x7d,             /* sapphire 0380: the program's own memory as a buffer */
+ };
+ 
+ struct msm_timespec { int64_t seconds, nanoseconds; };
+@@ -4393,6 +4394,11 @@ struct msm_surface {                            /* HackiOS's struct redwood_surf
+ #define MSM_SUBMIT_CMD_CTX_RESTORE_BUF 3
+ #define MSM_SUBMIT_FENCE_FD_OUT 0x20000000
+ #define MSM_DESCRIBE        0xffffffffu
++struct msm_user_memory {                        /* sapphire 0380 (the Metal driver's UserMemory) */
++	uint64_t address, size;                 /* the program's range: whole pages */
++	uint32_t flags;                         /* 0 */
++	uint32_t handle;                        /* back: the buffer */
++};
+ 
+ static uint64_t msm_bits[MSM_PAGES / 64];
+ static uint64_t msm_next;                       /* where the next search starts (next fit) */
+@@ -5835,6 +5841,9 @@ struct msm_bo {
+ 	bool                pooled;             /* GPU pool memory at pa (write-combined, never cleaned) */
+ 	uint64_t            pa;
+ 	uint32_t            fence;              /* the last submission that named it */
++	bool                user;               /* 0380: the program's own pages (userMemory), wired, cacheable */
++	ppnum_t            *pages;              /* ... their physical pages, size >> PAGE_SHIFT of them */
++	uint32_t            wfence;             /* ... the last submission that wrote them, until they are settled (0: none) */
+ };
+ #define MSM_LEFT            256u                /* buffers given back while the GPU still had them */
+ 
+@@ -5927,6 +5936,176 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_flush_stats, CTLTYPE_STRING | CTLFLAG_RD
+ SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_flush, CTLFLAG_RW | CTLFLAG_LOCKED, &gpu_flush_mode, 0,
+     "sapphire 0339: cache maintenance of surfaces at a submission: 0 = every mapped one every time (as before), 1 = by the surface's account, 2 = as 1 and surfaces are not mapped through the GPU client");
+ 
++/*
++ * sapphire 0380: the program's own memory as a GPU buffer (request 0x7d), what Metal's -newBufferWithBytesNoCopy: is:
++ * the caller's pages themselves, which the GPU reads where the program wrote them and writes where the program will
++ * read them. QuartzCore wraps an image's pages so and keeps a texture over them (its client-storage images:
++ * CA::OGL::MetalContext::copy_image_to_texture, 20H392), and never uploads that image again; HakiosMetal made a copy of
++ * the bytes when the buffer was made instead, which showed the image as it was then and nothing after.
++ *
++ * The pages: IOMemoryDescriptor::withAddressRange over the client's task, prepared for reading and writing. That wires
++ * them where they are, mapped as the program has them, until the buffer is freed (freeBo, after the last submission
++ * that named it), and marks each one dirty for the VM (vm_object_iopl_request: SET_PAGE_DIRTY for a request that may
++ * write), so that what the VM knows of their contents does not rest on the pmap's modified bit while the buffer holds
++ * them. Only pages the pmap manages are taken. Their GPU addresses are given 4 KB at a time, as any buffer's (place).
++ *
++ * The caches. This GPU reads and writes memory behind the processor's caches (no IO coherence: the stock kgsl SMMU node
++ * of this phone has no dma-coherent), and these pages are cacheable in every mapping of them. Cleaning all of them at
++ * every submission is what would cost: QuartzCore keeps 7 to 29 MB of images in client storage a command buffer once
++ * the alignment is declared (phone traces), 2 to 9 ms of cleaning at the ~3 GB/s 0336 measured for dc civac, at
++ * every submission, for pages nobody touched. So each page keeps an account, in the pmap: pmap_test_and_clear_modify
++ * (osfmk/arm/pmap/pmap.c, this patch) says whether any mapping wrote the page since it was last asked and makes the
++ * next write fault again, in one step under the page's lock, and only those pages are maintained:
++ *   - a submission that reads the buffer: each page written since is cleaned (dc cvac; 0339's H1);
++ *   - a submission that writes it (MSM_SUBMIT_BO_WRITE, or neither flag): each page written since is cleaned and
++ *     invalidated (dc civac; H2); and once that submission is done, before the program reads, the whole buffer is
++ *     cleaned and invalidated again (a line a processor fetched while the GPU wrote, by speculation or not, would be
++ *     what it reads: H3) -- at the first WAIT_FENCE or CPU_PREP of the client that finds it done, or when it is freed;
++ *   - when the buffer is made: every page's account started, then every line cleaned and invalidated.
++ * Nothing here maps the pages into the kernel: they are maintained through the kernel's physical map, by line.
++ *
++ * kern.sweet_gpu_usermem_track 0 (boot-arg gpu_usermem_track=0): every page of every such buffer maintained at every
++ * submission instead -- the plain rule, to hold the account to. kern.sweet_gpu_usermem 0 (boot-arg gpu_usermem=0): the
++ * request refused and GET_PARAM 0x1001 answers 0, and HakiosMetal answers nil for a no-copy buffer (QuartzCore then
++ * uploads its images). kern.sweet_gpu_usermem_stats: what was made and maintained.
++ * What this does not cover, as 0339 does not: a processor writing the pages while the GPU reads them (nothing orders
++ * the two, in Metal either); and a page with a mapping wired in the pmap, which the account cannot write-protect: it
++ * answers written every time and is maintained every time.
++ */
++extern "C" boolean_t pmap_test_and_clear_modify(ppnum_t pn);   /* osfmk/arm/pmap/pmap.c */
++extern "C" void pmap_set_modify(ppnum_t pn);
++extern "C" boolean_t pmap_valid_page(ppnum_t pn);
++extern "C" vm_offset_t phystokv(uint64_t pa);
++
++#define MSM_USER_BYTES      (512ull << 20)      /* what one client may hold wired for the GPU at a time */
++static int gpu_usermem = 1, gpu_usermem_track = 1;
++static struct {
++	uint64_t made, refused, freed, bytes, peak;
++	uint64_t looked, cleaned, flushed, settled;
++	struct gdiag_time make, sync, settle;
++} guser;
++
++/* the data cache's line, from CTR_EL0 (DminLine) */
++static vm_offset_t
++msm_user_line(void)
++{
++	static vm_offset_t line;
++
++	if (line == 0) {
++		uint64_t ctr;
++		__asm__ volatile ("mrs %0, ctr_el0" : "=r"(ctr));
++		line = (vm_offset_t)4 << ((ctr >> 16) & 0xf);
++	}
++	return line;
++}
++
++/* page PN through the kernel's physical map, line by line: cleaned, or cleaned and invalidated. No barrier: the
++ * caller's DSB before and after its pages. */
++static void
++msm_user_lines(ppnum_t pn, bool invalidate)
++{
++	const vm_offset_t line = msm_user_line();
++	vm_offset_t va = phystokv((uint64_t)pn << PAGE_SHIFT);
++	const vm_offset_t end = va + PAGE_SIZE;
++
++	for (; va < end; va += line) {
++		if (invalidate) {
++			__asm__ volatile ("dc civac, %0" :: "r"(va) : "memory");
++		} else {
++			__asm__ volatile ("dc cvac, %0" :: "r"(va) : "memory");
++		}
++	}
++}
++
++static inline void
++msm_user_dsb(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* Before a submission that names B runs: the pages a processor wrote since, as the submission's flags for B say.
++ * service_lock held. */
++static void
++msm_user_sync(struct msm_bo *b, uint32_t flags)
++{
++	const bool writes = (flags & MSM_SUBMIT_BO_WRITE) != 0 || (flags & MSM_SUBMIT_BO_READ) == 0;
++	const uint64_t n = b->size >> PAGE_SHIFT, t0 = mach_absolute_time();
++	uint64_t done = 0;
++
++	msm_user_dsb();
++	for (uint64_t p = 0; p < n; p++) {
++		if (gpu_usermem_track == 0 || pmap_test_and_clear_modify(b->pages[p])) {
++			msm_user_lines(b->pages[p], writes);
++			done++;
++		}
++	}
++	msm_user_dsb();
++	guser.looked += n;
++	if (writes) {
++		guser.flushed += done;
++	} else {
++		guser.cleaned += done;
++	}
++	gdiag_since(&guser.sync, t0);
++}
++
++/* B was written by a submission that is done: every line of it cleaned and invalidated, so that what the processor
++ * reads next is what the GPU wrote. The caller clears b->wfence. service_lock held. */
++static void
++msm_user_settle(struct msm_bo *b)
++{
++	const uint64_t n = b->size >> PAGE_SHIFT, t0 = mach_absolute_time();
++
++	msm_user_dsb();
++	for (uint64_t p = 0; p < n; p++) {
++		msm_user_lines(b->pages[p], true);
++	}
++	msm_user_dsb();
++	guser.settled++;
++	gdiag_since(&guser.settle, t0);
++}
++
++/* B's pages back to the program, the GPU done with them: settled if it wrote them, the pmap's modified bit given back
++ * (the VM's account of the pages was theirs before the buffer took it), unwired. freeBo's, service_lock held. */
++static void
++msm_user_free(struct msm_bo *b)
++{
++	const uint64_t n = b->size >> PAGE_SHIFT;
++
++	if (b->wfence != 0) {
++		msm_user_settle(b);
++	}
++	for (uint64_t p = 0; p < n; p++) {
++		pmap_set_modify(b->pages[p]);
++	}
++	b->md->complete();
++	IODelete(b->pages, ppnum_t, n);
++	b->pages = NULL;
++	guser.freed++;
++	guser.bytes -= b->size;
++}
++
++static int
++sweet_gpu_usermem_stats_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char line[512];
++
++	snprintf(line, sizeof(line), "program memory buffers (kern.sweet_gpu_usermem %d, track %d): made %llu, refused %llu, freed %llu, "
++	    "now %llu bytes (peak %llu); submissions looked at %llu pages, cleaned %llu, cleaned and invalidated %llu; settled after "
++	    "the GPU wrote %llu; made %llu in %llu us (max %llu), synced %llu in %llu us (max %llu), settled %llu in %llu us (max %llu)\n",
++	    gpu_usermem, gpu_usermem_track, guser.made, guser.refused, guser.freed, guser.bytes, guser.peak, guser.looked, guser.cleaned,
++	    guser.flushed, guser.settled, guser.make.n, guser.make.ns / 1000, guser.make.max / 1000, guser.sync.n, guser.sync.ns / 1000,
++	    guser.sync.max / 1000, guser.settle.n, guser.settle.ns / 1000, guser.settle.max / 1000);
++	return SYSCTL_OUT(req, line, strlen(line) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_usermem_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_usermem_stats_sysctl, "A", "sapphire 0380: the GPU buffers made of programs' own memory, and their cache maintenance");
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_usermem, CTLFLAG_RW | CTLFLAG_LOCKED, &gpu_usermem, 0,
++    "sapphire 0380: a program's own memory as a GPU buffer (request 0x7d): 1 = served (default), 0 = refused");
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_usermem_track, CTLFLAG_RW | CTLFLAG_LOCKED, &gpu_usermem_track, 0,
++    "sapphire 0380: 1 = only the pages a processor wrote since are maintained at a submission (default), 0 = every page");
++
+ class SapphireGPU : public IOService {
+ 	OSDeclareDefaultStructors(SapphireGPU);
+ };
+@@ -5945,6 +6124,9 @@ public:
+ 	struct msm_bo  *fKeep;                  /* 0342: MSM_KEEP buffers given back and kept (service_lock) */
+ 	uint64_t       *fKeepWhen;              /* ... and when each was */
+ 	uint64_t        fKeepBytes;
++	task_t          fTask;                  /* 0380: whose memory userMemory takes */
++	uint64_t        fUserBytes;             /* ... how much of it this client holds (service_lock) */
++	uint32_t        fUnsettled;             /* ... its buffers the GPU wrote and the caches have not been settled for */
+ 	bool keepBo(struct msm_bo *b);
+ 	uint32_t dropKept(uint64_t before);
+ 
+@@ -5963,6 +6145,8 @@ public:
+ 	IOReturn gemNew(struct msm_gem_new *r);
+ 	IOReturn gemInfo(struct msm_gem_info *r);
+ 	IOReturn surface(struct msm_surface *r);
++	IOReturn userMemory(struct msm_user_memory *r);
++	void settleUser(void);
+ 	IOReturn submitIt(struct msm_gem_submit *r);
+ };
+ 
+@@ -6004,6 +6188,15 @@ SapphireGPUClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
+ 		keep_arg = true;
+ 		(void)PE_parse_boot_argn("gpu_bocache", &gpu_bocache, sizeof(gpu_bocache));
+ 	}
++	fTask = owningTask;                             /* 0380 */
++	fUserBytes = 0;
++	fUnsettled = 0;
++	static bool user_arg;
++	if (!user_arg) {
++		user_arg = true;
++		(void)PE_parse_boot_argn("gpu_usermem", &gpu_usermem, sizeof(gpu_usermem));
++		(void)PE_parse_boot_argn("gpu_usermem_track", &gpu_usermem_track, sizeof(gpu_usermem_track));
++	}
+ 	LOG("msm: %s opened the GPU", fName);
+ 	return true;
+ }
+@@ -6106,6 +6299,13 @@ SapphireGPUClient::freeBo(struct msm_bo *b)
+ 		b->md->complete();
+ 		b->surf->release();
+ 	}
++	if (b->user) {
++		msm_user_free(b);                       /* 0380: settled if the GPU wrote it, the VM's bit given back, unwired */
++		if (b->wfence != 0 && fUnsettled != 0) {
++			fUnsettled--;
++		}
++		fUserBytes -= b->size;
++	}
+ 	if (b->pooled) {
+ 		bits_mark(gpool_bits, (b->pa - GPOOL_PA) >> 12, n, false);
+ 	}
+@@ -6266,7 +6466,9 @@ SapphireGPUClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMem
+ 
+ 	IOLockLock(service_lock);
+ 	struct msm_bo *b = fBo != NULL ? bo(type) : NULL;
+-	if (b != NULL && b->surf != NULL && !b->mapped && gpu_flush_mode == 2) {
++	if (b != NULL && b->user) {
++		r = kIOReturnUnsupported;               /* 0380: the program's own memory, mapped where it is already */
++	} else if (b != NULL && b->surf != NULL && !b->mapped && gpu_flush_mode == 2) {
+ 		/* 0339: a surface's pixels are the program's through IOSurface and its locks alone (an unmapping, which
+ 		 * also asks here, is of one mapped before and goes through) */
+ 		gflush.maps_refused++;
+@@ -6534,6 +6736,113 @@ SapphireGPUClient::surface(struct msm_surface *r)
+ 	return ret;
+ }
+ 
++/*
++ * 0380: the program's memory [address, address + size) as a buffer (see msm_user_sync). The range on whole pages, at
++ * most MSM_BUFFER_MAX, flags 0; this client holds at most MSM_USER_BYTES of it at a time. kIOReturnVMError: memory the
++ * program does not have (or that cannot be held), or a page the pmap does not manage.
++ */
++IOReturn
++SapphireGPUClient::userMemory(struct msm_user_memory *r)
++{
++	const uint64_t size = r->size, n = size >> PAGE_SHIFT, t0 = mach_absolute_time();
++	IOMemoryDescriptor *md;
++	ppnum_t *pages;
++	uint32_t h;
++	bool ok = true;
++
++	if (gpu_usermem == 0) {
++		return kIOReturnUnsupported;
++	}
++	if (r->address == 0 || (r->address & PAGE_MASK) != 0 || (r->address & 4095) != 0 || size == 0 || (size & PAGE_MASK) != 0 ||
++	    (size & 4095) != 0 || size > MSM_BUFFER_MAX || r->flags != 0 || r->address + size < r->address) {
++		guser.refused++;
++		return kIOReturnBadArgument;
++	}
++	md = IOMemoryDescriptor::withAddressRange(r->address, size, kIODirectionInOut, fTask);
++	pages = md != NULL ? IONew(ppnum_t, n) : NULL;
++	if (md == NULL || pages == NULL) {
++		OSSafeReleaseNULL(md);
++		guser.refused++;
++		return kIOReturnNoMemory;
++	}
++	if (md->prepare(kIODirectionInOut) != kIOReturnSuccess) {
++		md->release();
++		IODelete(pages, ppnum_t, n);
++		guser.refused++;
++		return kIOReturnVMError;
++	}
++	for (uint64_t p = 0; p < n && ok; p++) {
++		IOByteCount seg = 0;
++		addr64_t pa = md->getPhysicalSegment(p << PAGE_SHIFT, &seg, kIOMemoryMapperNone);
++
++		pages[p] = (ppnum_t)(pa >> PAGE_SHIFT);
++		ok = pa != 0 && pmap_valid_page(pages[p]);
++	}
++	if (ok) {
++		/* the account starts: every page's bit taken (a write from here on sets it again), then no line of the
++		 * buffer left in any cache */
++		for (uint64_t p = 0; p < n; p++) {
++			(void)pmap_test_and_clear_modify(pages[p]);
++		}
++		msm_user_dsb();
++		for (uint64_t p = 0; p < n; p++) {
++			msm_user_lines(pages[p], true);
++		}
++		msm_user_dsb();
++	}
++	IOReturn ret = ok ? kIOReturnNoMemory : kIOReturnVMError;
++	IOLockLock(service_lock);
++	struct msm_bo *b = ok && fUserBytes + size <= MSM_USER_BYTES ? slot(&h) : NULL;
++	if (b != NULL) {
++		b->md = md;
++		b->size = size;
++		b->user = true;
++		b->pages = pages;
++		if (place(b)) {
++			fCount++;
++			fBytes += size;
++			fUserBytes += size;
++			msm_census(b, 1);
++			r->handle = h;
++			guser.made++;
++			guser.bytes += size;
++			guser.peak = MAX(guser.peak, guser.bytes);
++			ret = kIOReturnSuccess;
++		} else {
++			bzero(b, sizeof(*b));
++		}
++	} else if (ok) {
++		LOG("msm: %s: %llu KB of its own memory as a GPU buffer refused: it holds %llu KB already, or no handle is left", fName,
++		    size >> 10, fUserBytes >> 10);
++	}
++	IOLockUnlock(service_lock);
++	if (ret != kIOReturnSuccess) {
++		md->complete();
++		md->release();
++		IODelete(pages, ppnum_t, n);
++		guser.refused++;
++	}
++	gdiag_since(&guser.make, t0);
++	return ret;
++}
++
++/* The client's program-memory buffers the GPU wrote: settled, those whose submission is done. With service_lock taken
++ * here. */
++void
++SapphireGPUClient::settleUser(void)
++{
++	IOLockLock(service_lock);
++	for (uint32_t i = 0; fUnsettled != 0 && i < MSM_BUFFERS + MSM_LEFT; i++) {
++		struct msm_bo *b = i < MSM_BUFFERS ? (fBo != NULL ? &fBo[i] : NULL) : (fLeft != NULL ? &fLeft[i - MSM_BUFFERS] : NULL);
++		if (b != NULL && b->md != NULL && b->user && b->wfence != 0 && msm_fence_done(b->wfence)) {
++			msm_user_settle(b);
++			b->wfence = 0;
++			fUnsettled--;
++		}
++	}
++	IOLockUnlock(service_lock);
++}
++
+ IOReturn
+ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ {
+@@ -6577,6 +6886,10 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 		uint64_t now = mach_absolute_time();
+ 		for (uint32_t i = 0; i < r->nr_bos; i++) {
+ 			struct msm_bo *b = bo(bos[i].handle);
++			if (b != NULL && b->user) {
++				msm_user_sync(b, bos[i].flags);         /* 0380: the pages a processor wrote since */
++				continue;
++			}
+ 			if (b == NULL || b->kva == NULL) {
+ 				continue;
+ 			}
+@@ -6670,6 +6983,12 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 				if (b->surf != NULL) {
+ 					b->surf->gpuFence = r->fence;   /* 0350: what a scanout of the surface waits for */
+ 				}
++				if (b->user && ((bos[i].flags & MSM_SUBMIT_BO_WRITE) != 0 || (bos[i].flags & MSM_SUBMIT_BO_READ) == 0)) {
++					if (b->wfence == 0) {
++						fUnsettled++;
++					}
++					b->wfence = r->fence;   /* 0380: its caches settled once this is done */
++				}
+ 			}
+ 		}
+ 		if (r->flags & MSM_SUBMIT_FENCE_FD_OUT) {
+@@ -6710,6 +7029,7 @@ msm_param(uint32_t which, uint64_t *value)
+ 	case 0x08: case 0x0a: case 0x11: *value = 0; return true;  /* PP_PGTABLE SUSPENDS RAYTRACING */
+ 	case 0x10: *value = ubwc_hbb(); return true;            /* HIGHEST_BANK_BIT: the one in force (0370) */
+ 	case 0x1000: *value = gpool_enabled(); return true;     /* sapphire: buffers are write-combined (libdrm) */
++	case 0x1001: *value = gpu_usermem != 0; return true;    /* sapphire 0380: request 0x7d, the program's own memory */
+ 	default: return false;                                  /* VA_START/VA_SIZE among them */
+ 	}
+ }
+@@ -6730,6 +7050,7 @@ SapphireGPUClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 		struct msm_submitqueue_query query;
+ 		struct drm_gem_close close;
+ 		struct msm_surface surface;
++		struct msm_user_memory userMemory;
+ 	} r;
+ 	size_t size = args->structureInputSize;
+ 	IOReturn ret = kIOReturnSuccess;
+@@ -6784,7 +7105,15 @@ SapphireGPUClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 		IOLockLock(service_lock);
+ 		b = bo(r.cpuPrep.handle);
+ 		gdiag.prep_n++;                         /* 0336 */
+-		if (b != NULL && b->kva != NULL) {
++		if (b != NULL && b->user) {
++			if (b->wfence != 0) {
++				msm_user_settle(b);             /* 0380: what the GPU wrote, before the processor reads */
++				b->wfence = 0;
++				if (fUnsettled != 0) {
++					fUnsettled--;
++				}
++			}
++		} else if (b != NULL && b->kva != NULL) {
+ 			uint32_t epoch = b->surf != NULL ? b->surf->cpuEpoch : 0;
+ 			sweet_dcache_flush((vm_offset_t)b->kva, (unsigned)b->size);
+ 			gdiag.prep_flush_bytes += b->size;
+@@ -6808,6 +7137,8 @@ SapphireGPUClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 			if (ms >= 2000) {
+ 				msm_hung(fName, r.waitFence.fence, false);
+ 			}
++		} else if (fUnsettled != 0) {
++			settleUser();                           /* 0380: the program's buffers the GPU wrote, now done */
+ 		}
+ 		break;
+ 	}
+@@ -6836,6 +7167,9 @@ SapphireGPUClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 	case kMsmSurface:
+ 		ret = surface(&r.surface);
+ 		break;
++	case kMsmUserMemory:
++		ret = userMemory(&r.userMemory);
++		break;
+ 	default:
+ 		if (unknown++ < 16) {
+ 			LOG("msm: %s: request %#x (%zu bytes) is not known here", fName, selector, size);
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -7266,6 +7266,56 @@ pmap_is_modified(
+ 	return phys_attribute_test(pn, PP_ATTR_MODIFIED);
+ }
+ 
++/*
++ * sapphire 0380: whether any mapping of page PN has written it since the last call for it, for a device that reads
++ * the page behind the processor's caches and cleans only what was written (the GPU of SapphireGpu.cpp, which is not
++ * coherent with them: its user memory buffers). When it was written, the page is made to fault on its next write
++ * again, as pmap_clear_modify makes it, and the bit is cleared; the caller cleans the page after the call.
++ *
++ * pmap_is_modified followed by pmap_clear_modify would lose writes: phys_attribute_clear() write-protects the page's
++ * mappings under its PV lock and clears the bit after that lock is let go, so a write fault taken in between on
++ * another processor (arm_fast_fault, which sets the bit under the same lock and makes the mapping writable again) has
++ * its bit cleared with its mapping left writable -- that write and every later one would never be seen. Here the test,
++ * the write-protection and the clearing are one step under the page's PV lock: a write fault falls wholly before it
++ * (its store done by the time the TLB invalidation of the write-protection completes, and cleaned by the caller after)
++ * or wholly after it (the bit set again, for the next call).
++ *
++ * The first look is without the lock: a write that faulted before the call set the bit before it. Pages the pmap does
++ * not manage, and a page with a wired mapping (which arm_force_fast_fault leaves writable: the bit is left set), answer
++ * TRUE every time. The VM's own account of these pages does not rest on the bit while the device holds them: it holds
++ * them through an IOPL prepared for writing, which marks each page dirty (vm_object_iopl_request, SET_PAGE_DIRTY), and
++ * gives the bit back (pmap_set_modify) when it lets them go.
++ */
++boolean_t
++pmap_test_and_clear_modify(
++	ppnum_t pn)
++{
++#if XNU_MONITOR
++	(void)pn;
++	return TRUE;            /* (no PPL entry for it: every page answers written, and is cleaned every time) */
++#else
++	pmap_paddr_t    pa = ptoa(pn);
++	unsigned int    pai;
++	boolean_t       modified;
++
++	if (!pa_valid(pa)) {
++		return TRUE;
++	}
++	if (!ppattr_pa_test_bits(pa, PP_ATTR_MODIFIED)) {
++		return FALSE;
++	}
++	pai = pa_index(pa);
++	pvh_lock(pai);
++	modified = ppattr_pa_test_bits(pa, PP_ATTR_MODIFIED);
++	if (modified &&
++	    arm_force_fast_fault_with_flush_range(pn, VM_PROT_ALL & ~VM_PROT_WRITE, PMAP_OPTIONS_FF_LOCKED, NULL)) {
++		ppattr_pa_clear_bits(pa, PP_ATTR_MODIFIED);
++	}
++	pvh_unlock(pai);
++	return modified;
++#endif
++}
++
+ 
+ /*
+  *	Set the reference bit on the specified physical page.
+--- a/osfmk/vm/pmap.h
++++ b/osfmk/vm/pmap.h
+@@ -580,6 +580,8 @@ extern void             pmap_set_modify(ppnum_t  pn);
+ extern void             pmap_clear_modify(ppnum_t pn);
+ /* Return modify bit */
+ extern boolean_t        pmap_is_modified(ppnum_t pn);
++/* sapphire 0380: modify bit, and if it was set: write-protect, then clear it, under the page's lock (arm pmap) */
++extern boolean_t        pmap_test_and_clear_modify(ppnum_t pn);
+ /* Return modified and referenced bits */
+ extern unsigned int pmap_get_refmod(ppnum_t pn);
+ /* Clear modified and referenced bits */

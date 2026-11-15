@@ -1,0 +1,154 @@
+0351: cpu: no cache maintenance before WFI by default (kern.sweet_idle_cache=0); set/way maintenance bounded by CLIDR's levels
+
+Needs 0344.
+
+- kern.sweet_idle_cache / boot-arg sweet_idle_cache default 0: nothing before WFI. On these cores WFI keeps
+  the core's state and its caches coherent; Linux idles them with dsb + wfi only (arch/arm64/kernel/
+  idle.c), and this kernel never powers a core down (no PSCI CPU_SUSPEND or CPU_OFF); where firmware powers
+  a core or cluster down, PSCI does the maintenance (TF-A psci_do_pwrdown_cache_maintenance). 1 (L1 and the
+  cluster's L2, sweet_FlushL1L2_Dcache) and 2 (L1 only) remain for measurement.
+- CleanPoC_Dcache, CleanPoU_Dcache, FlushPoC_Dcache and FlushPoU_Dcache turn CLIDR's count of levels into
+  DCACHE_SET_WAY's last level (count - 1, nothing when 0), as Linux's set/way loops do: PoU is the L1 only,
+  PoC the L1 and the L2 (the PoC paths did one extra, empty level; the PoU paths reached the L2).
+
+Measured (home-screen workload, interleaved, n=2 per value, with 0344's switch): 0 against 1 gives 25-26
+against 62-68 us of render-thread CPU per Metal draw and 44.0-46.9 against 29.6-31.6 command buffers/s.
+Lines a CPU holds live longer with 0; 0392 and 0394 deal with two paths where that matters. Two SpringBoard
+crashes on relaunch after a restart of backboardd (SIGBUS, SIGSEGV) were seen after running with 0 and none
+the same day before it; their cause is not established.
+
+--- a/bsd/kern/kern_sysctl.c
++++ b/bsd/kern/kern_sysctl.c
+@@ -2568,7 +2568,7 @@ sysctl_sweet_idle_cache SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_idle_cache,
+     CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_idle_cache, "I",
+-    "sapphire: before WFI 1 = upstream FlushPoU (L1 + cluster L2), 2 = the core's L1 only, 0 = nothing");
++    "sapphire: before WFI 0 = nothing (default), 1 = L1 + cluster L2 (as upstream did), 2 = the core's L1 only");
+ 
+ static int
+ sysctl_sweet_idle_stats SYSCTL_HANDLER_ARGS
+--- a/osfmk/arm64/caches_asm.s
++++ b/osfmk/arm64/caches_asm.s
+@@ -220,6 +220,10 @@ LEXT(clean_mmu_dcache)		/* sweet: was exported without a label */
+ #else /* !defined(APPLE_ARM64_ARCH_FAMILY) */
+ 	mrs		x0, CLIDR_EL1
+ 	ubfx		x0, x0, #24, #3	// extract CLIDR_EL1.LoC
++	cbnz		x0, 7f			// sapphire 0351: CLIDR_EL1 gives a count of levels; none -> nothing to do
++	ret
++7:
++	sub		x0, x0, #1		// DCACHE_SET_WAY takes the last level, 0-based and inclusive
+ 	DCACHE_SET_WAY csw
+ #endif /* defined(APPLE_ARM64_ARCH_FAMILY) */
+ 
+@@ -239,6 +243,10 @@ LEXT(CleanPoU_Dcache)
+ #else /* !defined(APPLE_ARM64_ARCH_FAMILY) */
+ 	mrs		x0, CLIDR_EL1
+ 	ubfx		x0, x0, #21, 3	// extract CLIDR_EL1.LoUIS
++	cbnz		x0, 7f			// sapphire 0351: CLIDR_EL1 gives a count of levels; none -> nothing to do
++	ret
++7:
++	sub		x0, x0, #1		// DCACHE_SET_WAY takes the last level, 0-based and inclusive
+ 	DCACHE_SET_WAY csw
+ #endif /* defined(APPLE_ARM64_ARCH_FAMILY) */
+ 
+@@ -376,6 +384,10 @@ LEXT(FlushPoC_Dcache)
+ #else /* !defined(APPLE_ARM64_ARCH_FAMILY) */
+ 	mrs		x0, CLIDR_EL1
+ 	ubfx		x0, x0, #24, #3	// extract CLIDR_EL1.LoC
++	cbnz		x0, 7f			// sapphire 0351: CLIDR_EL1 gives a count of levels; none -> nothing to do
++	ret
++7:
++	sub		x0, x0, #1		// DCACHE_SET_WAY takes the last level, 0-based and inclusive
+ 	DCACHE_SET_WAY cisw
+ #endif /* defined(APPLE_ARM64_ARCH_FAMILY) */
+ 
+@@ -404,6 +416,19 @@ LEXT(sweet_FlushL1_Dcache)
+ 	mov		x0, #0
+ 	DCACHE_SET_WAY cisw
+ 
++/*
++ * void sweet_FlushL1L2_Dcache(void)
++ *
++ *		sapphire: clean and invalidate by set/way the calling core's L1 and its cluster's L2 (levels 0 and 1), what
++ *		FlushPoU_Dcache did before 0351. Diagnostic only (kern.sweet_idle_cache=1).
++ */
++	.text
++	.align 2
++	.globl EXT(sweet_FlushL1L2_Dcache)
++LEXT(sweet_FlushL1L2_Dcache)
++	mov		x0, #1
++	DCACHE_SET_WAY cisw
++
+ /*
+  * void FlushPoU_Dcache(void)
+  *
+@@ -420,6 +445,10 @@ LEXT(FlushPoU_Dcache)
+ #else /* !defined(APPLE_ARM64_ARCH_FAMILY) */
+ 	mrs		x0, CLIDR_EL1
+ 	ubfx		x0, x0, #21, 3	// extract CLIDR_EL1.LoUIS
++	cbnz		x0, 7f			// sapphire 0351: CLIDR_EL1 gives a count of levels; none -> nothing to do
++	ret
++7:
++	sub		x0, x0, #1		// DCACHE_SET_WAY takes the last level, 0-based and inclusive
+ 	DCACHE_SET_WAY	cisw
+ #endif /* defined(APPLE_ARM64_ARCH_FAMILY) */
+ 
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -479,22 +479,26 @@ wfe_to_deadline_or_interrupt(uint32_t cid, uint64_t wfe_deadline, cpu_data_t *cd
+ 
+ #if defined(SWEET)
+ /*
+- * sapphire: what is done to the caches before WFI (kern.sweet_idle_cache, boot-arg sweet_idle_cache), and what it
+- * costs (kern.sweet_idle_stats); the cache identification and control registers of every CPU (kern.sweet_cpuregs).
++ * sapphire: what is done to the caches before WFI (kern.sweet_idle_cache, boot-arg sweet_idle_cache), what it costs
++ * (kern.sweet_idle_stats), and the cache identification and control registers of every CPU (kern.sweet_cpuregs).
+  *
+- * Upstream calls platform_cache_idle_enter() -> FlushPoU_Dcache() before every WFI on non-Apple cores (below).
+- * FlushPoU_Dcache passes CLIDR_EL1.LoUIS -- a count of levels, 1 on these cores -- to DCACHE_SET_WAY, whose bound
+- * is a 0-based, inclusive level ("x0: maximum cache level, 0-based, inclusive"; the loop ends on cmp/b.ls,
+- * caches_asm.s), so it cleans and invalidates by set/way level 0, the core's L1, *and* level 1, the L2 that the
+- * four cores of the cluster share: every idle entry of any core empties its cluster's L2 (2 MB on the A73s).
+- *   1  upstream: L1 + the cluster's L2 (the default; nothing changes unless asked)
+- *   2  the core's L1 only, what a clean and invalidate to the PoU means on Cortex-A53/A73
+- *   0  nothing, as Linux's WFI idle state; here WFI is entered directly (no PSCI CPU_SUSPEND), clock gating only
++ * Nothing is needed before WFI here: WFI keeps the core's state and leaves its caches in the coherency domain, and
++ * this kernel never powers a core down (no PSCI CPU_SUSPEND or CPU_OFF; SweetCPU's haltCPU/quiesceCPU panic). Linux
++ * idles these same cores with dsb + wfi and nothing else (arch/arm64/kernel/idle.c, cpu_do_idle); where PSCI does
++ * power a core or a cluster down, the firmware does the cache maintenance (TF-A psci_do_pwrdown_cache_maintenance).
++ * Upstream xnu calls platform_cache_idle_enter() -> FlushPoU_Dcache() here on every non-Apple core, and before 0351
++ * that cleaned and invalidated by set/way the core's L1 *and* the L2 its cluster shares (a count of levels handed to
++ * a loop that takes the last level, inclusive; fixed in caches_asm.s): every idle entry of any A73 emptied the A73s'
++ * 2 MB L2. The modes are kept to measure that:
++ *   0  nothing (the default)
++ *   1  the core's L1 and its cluster's L2, what upstream did (sweet_FlushL1L2_Dcache)
++ *   2  the core's L1 only (sweet_FlushL1_Dcache)
+  */
+-uint32_t sweet_idle_cache = 1;
++uint32_t sweet_idle_cache = 0;
+ uint64_t sweet_idle_entries[MAX_CPUS];
+ uint64_t sweet_idle_cache_abs[MAX_CPUS];
+ extern void sweet_FlushL1_Dcache(void);
++extern void sweet_FlushL1L2_Dcache(void);
+ 
+ static void
+ sweet_idle_cache_enter(void)
+@@ -504,7 +508,7 @@ sweet_idle_cache_enter(void)
+ 	uint64_t t0 = mach_absolute_time();
+ 
+ 	if (mode == 1) {
+-		platform_cache_idle_enter();
++		sweet_FlushL1L2_Dcache();
+ 	} else if (mode == 2) {
+ 		sweet_FlushL1_Dcache();
+ 	}
+@@ -1248,7 +1252,7 @@ cpu_machine_idle_init(boolean_t from_boot)
+ 		DTEntry         entry;
+ 
+ #if defined(SWEET)
+-		uint32_t idle_cache = 1;
++		uint32_t idle_cache = 0;
+ 		if (PE_parse_boot_argn("sweet_idle_cache", &idle_cache, sizeof(idle_cache)) && idle_cache <= 2) {
+ 			sweet_idle_cache = idle_cache;
+ 		}

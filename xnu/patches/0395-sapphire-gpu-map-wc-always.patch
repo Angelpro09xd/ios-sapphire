@@ -1,0 +1,32 @@
+sapphire: GPU buffers are mapped write-combined by the kernel whether or not they are zeroed
+
+With gpu_zero=0 a buffer of 256 KiB or more was never mapped by the kernel, so its pages kept no
+write-combined cache mode and the program saw them as device memory (reported by HouseOfBalance/ios-sapphire,
+patch 0332). The mapping is now made for every new buffer; only the bzero depends on gpu_zero. With the
+default gpu_zero=1 nothing changes.
+---
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index 0b62bba..d8f42b3 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -6627,11 +6627,18 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 			zero_all = z != 0;
+ 		}
+ 		bool zeroed = pm != NULL;
+-		if (pm != NULL && (zero_all || size < 256 * 1024) && !(reuse && gpu_bocache == 2)) {
++		/*
++		 * 0395: the kernel maps every new buffer write-combined once, zeroed or not. A buffer's pages take their
++		 * cache mode from the first mapping; one that the kernel never mapped reached the program as device
++		 * memory, where an unaligned store traps (EXC_ARM_DA_ALIGN in the Metal driver with gpu_zero=0).
++		 */
++		if (pm != NULL && !(reuse && gpu_bocache == 2)) {
+ 			diag_t0 = mach_absolute_time();
+ 			IOMemoryMap *km = pm->map(kIOMapWriteCombineCache);
+ 			if (km != NULL) {
+-				bzero((void *)km->getVirtualAddress(), size);
++				if (zero_all || size < 256 * 1024) {
++					bzero((void *)km->getVirtualAddress(), size);
++				}
+ 				km->release();
+ 			} else {
+ 				zeroed = false;

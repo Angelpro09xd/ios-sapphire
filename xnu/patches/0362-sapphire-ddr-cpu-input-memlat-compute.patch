@@ -1,0 +1,162 @@
+0362: TopazModem: the CPUs' input to the DDR manager, as stock memlat's compute monitors (kern.sweet_ddr_cpu, default 1)
+
+Counts only while 0361's DDR manager runs (kern.sweet_ddr_gov=1); needs 0361.
+
+Stock memlat (this phone's memlat.ko) has two compute monitors on the DDR, silver-compute and gold-compute:
+per CPU, the effective frequency (frequency times busy share of the sample) looks up the first row of the
+cluster's qcom,cpufreq-memfreq-tbl that is not under it, and the vote is the highest over the CPUs, never
+under 547000 kHz. Tables of this phone: gold-compute 1056000 -> 547000, 1344000 -> 768000, 1766400 ->
+1017000, 2208000 -> 1804000, 2803200 -> 2092000; silver-compute 1190400 -> 547000, 1516800 -> 768000,
+1804800 -> 1017000.
+
+This patch reproduces them. In this kernel CPUs 0-3 are the A73s (Linux's 4-7) at 2803.2 MHz and 4-7 the A53s
+at 1900.8 MHz, both fixed. The busy share comes from processor_info PROCESSOR_CPU_LOAD_INFO (10 ms ticks), so
+the window is kern.sweet_ddr_cpu_ms (100 ms) instead of stock's 8 ms PMU samples. The DDR rate becomes the
+BIMC vote of its row. The two monitors that count cache misses and bwmon are not reproduced.
+kern.sweet_ddr_cpu=0 drops the input. kern.sweet_ddr_cpu_stats: busy share per CPU, highest effective
+frequency, the rate memlat would ask, the BIMC vote.
+
+Checked on the host (144 checks with 0360 and 0361): idle CPUs give 547.2, a busy A73 2092.8, an A73 at 70 %
+1804.8, a busy A53 1017.6, and with the input off the manager's floor.
+Measured on the phone (one boot): with the manager on and the GPU fixed at 820 MHz, the DDR sits at 1804.8
+MHz and rises to 2092.8 during gestures. The CPU input's share of that is not measured on its own.
+
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -12055,11 +12055,135 @@ sweet_bus_stats_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_bus_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     NULL, 0, sweet_bus_stats_sysctl, "A", "sapphire 0361: the RPM's clock scaling and the DDR manager");
+ 
+-/* 0361 alone: no CPU input yet (0362 replaces this) */
++/*
++ * 0362: the CPUs' input, as stock memlat's compute monitors do it (MiCode topaz-t-oss memlat.c; this phone's
++ * memlat.ko; device tree DT:7712-7726, monitors "silver-compute" and "gold-compute"): per CPU, the effective frequency
++ * is its frequency times the busy share of the window; the first row of its cluster's qcom,cpufreq-memfreq-tbl that
++ * is not under it gives a DDR rate (past the last row, the last); the vote is the highest over the CPUs, and never
++ * under 547000, the floor of every stock monitor (so with any CPU awake Android's DDR is not under 547.2 MHz). The
++ * compute monitors ignore cache misses; the other two (instructions per L2 refill, PMU event 0x17) are not reproduced.
++ * In this kernel the CPUs 0-3 are the A73s (Linux numbers them 4-7) at 2803.2 MHz and 4-7 the A53s at 1900.8 MHz, both
++ * fixed (MPIDR 0x100-0x103 are the A73s); Android caps the A73s at 2400 MHz, and memlat asks 2092000 for either.
++ * The busy share comes from the scheduler's accounting (processor_info PROCESSOR_CPU_LOAD_INFO, 10 ms ticks), so the
++ * window is kern.sweet_ddr_cpu_ms (100: one tick of error is 10 %) instead of stock's 8 ms PMU samples.
++ *   kern.sweet_ddr_cpu   1 (default): the CPUs' input counts when the manager runs; 0: it does not.
++ */
++extern "C" processor_t cpu_to_processor(int cpu);
++extern "C" int ml_get_max_cpu_number(void);
++extern "C" kern_return_t processor_info(processor_t processor, processor_flavor_t flavor, host_t *host,
++    processor_info_t info, mach_msg_type_number_t *count);
++
++static const uint32_t memlat_gold[][2] = {          /* gold-compute, kHz -> kHz (DT:7720-7726) */
++	{ 1056000, 547000 }, { 1344000, 768000 }, { 1766400, 1017000 }, { 2208000, 1804000 }, { 2803200, 2092000 },
++};
++static const uint32_t memlat_silver[][2] = {        /* silver-compute (DT:7712-7718) */
++	{ 1190400, 547000 }, { 1516800, 768000 }, { 1804800, 1017000 },
++};
++#define MEMLAT_FLOOR_KHZ    547000u
++#define CPU_GOLD_KHZ        2803200u                /* this kernel's fixed rates */
++#define CPU_SILVER_KHZ      1900800u
++#define DDR_CPUS            8
++
++static int ddr_cpu_on = 1, ddr_cpu_ms = 100;
++static uint32_t ddr_cpu_ticks[DDR_CPUS][2];         /* busy, idle ticks at the window's start */
++static uint64_t ddr_cpu_t0;
++static struct { uint32_t busy_pct[DDR_CPUS], eff_mhz_max, want_khz; uint64_t windows; } gcpu;
++
++static uint32_t
++memlat_lookup(const uint32_t (*tbl)[2], unsigned n, uint32_t eff_khz)
++{
++	for (unsigned i = 0; i < n; i++) {
++		if (tbl[i][0] >= eff_khz) {
++			return tbl[i][1];
++		}
++	}
++	return tbl[n - 1][1];
++}
++
++static bool
++ddr_cpu_ticks_now(int cpu, uint32_t *busy, uint32_t *idle)
++{
++	processor_cpu_load_info_data_t li;
++	mach_msg_type_number_t count = PROCESSOR_CPU_LOAD_INFO_COUNT;
++	host_t host;
++
++	if (cpu > ml_get_max_cpu_number()) {
++		return false;
++	}
++	processor_t p = cpu_to_processor(cpu);
++	if (p == NULL || processor_info(p, PROCESSOR_CPU_LOAD_INFO, &host, (processor_info_t)&li, &count) != KERN_SUCCESS) {
++		return false;
++	}
++	*busy = li.cpu_ticks[CPU_STATE_USER] + li.cpu_ticks[CPU_STATE_SYSTEM] + li.cpu_ticks[CPU_STATE_NICE];
++	*idle = li.cpu_ticks[CPU_STATE_IDLE];
++	return true;
++}
++
++/* Every ddr_cpu_ms: the CPUs' vote (BIMC kHz of the row memlat asks) into ddr_in_cpu. bus_lock held. */
+ static void
+ ddr_cpu_sample(void)
+ {
++	uint64_t now = mach_absolute_time();
++
++	if (ddr_cpu_on == 0) {
++		ddr_in_cpu = 0;
++		ddr_cpu_t0 = 0;
++		return;
++	}
++	if (ddr_cpu_t0 != 0 && bus_ns(now - ddr_cpu_t0) < (uint64_t)MAX(ddr_cpu_ms, 20) * NSEC_PER_MSEC) {
++		return;
++	}
++	uint32_t want = MEMLAT_FLOOR_KHZ, eff_max = 0;
++	for (int c = 0; c < DDR_CPUS; c++) {
++		uint32_t busy = 0, idle = 0;
++		if (!ddr_cpu_ticks_now(c, &busy, &idle)) {
++			continue;
++		}
++		uint32_t db = busy - ddr_cpu_ticks[c][0], di = idle - ddr_cpu_ticks[c][1];
++		ddr_cpu_ticks[c][0] = busy;
++		ddr_cpu_ticks[c][1] = idle;
++		if (ddr_cpu_t0 == 0 || db + di == 0) {
++			continue;
++		}
++		uint32_t pct = (uint32_t)((uint64_t)db * 100 / (db + di));
++		bool gold = c < 4;
++		uint32_t eff = (uint32_t)((uint64_t)(gold ? CPU_GOLD_KHZ : CPU_SILVER_KHZ) * pct / 100);
++		uint32_t m = gold ? memlat_lookup(memlat_gold, 5, eff) : memlat_lookup(memlat_silver, 3, eff);
++		gcpu.busy_pct[c] = pct;
++		eff_max = MAX(eff_max, eff);
++		want = MAX(want, m);
++	}
++	if (ddr_cpu_t0 != 0) {
++		gcpu.windows++;
++		gcpu.eff_mhz_max = eff_max / 1000;
++		gcpu.want_khz = want;
++		/* a DDR rate of the device tree's table (547000 ... 2092000) to the BIMC vote of its row */
++		ddr_in_cpu = ddr_row_vote[ddr_row_of_rate(want)];
++	}
++	ddr_cpu_t0 = now;
++}
++
++static int
++sweet_ddr_cpu_stats_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[256];
++	size_t off = 0;
++
++	buf[0] = 0;
++	BUS_CAT("cpu input %d (%d ms windows, %llu): busy %%", ddr_cpu_on, ddr_cpu_ms, gcpu.windows);
++	for (int c = 0; c < DDR_CPUS; c++) {
++		BUS_CAT(" %u", gcpu.busy_pct[c]);
++	}
++	BUS_CAT("; highest effective %u MHz; memlat asks %u kHz (BIMC vote %u)", gcpu.eff_mhz_max, gcpu.want_khz, ddr_in_cpu);
++	return SYSCTL_OUT(req, buf, MIN(off, sizeof(buf) - 1) + 1);
+ }
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ddr_cpu_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_ddr_cpu_stats_sysctl, "A", "sapphire 0362: the CPUs' input to the DDR manager");
++SYSCTL_INT(_kern, OID_AUTO, sweet_ddr_cpu, CTLFLAG_RW | CTLFLAG_LOCKED, &ddr_cpu_on, 0,
++    "sapphire 0362: 1 = the CPUs' busy share counts, as stock memlat's compute monitors (1)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_ddr_cpu_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &ddr_cpu_ms, 0,
++    "sapphire 0362: the CPUs' window, ms (100)");
+ 
+ /* ---------------- the codec: from the RX macro to the speaker (audio=2) */
+ 

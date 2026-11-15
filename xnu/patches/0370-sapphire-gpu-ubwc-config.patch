@@ -1,0 +1,211 @@
+0370: SapphireGpu: the GPU's UBWC and tiling configuration as kgsl (or Linux) writes it for the a610 (boot-arg gpu_ubwc, kern.sweet_gpu_ubwc, default 0)
+
+Off unless gpu_ubwc=1|2 or kern.sweet_gpu_ubwc=1|2. Uses 0345's opp_drain() and service_lock, as 0348.
+
+Nothing in this kernel writes RB_NC_MODE_CNTL, TPL1_NC_MODE_CNTL, SP_NC_MODE_CNTL, UCHE_MODE_CNTL or
+RBBM_NC_MODE_CNTL: the units run on their reset values (read on the phone: RB/TPL1/SP_NC_MODE_CNTL 0x2,
+UCHE_MODE_CNTL 0x00200000), while GET_PARAM HIGHEST_BANK_BIT answers 14. These registers decide how a TILE6_3
+image (UBWC or not) is laid out: highest bank bit, level-1/level-2 bank swizzling, minimum access length,
+macrotile mode. The writer (RB) and the readers (TP, SP, UCHE) must agree.
+- gpu_ubwc=1: kgsl's on this phone (a6xx_start with the device tree's qcom,ubwc-mode 1 and
+  qcom,min-access-length 0x40, and the a610's highest_bank_bit 14): RB/TPL1/SP_NC_MODE_CNTL = 0x0000000b,
+  UCHE_MODE_CNTL = 0x00a00000; RBBM_NC_MODE_CNTL not written.
+- gpu_ubwc=2: Linux v6.12's (a6xx_calc_ubwc_config / a6xx_set_ubwc_config: highest bank bit 13, min_acc_len
+  1, ubwc_swizzle 7): 0x00000009 for the three, UCHE_MODE_CNTL = 0x00800000, RBBM_NC_MODE_CNTL = 0.
+- Written at every start of the CP (end of hw_init_regs(), also after a GPU reset); the values found the
+  first time are kept. kern.sweet_gpu_ubwc: read the mode; write 0/1/2 now (service_lock held, GPU idle;
+  EBUSY if it does not go idle within gpu_opp_drain ms); 0 restores the values found. An image already laid
+  out under the old values stays so: restart backboardd after a write.
+- kern.sweet_gpu_ubwc_regs: the five registers now and as found.
+- GET_PARAM HIGHEST_BANK_BIT (0x10): the bank bit in force (14 with gpu_ubwc 0 or 1, 13 with 2).
+
+Not run on the phone. Measured without it (reset values): TILE6_3 and UBWC images render, blend, sample and
+copy byte-identical to linear in a self-test (7 repetitions, 0 failures). What to watch with it: corrupted
+pictures in compressed textures until backboardd restarts; a GPU hang shows as 0317's recovery in the log.
+
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -2104,6 +2104,86 @@ hwcg_set(bool on)
+ 	gwr(0xae, on ? 0xaaa8aa82u : 0);
+ }
+ 
++/*
++ * sapphire 0370: the GPU's UBWC and tiling configuration -- how the RB, the TP, the SP and the UCHE lay out and read a
++ * TILE6_3 image (with or without UBWC): the highest bank bit, the UBWC 1.0 bank swizzling, the level-2 swizzling and
++ * the minimum access length (RB/TPL1/SP_NC_MODE_CNTL, UCHE_MODE_CNTL), and the macrotile mode (RBBM_NC_MODE_CNTL).
++ * Until now nothing here wrote them: they hold their reset values, the same for every unit as far as the images the
++ * driver already compresses show (read-only textures written by the 2D engine, read by the TP).
++ *   1: what kgsl writes on this phone (kgsl 5.x, graphics-kernel f900d903 adreno_a6xx.c a6xx_start :676-737): the DT's
++ *      qcom,ubwc-mode = <1> (KGSL_UBWC_1_0: mode bit 1) and qcom,min-access-length = <0x40> (mal 1), and the a610's
++ *      highest_bank_bit 14 (adreno-gpulist.h:1520): hbb_lo 1, hbb_hi 0, level-2 swizzling on, amsbc and the 565
++ *      predicator off; RBBM_NC_MODE_CNTL left alone (kgsl writes it for the a680 and a663 alone)
++ *   2: what Linux v6.12 writes for the a610 (a6xx_gpu.c a6xx_calc_ubwc_config :513-517, a6xx_set_ubwc_config :568-609):
++ *      highest bank bit 13, min_acc_len 1, ubwc_swizzle 7 (mode bit 1, level-2 on), macrotile mode 0
++ * The two differ in the highest bank bit alone (14 against 13; Mesa 25.0.7's a610 row says 13 too).
++ * boot-arg gpu_ubwc=1|2: written at every start of the CP (hw_init_regs, also after a reset of the GPU, 0317), the
++ * values found there first kept; kern.sweet_gpu_ubwc: read, the mode; write 0/1/2 now, with service_lock held and the
++ * GPU idle (EBUSY if it does not go idle within gpu_opp_drain ms), and at every start after -- 0 puts back the values
++ * found at the first start. Every tiled or compressed image already in memory was laid out under the old values:
++ * restart its owner (killall backboardd) after a write. kern.sweet_gpu_ubwc_regs: the five registers as they read now,
++ * and as they were found. GET_PARAM HIGHEST_BANK_BIT answers the bank bit in force (14 with gpu_ubwc 0, as before).
++ */
++static int gpu_ubwc;                            /* boot-arg gpu_ubwc, kern.sweet_gpu_ubwc */
++static bool ubwc_found_ok;                      /* the values hw_init_regs found before it first wrote any */
++static uint32_t ubwc_found[5];
++
++#define REG_RB_NC_MODE_CNTL     0x8e08          /* a6xx.xml (Mesa 25.0.7 a6xx.xml.h:6779) */
++#define REG_TPL1_NC_MODE_CNTL   0xb604          /* a6xx.xml.h:10138 */
++#define REG_SP_NC_MODE_CNTL     0xae02          /* a6xx.xml.h:9565 */
++#define REG_UCHE_MODE_CNTL      0x0e01          /* a6xx.xml.h:3916 */
++#define REG_RBBM_NC_MODE_CNTL   0x0534          /* a6xx.xml.h:3202 */
++
++static const uint16_t ubwc_regs[5] = { REG_RB_NC_MODE_CNTL, REG_TPL1_NC_MODE_CNTL, REG_SP_NC_MODE_CNTL, REG_UCHE_MODE_CNTL,
++	                               REG_RBBM_NC_MODE_CNTL };
++
++/* the bank bit in force: what GET_PARAM HIGHEST_BANK_BIT answers */
++static uint32_t
++ubwc_hbb(void)
++{
++	return gpu_ubwc == 2 ? 13 : 14;
++}
++
++/* the five values of MODE (1 kgsl's, 2 Linux's), as a6xx_set_ubwc_config packs them; RBBM_NC_MODE_CNTL ~0: not written */
++static void
++ubwc_values(int mode, uint32_t v[5])
++{
++	const uint32_t hbb = (mode == 2 ? 13 : 14) - 13, hbb_lo = hbb & 3, hbb_hi = (hbb >> 2) & 1;
++	const uint32_t ubwc_mode = 1, mal = 1, level2_off = 0, amsbc = 0, rgb565 = 0, uavflag = 0;
++
++	v[0] = (level2_off << 12) | (rgb565 << 11) | (hbb_hi << 10) | (amsbc << 4) | (mal << 3) | (hbb_lo << 1) | ubwc_mode;
++	v[1] = (level2_off << 6) | (hbb_hi << 4) | (mal << 3) | (hbb_lo << 1) | ubwc_mode;
++	v[2] = (level2_off << 12) | (hbb_hi << 10) | (uavflag << 4) | (mal << 3) | (hbb_lo << 1) | ubwc_mode;
++	v[3] = (mal << 23) | (hbb_lo << 21);
++	v[4] = mode == 2 ? 0 : ~0u;                 /* Linux writes macrotile_mode 0; kgsl leaves it */
++}
++
++/* with the GPU idle (hw_init_regs, or the sysctl under service_lock after opp_drain) */
++static void
++ubwc_set(int mode)
++{
++	uint32_t v[5];
++
++	if (!ubwc_found_ok) {
++		for (unsigned i = 0; i < 5; i++) {
++			ubwc_found[i] = grd(ubwc_regs[i]);
++		}
++		ubwc_found_ok = true;
++	}
++	if (mode == 0) {
++		for (unsigned i = 0; i < 5; i++) {
++			v[i] = ubwc_found[i];
++		}
++	} else {
++		ubwc_values(mode, v);
++	}
++	for (unsigned i = 0; i < 5; i++) {
++		if (v[i] != ~0u) {
++			gwr(ubwc_regs[i], v[i]);
++		}
++	}
++}
++
+ static void
+ hw_init_regs(void)
+ {
+@@ -2141,6 +2221,9 @@ hw_init_regs(void)
+ 	if (gpu_hwcg != 0) {
+ 		hwcg_set(true);                         /* 0348 */
+ 	}
++	if (gpu_ubwc != 0) {
++		ubwc_set(gpu_ubwc);                     /* 0370 */
++	}
+ }
+ 
+ /* Type-7 packet header: opcode and count each carry an odd-parity bit. */
+@@ -3571,6 +3654,10 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+ 	clk_lock = IOLockAlloc();
+ 	(void)PE_parse_boot_argn("gpu_opp_drain", &opp_drain_ms, sizeof(opp_drain_ms));      /* 0345 */
+ 	(void)PE_parse_boot_argn("gpu_hwcg", &gpu_hwcg, sizeof(gpu_hwcg));                   /* 0348 */
++	(void)PE_parse_boot_argn("gpu_ubwc", &gpu_ubwc, sizeof(gpu_ubwc));                   /* 0370 */
++	if (gpu_ubwc < 0 || gpu_ubwc > 2) {
++		gpu_ubwc = 0;
++	}
+ 	(void)PE_parse_boot_argn("gpu_opp_park", &opp_park, sizeof(opp_park));
+ 	if (opp_drain_ms == 0 || opp_drain_ms > 1000) {
+ 		opp_drain_ms = 100;
+@@ -5430,6 +5517,66 @@ sweet_gpu_hwcg_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_hwcg, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     NULL, 0, sweet_gpu_hwcg_sysctl, "I", "sapphire 0348: 1 = hardware clock gating of the GPU's blocks, as kgsl sets it");
+ 
++/* 0370: read, the mode; write 0/1/2, now (the GPU idle) and at every start after. */
++static int
++sweet_gpu_ubwc_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = gpu_ubwc;
++	int error;
++
++	error = sysctl_io_number(req, v, sizeof(v), &v, NULL);
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (v < 0 || v > 2) {
++		return EINVAL;
++	}
++	if (!service_ready || service_lock == NULL) {
++		return ENODEV;
++	}
++	IOLockLock(service_lock);
++	if (!service_ready || !opp_drain(opp_drain_ms)) {
++		IOLockUnlock(service_lock);
++		return EBUSY;
++	}
++	gpu_ubwc = v;
++	ubwc_set(v);
++	uint32_t rb = grd(REG_RB_NC_MODE_CNTL), tp = grd(REG_TPL1_NC_MODE_CNTL), sp = grd(REG_SP_NC_MODE_CNTL), uc = grd(REG_UCHE_MODE_CNTL);
++	IOLockUnlock(service_lock);
++	LOG("ubwc: mode %d (RB_NC_MODE_CNTL %08x TPL1 %08x SP %08x UCHE_MODE_CNTL %08x); restart backboardd", v, rb, tp, sp, uc);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_ubwc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_ubwc_sysctl, "I", "sapphire 0370: UBWC/tiling configuration, 0 as found, 1 kgsl's (bank bit 14), 2 Linux's (13)");
++
++/* 0370: the five registers now, and as hw_init_regs found them before 0370 first wrote them */
++static int
++sweet_gpu_ubwc_regs_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char line[256];
++	uint32_t now[5] = { 0, 0, 0, 0, 0 };
++	bool have = false;
++
++	if (service_ready && service_lock != NULL) {
++		IOLockLock(service_lock);
++		if (service_ready) {
++			for (unsigned i = 0; i < 5; i++) {
++				now[i] = grd(ubwc_regs[i]);
++			}
++			have = true;
++		}
++		IOLockUnlock(service_lock);
++	}
++	snprintf(line, sizeof(line), "mode %d, bank bit %u; now RB %08x TPL1 %08x SP %08x UCHE %08x RBBM %08x%s; found %sRB %08x TPL1 %08x "
++	    "SP %08x UCHE %08x RBBM %08x", gpu_ubwc, ubwc_hbb(), now[0], now[1], now[2], now[3], now[4], have ? "" : " (no GPU)",
++	    ubwc_found_ok ? "" : "(not yet) ", ubwc_found[0], ubwc_found[1], ubwc_found[2], ubwc_found[3], ubwc_found[4]);
++	return SYSCTL_OUT(req, line, strlen(line) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_ubwc_regs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_gpu_ubwc_regs_sysctl, "A", "sapphire 0370: RB/TPL1/SP_NC_MODE_CNTL, UCHE_MODE_CNTL, RBBM_NC_MODE_CNTL now and as found");
++
+ /*
+  * GPU memory (0151): the gigabyte from 0x1_0000_0000 to 0x1_4000_0000 is DDR that nobody uses
+  * here -- xnu runs from 0x1_4000_0000 (the shim clamps it there), the fixed firmware carve-outs
+@@ -6561,7 +6708,7 @@ msm_param(uint32_t which, uint64_t *value)
+ 	case 0x07: *value = 1; return true;                     /* PRIORITIES */
+ 	case 0x09: *value = gpu_faults; return true;           /* FAULTS: the resets of a hung GPU (0317) */
+ 	case 0x08: case 0x0a: case 0x11: *value = 0; return true;  /* PP_PGTABLE SUSPENDS RAYTRACING */
+-	case 0x10: *value = 14; return true;                    /* HIGHEST_BANK_BIT */
++	case 0x10: *value = ubwc_hbb(); return true;            /* HIGHEST_BANK_BIT: the one in force (0370) */
+ 	case 0x1000: *value = gpool_enabled(); return true;     /* sapphire: buffers are write-combined (libdrm) */
+ 	default: return false;                                  /* VA_START/VA_SIZE among them */
+ 	}

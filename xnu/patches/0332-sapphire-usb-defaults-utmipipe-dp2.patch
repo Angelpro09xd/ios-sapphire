@@ -1,0 +1,56 @@
+0332: sweet_usb: UTMI as the PIPE clock (0331) and data path v2 (0330) by default
+
+- sweetusb_utmipipe defaults to 1 (0 turns it off).
+- sweetusb_dp defaults to 2 (any other value selects the old data path). The default is applied in
+  gadget_start, where the boot-arg is read; ud_dp stays 0 until then, so the v2 paths (ud_if_output,
+  ud_event, the sysctl, the log thread) never run before gadget_start has set them up.
+
+With both defaults in the kernel the boot-args no longer need them, which keeps the command line under the
+575 characters the shim passes with sweet_splash.
+
+Measured with this kernel and no USB boot-args: 3 of 3 normal boots and 1 of 1 fastboot-continue boot
+enumerated (41-44 s); over all kernels with UTMI as the PIPE clock, 8 of 8 normal boots enumerated.
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -286,7 +286,12 @@ static struct {
+ } ud;
+ 
+ /* 0330: sweetusb_dp: 2 selects the data path v2 (below, before ud_thread), any other value the old path */
+-static int ud_dp;
++/*
++ * 0332: data path v2 (0330) is the default; sweetusb_dp=0 selects the old path for an A/B.
++ * Measured with v2: 20 copies of 30 MB over SSH, 10 each way, all intact, 0 Start Transfer
++ * refused; with the old path a 4 MiB copy stopped the link after 192 KiB (130538 refused Starts).
++ */
++static int ud_dp;      /* 0 until gadget_start has initialised everything; the default is chosen there */
+ #define DP_TRB_RX       0x1400          /* one data TRB per 64-byte line, away from ep0's (0x1000-0x107f) */
+ #define DP_TRB_TX       0x1440
+ #define DP_TRB_INT      0x1480
+@@ -2092,9 +2097,13 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
+-	PE_parse_boot_argn("sweetusb_dp", &ud_dp, sizeof(ud_dp));
+-	if (ud_dp != 2) {
+-		ud_dp = 0;
++	{
++		/* sweetusb_dp: default 2, applied here where the boot-arg is read and never as the
++		 * variable's initial value, so that the v2 paths (ud_if_output, ud_event, the sysctl,
++		 * the log thread) do not run before gadget_start has set them up. */
++		int want = 2;
++		PE_parse_boot_argn("sweetusb_dp", &want, sizeof(want));
++		ud_dp = (want == 2) ? 2 : 0;
+ 	}
+ 	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+@@ -2120,7 +2129,8 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	 * PHY being identical on both paths, and QSCRATCH GENERAL_CFG 0x4 on both (never selected).
+ 	 */
+ 	{
+-		int utmipipe = 0;
++		/* 0332: on by default (normal boots: 8 of 8 enumerate with it, 0 of 3 without); sweetusb_utmipipe=0 disables */
++		int utmipipe = 1;
+ 		PE_parse_boot_argn("sweetusb_utmipipe", &utmipipe, sizeof(utmipipe));
+ 		if (utmipipe) {
+ 			vm_offset_t qsg = ml_io_map(QSCRATCH_PA, 0x100);

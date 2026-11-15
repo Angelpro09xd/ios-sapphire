@@ -1,0 +1,1245 @@
+0350: SweetFramebuffer, SweetSurface: window server frames scanned out through VIG0's scaler, no GPU copy (kern.sweet_fb_scanout, default 0)
+
+Needs 0339, 0340 and 0349. No change of behaviour unless switched on.
+
+Each frame the window server swaps (a 750 x 1624 IOSurface, iOS at 2x) is copied by the GPU, scaled 1.5x,
+into a 1080 x 2400 flip buffer (4.15 ms of GPU time per copy on average, measured with 0336). VIG0 has a
+QSEED3LITE scaler that can do the scaling instead.
+
+kern.sweet_fb_scanout (read-write, boot-arg sweetfb_scanout):
+  0 (default)  copies, as now;
+  1  the window server's screen surfaces are made in a pool the MDP can scan, and a frame of one of them is
+     shown as it is: VIG0 points at the surface and the scaler scales the panel's window of it (720 x 1600,
+     1.5x) onto the panel;
+  2  the pool only: surfaces made in it, frames still copied.
+Surfaces made before the switch stay where they are: switch on and restart backboardd (or boot with
+sweetfb_scanout=1). Setting 0 takes effect at the next swap.
+
+The pool: 4 slots of 5 MiB at 0xe5000000 (RAM the kernel does not manage, below 4 GiB for the plane's 32-bit
+address), mapped write-combined everywhere (kernel, every process, the GPU client), so neither the GPU nor
+the MDP needs cache maintenance on it. A surface gets a slot when backboardd makes it at the screen's 2x
+size, 'BGRA', one plane, rows of whole 64-byte lines.
+
+A frame is scanned out when it has one layer from the pool, of the screen's size and format, not on the
+panel nor waiting; anything else is copied, in the same queue (0340) and in order. The flip waits for the msm
+fence of the last submission made before the SwapEnd and of any later one that named the surface; the plane
+is rewritten only when the MDP has taken the last flush and the scan is between a sixteenth and three
+quarters of the refresh, so it is never latched half written; a surface stays in use until the MDP has
+taken a later flip. If the MDP does not take a flush of the scaled plane in 100 ms, the scanout switches
+itself off and copies go on.
+
+The scaled plane is set up as Linux v6.12 sets up an RGB plane on this scaler (dpu_plane.c
+_dpu_plane_setup_scaler3, dpu_hw_util.c dpu_hw_setup_scaler3), also the stock driver's default without
+userspace scaler data: 27 registers, bilinear, no coefficient table. The scanout starts only if the
+bootloader's plane is as expected (whole panel, scaler off, linear 32-bit RGB, VIG0 in the mixer).
+
+kern.sweet_fb_scanout_diag (read only): readiness (or why not), pool use, frames and flips, frames copied and
+why, waits, plane rewrites, stops, flushes not taken.
+
+Locking: under fPresentLock, as 0340's queue; the plane is rewritten with it held, spinning 20 ms at most.
+Lock order unchanged.
+
+Measured on the phone (n=1): with 1, CTL_FLUSH returned its bits in 769 of 769 flips, no flush not taken, no
+hang; but CoreAnimation kept drawing into the surface on the panel (it is told nothing by SwapWait), so more
+than half of the frames went back to the copy and the plane switched modes ~400 times each way. 0353 and
+0354 address that. Off at once: sysctl -w kern.sweet_fb_scanout=0.
+
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -4304,6 +4304,28 @@ msm_fence_done(uint32_t f)
+ 	return (int32_t)(*(volatile uint32_t *)(pool + OFF_MSM_FENCE) - f) >= 0;
+ }
+ 
++/*
++ * sapphire 0350, for SweetFramebuffer's scanout of the window server's surfaces: the fence of the last msm submission
++ * handed to the CP, and whether a given one is done. The frame a SwapEnd names was drawn by submissions made before it
++ * (HakiosMetal's commit submits before it returns), and the CP runs the one ring in order, so the last fence at that
++ * moment covers them; what a submission made later draws into the surface is in its gpuFence (submitIt()). A GPU that
++ * takes no more work has nothing pending, as for the copies (sapphire_gpu_fence_done()).
++ */
++uint32_t sapphire_gpu_msm_fence(void);
++bool sapphire_gpu_msm_fence_done(uint32_t fence);
++
++uint32_t
++sapphire_gpu_msm_fence(void)
++{
++	return *(volatile uint32_t *)&msm_seq;          /* (a word, written under service_lock: read as it stands) */
++}
++
++bool
++sapphire_gpu_msm_fence_done(uint32_t fence)
++{
++	return !service_ready || fence == 0 || pool == NULL || msm_fence_done(fence);
++}
++
+ static bool
+ msm_gpu_idle(void)
+ {
+@@ -6045,8 +6067,10 @@ SapphireGPUClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMem
+ 			OSIncrementAtomic((volatile SInt32 *)&b->surf->cpuEpoch);      /* 0339: mapped, or unmapped after use */
+ 		}
+ 		*memory = b->md;
+-		/* pool memory write-combined; kernel memory never (see above). libdrm asks for the same. */
+-		*options = b->pooled ? kIOMapWriteCombineCache : kIOMapDefaultCache;
++		/* pool memory write-combined; kernel memory never (see above). libdrm asks for the same. 0350: a surface of the
++		 * framebuffer's scanout pool too (mapped by default, memory the kernel does not manage would be Device memory,
++		 * and the program's other mapping of it is write-combined: SweetSurface.cpp) */
++		*options = b->pooled || (b->surf != NULL && b->surf->lowPool) ? kIOMapWriteCombineCache : kIOMapDefaultCache;
+ 		r = kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(service_lock);
+@@ -6361,8 +6385,8 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 				 * also cleaned an unchanged surface again cleaned the 11 MB display surface on every
+ 				 * frame (glFlush took 9 ms a frame, most of the CPU's time); the GPU alone writes it.
+ 				 */
+-				if (seed == b->seed && !b->mapped) {
+-					continue;
++				if ((seed == b->seed && !b->mapped) || b->surf->lowPool) {
++					continue;               /* (0350: a scanout pool surface is write-combined everywhere: no cache holds it) */
+ 				}
+ 				b->seed = seed;
+ 				b->cleaned = now;
+@@ -6432,6 +6456,9 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 			struct msm_bo *b = bo(bos[i].handle);
+ 			if (b != NULL) {
+ 				b->fence = r->fence;
++				if (b->surf != NULL) {
++					b->surf->gpuFence = r->fence;   /* 0350: what a scanout of the surface waits for */
++				}
+ 			}
+ 		}
+ 		if (r->flags & MSM_SUBMIT_FENCE_FD_OUT) {
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -440,6 +440,132 @@ sweet_fbl_sample(volatile uint32_t *ctl, volatile uint32_t *intf)
+ 	}
+ }
+ 
++/*
++ * sapphire 0350: the window server's frames scanned out by the display engine itself. kern.sweet_fb_scanout (boot-arg
++ * sweetfb_scanout; default 0: as before):
++ *   0  as before: every frame is copied by the GPU, scaled, into a flip buffer;
++ *   1  the window server's screen surfaces are made in a pool the MDP can scan (SweetSurface.cpp), and a frame of one
++ *      such surface goes to the panel as it is: VIG0 is pointed at the surface and its scaler (QSEED3LITE) scales the
++ *      panel's window of it onto the panel, the window and the factor the copy used -- no copy, no flip buffer,
++ *      nothing of the GPU's. Needs the frame queue (kern.sweet_fb_queue=1), whose thread flips;
++ *   2  the pool only: surfaces made in it, frames still copied (to tell the memory apart from the presentation).
++ * Surfaces made before it was set stay where they are: the window server makes its screen surfaces when it starts
++ * (restarting backboardd makes them again). Anything else goes the copy's way, as before, in the same queue and in
++ * order: a frame with more than one layer, a surface not from the pool or of another size or format, one swapped
++ * again while the panel may still read it or a frame of it waits, a plane the bootloader did not leave as start()
++ * expects (then it never starts: kern.sweet_fb_scanout_diag says why). Setting 0 (or 2) takes effect at the next swap,
++ * and a frame of the pool that is on the panel then is copied into a flip buffer at once (the latest swap presented
++ * again the copy's way), so that the panel leaves the scaled plane without waiting for the window server.
++ *
++ * What a scan needs, and how it is had:
++ *   - memory the MDP reaches: a physical address below 4 GiB (the plane's address register has 32 bits, and the
++ *     display's SMMU stream bypasses, as it does for the flip buffers): the pool, SWEET_FB_SCAN_SLOTS slots of 5 MiB
++ *     from 0xe5000000, RAM the kernel does not manage, after the flip buffers' pool (0xe2000000-0xe5000000) and below
++ *     the QSEE pool (0xe8000000);
++ *   - the surface left alone while the panel may read it: in use (sweet_hold) from its SwapEnd until the MDP has taken
++ *     the flip of a later frame. The window server then draws into another one, or makes one more;
++ *   - the frame drawn before it is shown: the flip waits for the msm fence of the last submission made before the
++ *     SwapEnd (HakiosMetal's commit submits before it returns, and the CP runs one ring in order), and for any later
++ *     one that named the surface (its gpuFence); 250 ms at most;
++ *   - the plane rewritten only when it cannot be latched half written: the MDP has taken the last flush (CTL_FLUSH's
++ *     bits clear) and the scan is between a sixteenth and three quarters of the refresh, milliseconds from the next
++ *     frame start, where the registers are latched; a write takes microseconds. A flip of a flip buffer rewrites the
++ *     plane back the same way.
++ * The scaled plane is Linux's for an RGB plane on this scaler (dpu_plane.c: _dpu_plane_setup_scaler3,
++ * _dpu_plane_setup_pixel_ext; dpu_hw_util.c: dpu_hw_setup_scaler3; dpu_hw_sspp.c: setup_rects, setup_pe_config), which is
++ * also the stock driver's when userspace gives no scaler data (sde_plane.c, _sde_plane_setup_scaler3): bilinear, no
++ * coefficient table (the tables are userspace's, through the lut_sep property: the kernel has none), phase steps
++ * (src << 21) / dst with a zero initial phase, preload 4 x 2 (scaler 3.0), pixel extension the size of the source, PE
++ * override on. The unscaled plane is what the bootloader left (read in start()) and goes back at the first flip of a flip
++ * buffer.
++ */
++#define SWEET_FB_SCAN_PA        0xE5000000ull
++#define SWEET_FB_SCAN_SLOTS     4
++#define SWEET_FB_SCAN_SLOT      0x00500000u
++#define SWEET_FB_FMT_BGRA       0x42475241
++static int sweet_fb_scanout = 0;
++static bool sweet_fb_scan_ready;                /* start() found the plane as it should be and set up the pool */
++static struct {
++	uint64_t frames, flips, forced, late_draw, not_one_layer, not_pool, unfit, reused, queue_off;
++	uint64_t holds, hold_us, hold_max_us, timeouts, to_scaled, to_unscaled, unscaled_waits, unscaled_wait_max_us;
++	uint64_t window_waits, released, stops, stuck;
++} sweet_fbs;
++extern uint32_t sapphire_gpu_msm_fence(void);           /* SapphireGpu.cpp: the last msm submission's fence */
++extern bool sapphire_gpu_msm_fence_done(uint32_t fence); /* ... and whether a given one is done */
++
++/* The plane's registers the scaled scanout writes (VIG0's offsets; the scaler's at +0xa00), in the order Linux writes them. */
++#define SWEET_PLANE_REGS        27
++static const uint16_t sweet_plane_off[SWEET_PLANE_REGS] = {
++	0x000, 0x008, 0x00c, 0x010,                     /* SSPP_SRC_SIZE, SRC_XY, OUT_SIZE, OUT_XY */
++	0x100, 0x104, 0x108,                            /* SSPP_SW_PIX_EXT_C0_LR, _TB, _REQ_PIXELS */
++	0x110, 0x114, 0x118,                            /* ... C1C2 */
++	0x120, 0x124, 0x128,                            /* ... C3 */
++	0xa90, 0xa94, 0xa98, 0xa9c,                     /* QSEED3_PHASE_INIT_Y_H, _Y_V, _UV_H, _UV_V */
++	0xa10, 0xa14, 0xa18, 0xa1c,                     /* QSEED3_PHASE_STEP_Y_H, _Y_V, _UV_H, _UV_V */
++	0xa20, 0xa40, 0xa44, 0xa48,                     /* QSEED3_PRELOAD, _SRC_SIZE_Y_RGB_A, _SRC_SIZE_UV, _DST_SIZE */
++	0xa04,                                          /* QSEED3_OP_MODE */
++	0x038,                                          /* SSPP_SRC_OP_MODE */
++};
++
++/*
++ * The scaled plane's register values, in sweet_plane_off[]'s order: the part (sx, sy, sw, sh) of the surface onto
++ * dw x dh of the panel at out_xy (the bootloader's), for the source format in src_format (SSPP_SRC_FORMAT: BIT(8) alpha,
++ * BIT(14) 10-bit) and the bootloader's SSPP_SRC_OP_MODE in src_op. Arithmetic only, so that a host program can set it
++ * beside Linux's own functions (dpu_plane.c, dpu_hw_util.c, dpu_hw_sspp.c of v6.12).
++ */
++static void
++sweet_plane_scaled_regs(uint32_t *v, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh, uint32_t dw, uint32_t dh,
++    uint32_t out_xy, uint32_t src_format, uint32_t src_op)
++{
++	/* _dpu_plane_setup_scaler3: mult_frac(1 << PHASE_STEP_SHIFT, src, dst), the same for the chroma (RGB: no subsampling) */
++	uint32_t step_x = (uint32_t)(((uint64_t)sw << 21) / dw), step_y = (uint32_t)(((uint64_t)sh << 21) / dh);
++	uint32_t req = (sh << 16) | sw;                 /* _dpu_plane_setup_pixel_ext: the whole source, no extension */
++	uint32_t op = 1u | (3u << 16) | (1u << 31);     /* enable, Y/RGB filter DPU_SCALE_BIL, blend_cfg 1 */
++
++	if ((src_format & (1u << 14)) == 0) {
++		op |= 1u << 14;                         /* 8-bit data (not DX) */
++	}
++	if ((src_format & (1u << 8)) != 0) {
++		op |= (1u << 10) | (1u << 29);          /* alpha, filtered DPU_SCALE_ALPHA_BIL (scaler version not 0x1002) */
++	}
++	v[0] = (sh << 16) | sw;                         /* setup_rects */
++	v[1] = (sy << 16) | sx;
++	v[2] = (dh << 16) | dw;
++	v[3] = out_xy;
++	for (unsigned c = 0; c < 3; c++) {              /* setup_pe_config: LR, TB 0; C3's TB is written with C3's LR, also 0 */
++		v[4 + 3 * c] = 0;
++		v[5 + 3 * c] = 0;
++		v[6 + 3 * c] = req;
++	}
++	v[13] = v[14] = v[15] = v[16] = 0;              /* dpu_hw_setup_scaler3: initial phases (left 0 by the plane) */
++	v[17] = v[19] = step_x & 0xFFFFFF;
++	v[18] = v[20] = step_y & 0xFFFFFF;
++	v[21] = 4u | (2u << 8) | (4u << 16) | (2u << 24);       /* DPU_QSEED4_DEFAULT_PRELOAD_H/V (scaler 3.0) */
++	v[22] = v[23] = (sw & 0x1FFFF) | ((sh & 0x1FFFF) << 16);
++	v[24] = (dw & 0x1FFFF) | ((dh & 0x1FFFF) << 16);
++	v[25] = op;
++	v[26] = src_op | (1u << 31);                    /* setup_format: MDSS_MDP_OP_PE_OVERRIDE */
++}
++
++/*
++ * The part of the window server's 2x surface (lw x lh) the panel (pw x ph) shows, in the surface's whole pixels: the
++ * panel's window of the 3x picture at (offx, offy) of SWEET_FB_LOGICAL_W x _H, scaled by 2/3, of the part of the surface
++ * drawn (0321: rscale permille, 400-1000). present()'s copy takes the same window in 1/256 pixels (sapphire_gpu_copy_scaled:
++ * x and y << 8); here the origin is rounded down and the size to the nearest pixel.
++ */
++static void
++sweet_scan_window(uint32_t lw, uint32_t lh, int32_t offx, int32_t offy, uint32_t pw, uint32_t ph, int rscale,
++    uint32_t *sx, uint32_t *sy, uint32_t *sw, uint32_t *sh)
++{
++	int rs = rscale >= 400 && rscale <= 1000 ? rscale : 1000;
++	uint64_t kx = ((uint64_t)lw << 8) * (uint64_t)rs / 1000, ky = ((uint64_t)lh << 8) * (uint64_t)rs / 1000;
++
++	*sx = (uint32_t)(((uint64_t)(uint32_t)offx * kx / SWEET_FB_LOGICAL_W) >> 8);
++	*sy = (uint32_t)(((uint64_t)(uint32_t)offy * ky / SWEET_FB_LOGICAL_H) >> 8);
++	*sw = (uint32_t)((((uint64_t)pw * kx / SWEET_FB_LOGICAL_W) + 128) >> 8);
++	*sh = (uint32_t)((((uint64_t)ph * ky / SWEET_FB_LOGICAL_H) + 128) >> 8);
++}
++
+ struct SweetLowBuf {
+ 	IOMemoryMap *map;
+ 	uint8_t     *va;
+@@ -575,11 +701,20 @@ public:
+ 	IOLock       *fPresentLock;   /* 0201: present() from SwapEnd and from the vsync timer */
+ 	bool          fNow;           /* 0201: boot-arg sweetfb_now (default 1): present at SwapEnd */
+ 	/* 0340: the frame queue (see sweet_fb_queue above). All of it with fPresentLock. */
++	struct SweetGeo {
++		uint32_t      sx, sy, sw, sh; /* 0350: the part of a surface the panel shows, in its pixels */
++	};
+ 	struct SweetQFrame {
+ 		uint64_t      pa;             /* the flip buffer the GPU copies the frame into */
+ 		uint32_t      fence;          /* that copy's fence */
+ 		uint64_t      queued, arrived; /* when the copy was queued; when the frame's SwapEnd came in */
+ 		SweetSurface *held[4];        /* the frame's surfaces: in use until it is flipped */
++		/* 0350: a frame of a pool surface, scanned out as it is: pa is the surface's, fence an msm fence, and its
++		 * surfaces stay in use after its flip, until the MDP has taken a later one */
++		bool          scan;
++		SweetSurface *surf;
++		uint32_t      stride;
++		struct SweetGeo geo;
+ 	};
+ 	struct SweetQFrame fQ[SWEET_FB_BUFS];     /* the frames waiting for the panel, oldest first */
+ 	uint32_t      fQCount;
+@@ -600,6 +735,30 @@ public:
+ 	bool          presentQueued(const uint8_t *rec, SweetSurface **held, bool *queued);
+ 	void          queueThread(void) __attribute__((noreturn));
+ 	static void   queueThreadMain(void *self, wait_result_t result) __attribute__((noreturn));
++	/* 0350: the scanout of the window server's surfaces (sweet_fb_scanout). All of it with fPresentLock. */
++	uint32_t      fPlane0[SWEET_PLANE_REGS];      /* the plane's registers as the bootloader left them (unscaled) */
++	uint32_t      fPlaneFormat, fScalerVersion;   /* SSPP_SRC_FORMAT and QSEED3_HW_VERSION at boot */
++	const char   *fScanWhy;       /* why there is no scanout (start()), or NULL */
++	bool          fPlaneScaled;   /* the plane is set up for a surface (scaled), not for a flip buffer */
++	struct SweetGeo fPlaneGeo;    /* ... with this part of it */
++	uint32_t      fPlaneStride;
++	SweetSurface *fScanShow[4];   /* the surfaces of the frame on the panel, when it is a frame of a surface */
++	SweetSurface *fScanLeave[4][4]; /* ... of frames left since the MDP was last seen to take a flip, oldest first */
++	bool          fFlushKnown, fFlushReadback;    /* CTL_FLUSH has been read right after a write; it read the bits set */
++	bool          fScanStuck;     /* the MDP did not take a flush of the scaled plane in 100 ms */
++	void          scanoutInit(void);
++	bool          scanoutOn(void);
++	bool          scanoutBusy(SweetSurface *s);
++	void          scanoutLeave(void);
++	void          scanoutRetire(void);
++	void          scanoutStop(void);
++	bool          planeWritable(void);
++	void          planeScaled(uint64_t pa, uint32_t stride, const struct SweetGeo *g);
++	void          planeUnscaled(void);
++	void          flipNote(uint64_t pa, bool force);
++	bool          frameDone(const struct SweetQFrame *f, uint64_t now);
++	void          frameShow(struct SweetQFrame *f);
++	bool          presentScanout(const uint8_t *rec, SweetSurface **held, bool *queued);
+ };
+ 
+ /*
+@@ -953,9 +1112,61 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: frame queue %s (kern.sweet_fb_queue), %u flip buffers, its thread %s\n", sweet_fb_queue ? "on" : "off",
+ 		    fFlip[2] != NULL ? 3u : 2u, fQThread ? "started" : "NOT started (the timer's ticks flip)");
+ 	}
++	scanoutInit();                  /* 0350 */
+ 	return true;
+ }
+ 
++/*
++ * 0350: whether the plane is as the scanout expects it, and the pool. The plane's registers are the bootloader's: this
++ * kernel has only pointed it elsewhere (SRC0_ADDR, SRC_YSTRIDE0) so far. The scanout needs iOS drawing at 2x (a surface
++ * smaller than the panel, the copy's case), the copy's way to fall back on (two flip buffers, the queue's thread, the
++ * interface's counters), a plane that shows the whole panel unscaled from (0, 0) -- source and output both the panel's
++ * size, the scaler off -- out of linear 32-bit RGB, and VIG0 in the mixer.
++ */
++void
++AppleCLCD::scanoutInit(void)
++{
++	PE_parse_boot_argn("sweetfb_scanout", &sweet_fb_scanout, sizeof(sweet_fb_scanout));
++	if (fVig0 == NULL || fCtl0 == NULL) {
++		fScanWhy = "the plane is not mapped";
++		return;
++	}
++	for (unsigned k = 0; k < SWEET_PLANE_REGS; k++) {
++		fPlane0[k] = fVig0[sweet_plane_off[k] / 4];
++	}
++	fPlaneFormat = fVig0[0x30 / 4];
++	fScalerVersion = fVig0[0xa00 / 4];
++	uint32_t panel = (fHeight << 16) | fWidth, layer = fCtl0[0x00 / 4];
++	if (!fScale2 || fLogicalW >= fWidth || fLogicalH >= fHeight) {
++		fScanWhy = "iOS does not draw at 2x (sweetfb_scale=2): its surface is not smaller than the panel";
++	} else if (fFlip[0] == NULL || fFlip[1] == NULL || !fQThread || fIntf1 == NULL) {
++		fScanWhy = "no flip buffers, frame queue thread or interface counters to fall back on";
++	} else if (fPlane0[0] != panel || fPlane0[2] != panel || fPlane0[1] != 0 || fPlane0[3] != 0) {
++		fScanWhy = "the plane does not show the whole panel unscaled from (0, 0)";
++	} else if ((fPlane0[25] & 1) != 0 || fScalerVersion == 0 || fScalerVersion == ~0u) {
++		fScanWhy = "the scaler is on already, or does not answer";
++	} else if (((fPlaneFormat >> 9) & 3) != 3 || (fPlaneFormat >> 30) != 0 || (fPlaneFormat & (1u << 15)) != 0 ||
++	    (fPlane0[26] & 1) != 0) {
++		fScanWhy = "the plane's format is not linear 32-bit RGB";
++	} else if ((layer & 7) == 0) {
++		fScanWhy = "VIG0 is not in the mixer (CTL_LAYER(LM0))";
++	} else {
++		sweet_scanout_pool_set(SWEET_FB_SCAN_PA, SWEET_FB_SCAN_SLOTS, SWEET_FB_SCAN_SLOT, fLogicalW, fLogicalH);
++		sweet_fb_scan_ready = true;
++	}
++	IOLog("SWEET FB: scanout (kern.sweet_fb_scanout %d): %s; plane at boot: src %#x/%#x out %#x/%#x format %#x op %#x pe %#x, "
++	    "scaler %#x op %#x, CTL_LAYER %#x; pool %u x %u KB at %#llx\n", sweet_fb_scanout,
++	    fScanWhy != NULL ? fScanWhy : "ready", fPlane0[0], fPlane0[1], fPlane0[2], fPlane0[3], fPlaneFormat, fPlane0[26],
++	    fPlane0[6], fScalerVersion, fPlane0[25], layer, (uint32_t)SWEET_FB_SCAN_SLOTS, SWEET_FB_SCAN_SLOT >> 10, SWEET_FB_SCAN_PA);
++}
++
++/* SweetSurface.cpp asks: are the window server's screen surfaces to be made in the pool now? */
++int
++sweet_fb_scanout_pool_on(void)
++{
++	return sweet_fb_scan_ready && (sweet_fb_scanout == 1 || sweet_fb_scanout == 2);
++}
++
+ /*
+  * The display's modes, the way CoreAnimation reads them (properties TimingElements and
+  * ColorElements; the current one is block 0x40 of selector 79): one timing, the presented size
+@@ -1116,7 +1327,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			IOLockUnlock(fb->fLock);
+ 			if (first && fb->fPixels != 0) {
+ 				if (fb->fVig0 != NULL && fb->fScanPhys != fb->fBootSrc) {
++					/* (0350: with fPresentLock, as every flip that may leave a scaled plane or a surface on it) */
++					if (fb->fPresentLock != NULL) {
++						IOLockLock(fb->fPresentLock);
++					}
+ 					fb->scanFrom(fb->fBootSrc, fb->fBootStride);
++					if (fb->fPresentLock != NULL) {
++						IOLockUnlock(fb->fPresentLock);
++					}
+ 				}
+ 				for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 					volatile uint64_t *row = (volatile uint64_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+@@ -1148,7 +1366,13 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			return;
+ 		}
+ 		if (fb->fVig0 != NULL && fb->fScanPhys != fb->fBootSrc) {
++			if (fb->fPresentLock != NULL) {
++				IOLockLock(fb->fPresentLock);   /* (0350) */
++			}
+ 			fb->scanFrom(fb->fBootSrc, fb->fBootStride);
++			if (fb->fPresentLock != NULL) {
++				IOLockUnlock(fb->fPresentLock);
++			}
+ 		}
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+@@ -1386,8 +1610,15 @@ AppleCLCD::presentNow(const uint8_t *rec, SweetSurface **held)
+ 	bool queued = false, copied;
+ 	if (queueOn()) {
+ 		fQArrived = diag_t0;
+-		copied = presentQueued(rec, held, &queued);     /* 0340: queued, the frame keeps its surfaces until its flip */
++		if (scanoutOn() && presentScanout(rec, held, &queued)) {
++			copied = true;                  /* 0350: scanned out as it is; queued, it keeps its surfaces */
++		} else {
++			copied = presentQueued(rec, held, &queued);     /* 0340: queued, the frame keeps its surfaces until its flip */
++		}
+ 	} else {
++		if (sweet_fb_scanout == 1 && sweet_fb_scan_ready) {
++			sweet_fbs.queue_off++;          /* 0350: the scanout needs the frame queue (kern.sweet_fb_queue=1) */
++		}
+ 		queueDrain();                           /* (the queue was just turned off: what it still holds goes first) */
+ 		copied = present(rec);
+ 	}
+@@ -1464,7 +1695,30 @@ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ 	 * is, and where the panel's scan was when the flip was written, are kept for the frame queue: the buffer is
+ 	 * not written and no other flip is made before the flip is seen taken (flipTaken()). If the flip before this
+ 	 * one has not been seen taken, the MDP may be reading either the buffer noted then or that flip's own.
++	 * 0350: a flip buffer is shown unscaled, the plane as the bootloader set it up: a scaled plane (a surface on the
++	 * panel) is set back first, where it cannot be latched half written; that surface is read until this flip is taken.
+ 	 */
++	flipNote(pa, fPlaneScaled);
++	planeUnscaled();
++	scanoutLeave();
++	fVig0[0x14 / 4] = (uint32_t)pa;
++	fVig0[0x24 / 4] = stride;
++	__asm__ volatile("dsb sy" ::: "memory");
++	fCtl0[0x18 / 4] = 0x20001;      /* flush VIG0 + CTL: latched at the next vsync */
++	__asm__ volatile("dsb sy" ::: "memory");
++	sweet_fbl_wrote(fCtl0, fIntf1); /* 0349: what CTL_FLUSH reads back, and when it clears (read only) */
++	fScanPhys = pa;
++	fScanStride = stride;
++}
++
++/*
++ * 0350 (0340's bookkeeping of a flip, from scanFrom(), shared with planeScaled()): a flip to pa is about to be written.
++ * Which flip buffer the MDP is leaving, and where the scan is, for flipTaken(); force: a flip that rewrites the plane
++ * counts as one even to the same address.
++ */
++void
++AppleCLCD::flipNote(uint64_t pa, bool force)
++{
+ 	uint64_t now = mach_absolute_time();
+ 	bool taken = flipTaken(now);
+ 	uint64_t leaving = 0;
+@@ -1473,7 +1727,7 @@ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ 			leaving = fFlipPhys[i];
+ 		}
+ 	}
+-	if (pa != fScanPhys) {
++	if (pa != fScanPhys || force) {
+ 		if (taken) {
+ 			fQRetirePa[0] = leaving;
+ 			fQRetirePa[1] = 0;
+@@ -1490,14 +1744,6 @@ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ 		fQFlipAbs = now;
+ 		fQLatchWait = true;
+ 	}
+-	fVig0[0x14 / 4] = (uint32_t)pa;
+-	fVig0[0x24 / 4] = stride;
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	fCtl0[0x18 / 4] = 0x20001;      /* flush VIG0 + CTL: latched at the next vsync */
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	sweet_fbl_wrote(fCtl0, fIntf1); /* 0349: what CTL_FLUSH reads back, and when it clears (read only) */
+-	fScanPhys = pa;
+-	fScanStride = stride;
+ }
+ 
+ /*
+@@ -1918,6 +2164,10 @@ sweet_fb_clean_for_gpu(SweetSurface *s, uintptr_t va, vm_offset_t part, uint64_t
+ 	uint32_t seed_now = s->state != NULL ? *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
+ 	uint32_t epoch = s->cpuEpoch;           /* read first: an access announced meanwhile is cleaned the next time */
+ 
++	if (s->lowPool) {
++		return false;                   /* 0350: a scanout pool surface is write-combined everywhere: no cache holds it */
++	}
++
+ 	if (sapphire_gpu_flush_tracking() && !s->wrapped && s->memory != NULL) {
+ 		if (s->cleanEpoch == epoch) {
+ 			return false;
+@@ -2313,6 +2563,9 @@ AppleCLCD::flipTaken(uint64_t now)
+ 		return true;
+ 	}
+ 	bool taken = fIntf1 != NULL && (uint32_t)(fIntf1[(0x800 + 0x0ac) / 4] - fQFlipFrame) >= (fQFlipLate ? 2u : 1u);
++	if (taken && fFlushReadback && (fCtl0[0x18 / 4] & 0x20001) != 0) {
++		taken = false;                          /* 0350: CTL_FLUSH says the MDP has not taken it yet (seen to read back) */
++	}
+ 	if (!taken) {
+ 		nanoseconds_to_absolutetime(34 * NSEC_PER_MSEC, &limit);
+ 		if (now - fQFlipAbs < limit) {
+@@ -2385,26 +2638,43 @@ AppleCLCD::queueFlip(void)
+ 	bool taken = flipTaken(now);
+ 	bool wake = waiting && taken;           /* the buffer the MDP was leaving is free from now on */
+ 
++	if (taken) {
++		scanoutRetire();                        /* 0350: ... and the surfaces it was leaving */
++	} else if (fPlaneScaled && fFlushReadback && !fScanStuck && fCtl0 != NULL && (fCtl0[0x18 / 4] & 0x20001) != 0) {
++		uint64_t limit;
++		nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &limit);
++		if (now - fQFlipAbs > limit) {
++			/* 0350: the MDP has not taken a flush of the scaled plane in 100 ms: back to the copies, for good */
++			fScanStuck = true;
++			if (sweet_fb_scanout == 1) {
++				sweet_fb_scanout = 0;
++			}
++			sweet_fbs.stuck++;
++			IOLog("SWEET FB: scanout: the MDP has not taken a flush in 100 ms (CTL_FLUSH %#x): scanout off\n", fCtl0[0x18 / 4]);
++		}
++	}
+ 	if (fPowerOff) {
+ 		queueDrop();
+-	} else if (fQCount != 0 && taken && sapphire_gpu_fence_done(fQ[0].fence)) {
+-		struct SweetQFrame f = fQ[0];
+-		for (uint32_t k = 1; k < fQCount; k++) {
+-			fQ[k - 1] = fQ[k];
+-		}
+-		fQCount--;
+-		sweet_fbd.pend_swap = f.queued;         /* 0336's "swap to flip" is this frame's, from its copy being queued */
+-		scanFrom(f.pa, fRowBytes);
+-		sweet_fbd_flip(fIntf1);
+-		queueFront(f.pa);
+-		sweet_fbq.flips++;
+-		sweet_fbq.late += fQFlipLate;
+-		if (f.arrived != 0 && now > f.arrived) {
+-			sweet_fbd_add(&sweet_fbq.lat, sweet_fbd_lat_us, sizeof(sweet_fbd_lat_us) / sizeof(sweet_fbd_lat_us[0]),
+-			    sweet_fbd_us(f.arrived, now));
+-		}
+-		sweet_hold_set(f.held, false);
+-		wake = true;                            /* ... and one frame fewer waits */
++	} else if (fQCount != 0 && taken && frameDone(&fQ[0], now)) {
++		/* 0350: a flip that rewrites the plane (to a surface, or back from one) only where it cannot be latched half written */
++		if ((fQ[0].scan || fPlaneScaled) && !fScanStuck && !planeWritable()) {
++			sweet_fbs.window_waits++;
++		} else {
++			struct SweetQFrame f = fQ[0];
++			for (uint32_t k = 1; k < fQCount; k++) {
++				fQ[k - 1] = fQ[k];
++			}
++			fQCount--;
++			sweet_fbd.pend_swap = f.queued;         /* 0336's "swap to flip" is this frame's, from its copy being queued */
++			frameShow(&f);
++			sweet_fbq.late += fQFlipLate;
++			if (f.arrived != 0 && now > f.arrived) {
++				sweet_fbd_add(&sweet_fbq.lat, sweet_fbd_lat_us, sizeof(sweet_fbd_lat_us) / sizeof(sweet_fbd_lat_us[0]),
++				    sweet_fbd_us(f.arrived, now));
++			}
++			sweet_hold_set(f.held, false);          /* (a frame of a surface keeps its: frameShow() took them) */
++			wake = true;                            /* ... and one frame fewer waits */
++		}
+ 	}
+ 	if (wake) {
+ 		IOLockWakeup(fPresentLock, &fQCount, false);    /* whoever waits in SwapEnd for a buffer or for its turn */
+@@ -2423,17 +2693,14 @@ AppleCLCD::queueDrain(void)
+ 		return;
+ 	}
+ 	struct SweetQFrame f = fQ[fQCount - 1];
+-	for (unsigned i = 0; i < 200 && !sapphire_gpu_fence_done(f.fence); i++) {
++	for (unsigned i = 0; i < 200 && !frameDone(&f, mach_absolute_time()); i++) {
+ 		IODelay(100);
+ 	}
+ 	fQCount--;
+ 	queueDrop();
+ 	if (!fPowerOff) {
+ 		sweet_fbd.pend_swap = f.queued;
+-		scanFrom(f.pa, fRowBytes);
+-		sweet_fbd_flip(fIntf1);
+-		queueFront(f.pa);
+-		sweet_fbq.flips++;
++		frameShow(&f);                  /* (0350: a frame of a surface rewrites the plane where it may) */
+ 	}
+ 	sweet_hold_set(f.held, false);
+ 	sweet_fbq.drained++;
+@@ -2590,6 +2857,410 @@ AppleCLCD::queueThread(void)
+ 	}
+ }
+ 
++/* ---------------------------------------------------------------- sapphire 0350: the scanout of the window server's surfaces */
++
++bool
++AppleCLCD::scanoutOn(void)
++{
++	return sweet_fb_scanout == 1 && sweet_fb_scan_ready && !fScanStuck && fQThread && queueOn();
++}
++
++/* Whether the panel may still read surface s, or a frame of it waits: then it is not scanned out again. */
++bool
++AppleCLCD::scanoutBusy(SweetSurface *s)
++{
++	for (uint32_t k = 0; k < 4; k++) {
++		if (fScanShow[k] == s) {
++			return true;
++		}
++		for (uint32_t f = 0; f < 4; f++) {
++			if (fScanLeave[f][k] == s) {
++				return true;
++			}
++		}
++		for (uint32_t q = 0; q < fQCount; q++) {
++			if (fQ[q].held[k] == s) {
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
++/*
++ * A flip is being written: the surfaces of the frame on the panel (a frame of a surface) are read until the MDP takes
++ * it, and kept in use until then (scanoutRetire()). With four frames left and no flip seen taken since, the oldest is
++ * let go: four flips have been written since it was on the panel.
++ */
++void
++AppleCLCD::scanoutLeave(void)
++{
++	bool any = false;
++	for (uint32_t k = 0; k < 4; k++) {
++		any |= fScanShow[k] != NULL;
++	}
++	if (!any) {
++		return;
++	}
++	uint32_t f = 0;
++	for (; f < 4; f++) {
++		bool used = false;
++		for (uint32_t k = 0; k < 4; k++) {
++			used |= fScanLeave[f][k] != NULL;
++		}
++		if (!used) {
++			break;
++		}
++	}
++	if (f == 4) {
++		sweet_hold_set(fScanLeave[0], false);
++		sweet_fbs.released++;
++		for (uint32_t k = 0; k < 3; k++) {
++			memcpy(fScanLeave[k], fScanLeave[k + 1], sizeof(fScanLeave[k]));
++		}
++		bzero(fScanLeave[3], sizeof(fScanLeave[3]));
++		f = 3;
++	}
++	memcpy(fScanLeave[f], fScanShow, sizeof(fScanShow));
++	bzero(fScanShow, sizeof(fScanShow));
++}
++
++/* The MDP has taken the last flip written: it reads that frame alone, and the surfaces it left are free. */
++void
++AppleCLCD::scanoutRetire(void)
++{
++	for (uint32_t f = 0; f < 4; f++) {
++		bool used = false;
++		for (uint32_t k = 0; k < 4; k++) {
++			used |= fScanLeave[f][k] != NULL;
++		}
++		if (used) {
++			sweet_hold_set(fScanLeave[f], false);
++			sweet_fbs.released++;
++		}
++	}
++}
++
++/*
++ * Whether the plane's registers may be rewritten now: the MDP has taken the last flush (CTL_FLUSH's VIG0 and CTL bits
++ * clear: what is written while one is pending is latched with it), and the scan is between a sixteenth and three
++ * quarters of the refresh (INTF_LINE_COUNT, in lines of vtotal), milliseconds away from the next frame start and from the
++ * programmable fetch before it, where the plane is latched; writing it takes microseconds.
++ */
++bool
++AppleCLCD::planeWritable(void)
++{
++	if (fCtl0 == NULL || fIntf1 == NULL || (fCtl0[0x18 / 4] & 0x20001) != 0) {
++		return false;
++	}
++	uint32_t hsync = fIntf1[(0x800 + 0x008) / 4] >> 16;
++	uint32_t vtotal = hsync != 0 ? fIntf1[(0x800 + 0x00c) / 4] / hsync : 0;
++	uint64_t line = fIntf1[(0x800 + 0x0b0) / 4];
++	return vtotal != 0 && line < vtotal && line * 16 >= vtotal && line * 4 < (uint64_t)vtotal * 3;
++}
++
++/* Until the plane may be rewritten, 20 ms at most (a refresh is 8.3): spinning, so that it also serves a panic. */
++static void
++sweet_plane_wait(AppleCLCD *fb)
++{
++	uint64_t t0 = mach_absolute_time(), now = t0, limit;
++	nanoseconds_to_absolutetime(20 * NSEC_PER_MSEC, &limit);
++	while (!fb->fScanStuck && !fb->planeWritable() && (now = mach_absolute_time()) - t0 < limit) {
++	}
++	if (now != t0) {
++		uint64_t us = sweet_fbd_us(t0, now);
++		sweet_fbs.unscaled_waits++;
++		if (us > sweet_fbs.unscaled_wait_max_us) {
++			sweet_fbs.unscaled_wait_max_us = us;
++		}
++	}
++}
++
++/* Back to the plane the bootloader set up (unscaled, the panel's size), before a flip of a flip buffer. */
++void
++AppleCLCD::planeUnscaled(void)
++{
++	if (!fPlaneScaled || fVig0 == NULL) {
++		return;
++	}
++	sweet_plane_wait(this);
++	for (unsigned k = 0; k < SWEET_PLANE_REGS; k++) {
++		fVig0[sweet_plane_off[k] / 4] = fPlane0[k];
++	}
++	fPlaneScaled = false;
++	sweet_fbs.to_unscaled++;
++}
++
++/*
++ * The panel shows surface memory at pa (rows of stride bytes), part g of it scaled onto the whole panel: the plane is
++ * rewritten when it is not set up so already, then pointed at the surface, and flushed. Whether CTL_FLUSH reads back
++ * the bits until the MDP takes them is looked at once, here: the write is far from a frame start (planeWritable()), so
++ * bits read clear right after it mean that the register does not read back.
++ */
++void
++AppleCLCD::planeScaled(uint64_t pa, uint32_t stride, const struct SweetGeo *g)
++{
++	bool geometry = !fPlaneScaled || memcmp(g, &fPlaneGeo, sizeof(*g)) != 0;
++
++	flipNote(pa, geometry);
++	if (!planeWritable()) {
++		sweet_plane_wait(this);         /* (from queueDrain(); the queue's flips come here writable) */
++	}
++	if (geometry) {
++		uint32_t v[SWEET_PLANE_REGS];
++		sweet_plane_scaled_regs(v, g->sx, g->sy, g->sw, g->sh, fWidth, fHeight, fPlane0[3], fPlaneFormat, fPlane0[26]);
++		for (unsigned k = 0; k < SWEET_PLANE_REGS; k++) {
++			fVig0[sweet_plane_off[k] / 4] = v[k];
++		}
++		if (!fPlaneScaled) {
++			sweet_fbs.to_scaled++;
++		}
++		fPlaneScaled = true;
++		fPlaneGeo = *g;
++	}
++	scanoutLeave();
++	fVig0[0x14 / 4] = (uint32_t)pa;
++	fVig0[0x24 / 4] = stride;
++	__asm__ volatile("dsb sy" ::: "memory");
++	fCtl0[0x18 / 4] = 0x20001;      /* flush VIG0 + CTL: latched at the next frame start */
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (!fFlushKnown) {
++		fFlushReadback = (fCtl0[0x18 / 4] & 0x20001) != 0;
++		fFlushKnown = true;
++		IOLog("SWEET FB: scanout: first frame of a surface on the panel (%u,%u %ux%u of it scaled to %ux%u); CTL_FLUSH %s\n",
++		    g->sx, g->sy, g->sw, g->sh, fWidth, fHeight, fFlushReadback ? "reads back until taken: flips are taken by it" :
++		    "reads clear at once: flips are taken by the frame counter");
++	}
++	sweet_fbl_wrote(fCtl0, fIntf1); /* 0349 */
++	fScanPhys = pa;
++	fScanStride = stride;
++	fPlaneStride = stride;
++}
++
++/* Whether a frame's drawing is done: a copy's fence, or for a frame of a surface the msm fences (250 ms at most). */
++bool
++AppleCLCD::frameDone(const struct SweetQFrame *f, uint64_t now)
++{
++	if (!f->scan) {
++		return sapphire_gpu_fence_done(f->fence);
++	}
++	uint32_t want = f->fence, last = f->surf != NULL ? f->surf->gpuFence : 0;
++	if (last != 0 && (int32_t)(last - want) > 0) {
++		want = last;                    /* a submission after the SwapEnd named the surface: wait for that one too */
++	}
++	if (sapphire_gpu_msm_fence_done(want)) {
++		return true;
++	}
++	uint64_t limit;
++	nanoseconds_to_absolutetime(250 * NSEC_PER_MSEC, &limit);
++	return now - f->queued > limit;
++}
++
++/* The frame goes to the panel (fPresentLock held). A frame of a surface keeps its surfaces in use: its held[] is taken. */
++void
++AppleCLCD::frameShow(struct SweetQFrame *f)
++{
++	if (f->scan) {
++		uint32_t last = f->surf != NULL ? f->surf->gpuFence : 0;
++		if (last != 0 && (int32_t)(last - f->fence) > 0) {
++			sweet_fbs.late_draw++;          /* drawn by a submission made after its SwapEnd */
++		}
++		if (!sapphire_gpu_msm_fence_done((int32_t)(last - f->fence) > 0 ? last : f->fence)) {
++			sweet_fbs.forced++;             /* 250 ms and still drawing: shown anyway */
++		}
++		planeScaled(f->pa, f->stride, &f->geo);
++		memcpy(fScanShow, f->held, sizeof(fScanShow));
++		bzero(f->held, sizeof(f->held));
++		sweet_fbs.flips++;
++	} else {
++		scanFrom(f->pa, fRowBytes);
++	}
++	sweet_fbd_flip(fIntf1);
++	queueFront(f->pa);
++	sweet_fbq.flips++;
++}
++
++/*
++ * A frame through the scanout (fPresentLock held, the queue on; from SwapEnd, or from the timer for its own frames).
++ * Returns false, having changed nothing, for a frame it does not take: then it goes the copy's way.
++ */
++bool
++AppleCLCD::presentScanout(const uint8_t *rec, SweetSurface **held, bool *queued)
++{
++	uint32_t mask = get32(rec, 0x104), layer = SWEET_FB_LAYERS, n = 0;
++
++	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++		if ((mask & (1u << i)) && get32(rec, 0x54 + 4 * i) != 0) {
++			layer = i;
++			n++;
++		}
++	}
++	if (n != 1) {
++		sweet_fbs.not_one_layer++;
++		return false;
++	}
++	SweetSurface *own[4] = {};
++	SweetSurface *s = held != NULL ? held[layer] : NULL;
++	if (s == NULL) {
++		if ((s = sweet_surface_copy(get32(rec, 0x54 + 4 * layer))) == NULL) {
++			return false;
++		}
++		own[layer] = s;
++	}
++	struct SweetGeo g;
++	sweet_scan_window(fLogicalW, fLogicalH, fOffX, fOffY, fWidth, fHeight, sweet_fb_rscale, &g.sx, &g.sy, &g.sw, &g.sh);
++	bool ok = false;
++	if (!s->lowPool || s->scanoutPhys == 0) {
++		sweet_fbs.not_pool++;
++	} else if (s->width != fLogicalW || s->height != fLogicalH || s->pixelFormat != SWEET_FB_FMT_BGRA ||
++	    s->bytesPerElement != 4 || (s->bytesPerRow & 63) != 0 || s->bytesPerRow > 0xffff || s->offset != 0 || g.sw == 0 ||
++	    g.sh == 0 || g.sx + g.sw > s->width || g.sy + g.sh > s->height ||
++	    s->scanoutPhys + (uint64_t)s->bytesPerRow * s->height > (1ull << 32)) {
++		sweet_fbs.unfit++;
++	} else if (scanoutBusy(s)) {
++		sweet_fbs.reused++;                     /* swapped again while the panel may read it: copied instead */
++	} else {
++		ok = true;
++	}
++	if (!ok) {
++		OSSafeReleaseNULL(own[layer]);
++		return false;
++	}
++
++	/* as present() at a frame of iOS: the console stops, the boot screen goes; and 0321's ids */
++	fConsShown = false;
++	splashEnd();
++	if (!fConsolePaused) {
++		int quiet = 0;
++		fConsolePaused = true;
++		if (PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
++			sweet_console_muted = 1;
++		}
++	}
++	{
++		bool known = false;
++		for (unsigned i = 0; i < 4; i++) {
++			known |= sweet_fb_ids[i] == s->id;
++		}
++		if (!known) {
++			sweet_fb_ids[sweet_fb_ids_next++ & 3] = s->id;
++		}
++	}
++	if (fFlipWait) {
++		/* the queue was just turned on: the copy the old path left pending is the queue's first frame (as presentQueued()) */
++		if (fQCount < SWEET_FB_BUFS) {
++			struct SweetQFrame *f = &fQ[fQCount++];
++			bzero(f, sizeof(*f));
++			f->pa = fFlipPhys[fFlipIdx ^ 1];
++			f->fence = sapphire_gpu_copy_fence();
++			f->queued = sweet_fbd.pend_swap;
++			sweet_fbq.adopted++;
++		}
++		fFlipWait = false;
++		sweet_fbd.pend_swap = 0;
++	}
++	queueFlip();
++
++	/* as many frames waiting as kern.sweet_fb_queue_depth allows: until the oldest is flipped, but not for long */
++	uint32_t depth = sweet_fb_queue_depth < 1 ? 1 : sweet_fb_queue_depth > SWEET_FB_BUFS - 1 ? SWEET_FB_BUFS - 1 :
++	    (uint32_t)sweet_fb_queue_depth;
++	if (fQCount >= depth) {
++		uint64_t t0 = mach_absolute_time(), deadline;
++		int ms = sweet_fb_queue_hold_ms;
++		if (ms > 0) {
++			clock_interval_to_deadline((uint32_t)(ms > 200 ? 200 : ms), kMillisecondScale, &deadline);
++			while (fQCount >= depth) {
++				IOLockWakeup(fPresentLock, &fQThread, true);
++				int result = IOLockSleepDeadline(fPresentLock, &fQCount, deadline, THREAD_UNINT);
++				queueFlip();
++				if (result == THREAD_TIMED_OUT) {
++					break;
++				}
++			}
++		}
++		uint64_t us = sweet_fbd_us(t0, mach_absolute_time());
++		sweet_fbs.holds++;
++		sweet_fbs.hold_us += us;
++		if (us > sweet_fbs.hold_max_us) {
++			sweet_fbs.hold_max_us = us;
++		}
++		if (fQCount >= depth) {
++			/* still none: the newest waiting frame gives up its place to this one and is never shown */
++			struct SweetQFrame *f = &fQ[--fQCount];
++			sweet_hold_set(f->held, false);
++			sweet_fbd.overwritten++;
++			sweet_fbs.timeouts++;
++		}
++		if (!scanoutOn() || scanoutBusy(s)) {
++			/* (turned off, or the surface taken, while this waited: the copy's way after all) */
++			OSSafeReleaseNULL(own[layer]);
++			return false;
++		}
++	}
++	if (own[layer] != NULL) {
++		sweet_hold(s, true);                    /* (the timer's own frame: no SwapEnd holds it) */
++	}
++	struct SweetQFrame *f = &fQ[fQCount++];
++	bzero(f, sizeof(*f));
++	f->scan = true;
++	f->surf = s;
++	f->pa = s->scanoutPhys;
++	f->stride = s->bytesPerRow;
++	f->geo = g;
++	f->fence = sapphire_gpu_msm_fence();
++	f->queued = mach_absolute_time();
++	f->arrived = fQArrived;
++	memcpy(f->held, own[layer] != NULL ? own : held, sizeof(f->held));
++	*queued = true;
++	sweet_fbs.frames++;
++	sweet_fbq.frames++;
++	if (fQCount > sweet_fbq.depth_max) {
++		sweet_fbq.depth_max = fQCount;
++	}
++	queueFlip();                                    /* (drawn already, and the plane writable now: flipped at once) */
++	IOLockWakeup(fPresentLock, &fQThread, true);
++	return true;
++}
++
++/*
++ * kern.sweet_fb_scanout set to something else than 1: if the plane shows a surface, or a frame of one waits, the latest
++ * swap is presented once more the copy's way, so that the panel goes back to a flip buffer now and not at the window
++ * server's next frame (fPresentLock taken here; from the sysctl).
++ */
++void
++AppleCLCD::scanoutStop(void)
++{
++	uint8_t *rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++	if (rec == NULL || fPresentLock == NULL) {
++		if (rec != NULL) {
++			IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		}
++		return;
++	}
++	IOLockLock(fLock);
++	memcpy(rec, fPending, SWEET_FB_SWAP_REC_SIZE);
++	bool off = fPowerOff;
++	IOLockUnlock(fLock);
++	IOLockLock(fPresentLock);
++	bool scanning = fPlaneScaled;
++	for (uint32_t q = 0; q < fQCount; q++) {
++		scanning |= fQ[q].scan;
++	}
++	if (scanning && !off) {
++		SweetSurface *none[4] = {};
++		bool queued = false;
++		if (queueOn()) {
++			(void)presentQueued(rec, none, &queued);
++		} else {
++			queueDrain();
++			(void)present(rec);
++		}
++		sweet_fbs.stops++;
++	}
++	IOLockUnlock(fPresentLock);
++	IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++}
++
+ bool
+ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
+@@ -3314,3 +3985,69 @@ sweet_fb_latch_sysctl SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_latch, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     NULL, 0, sweet_fb_latch_sysctl, "A", "sapphire 0349: whether CTL_FLUSH reads back a flip's bits and when they clear");
++
++/*
++ * sapphire 0350: kern.sweet_fb_scanout (0 copies as before, 1 scanout of the window server's surfaces, 2 their pool only;
++ * boot-arg sweetfb_scanout) and kern.sweet_fb_scanout_diag (sweet_fbs, at the top; read only).
++ */
++static int
++sweet_fb_scanout_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = sweet_fb_scanout;
++	int error = sysctl_handle_int(oidp, &v, 0, req);
++
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (v < 0 || v > 2) {
++		return EINVAL;
++	}
++	int was = sweet_fb_scanout;
++	if (v == 1 && sweet_frame_fb != NULL) {
++		sweet_frame_fb->fScanStuck = false;     /* (a new try after the MDP once did not take a flush) */
++	}
++	sweet_fb_scanout = v;
++	if (was == 1 && v != 1 && sweet_frame_fb != NULL) {
++		sweet_frame_fb->scanoutStop();
++	}
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_scanout, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sweet_fb_scanout_sysctl, "I",
++    "sapphire 0350: 1 = the window server's surfaces scanned out by VIG0's scaler (no copy), 2 = their pool only, 0 = as before");
++
++static int
++sweet_fb_scanout_diag_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[2048];
++	size_t off = 0;
++	AppleCLCD *fb = sweet_frame_fb;
++	uint32_t used = 0, slots = 0;
++	uint64_t made = 0, refused = 0;
++
++	sweet_scanout_pool_census(&used, &slots, &made, &refused);
++	buf[0] = 0;
++	SWEET_FBD_CAT("scanout (kern.sweet_fb_scanout %d): %s; plane now %s, scaler %#x; CTL_FLUSH %s\n", sweet_fb_scanout,
++	    fb == NULL ? "no framebuffer" : fb->fScanWhy != NULL ? fb->fScanWhy : fb->fScanStuck ? "stopped: a flush was not taken" :
++	    "ready", fb != NULL && fb->fPlaneScaled ? "scaled" : "unscaled", fb != NULL ? fb->fScalerVersion : 0,
++	    fb == NULL || !fb->fFlushKnown ? "not looked at yet" : fb->fFlushReadback ? "reads back" : "does not read back");
++	SWEET_FBD_CAT("pool: %u of %u slots in use, %llu surfaces made in it, %llu refused (full)\n", used, slots, made, refused);
++	SWEET_FBD_CAT("frames %llu flips %llu; copied instead: not one layer %llu, not from the pool %llu, unfit %llu, "
++	    "swapped again while on the panel or waiting %llu, queue off %llu\n", sweet_fbs.frames, sweet_fbs.flips,
++	    sweet_fbs.not_one_layer, sweet_fbs.not_pool, sweet_fbs.unfit, sweet_fbs.reused, sweet_fbs.queue_off);
++	SWEET_FBD_CAT("drawn after the SwapEnd %llu, shown before done (250 ms) %llu; swaps that waited %llu, %llu us in all, "
++	    "max %llu; given up %llu; flips waiting for a writable plane %llu\n", sweet_fbs.late_draw, sweet_fbs.forced,
++	    sweet_fbs.holds, sweet_fbs.hold_us, sweet_fbs.hold_max_us, sweet_fbs.timeouts, sweet_fbs.window_waits);
++	SWEET_FBD_CAT("plane to scaled %llu, to unscaled %llu (waited %llu times, max %llu us); frames let go after the "
++	    "panel left them %llu; stops %llu; flushes not taken %llu\n", sweet_fbs.to_scaled, sweet_fbs.to_unscaled,
++	    sweet_fbs.unscaled_waits, sweet_fbs.unscaled_wait_max_us, sweet_fbs.released, sweet_fbs.stops, sweet_fbs.stuck);
++	if (fb != NULL && fb->fPlaneScaled) {
++		SWEET_FBD_CAT("showing %u,%u %ux%u of a surface (rows of %u bytes) at %#llx\n", fb->fPlaneGeo.sx, fb->fPlaneGeo.sy,
++		    fb->fPlaneGeo.sw, fb->fPlaneGeo.sh, fb->fPlaneStride, fb->fScanPhys);
++	}
++	return SYSCTL_OUT(req, buf, off + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_scanout_diag, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_fb_scanout_diag_sysctl, "A", "sapphire 0350: the scanout's state and counters");
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -186,6 +186,80 @@ sweet_scanout_free_slot(int slot)
+ 	IOLockUnlock(sweet_surface_lock);
+ }
+ 
++/*
++ * sapphire 0350: the framebuffer's scanout pool. While kern.sweet_fb_scanout is 1 or 2 (SweetFramebuffer.cpp), a surface
++ * that the window server (backboardd) makes at the size iOS draws the screen at (750 x 1624 at 2x), 32-bit BGRA in one
++ * plane with rows of whole 64-byte lines, gets a slot of it: memory the MDP scans by physical address (below 4 GiB and
++ * contiguous; the display's SMMU stream is in bypass, as for the flip buffers), mapped write-combined in the kernel, in
++ * every program that maps the surface and in the GPU client's mapping, so that no CPU cache holds any of it and neither
++ * the GPU's reads and writes nor the MDP's need cache maintenance. Everyone else's surfaces, and these once the pool is
++ * full, are made as before; a slot goes back when its surface is freed (the framebuffer holds the surfaces it shows).
++ */
++static uint64_t sweet_pool_pa;
++static uint32_t sweet_pool_slots, sweet_pool_slot_size, sweet_pool_w, sweet_pool_h;
++static uint32_t sweet_pool_used;                /* bit per slot, sweet_surface_lock */
++static uint64_t sweet_pool_made, sweet_pool_refused;
++
++void
++sweet_scanout_pool_set(uint64_t pa, uint32_t slots, uint32_t slot_size, uint32_t width, uint32_t height)
++{
++	sweet_pool_pa = pa;
++	sweet_pool_slot_size = slot_size;
++	sweet_pool_w = width;
++	sweet_pool_h = height;
++	sweet_pool_slots = slots < 32 ? slots : 32;
++}
++
++void
++sweet_scanout_pool_census(uint32_t *used, uint32_t *slots, uint64_t *made, uint64_t *refused)
++{
++	*used = (uint32_t)__builtin_popcount(sweet_pool_used);
++	*slots = sweet_pool_slots;
++	*made = sweet_pool_made;
++	*refused = sweet_pool_refused;
++}
++
++static bool
++sweet_pool_eligible(const SweetSurface *s)
++{
++	char who[32];
++
++	if (sweet_pool_slots == 0 || !sweet_fb_scanout_pool_on() || s->width != sweet_pool_w || s->height != sweet_pool_h ||
++	    s->pixelFormat != 0x42475241 || s->bytesPerElement != 4 || s->planeCount > 1 || s->elementWidth != 1 ||
++	    s->elementHeight != 1 || s->offset != 0 || (s->bytesPerRow & 63) != 0 || s->allocSize > sweet_pool_slot_size) {
++		return false;
++	}
++	proc_selfname(who, sizeof(who));
++	return strcmp(who, "backboardd") == 0;
++}
++
++static int
++sweet_pool_alloc_slot(void)
++{
++	int slot = -1;
++	IOLockLock(sweet_surface_lock);
++	for (uint32_t i = 0; i < sweet_pool_slots; i++) {
++		if (!(sweet_pool_used & (1u << i))) {
++			sweet_pool_used |= 1u << i;
++			slot = (int)i;
++			break;
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	return slot;
++}
++
++static void
++sweet_pool_free_slot(int slot)
++{
++	if (slot < 0) {
++		return;
++	}
++	IOLockLock(sweet_surface_lock);
++	sweet_pool_used &= ~(1u << slot);
++	IOLockUnlock(sweet_surface_lock);
++}
++
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
+ void
+@@ -201,7 +275,11 @@ SweetSurface::free()
+ 	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+-	sweet_scanout_free_slot(scanoutSlot);
++	if (lowPool) {
++		sweet_pool_free_slot(scanoutSlot);      /* 0350 */
++	} else {
++		sweet_scanout_free_slot(scanoutSlot);
++	}
+ 	scanoutSlot = -1;
+ 	sweet_surface_counted(-1);
+ 	OSObject::free();
+@@ -216,7 +294,8 @@ SweetSurface::kernelAddress()
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(scanoutPhys || wrapped ? kIOMapDefaultCache : kIOMapWriteCombineCache);
++		/* (0350: a slot of the scanout pool is write-combined like the panel's memory; mapped by default it would be Device) */
++		kernelMap = memory->map((scanoutPhys && !lowPool) || wrapped ? kIOMapDefaultCache : kIOMapWriteCombineCache);
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -853,6 +932,47 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			    client_address->unsigned64BitValue(), used, s->width, s->height, s->pixelFormat, ret);
+ 		}
+ 	}
++	if (ret == kIOReturnSuccess && s->memory == NULL && sweet_pool_eligible(s)) {
++		/* 0350: one of the window server's screen surfaces, from the framebuffer's scanout pool */
++		static uint32_t pool_told;
++		int slot = sweet_pool_alloc_slot();
++		uint64_t pa = slot >= 0 ? sweet_pool_pa + (uint64_t)slot * sweet_pool_slot_size : 0;
++		IOMemoryDescriptor *pmem = slot >= 0 ? IOMemoryDescriptor::withPhysicalAddress(pa, s->allocSize, kIODirectionInOut) : NULL;
++		if (pmem != NULL) {
++			s->memory = pmem;
++			s->scanoutPhys = pa;
++			s->scanoutSlot = slot;
++			s->lowPool = true;
++			s->mapCache = kIOMapWriteCombineCache;
++			uintptr_t va = s->kernelAddress();
++			if (va == 0) {
++				/* (no kernel mapping: made as before) */
++				OSSafeReleaseNULL(s->memory);
++				s->scanoutPhys = 0;
++				s->scanoutSlot = -1;
++				s->lowPool = false;
++				sweet_pool_free_slot(slot);
++				slot = -1;
++			} else {
++				bzero((void *)va, s->allocSize);
++				sweet_pool_made++;
++				if (!sweet_surface_publish(s)) {
++					ret = kIOReturnNoResources;
++				}
++			}
++		} else if (slot >= 0) {
++			sweet_pool_free_slot(slot);
++			slot = -1;
++		}
++		if (slot < 0) {
++			sweet_pool_refused++;
++		}
++		if (pool_told++ < 12) {
++			IOLog("SWEET SURF: scanout pool: surface %u %ux%u bpr %u %s (%u of %u slots in use)\n", s->id, s->width, s->height,
++			    s->bytesPerRow, slot >= 0 ? "in a slot" : "not in the pool (full)", (uint32_t)__builtin_popcount(sweet_pool_used),
++			    sweet_pool_slots);
++		}
++	}
+ 	if (ret == kIOReturnSuccess && s->memory == NULL && sweet_scanout_eligible(s)) {
+ 		int slot = sweet_scanout_alloc_slot();
+ 		if (slot >= 0) {
+@@ -948,7 +1068,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 				at = n > 0 && at + (size_t)n < sizeof(keys) ? at + (size_t)n : sizeof(keys) - 1;
+ 			}
+ 			OSSafeReleaseNULL(it);
+-			IOLog("SWEET SURF: screen-sized surface %u by %s (0x%x):%s\n", s->id, who, ret, keys);
++			IOLog("SWEET SURF: screen-sized surface %u by %s (0x%x):%s\n", s->id, who, (uint32_t)ret, keys);
+ 		}
+ 	}
+ 	props->release();
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -62,8 +62,16 @@ public:
+ 	volatile uint32_t         cpuEpoch, cleanEpoch, invalEpoch;
+ 	uint32_t                  wrapDelta;    /* wrapped client memory: where it starts in its first page */
+ 	bool                      wrapped;      /* memory is a prepared range of a task (IOSurfaceWrapClient*) */
++	/*
++	 * sapphire 0350: lowPool, the memory is a slot of the framebuffer's scanout pool (scanoutPhys, scanoutSlot): RAM the
++	 * kernel does not manage, below 4 GiB, mapped write-combined everywhere (no CPU cache holds any of it). gpuFence:
++	 * the msm fence of the last submission that named the surface (SapphireGpu.cpp, under its lock), so that a scanout
++	 * of it waits for whatever was drawn into it, even if submitted after its SwapEnd.
++	 */
++	bool                      lowPool;
++	volatile uint32_t         gpuFence;
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { sweet_surface_counted(1); gpuSeed = 0; gpuDrawn = false; cpuEpoch = 1; cleanEpoch = 0; invalEpoch = 0; scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { sweet_surface_counted(1); gpuSeed = 0; gpuDrawn = false; cpuEpoch = 1; cleanEpoch = 0; invalEpoch = 0; scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; lowPool = false; gpuFence = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+@@ -88,6 +96,16 @@ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+  */
+ void sweet_scanout_set_geometry(uint32_t w1, uint32_t h1, uint32_t w2, uint32_t h2);
+ 
++/*
++ * sapphire 0350: the framebuffer's scanout pool (SweetFramebuffer.cpp, kern.sweet_fb_scanout). The framebuffer gives its
++ * memory (slots of slot_size bytes from pa, below 4 GiB) and the size of the surfaces it can scan out of it; while
++ * sweet_fb_scanout_pool_on() says so, a surface the window server makes at that size, 32-bit BGRA in one plane, gets a
++ * slot. The census: slots in use and in all, surfaces given one, and refused for want of one.
++ */
++void sweet_scanout_pool_set(uint64_t pa, uint32_t slots, uint32_t slot_size, uint32_t width, uint32_t height);
++void sweet_scanout_pool_census(uint32_t *used, uint32_t *slots, uint64_t *made, uint64_t *refused);
++int sweet_fb_scanout_pool_on(void);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
