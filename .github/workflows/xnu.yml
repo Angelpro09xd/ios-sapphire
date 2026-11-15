@@ -15,6 +15,8 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+  # The working branch is `sapphire`, not `main`: this push trigger never fires there.
+  # Start it by hand: `gh workflow run xnu.yml -R <fork> --ref sapphire`.
   push:
     branches: [main]
     paths:
@@ -42,9 +44,9 @@ env:
 
 jobs:
   build:
-    # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
-    # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-14
+    # macos-14 images were retired: macos-15 with its oldest Xcode 16.x (selected in Deps), as in
+    # xnu-4k.yml; patch 0141 gives this xnu the IORPC.kernelContent that Xcode 16's iig emits
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -70,12 +72,13 @@ jobs:
       - name: Deps
         run: |
           brew install jq gum bash cmake ninja ccache
-          # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 14
+          # build.sh only checks that xcodes exists (Xcode is preinstalled)
           printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
           sudo chmod +x /usr/local/bin/xcodes
           sw_vers
           ls -d /Applications/Xcode*.app
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          # the oldest Xcode 16.x on the runner (the port was built with 16.0), as in xnu-4k.yml
+          XC=$(ls -d /Applications/Xcode_16*.app | sort -V | head -1)
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           sudo xcode-select -s "$XC"
           xcodebuild -version
@@ -145,7 +148,8 @@ jobs:
           mkdir -p out
           cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
           ls -la out
-          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+          # files only: kernel.development.sweet.link is a directory (as in xnu-4k.yml)
+          (cd out && find . -maxdepth 1 -type f -name "kernel.*" -exec shasum -a 256 {} + > SHA256SUMS) || true
 
       - uses: actions/upload-artifact@v4
         if: always()
